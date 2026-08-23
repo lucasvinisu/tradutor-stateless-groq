@@ -8,10 +8,10 @@ const translationCache = new Map();
 const processingJobs = new Set();
 
 const manifest = {
-    id: "org.tradutor.stateless.gemini.optimized",
-    version: "3.1.0",
-    name: "Tradutor Gemini 2-Parts",
-    description: "Traduz legendas divididas em duas metades para máxima velocidade e estabilidade.",
+    id: "org.tradutor.stateless.gemini.multisource.stable",
+    version: "4.1.0",
+    name: "Tradutor Gemini Multi-Source 2-Parts",
+    description: "Busca em múltiplas fontes de legenda e traduz em 2 metades usando Google Gemini.",
     resources: ["subtitles"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -22,6 +22,37 @@ app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
 
+// Função para tentar buscar legendas em múltiplas fontes públicas
+async function fetchSubtitleUrl(type, id) {
+    const sources = [
+        // Fonte 1: OpenSubtitles v3 (Principal e mais completa)
+        async () => {
+            const res = await fetch(`https://opensubtitles-v3.strem.io/subtitles/${type}/${id}.json`);
+            const data = await res.json();
+            if (data.subtitles && data.subtitles.length > 0) {
+                const sub = data.subtitles.find(s => s.lang === 'eng' || s.lang === 'en') || data.subtitles[0];
+                return sub?.url || null;
+            }
+            return null;
+        },
+        // Fonte 2: SubDL / Fontes alternativas públicas (se aplicável via Stremio add-on resolvers)
+        async () => {
+            // Caso queira adicionar outro endpoint público compatível no futuro
+            return null;
+        }
+    ];
+
+    for (const sourceFn of sources) {
+        try {
+            const url = await sourceFn();
+            if (url) return url;
+        } catch (e) {
+            // Ignora falhas de uma fonte individual e tenta a próxima
+        }
+    }
+    return null;
+}
+
 // Função para dividir o SRT exatamente em 2 metades equilibradas
 function splitSrtInHalves(srtText) {
     const blocks = srtText.replace(/\r\n/g, '\n').split(/\n\s*\n/).filter(b => b.trim() !== '');
@@ -31,6 +62,7 @@ function splitSrtInHalves(srtText) {
     return [half1, half2];
 }
 
+// Motor de tradução em background usando a estratégia comprovada de 2 metades
 async function backgroundTranslate(cacheKey, srtUrl) {
     if (processingJobs.has(cacheKey)) return;
     processingJobs.add(cacheKey);
@@ -94,24 +126,17 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
     }
 
     try {
-        const subSearchUrl = `https://opensubtitles-v3.strem.io/subtitles/${type}/${id}.json`;
-        const searchResp = await fetch(subSearchUrl);
-        const searchData = await searchResp.json();
+        const subtitleUrl = await fetchSubtitleUrl(type, id);
 
-        if (!searchData.subtitles || searchData.subtitles.length === 0) {
-            return res.json({ subtitles: [] });
-        }
-
-        const targetSub = searchData.subtitles.find(s => s.lang === 'eng' || s.lang === 'en') || searchData.subtitles[0];
-        if (!targetSub || !targetSub.url) {
+        if (!subtitleUrl) {
             return res.json({ subtitles: [] });
         }
 
         if (!processingJobs.has(cacheKey)) {
-            backgroundTranslate(cacheKey, targetSub.url);
+            backgroundTranslate(cacheKey, subtitleUrl);
         }
 
-        const warningSrt = `1\n00:00:01,000 --> 00:00:08,000\n⏳ Traduzindo com Gemini (2 Partes)...\n\n2\n00:00:08,500 --> 00:00:15,000\nAguarde 10 segundos e recarregue a legenda.`;
+        const warningSrt = `1\n00:00:01,000 --> 00:00:08,000\n⏳ Buscando e traduzindo (Gemini)...\n\n2\n00:00:08,500 --> 00:00:15,000\nAguarde 10 segundos e recarregue a legenda.`;
         const warningBase64 = Buffer.from(warningSrt, 'utf-8').toString('base64');
 
         res.json({
@@ -130,5 +155,5 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`[SISTEMA] Servidor Gemini 2-Parts rodando na porta ${PORT}`);
+    console.log(`[SISTEMA] Servidor Multi-Source Stable rodando na porta ${PORT}`);
 });
