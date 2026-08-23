@@ -4,15 +4,14 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Memória RAM temporária para guardar traduções e evitar chamadas duplicadas
 const translationCache = new Map();
 const processingJobs = new Set();
 
 const manifest = {
     id: "org.tradutor.stateless.gemini.async",
-    version: "2.0.0",
-    name: "Tradutor Gemini Async",
-    description: "Traduz legendas em segundo plano usando Google Gemini.",
+    version: "2.1.0",
+    name: "Tradutor Gemini Async Otimizado",
+    description: "Traduz legendas em blocos seguros usando Google Gemini.",
     resources: ["subtitles"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -23,7 +22,16 @@ app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
 
-// Função que traduz no background
+// Função para fatiar o SRT em blocos seguros para o Gemini processar rápido
+function chunkSrt(srtText, maxBlockSize = 40) {
+    const blocks = srtText.replace(/\r\n/g, '\n').split(/\n\s*\n/).filter(b => b.trim() !== '');
+    const chunks = [];
+    for (let i = 0; i < blocks.length; i += maxBlockSize) {
+        chunks.push(blocks.slice(i, i + maxBlockSize).join('\n\n'));
+    }
+    return chunks;
+}
+
 async function backgroundTranslate(cacheKey, srtUrl) {
     if (processingJobs.has(cacheKey)) return;
     processingJobs.add(cacheKey);
@@ -33,31 +41,40 @@ async function backgroundTranslate(cacheKey, srtUrl) {
         const srtResp = await fetch(srtUrl);
         const srtText = await srtResp.text();
 
+        const chunks = chunkSrt(srtText, 40); // Blocos de 40 legendas por requisição
+        let translatedChunks = [];
         const apiKey = process.env.GEMINI_API_KEY;
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
 
-        const prompt = `Você é um tradutor profissional de legendas de filmes e séries para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos de legenda SRT. Não adicione nenhum comentário, markdown extra ou introdução, devolva apenas o texto traduzido no formato SRT puro:\n\n${srtText}`;
+        console.log(`[BACKGROUND] Traduzindo ${chunks.chunks?.length || chunks.length} blocos via Gemini...`);
 
-        console.log(`[BACKGROUND] Enviando para o Google Gemini...`);
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-        });
+        for (let i = 0; i < chunks.length; i++) {
+            const prompt = `Traduza os blocos de legenda SRT abaixo para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos. Não adicione comentários:\n\n${chunks[i]}`;
 
-        const data = await response.json();
-        if (data.error) {
-            console.error("[ERRO GEMINI BACKGROUND]", data.error.message);
-            processingJobs.delete(cacheKey);
-            return;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+            });
+
+            const data = await response.json();
+            if (data.error) {
+                console.error(`[ERRO GEMINI LOTE ${i+1}]`, data.error.message);
+                translatedChunks.push(chunks[i]); // Mantém o original se falhar
+            } else {
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || chunks[i];
+                translatedChunks.push(text);
+            }
+
+            // Pequena pausa para estabilidade
+            await new Promise(resolve => setTimeout(resolve, 200));
         }
 
-        const translatedText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (translatedText) {
-            const base64Sub = Buffer.from(translatedText, 'utf-8').toString('base64');
-            translationCache.set(cacheKey, `data:text/plain;base64,${base64Sub}`);
-            console.log(`[SUCESSO] Tradução concluída e salva em cache para ${cacheKey}!`);
-        }
+        const finalTranslatedText = translatedChunks.join('\n\n');
+        const base64Sub = Buffer.from(finalTranslatedText, 'utf-8').toString('base64');
+        translationCache.set(cacheKey, `data:text/plain;base64,${base64Sub}`);
+        console.log(`[SUCESSO] Tradução completa e salva em cache para ${cacheKey}!`);
+
     } catch (err) {
         console.error("[ERRO CRÍTICO BACKGROUND]", err);
     } finally {
@@ -70,7 +87,6 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
     const cacheKey = `${type}-${id}`;
     console.log(`[STREMIO] Pedido recebido para ${type} ID: ${id}`);
 
-    // 1. Se já estiver traduzido e salvo na memória, entrega instantaneamente!
     if (translationCache.has(cacheKey)) {
         console.log(`[CACHE] Entregando legenda traduzida instantaneamente para ${cacheKey}`);
         return res.json({
@@ -92,12 +108,10 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
             return res.json({ subtitles: [] });
         }
 
-        // 2. Se não estiver traduzido, disparar a tradução em background e devolver um aviso imediato ao Stremio
         if (!processingJobs.has(cacheKey)) {
             backgroundTranslate(cacheKey, targetSub.url);
         }
 
-        // Cria uma legenda temporária de aviso para respeitar o tempo limite do Stremio
         const warningSrt = `1\n00:00:01,000 --> 00:00:08,000\n⏳ Traduzindo com Gemini...\n\n2\n00:00:08,500 --> 00:00:15,000\nAguarde 1 minuto e recarregue a legenda.`;
         const warningBase64 = Buffer.from(warningSrt, 'utf-8').toString('base64');
 
@@ -117,5 +131,5 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`[SISTEMA] Servidor Async Gemini rodando na porta ${PORT}`);
+    console.log(`[SISTEMA] Servidor Async Gemini Otimizado rodando na porta ${PORT}`);
 });
