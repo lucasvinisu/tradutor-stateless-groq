@@ -3,6 +3,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(cors());
 app.disable("x-powered-by");
 
@@ -14,55 +15,215 @@ app.disable("x-powered-by");
 
 const PORT = Number(process.env.PORT || 10000);
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const GEMINI_API_KEY =
+    process.env.GEMINI_API_KEY || "";
+
+const GEMINI_MODEL =
+    process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 /*
- * No Render, recomendo definir:
+ * URL pública do Render.
  *
- * PUBLIC_URL=https://seu-addon.onrender.com
+ * Exemplo:
  *
- * Se não definir, o addon tenta descobrir automaticamente pelo request.
+ * PUBLIC_URL=https://meu-addon.onrender.com
+ *
+ * Se não definir, tentamos descobrir pelo request.
  */
-const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const PUBLIC_URL =
+    (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 
 /*
- * Limites de segurança/performance.
+|--------------------------------------------------------------------------
+| LIMITES DE REDE
+|--------------------------------------------------------------------------
+*/
+
+const SOURCE_FETCH_TIMEOUT_MS =
+    Number(process.env.SOURCE_FETCH_TIMEOUT_MS || 20_000);
+
+const GEMINI_TIMEOUT_MS =
+    Number(process.env.GEMINI_TIMEOUT_MS || 60_000);
+
+/*
+ * Quanto tempo o endpoint /subtitle/:jobId.srt
+ * espera antes de devolver uma legenda de processamento.
  */
-const SOURCE_FETCH_TIMEOUT_MS = 20_000;
-const GEMINI_TIMEOUT_MS = 60_000;
-
-const WAIT_FOR_TRANSLATION_MS = 25_000;
-
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const JOB_TTL_MS = 2 * 60 * 60 * 1000;   // 2h
-const MAX_CACHE_ENTRIES = 500;
-const MAX_JOBS = 500;
-
-const BATCH_SIZE = 60;
-const MAX_SOURCE_CHARS = 500_000;
-
-const MAX_GEMINI_RETRIES = 3;
-const RETRY_BASE_MS = 1_500;
+const WAIT_FOR_TRANSLATION_MS =
+    Number(process.env.WAIT_FOR_TRANSLATION_MS || 25_000);
 
 /*
 |--------------------------------------------------------------------------
 | CACHE E JOBS
 |--------------------------------------------------------------------------
+*/
+
+const CACHE_TTL_MS =
+    Number(
+        process.env.CACHE_TTL_MS ||
+        24 * 60 * 60 * 1000
+    );
+
+const JOB_TTL_MS =
+    Number(
+        process.env.JOB_TTL_MS ||
+        2 * 60 * 60 * 1000
+    );
+
+const MAX_CACHE_ENTRIES =
+    Number(process.env.MAX_CACHE_ENTRIES || 500);
+
+const MAX_JOBS =
+    Number(process.env.MAX_JOBS || 500);
+
+/*
+|--------------------------------------------------------------------------
+| LIMITES DA TRADUÇÃO
+|--------------------------------------------------------------------------
 |
-| translationCache:
-|   guarda resultados já concluídos.
+| Não usamos somente quantidade de blocos.
 |
-| jobs:
-|   acompanha traduções em andamento/concluídas.
+| Um lote precisa respeitar:
 |
-| Tudo fica em RAM.
-| Portanto, se o Render reiniciar, o cache é perdido.
+| - MAX_BATCH_BLOCKS
+| - MAX_BATCH_CHARS
+|
+| O primeiro limite atingido encerra o lote.
+|--------------------------------------------------------------------------
+*/
+
+const MAX_BATCH_BLOCKS =
+    Number(process.env.MAX_BATCH_BLOCKS || 30);
+
+const MAX_BATCH_CHARS =
+    Number(process.env.MAX_BATCH_CHARS || 12_000);
+
+const MAX_SOURCE_CHARS =
+    Number(process.env.MAX_SOURCE_CHARS || 300_000);
+
+/*
+|--------------------------------------------------------------------------
+| RATE LIMIT DO GEMINI
+|--------------------------------------------------------------------------
+|
+| Como a API é gratuita, preferimos segurança.
+|
+| Por padrão:
+|
+| - somente 1 requisição Gemini simultânea;
+| - intervalo mínimo entre requisições;
+| - retry limitado.
+|
+| IMPORTANTE:
+|
+| Os limites reais de RPM/TPM/RPD dependem do projeto
+| e podem ser diferentes. Consulte o AI Studio.
+|--------------------------------------------------------------------------
+*/
+
+const MAX_CONCURRENT_GEMINI =
+    Math.max(
+        1,
+        Number(process.env.MAX_CONCURRENT_GEMINI || 1)
+    );
+
+const MIN_GEMINI_INTERVAL_MS =
+    Math.max(
+        0,
+        Number(process.env.MIN_GEMINI_INTERVAL_MS || 3500)
+    );
+
+const MAX_GEMINI_RETRIES =
+    Math.max(
+        0,
+        Number(process.env.MAX_GEMINI_RETRIES || 2)
+    );
+
+const RETRY_BASE_MS =
+    Math.max(
+        500,
+        Number(process.env.RETRY_BASE_MS || 4000)
+    );
+
+/*
+ * Número máximo de tentativas para corrigir JSON
+ * ou resultado estrutural inválido.
+ *
+ * Isso é separado do retry HTTP.
+ */
+const MAX_TRANSLATION_RETRIES =
+    Math.max(
+        0,
+        Number(
+            process.env.MAX_TRANSLATION_RETRIES || 1
+        )
+    );
+
+/*
+|--------------------------------------------------------------------------
+| PROTEÇÃO CONTRA EXCESSO DE JOBS
+|--------------------------------------------------------------------------
+*/
+
+const MAX_ACTIVE_JOBS =
+    Math.max(
+        1,
+        Number(process.env.MAX_ACTIVE_JOBS || 3)
+    );
+
+/*
+|--------------------------------------------------------------------------
+| ESTRUTURAS EM MEMÓRIA
 |--------------------------------------------------------------------------
 */
 
 const translationCache = new Map();
+
 const jobs = new Map();
+
+/*
+ * Relação:
+ *
+ * cacheKey -> jobId
+ *
+ * Isso evita procurar todos os jobs.
+ */
+const jobsByCacheKey = new Map();
+
+/*
+|--------------------------------------------------------------------------
+| FILA GLOBAL DO GEMINI
+|--------------------------------------------------------------------------
+*/
+
+const geminiQueue = [];
+
+let activeGeminiRequests = 0;
+
+let lastGeminiRequestAt = 0;
+
+/*
+|--------------------------------------------------------------------------
+| ESTATÍSTICAS
+|--------------------------------------------------------------------------
+*/
+
+const stats = {
+    geminiRequests: 0,
+    geminiSuccess: 0,
+    geminiErrors: 0,
+    geminiRateLimited: 0,
+
+    translationsStarted: 0,
+    translationsCompleted: 0,
+    translationsFailed: 0,
+
+    cacheHits: 0,
+
+    sourceDownloads: 0,
+
+    startedAt: Date.now()
+};
 
 /*
 |--------------------------------------------------------------------------
@@ -72,15 +233,30 @@ const jobs = new Map();
 
 const manifest = {
     id: "org.tradutor.stateless.gemini.async",
-    version: "3.0.0",
+    version: "4.0.0",
+
     name: "Tradutor Gemini Async",
+
     description:
         "Traduz automaticamente legendas em inglês para Português do Brasil usando Google Gemini.",
+
     logo: "",
-    resources: ["subtitles"],
-    types: ["movie", "series"],
-    idPrefixes: ["tt"],
+
+    resources: [
+        "subtitles"
+    ],
+
+    types: [
+        "movie",
+        "series"
+    ],
+
+    idPrefixes: [
+        "tt"
+    ],
+
     catalogs: [],
+
     behaviorHints: {
         configurable: false,
         adult: false
@@ -89,12 +265,14 @@ const manifest = {
 
 /*
 |--------------------------------------------------------------------------
-| HELPERS GERAIS
+| HELPERS
 |--------------------------------------------------------------------------
 */
 
 function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise(resolve => {
+        setTimeout(resolve, ms);
+    });
 }
 
 function sha256(text) {
@@ -111,7 +289,9 @@ function randomId(length = 16) {
 }
 
 function cleanBaseUrl(req) {
-    if (PUBLIC_URL) return PUBLIC_URL;
+    if (PUBLIC_URL) {
+        return PUBLIC_URL;
+    }
 
     const protocol =
         req.headers["x-forwarded-proto"] ||
@@ -125,14 +305,25 @@ function cleanBaseUrl(req) {
     return `${protocol}://${host}`;
 }
 
-function safeJson(res, data, status = 200) {
+function safeJson(
+    res,
+    data,
+    status = 200
+) {
     res.status(status);
-    res.set("Cache-Control", "no-store");
+
+    res.set(
+        "Cache-Control",
+        "no-store"
+    );
+
     return res.json(data);
 }
 
 function getErrorMessage(error) {
-    if (!error) return "Erro desconhecido";
+    if (!error) {
+        return "Erro desconhecido";
+    }
 
     if (typeof error === "string") {
         return error;
@@ -151,18 +342,27 @@ function getErrorMessage(error) {
 |--------------------------------------------------------------------------
 */
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000) {
-    const controller = new AbortController();
+async function fetchWithTimeout(
+    url,
+    options = {},
+    timeoutMs = 20_000
+) {
+    const controller =
+        new AbortController();
 
-    const timer = setTimeout(() => {
-        controller.abort();
-    }, timeoutMs);
+    const timer =
+        setTimeout(() => {
+            controller.abort();
+        }, timeoutMs);
 
     try {
-        return await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
+        return await fetch(
+            url,
+            {
+                ...options,
+                signal: controller.signal
+            }
+        );
     } finally {
         clearTimeout(timer);
     }
@@ -170,65 +370,123 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000) {
 
 /*
 |--------------------------------------------------------------------------
-| LIMPEZA DE CACHE
+| LIMPEZA DE MEMÓRIA
 |--------------------------------------------------------------------------
 */
 
 function cleanupMemory() {
     const now = Date.now();
 
-    for (const [key, item] of translationCache.entries()) {
+    /*
+     * CACHE
+     */
+    for (
+        const [key, item]
+        of translationCache.entries()
+    ) {
         if (item.expiresAt <= now) {
             translationCache.delete(key);
         }
     }
 
-    for (const [key, job] of jobs.entries()) {
+    /*
+     * JOBS
+     */
+    for (
+        const [key, job]
+        of jobs.entries()
+    ) {
         if (
             job.expiresAt <= now &&
             job.status !== "processing"
         ) {
             jobs.delete(key);
+
+            if (
+                jobsByCacheKey.get(
+                    job.cacheKey
+                ) === key
+            ) {
+                jobsByCacheKey.delete(
+                    job.cacheKey
+                );
+            }
         }
     }
 
     /*
-     * Limites máximos para impedir crescimento infinito.
+     * Limite do cache.
      */
-    while (translationCache.size > MAX_CACHE_ENTRIES) {
-        const firstKey = translationCache.keys().next().value;
+    while (
+        translationCache.size >
+        MAX_CACHE_ENTRIES
+    ) {
+        const firstKey =
+            translationCache
+                .keys()
+                .next()
+                .value;
 
-        if (firstKey === undefined) break;
-
-        translationCache.delete(firstKey);
-    }
-
-    while (jobs.size > MAX_JOBS) {
-        const firstKey = jobs.keys().next().value;
-
-        if (firstKey === undefined) break;
-
-        const job = jobs.get(firstKey);
-
-        /*
-         * Nunca eliminamos um job em processamento.
-         */
-        if (job?.status === "processing") {
+        if (
+            firstKey === undefined
+        ) {
             break;
         }
 
-        jobs.delete(firstKey);
+        translationCache.delete(
+            firstKey
+        );
+    }
+
+    /*
+     * Limite dos jobs.
+     *
+     * Nunca remove processamento ativo.
+     */
+    while (
+        jobs.size >
+        MAX_JOBS
+    ) {
+        let removed = false;
+
+        for (
+            const [key, job]
+            of jobs.entries()
+        ) {
+            if (
+                job.status !== "processing"
+            ) {
+                jobs.delete(key);
+
+                if (
+                    jobsByCacheKey.get(
+                        job.cacheKey
+                    ) === key
+                ) {
+                    jobsByCacheKey.delete(
+                        job.cacheKey
+                    );
+                }
+
+                removed = true;
+                break;
+            }
+        }
+
+        if (!removed) {
+            break;
+        }
     }
 }
 
-/*
- * Executa limpeza periodicamente.
- */
-setInterval(cleanupMemory, 5 * 60 * 1000).unref();
+setInterval(
+    cleanupMemory,
+    5 * 60 * 1000
+).unref();
 
 /*
 |--------------------------------------------------------------------------
-| NORMALIZAÇÃO DE SRT
+| NORMALIZAÇÃO SRT
 |--------------------------------------------------------------------------
 */
 
@@ -242,8 +500,14 @@ function normalizeSrt(text) {
 
 function stripCodeFences(text) {
     return String(text || "")
-        .replace(/^```(?:srt|text|plaintext)?\s*/i, "")
-        .replace(/\s*```$/i, "")
+        .replace(
+            /^```(?:json|srt|text|plaintext)?\s*/i,
+            ""
+        )
+        .replace(
+            /\s*```$/i,
+            ""
+        )
         .trim();
 }
 
@@ -254,43 +518,64 @@ function stripCodeFences(text) {
 */
 
 function parseSrt(srt) {
-    const normalized = normalizeSrt(srt);
+    const normalized =
+        normalizeSrt(srt);
 
     if (!normalized) {
         return [];
     }
 
-    const blocks = normalized
-        .split(/\n{2,}/)
-        .map(block => block.trim())
-        .filter(Boolean);
+    const blocks =
+        normalized
+            .split(/\n{2,}/)
+            .map(block => block.trim())
+            .filter(Boolean);
 
     const result = [];
 
-    for (const block of blocks) {
-        const lines = block.split("\n");
+    for (
+        const block
+        of blocks
+    ) {
+        const lines =
+            block.split("\n");
 
         if (lines.length < 3) {
             continue;
         }
 
-        const indexLine = lines[0].trim();
-        const timingLine = lines[1].trim();
+        const indexLine =
+            lines[0].trim();
 
-        if (!/^\d+$/.test(indexLine)) {
+        const timingLine =
+            lines[1].trim();
+
+        if (
+            !/^\d+$/.test(
+                indexLine
+            )
+        ) {
             continue;
         }
 
-        if (!/^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/.test(timingLine)) {
+        if (
+            !/^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/
+                .test(timingLine)
+        ) {
             continue;
         }
 
-        const textLines = lines.slice(2);
+        const textLines =
+            lines.slice(2);
 
         result.push({
             index: Number(indexLine),
-            timing: timingLine,
-            text: textLines.join("\n")
+
+            timing:
+                timingLine,
+
+            text:
+                textLines.join("\n")
         });
     }
 
@@ -303,64 +588,123 @@ function parseSrt(srt) {
 |--------------------------------------------------------------------------
 */
 
-function buildSrt(blocks, translatedTexts) {
-    return blocks
-        .map((block, index) => {
-            const translated = translatedTexts[index] ?? block.text;
+function buildSrt(
+    blocks,
+    translatedTexts
+) {
+    return (
+        blocks
+            .map(
+                (
+                    block,
+                    index
+                ) => {
+                    const translated =
+                        translatedTexts[index] ??
+                        block.text;
 
-            return [
-                block.index,
-                block.timing,
-                translated
-            ].join("\n");
-        })
-        .join("\n\n")
-        .trim() + "\n";
+                    return [
+                        block.index,
+                        block.timing,
+                        translated
+                    ].join("\n");
+                }
+            )
+            .join("\n\n")
+            .trim() + "\n"
+    );
 }
 
 /*
 |--------------------------------------------------------------------------
-| VALIDAÇÃO DO SRT
+| VALIDAÇÃO
 |--------------------------------------------------------------------------
 */
 
-function validateSrt(originalBlocks, translatedTexts) {
-    if (!Array.isArray(translatedTexts)) {
+function validateTranslation(
+    originalBlocks,
+    translatedTexts
+) {
+    if (
+        !Array.isArray(
+            translatedTexts
+        )
+    ) {
         return {
             valid: false,
-            reason: "Resultado do Gemini não é um array."
+            reason:
+                "Resultado não é array."
         };
     }
 
-    if (translatedTexts.length !== originalBlocks.length) {
+    if (
+        translatedTexts.length !==
+        originalBlocks.length
+    ) {
         return {
             valid: false,
-            reason: `Quantidade diferente de blocos. Esperado: ${originalBlocks.length}. Recebido: ${translatedTexts.length}.`
+            reason:
+                `Quantidade incorreta. Esperado ${originalBlocks.length}, recebido ${translatedTexts.length}.`
         };
     }
 
-    for (let i = 0; i < translatedTexts.length; i++) {
-        if (typeof translatedTexts[i] !== "string") {
+    for (
+        let i = 0;
+        i < translatedTexts.length;
+        i++
+    ) {
+        const text =
+            translatedTexts[i];
+
+        if (
+            typeof text !==
+            "string"
+        ) {
             return {
                 valid: false,
-                reason: `Bloco ${i + 1} não é texto.`
+                reason:
+                    `Bloco ${i + 1} não é texto.`
             };
         }
 
-        const originalLineCount =
-            originalBlocks[i].text.split("\n").length;
-
-        const translatedLineCount =
-            translatedTexts[i].split("\n").length;
+        /*
+         * Texto vazio só é aceitável se o original
+         * também estiver vazio.
+         */
+        if (
+            !text.trim() &&
+            originalBlocks[i]
+                .text
+                .trim()
+        ) {
+            return {
+                valid: false,
+                reason:
+                    `Bloco ${originalBlocks[i].index} ficou vazio.`
+            };
+        }
 
         /*
-         * Permite até uma pequena diferença.
-         *
-         * A regra ideal é manter o mesmo número de linhas,
-         * mas não vale a pena rejeitar tudo por uma diferença
-         * mínima em algumas legendas mal formatadas.
+         * Não permitimos que o Gemini transforme
+         * um bloco em dezenas de linhas.
          */
-        if (Math.abs(originalLineCount - translatedLineCount) > 1) {
+        const originalLines =
+            originalBlocks[i]
+                .text
+                .split("\n")
+                .length;
+
+        const translatedLines =
+            text
+                .split("\n")
+                .length;
+
+        if (
+            Math.abs(
+                originalLines -
+                translatedLines
+            ) > 1
+        ) {
             return {
                 valid: false,
                 reason:
@@ -378,37 +722,48 @@ function validateSrt(originalBlocks, translatedTexts) {
 |--------------------------------------------------------------------------
 | SELEÇÃO DE LEGENDA
 |--------------------------------------------------------------------------
-|
-| O OpenSubtitles pode devolver várias opções.
-| Tentamos priorizar:
-| - inglês
-| - não-HI
-| - formato SRT
-|--------------------------------------------------------------------------
 */
 
-function scoreSubtitle(subtitle) {
+function scoreSubtitle(
+    subtitle
+) {
     let score = 0;
 
-    const lang = String(subtitle?.lang || "").toLowerCase();
+    const lang =
+        String(
+            subtitle?.lang || ""
+        ).toLowerCase();
 
-    if (lang === "eng") score += 100;
-    else if (lang === "en") score += 90;
+    if (lang === "eng") {
+        score += 100;
+    } else if (lang === "en") {
+        score += 90;
+    }
 
-    if (subtitle?.hearingImpaired === false) {
+    if (
+        subtitle?.hearingImpaired ===
+        false
+    ) {
         score += 20;
     }
 
     if (
         subtitle?.format &&
-        String(subtitle.format).toLowerCase() === "srt"
+        String(
+            subtitle.format
+        ).toLowerCase() ===
+            "srt"
     ) {
         score += 20;
     }
 
     if (
         subtitle?.name &&
-        /english/i.test(String(subtitle.name))
+        /english/i.test(
+            String(
+                subtitle.name
+            )
+        )
     ) {
         score += 10;
     }
@@ -416,45 +771,78 @@ function scoreSubtitle(subtitle) {
     return score;
 }
 
-function selectBestSubtitle(subtitles) {
-    if (!Array.isArray(subtitles)) {
+function selectBestSubtitle(
+    subtitles
+) {
+    if (
+        !Array.isArray(
+            subtitles
+        )
+    ) {
         return null;
     }
 
-    const candidates = subtitles
-        .filter(sub => {
-            const lang = String(sub?.lang || "").toLowerCase();
+    const candidates =
+        subtitles
+            .filter(sub => {
+                const lang =
+                    String(
+                        sub?.lang || ""
+                    ).toLowerCase();
 
-            return (
-                (lang === "eng" || lang === "en") &&
-                typeof sub?.url === "string" &&
-                sub.url.startsWith("http")
+                return (
+                    (
+                        lang === "eng" ||
+                        lang === "en"
+                    ) &&
+                    typeof sub?.url ===
+                        "string" &&
+                    /^https?:\/\//i.test(
+                        sub.url
+                    )
+                );
+            })
+            .sort(
+                (
+                    a,
+                    b
+                ) =>
+                    scoreSubtitle(b) -
+                    scoreSubtitle(a)
             );
-        })
-        .sort((a, b) => scoreSubtitle(b) - scoreSubtitle(a));
 
-    return candidates[0] || null;
+    return (
+        candidates[0] ||
+        null
+    );
 }
 
 /*
 |--------------------------------------------------------------------------
-| BAIXAR LEGENDA
+| DOWNLOAD DA LEGENDA
 |--------------------------------------------------------------------------
 */
 
-async function downloadSubtitle(url) {
-    console.log(`[SOURCE] Baixando legenda: ${url}`);
-
-    const response = await fetchWithTimeout(
-        url,
-        {
-            headers: {
-                "User-Agent":
-                    "Stremio-Gemini-Subtitle-Translator/3.0"
-            }
-        },
-        SOURCE_FETCH_TIMEOUT_MS
+async function downloadSubtitle(
+    url
+) {
+    console.log(
+        `[SOURCE] Baixando legenda: ${url}`
     );
+
+    stats.sourceDownloads++;
+
+    const response =
+        await fetchWithTimeout(
+            url,
+            {
+                headers: {
+                    "User-Agent":
+                        "Stremio-Gemini-Subtitle-Translator/4.0"
+                }
+            },
+            SOURCE_FETCH_TIMEOUT_MS
+        );
 
     if (!response.ok) {
         throw new Error(
@@ -462,15 +850,23 @@ async function downloadSubtitle(url) {
         );
     }
 
-    const text = normalizeSrt(await response.text());
+    const text =
+        normalizeSrt(
+            await response.text()
+        );
 
     if (!text) {
-        throw new Error("A legenda baixada está vazia.");
+        throw new Error(
+            "A legenda baixada está vazia."
+        );
     }
 
-    if (text.length > MAX_SOURCE_CHARS) {
+    if (
+        text.length >
+        MAX_SOURCE_CHARS
+    ) {
         throw new Error(
-            `Legenda muito grande (${text.length} caracteres).`
+            `Legenda muito grande (${text.length} caracteres). Limite: ${MAX_SOURCE_CHARS}.`
         );
     }
 
@@ -479,149 +875,408 @@ async function downloadSubtitle(url) {
 
 /*
 |--------------------------------------------------------------------------
-| SCHEMA JSON DO GEMINI
+| CONSTRUÇÃO DOS LOTES
 |--------------------------------------------------------------------------
 |
-| Pedimos uma lista:
+| Não usamos somente número de blocos.
 |
-| [
-|   { "id": 1, "text": "Olá..." },
-|   { "id": 2, "text": "Tudo bem?" }
-| ]
+| Um lote termina quando atingir:
 |
-| Dessa maneira o servidor reconstrói o SRT sozinho.
+| - MAX_BATCH_BLOCKS
+| OU
+| - MAX_BATCH_CHARS
+|--------------------------------------------------------------------------
+*/
+
+function createBatches(
+    blocks
+) {
+    const batches = [];
+
+    let current = [];
+
+    let currentChars = 0;
+
+    for (
+        const block
+        of blocks
+    ) {
+        const blockPayload =
+            JSON.stringify({
+                id: block.index,
+                text: block.text
+            });
+
+        const blockChars =
+            blockPayload.length;
+
+        const exceedsBlocks =
+            current.length >=
+            MAX_BATCH_BLOCKS;
+
+        const exceedsChars =
+            current.length > 0 &&
+            currentChars +
+                blockChars >
+                MAX_BATCH_CHARS;
+
+        if (
+            exceedsBlocks ||
+            exceedsChars
+        ) {
+            batches.push(
+                current
+            );
+
+            current = [];
+
+            currentChars = 0;
+        }
+
+        current.push(
+            block
+        );
+
+        currentChars +=
+            blockChars;
+    }
+
+    if (
+        current.length > 0
+    ) {
+        batches.push(
+            current
+        );
+    }
+
+    return batches;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SCHEMA GEMINI
 |--------------------------------------------------------------------------
 */
 
 const translationResponseSchema = {
     type: "ARRAY",
+
     items: {
         type: "OBJECT",
+
         properties: {
             id: {
-                type: "INTEGER",
-                description:
-                    "Identificador do bloco recebido. Deve ser devolvido exatamente igual."
+                type: "INTEGER"
             },
+
             text: {
-                type: "STRING",
-                description:
-                    "Texto traduzido para Português do Brasil."
+                type: "STRING"
             }
         },
-        required: ["id", "text"]
+
+        required: [
+            "id",
+            "text"
+        ]
     }
 };
 
 /*
 |--------------------------------------------------------------------------
-| GEMINI
+| CLASSIFICAÇÃO DE ERROS
 |--------------------------------------------------------------------------
 */
 
-async function callGemini(prompt) {
-    if (!GEMINI_API_KEY) {
+function classifyGeminiError(
+    error,
+    status
+) {
+    const message =
+        String(
+            getErrorMessage(error)
+        ).toLowerCase();
+
+    if (
+        status === 429 ||
+        message.includes(
+            "resource_exhausted"
+        ) ||
+        message.includes(
+            "rate limit"
+        ) ||
+        message.includes(
+            "quota"
+        )
+    ) {
+        return "rate_limit";
+    }
+
+    if (
+        status === 400
+    ) {
+        return "bad_request";
+    }
+
+    if (
+        status === 401 ||
+        status === 403
+    ) {
+        return "auth";
+    }
+
+    if (
+        status >= 500
+    ) {
+        return "server";
+    }
+
+    if (
+        message.includes(
+            "timeout"
+        ) ||
+        message.includes(
+            "aborted"
+        )
+    ) {
+        return "timeout";
+    }
+
+    return "unknown";
+}
+
+/*
+|--------------------------------------------------------------------------
+| FILA GEMINI
+|--------------------------------------------------------------------------
+*/
+
+function enqueueGemini(
+    task
+) {
+    return new Promise(
+        (
+            resolve,
+            reject
+        ) => {
+            geminiQueue.push({
+                task,
+                resolve,
+                reject
+            });
+
+            processGeminiQueue();
+        }
+    );
+}
+
+async function processGeminiQueue() {
+    while (
+        activeGeminiRequests <
+            MAX_CONCURRENT_GEMINI &&
+        geminiQueue.length > 0
+    ) {
+        const item =
+            geminiQueue.shift();
+
+        activeGeminiRequests++;
+
+        try {
+            const now =
+                Date.now();
+
+            const elapsed =
+                now -
+                lastGeminiRequestAt;
+
+            if (
+                elapsed <
+                MIN_GEMINI_INTERVAL_MS
+            ) {
+                await sleep(
+                    MIN_GEMINI_INTERVAL_MS -
+                        elapsed
+                );
+            }
+
+            lastGeminiRequestAt =
+                Date.now();
+
+            const result =
+                await item.task();
+
+            item.resolve(
+                result
+            );
+        } catch (
+            error
+        ) {
+            item.reject(
+                error
+            );
+        } finally {
+            activeGeminiRequests--;
+
+            /*
+             * Continua processando a fila.
+             */
+            setImmediate(
+                processGeminiQueue
+            );
+        }
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| GEMINI REQUEST
+|--------------------------------------------------------------------------
+*/
+
+async function callGeminiDirect(
+    prompt
+) {
+    if (
+        !GEMINI_API_KEY
+    ) {
         throw new Error(
-            "GEMINI_API_KEY não foi configurada no ambiente."
+            "GEMINI_API_KEY não foi configurada no Render."
         );
     }
 
     const endpoint =
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+            GEMINI_MODEL
+        )}:generateContent`;
 
-    let lastError = null;
+    let lastError =
+        null;
 
-    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
+    for (
+        let attempt = 1;
+        attempt <=
+            MAX_GEMINI_RETRIES + 1;
+        attempt++
+    ) {
         try {
+            stats.geminiRequests++;
+
             console.log(
-                `[GEMINI] Tentativa ${attempt}/${MAX_GEMINI_RETRIES}`
+                `[GEMINI] Request ${attempt}/${MAX_GEMINI_RETRIES + 1}`
             );
 
-            const response = await fetchWithTimeout(
-                endpoint,
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": GEMINI_API_KEY
-                    },
-                    body: JSON.stringify({
-                        systemInstruction: {
-                            parts: [
-                                {
-                                    text:
-                                        "Você é um tradutor profissional especializado em legendas de filmes e séries. " +
-                                        "Traduza do inglês para Português do Brasil natural, fluente e contemporâneo. " +
-                                        "Preserve nomes próprios, marcas, expressões quando fizer sentido, intenção, tom, humor, " +
-                                        "gírias, palavrões e nuances do diálogo. Não faça censura. " +
-                                        "Não explique nada. Não resuma. Não omita informações. " +
-                                        "Não altere o significado. " +
-                                        "Mantenha a quantidade e os IDs dos blocos exatamente como recebidos. " +
-                                        "Retorne exclusivamente o JSON solicitado."
-                                }
-                            ]
+            const response =
+                await fetchWithTimeout(
+                    endpoint,
+                    {
+                        method: "POST",
+
+                        headers: {
+                            "Content-Type":
+                                "application/json",
+
+                            "x-goog-api-key":
+                                GEMINI_API_KEY
                         },
 
-                        contents: [
-                            {
-                                role: "user",
-                                parts: [
+                        body:
+                            JSON.stringify({
+                                systemInstruction: {
+                                    parts: [
+                                        {
+                                            text:
+                                                "Traduza legendas de inglês para Português do Brasil. Preserve significado, tom, nomes próprios, gírias, palavrões, tags de formatação e quebras de linha. Não resuma, não censure, não explique. Responda exclusivamente no JSON definido pelo schema."
+                                        }
+                                    ]
+                                },
+
+                                contents: [
                                     {
-                                        text: prompt
+                                        role:
+                                            "user",
+
+                                        parts: [
+                                            {
+                                                text:
+                                                    prompt
+                                            }
+                                        ]
                                     }
-                                ]
-                            }
-                        ],
+                                ],
 
-                        generationConfig: {
-                            responseMimeType: "application/json",
-                            responseSchema:
-                                translationResponseSchema,
+                                generationConfig: {
+                                    responseMimeType:
+                                        "application/json",
 
-                            /*
-                             * Para tradução estruturada não queremos
-                             * um raciocínio extremamente longo.
-                             */
-                            thinkingConfig: {
-                                thinkingLevel: "low"
-                            },
+                                    responseSchema:
+                                        translationResponseSchema,
 
-                            maxOutputTokens: 8192
-                        }
-                    })
-                },
-                GEMINI_TIMEOUT_MS
-            );
+                                    thinkingConfig: {
+                                        thinkingLevel:
+                                            "low"
+                                    },
 
-            const rawText = await response.text();
+                                    maxOutputTokens:
+                                        8192
+                                }
+                            })
+                    },
+                    GEMINI_TIMEOUT_MS
+                );
+
+            const rawText =
+                await response.text();
 
             let data;
 
             try {
-                data = JSON.parse(rawText);
+                data =
+                    JSON.parse(
+                        rawText
+                    );
             } catch {
-                throw new Error(
-                    `Gemini retornou resposta não-JSON. HTTP ${response.status}.`
-                );
+                const error =
+                    new Error(
+                        `Gemini retornou resposta não-JSON. HTTP ${response.status}.`
+                    );
+
+                error.status =
+                    response.status;
+
+                throw error;
             }
 
-            if (!response.ok) {
+            if (
+                !response.ok
+            ) {
                 const apiMessage =
                     data?.error?.message ||
                     `HTTP ${response.status}`;
 
-                const error = new Error(apiMessage);
+                const error =
+                    new Error(
+                        apiMessage
+                    );
 
-                error.status = response.status;
+                error.status =
+                    response.status;
+
                 error.retryAfter =
-                    response.headers.get("retry-after");
+                    response.headers.get(
+                        "retry-after"
+                    );
 
                 throw error;
             }
 
             const text =
-                data?.candidates?.[0]?.content?.parts
-                    ?.map(part => part?.text || "")
+                data?.candidates?.[0]
+                    ?.content
+                    ?.parts
+                    ?.map(
+                        part =>
+                            part?.text ||
+                            ""
+                    )
                     .join("")
                     .trim();
 
@@ -631,123 +1286,209 @@ async function callGemini(prompt) {
                 );
             }
 
+            stats.geminiSuccess++;
+
             return text;
-        } catch (error) {
-            lastError = error;
+        } catch (
+            error
+        ) {
+            lastError =
+                error;
+
+            stats.geminiErrors++;
+
+            const category =
+                classifyGeminiError(
+                    error,
+                    error?.status
+                );
+
+            if (
+                category ===
+                "rate_limit"
+            ) {
+                stats.geminiRateLimited++;
+            }
 
             console.error(
-                `[GEMINI] Erro na tentativa ${attempt}:`,
-                getErrorMessage(error)
+                `[GEMINI] Erro (${category}): ${getErrorMessage(error)}`
             );
 
             /*
-             * Erros de autenticação ou requisição inválida
-             * não devem ficar sendo repetidos.
+             * Nunca insistir em erros permanentes.
              */
             if (
-                error?.status === 400 ||
-                error?.status === 401 ||
-                error?.status === 403
+                category ===
+                    "auth" ||
+                category ===
+                    "bad_request"
             ) {
                 break;
             }
-
-            if (attempt >= MAX_GEMINI_RETRIES) {
-                break;
-            }
-
-            let waitMs =
-                RETRY_BASE_MS * Math.pow(2, attempt - 1);
-
-            const retryAfterSeconds =
-                Number(error?.retryAfter);
 
             if (
-                Number.isFinite(retryAfterSeconds) &&
-                retryAfterSeconds > 0
+                attempt >
+                MAX_GEMINI_RETRIES
             ) {
-                waitMs = Math.min(
-                    retryAfterSeconds * 1000,
-                    30_000
-                );
+                break;
             }
 
             /*
-             * Pequeno jitter para evitar várias tentativas
-             * simultâneas exatamente no mesmo instante.
+             * Para 429 respeitamos Retry-After
+             * quando disponível.
              */
-            waitMs += Math.floor(Math.random() * 500);
+            let waitMs =
+                RETRY_BASE_MS *
+                Math.pow(
+                    2,
+                    attempt - 1
+                );
+
+            const retryAfter =
+                Number(
+                    error?.retryAfter
+                );
+
+            if (
+                Number.isFinite(
+                    retryAfter
+                ) &&
+                retryAfter > 0
+            ) {
+                waitMs =
+                    Math.min(
+                        retryAfter *
+                            1000,
+                        60_000
+                    );
+            }
+
+            /*
+             * Jitter.
+             */
+            waitMs +=
+                Math.floor(
+                    Math.random() *
+                        1000
+                );
+
+            /*
+             * Rate limit merece uma espera
+             * maior.
+             */
+            if (
+                category ===
+                "rate_limit"
+            ) {
+                waitMs =
+                    Math.max(
+                        waitMs,
+                        10_000
+                    );
+            }
 
             console.log(
-                `[GEMINI] Aguardando ${waitMs}ms antes do retry...`
+                `[GEMINI] Retry em ${waitMs}ms`
             );
 
-            await sleep(waitMs);
+            await sleep(
+                waitMs
+            );
         }
     }
 
-    throw lastError || new Error("Falha desconhecida no Gemini.");
+    throw (
+        lastError ||
+        new Error(
+            "Falha desconhecida no Gemini."
+        )
+    );
 }
 
 /*
 |--------------------------------------------------------------------------
-| TRADUZ UM LOTE
+| GEMINI COM FILA
 |--------------------------------------------------------------------------
 */
 
-async function translateBatch(blocks, attempt = 1) {
-    const payload = blocks.map(block => ({
-        id: block.index,
-        text: block.text
-    }));
+async function callGemini(
+    prompt
+) {
+    return enqueueGemini(
+        () =>
+            callGeminiDirect(
+                prompt
+            )
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| TRADUÇÃO DE UM LOTE
+|--------------------------------------------------------------------------
+*/
+
+async function translateBatch(
+    blocks,
+    attempt = 0
+) {
+    const payload =
+        blocks.map(
+            block => ({
+                id:
+                    block.index,
+
+                text:
+                    block.text
+            })
+        );
 
     const prompt = `
-Traduza os diálogos abaixo de inglês para Português do Brasil.
+Traduza para Português do Brasil.
 
-REGRAS OBRIGATÓRIAS:
+Regras:
+- devolva exatamente um objeto por bloco;
+- mantenha cada id exatamente igual;
+- traduza somente text;
+- preserve tags como <i>, </i>, <b>, </b>, {\i1}, {\i0};
+- preserve quebras de linha quando possível;
+- mantenha nomes próprios;
+- preserve tom, gírias, palavrões e intenção;
+- não resuma;
+- não explique;
+- não censure.
 
-1. Retorne exatamente um objeto para cada bloco recebido.
-2. Não remova nenhum ID.
-3. Não crie IDs novos.
-4. Cada "id" deve permanecer exatamente igual.
-5. Traduza somente o conteúdo de "text".
-6. Preserve as quebras de linha de cada bloco sempre que possível.
-7. Preserve tags de formatação, como <i>, </i>, <b>, </b>, {\i1}, {\i0}, etc.
-8. Não coloque markdown.
-9. Não coloque explicações.
-10. Não escreva texto fora do JSON.
-11. Não transforme fala em resumo.
-12. Mantenha nomes próprios e termos técnicos apropriados.
-13. Prefira português brasileiro natural em vez de tradução literal.
-14. Palavrões e linguagem informal devem continuar com o mesmo peso.
-15. Não suavize ou censure o texto.
-16. Preserve a intenção e o contexto da fala.
-
-FORMATO:
-[
-  {
-    "id": 123,
-    "text": "Texto traduzido"
-  }
-]
-
-DADOS:
-${JSON.stringify(payload, null, 2)}
+JSON:
+${JSON.stringify(payload)}
 `;
 
-    const raw = await callGemini(prompt);
+    const raw =
+        await callGemini(
+            prompt
+        );
 
     let parsed;
 
     try {
-        parsed = JSON.parse(stripCodeFences(raw));
-    } catch (error) {
-        if (attempt < 2) {
+        parsed =
+            JSON.parse(
+                stripCodeFences(
+                    raw
+                )
+            );
+    } catch {
+        if (
+            attempt <
+            MAX_TRANSLATION_RETRIES
+        ) {
             console.warn(
-                "[TRANSLATE] JSON inválido. Repetindo lote..."
+                "[TRANSLATE] JSON inválido. Repetindo lote."
             );
 
-            return translateBatch(blocks, attempt + 1);
+            return translateBatch(
+                blocks,
+                attempt + 1
+            );
         }
 
         throw new Error(
@@ -755,45 +1496,78 @@ ${JSON.stringify(payload, null, 2)}
         );
     }
 
-    if (!Array.isArray(parsed)) {
-        if (attempt < 2) {
-            return translateBatch(blocks, attempt + 1);
+    if (
+        !Array.isArray(
+            parsed
+        )
+    ) {
+        if (
+            attempt <
+            MAX_TRANSLATION_RETRIES
+        ) {
+            return translateBatch(
+                blocks,
+                attempt + 1
+            );
         }
 
         throw new Error(
-            "Gemini não retornou uma lista de traduções."
+            "Gemini não retornou uma lista."
         );
     }
 
-    const translatedById = new Map();
+    const translatedById =
+        new Map();
 
-    for (const item of parsed) {
+    for (
+        const item
+        of parsed
+    ) {
         if (
             item &&
-            Number.isInteger(item.id) &&
-            typeof item.text === "string"
+            Number.isInteger(
+                item.id
+            ) &&
+            typeof item.text ===
+                "string"
         ) {
             translatedById.set(
                 item.id,
-                item.text.trim()
+                item.text
             );
         }
     }
 
-    const translatedTexts = blocks.map(block => {
-        return translatedById.get(block.index);
-    });
-
     /*
-     * Se qualquer bloco desapareceu, falhamos o lote.
+     * Verifica IDs.
      */
-    if (translatedTexts.some(text => typeof text !== "string")) {
-        if (attempt < 2) {
+    const translatedTexts =
+        blocks.map(
+            block =>
+                translatedById.get(
+                    block.index
+                )
+        );
+
+    if (
+        translatedTexts.some(
+            text =>
+                typeof text !==
+                "string"
+        )
+    ) {
+        if (
+            attempt <
+            MAX_TRANSLATION_RETRIES
+        ) {
             console.warn(
-                "[TRANSLATE] Gemini perdeu algum bloco. Repetindo lote..."
+                "[TRANSLATE] Gemini perdeu blocos. Repetindo."
             );
 
-            return translateBatch(blocks, attempt + 1);
+            return translateBatch(
+                blocks,
+                attempt + 1
+            );
         }
 
         throw new Error(
@@ -802,24 +1576,30 @@ ${JSON.stringify(payload, null, 2)}
     }
 
     const validation =
-        validateSrt(blocks, translatedTexts);
+        validateTranslation(
+            blocks,
+            translatedTexts
+        );
 
-    if (!validation.valid) {
-        if (attempt < 2) {
+    if (
+        !validation.valid
+    ) {
+        if (
+            attempt <
+            MAX_TRANSLATION_RETRIES
+        ) {
             console.warn(
-                `[TRANSLATE] Validação falhou: ${validation.reason}. Repetindo lote...`
+                `[TRANSLATE] Validação falhou: ${validation.reason}`
             );
 
-            return translateBatch(blocks, attempt + 1);
+            return translateBatch(
+                blocks,
+                attempt + 1
+            );
         }
 
-        /*
-         * Caso a segunda tentativa ainda tenha alguma
-         * diferença estrutural, usamos o resultado em vez
-         * de perder a tradução inteira.
-         */
-        console.warn(
-            `[TRANSLATE] Resultado aceito apesar da validação: ${validation.reason}`
+        throw new Error(
+            `Resultado inválido: ${validation.reason}`
         );
     }
 
@@ -832,69 +1612,87 @@ ${JSON.stringify(payload, null, 2)}
 |--------------------------------------------------------------------------
 */
 
-async function translateSrt(originalSrt) {
-    const blocks = parseSrt(originalSrt);
+async function translateSrt(
+    originalSrt
+) {
+    const blocks =
+        parseSrt(
+            originalSrt
+        );
 
-    if (blocks.length === 0) {
+    if (
+        blocks.length === 0
+    ) {
         throw new Error(
             "Não foi possível identificar blocos SRT válidos."
         );
     }
 
     console.log(
-        `[TRANSLATE] ${blocks.length} blocos encontrados.`
+        `[TRANSLATE] ${blocks.length} blocos.`
     );
 
-    const batches = [];
-
-    for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
-        batches.push(
-            blocks.slice(i, i + BATCH_SIZE)
+    const batches =
+        createBatches(
+            blocks
         );
-    }
 
     console.log(
-        `[TRANSLATE] Dividindo em ${batches.length} lote(s).`
+        `[TRANSLATE] ${batches.length} lote(s).`
     );
 
-    const translatedTexts = [];
+    const translatedTexts =
+        [];
 
-    for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
+    for (
+        let i = 0;
+        i < batches.length;
+        i++
+    ) {
+        const batch =
+            batches[i];
 
         console.log(
-            `[TRANSLATE] Lote ${i + 1}/${batches.length} (${batch.length} blocos)...`
+            `[TRANSLATE] Lote ${i + 1}/${batches.length} - ${batch.length} blocos.`
         );
 
         const translated =
-            await translateBatch(batch);
+            await translateBatch(
+                batch
+            );
 
-        translatedTexts.push(...translated);
-
-        /*
-         * Pequeno intervalo entre lotes.
-         * Ajuda a evitar rajadas desnecessárias.
-         */
-        if (i < batches.length - 1) {
-            await sleep(150);
-        }
+        translatedTexts.push(
+            ...translated
+        );
     }
 
-    if (translatedTexts.length !== blocks.length) {
+    if (
+        translatedTexts.length !==
+        blocks.length
+    ) {
         throw new Error(
-            "Quantidade final de blocos traduzidos não corresponde à original."
+            "Quantidade final de traduções incorreta."
         );
     }
 
     const translatedSrt =
-        buildSrt(blocks, translatedTexts);
+        buildSrt(
+            blocks,
+            translatedTexts
+        );
 
     /*
-     * Validação final.
+     * Validação final do SRT.
      */
-    const finalBlocks = parseSrt(translatedSrt);
+    const finalBlocks =
+        parseSrt(
+            translatedSrt
+        );
 
-    if (finalBlocks.length !== blocks.length) {
+    if (
+        finalBlocks.length !==
+        blocks.length
+    ) {
         throw new Error(
             "O SRT reconstruído perdeu blocos."
         );
@@ -909,27 +1707,69 @@ async function translateSrt(originalSrt) {
 |--------------------------------------------------------------------------
 */
 
-function setTranslationCache(key, srt) {
-    translationCache.set(key, {
-        srt,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + CACHE_TTL_MS
-    });
+function setTranslationCache(
+    key,
+    srt
+) {
+    const now =
+        Date.now();
+
+    translationCache.set(
+        key,
+        {
+            srt,
+
+            createdAt:
+                now,
+
+            expiresAt:
+                now +
+                CACHE_TTL_MS
+        }
+    );
 
     cleanupMemory();
 }
 
-function getTranslationCache(key) {
-    const item = translationCache.get(key);
+function getTranslationCache(
+    key
+) {
+    const item =
+        translationCache.get(
+            key
+        );
 
     if (!item) {
         return null;
     }
 
-    if (item.expiresAt <= Date.now()) {
-        translationCache.delete(key);
+    if (
+        item.expiresAt <=
+        Date.now()
+    ) {
+        translationCache.delete(
+            key
+        );
+
         return null;
     }
+
+    /*
+     * Atualiza posição no Map.
+     *
+     * Isso transforma o acesso em algo
+     * próximo de LRU.
+     */
+    translationCache.delete(
+        key
+    );
+
+    translationCache.set(
+        key,
+        item
+    );
+
+    stats.cacheHits++;
 
     return item.srt;
 }
@@ -948,48 +1788,119 @@ function createJob({
     sourceHash,
     sourceSrt
 }) {
-    const now = Date.now();
+    const now =
+        Date.now();
 
     const job = {
-        id: jobId,
+        id:
+            jobId,
 
         cacheKey,
+
         type,
+
         videoId,
+
         sourceHash,
 
         sourceSrt,
 
-        status: "processing",
+        status:
+            "processing",
 
-        result: null,
-        error: null,
+        result:
+            null,
 
-        createdAt: now,
-        updatedAt: now,
+        error:
+            null,
 
-        expiresAt: now + JOB_TTL_MS,
+        createdAt:
+            now,
 
-        promise: null
+        updatedAt:
+            now,
+
+        expiresAt:
+            now +
+            JOB_TTL_MS,
+
+        promise:
+            null
     };
 
-    jobs.set(jobId, job);
+    jobs.set(
+        jobId,
+        job
+    );
+
+    jobsByCacheKey.set(
+        cacheKey,
+        jobId
+    );
 
     return job;
 }
 
-function getJob(jobId) {
-    const job = jobs.get(jobId);
+function getJob(
+    jobId
+) {
+    const job =
+        jobs.get(
+            jobId
+        );
 
     if (!job) {
         return null;
     }
 
     if (
-        job.expiresAt <= Date.now() &&
-        job.status !== "processing"
+        job.expiresAt <=
+            Date.now() &&
+        job.status !==
+            "processing"
     ) {
-        jobs.delete(jobId);
+        jobs.delete(
+            jobId
+        );
+
+        if (
+            jobsByCacheKey.get(
+                job.cacheKey
+            ) === jobId
+        ) {
+            jobsByCacheKey.delete(
+                job.cacheKey
+            );
+        }
+
+        return null;
+    }
+
+    return job;
+}
+
+function getJobByCacheKey(
+    cacheKey
+) {
+    const jobId =
+        jobsByCacheKey.get(
+            cacheKey
+        );
+
+    if (!jobId) {
+        return null;
+    }
+
+    const job =
+        getJob(
+            jobId
+        );
+
+    if (!job) {
+        jobsByCacheKey.delete(
+            cacheKey
+        );
+
         return null;
     }
 
@@ -998,90 +1909,163 @@ function getJob(jobId) {
 
 /*
 |--------------------------------------------------------------------------
-| PROCESSAMENTO DO JOB
+| JOB ATIVO
 |--------------------------------------------------------------------------
 */
 
-async function processJob(job) {
+function countActiveJobs() {
+    let count = 0;
+
+    for (
+        const job
+        of jobs.values()
+    ) {
+        if (
+            job.status ===
+            "processing"
+        ) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/*
+|--------------------------------------------------------------------------
+| PROCESSAMENTO
+|--------------------------------------------------------------------------
+*/
+
+async function processJob(
+    job
+) {
+    stats.translationsStarted++;
+
     console.log(
-        `[JOB ${job.id}] Iniciando tradução.`
+        `[JOB ${job.id}] Iniciando.`
     );
 
     try {
         /*
-         * Primeiro verifica cache global.
+         * Verifica cache novamente.
+         *
+         * Importante em caso de jobs duplicados.
          */
         const cached =
-            getTranslationCache(job.cacheKey);
+            getTranslationCache(
+                job.cacheKey
+            );
 
         if (cached) {
-            job.status = "completed";
-            job.result = cached;
-            job.updatedAt = Date.now();
+            job.status =
+                "completed";
 
-            console.log(
-                `[JOB ${job.id}] Resultado já estava no cache.`
-            );
+            job.result =
+                cached;
+
+            job.updatedAt =
+                Date.now();
+
+            stats.translationsCompleted++;
 
             return;
         }
 
         const translated =
-            await translateSrt(job.sourceSrt);
+            await translateSrt(
+                job.sourceSrt
+            );
 
         setTranslationCache(
             job.cacheKey,
             translated
         );
 
-        job.status = "completed";
-        job.result = translated;
-        job.updatedAt = Date.now();
+        job.status =
+            "completed";
+
+        job.result =
+            translated;
+
+        job.updatedAt =
+            Date.now();
+
+        stats.translationsCompleted++;
 
         console.log(
-            `[JOB ${job.id}] Tradução concluída.`
+            `[JOB ${job.id}] Concluído.`
         );
-    } catch (error) {
-        job.status = "failed";
-        job.error = getErrorMessage(error);
-        job.updatedAt = Date.now();
+    } catch (
+        error
+    ) {
+        job.status =
+            "failed";
+
+        job.error =
+            getErrorMessage(
+                error
+            );
+
+        job.updatedAt =
+            Date.now();
+
+        stats.translationsFailed++;
 
         console.error(
-            `[JOB ${job.id}] Falha: ${job.error}`
+            `[JOB ${job.id}] Falhou: ${job.error}`
         );
     }
 }
 
 /*
 |--------------------------------------------------------------------------
-| ESPERAR JOB POR UM TEMPO LIMITADO
+| WAIT JOB
 |--------------------------------------------------------------------------
 */
 
-async function waitForJob(job, timeoutMs) {
-    if (job.status === "completed") {
+async function waitForJob(
+    job,
+    timeoutMs
+) {
+    if (
+        job.status ===
+        "completed"
+    ) {
         return true;
     }
 
-    if (job.status === "failed") {
+    if (
+        job.status ===
+        "failed"
+    ) {
         return false;
     }
 
-    const start = Date.now();
+    const start =
+        Date.now();
 
     while (
-        job.status === "processing" &&
-        Date.now() - start < timeoutMs
+        job.status ===
+            "processing" &&
+        Date.now() -
+            start <
+            timeoutMs
     ) {
-        await sleep(300);
+        await sleep(
+            300
+        );
     }
 
-    return job.status === "completed";
+    return (
+        job.status ===
+        "completed"
+    );
 }
 
 /*
 |--------------------------------------------------------------------------
-| LEGENDA DE AVISO
+| SRT DE PROCESSAMENTO
 |--------------------------------------------------------------------------
 */
 
@@ -1093,14 +2077,26 @@ function buildProcessingSrt() {
         "",
         "2",
         "00:00:07,500 --> 00:00:15,000",
-        "Aguarde alguns segundos e tente recarregar as legendas."
+        "Aguarde alguns segundos e recarregue as legendas."
     ].join("\n");
 }
 
-function buildErrorSrt(message) {
-    const safeMessage = String(message || "Erro desconhecido")
-        .replace(/\s+/g, " ")
-        .slice(0, 180);
+function buildErrorSrt(
+    message
+) {
+    const safeMessage =
+        String(
+            message ||
+                "Erro desconhecido."
+        )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .slice(
+                0,
+                180
+            );
 
     return [
         "1",
@@ -1115,23 +2111,31 @@ function buildErrorSrt(message) {
 
 /*
 |--------------------------------------------------------------------------
-| RESPOSTA DE SUBTITLE
+| RESPOSTA SRT
 |--------------------------------------------------------------------------
 */
 
-function sendSubtitleResponse(res, srt, cacheControl = "no-store") {
+function sendSubtitleResponse(
+    res,
+    srt,
+    cacheControl = "no-store"
+) {
     res.status(200);
 
     res.set({
         "Content-Type":
             "text/plain; charset=utf-8",
 
-        "Cache-Control": cacheControl,
+        "Cache-Control":
+            cacheControl,
 
-        "Access-Control-Allow-Origin": "*"
+        "Access-Control-Allow-Origin":
+            "*"
     });
 
-    return res.send(srt);
+    return res.send(
+        srt
+    );
 }
 
 /*
@@ -1140,299 +2144,492 @@ function sendSubtitleResponse(res, srt, cacheControl = "no-store") {
 |--------------------------------------------------------------------------
 */
 
-app.get("/manifest.json", (req, res) => {
-    res.json(manifest);
-});
+app.get(
+    "/manifest.json",
+    (
+        req,
+        res
+    ) => {
+        res.json(
+            manifest
+        );
+    }
+);
 
 /*
 |--------------------------------------------------------------------------
-| HEALTH CHECK
+| HOME
 |--------------------------------------------------------------------------
 */
 
-app.get("/", (req, res) => {
-    res.json({
-        name: manifest.name,
-        version: manifest.version,
-        status: "online",
-        model: GEMINI_MODEL
-    });
-});
+app.get(
+    "/",
+    (
+        req,
+        res
+    ) => {
+        res.json({
+            name:
+                manifest.name,
 
-app.get("/health", (req, res) => {
-    res.json({
-        status: "ok",
-        uptime: process.uptime(),
-        jobs: jobs.size,
-        cache: translationCache.size,
-        model: GEMINI_MODEL
-    });
-});
+            version:
+                manifest.version,
+
+            status:
+                "online",
+
+            model:
+                GEMINI_MODEL,
+
+            geminiQueue:
+                geminiQueue.length,
+
+            activeGeminiRequests:
+                activeGeminiRequests
+        });
+    }
+);
 
 /*
 |--------------------------------------------------------------------------
-| BUSCA DE LEGENDA NO STREMIO
+| HEALTH
 |--------------------------------------------------------------------------
 */
 
-async function findEnglishSubtitle(type, id) {
+app.get(
+    "/health",
+    (
+        req,
+        res
+    ) => {
+        const uptime =
+            process.uptime();
+
+        res.json({
+            status:
+                "ok",
+
+            uptime,
+
+            model:
+                GEMINI_MODEL,
+
+            jobs:
+                jobs.size,
+
+            activeJobs:
+                countActiveJobs(),
+
+            cache:
+                translationCache.size,
+
+            geminiQueue:
+                geminiQueue.length,
+
+            activeGeminiRequests:
+                activeGeminiRequests,
+
+            stats: {
+                ...stats
+            },
+
+            config: {
+                maxConcurrentGemini:
+                    MAX_CONCURRENT_GEMINI,
+
+                minGeminiIntervalMs:
+                    MIN_GEMINI_INTERVAL_MS,
+
+                maxBatchBlocks:
+                    MAX_BATCH_BLOCKS,
+
+                maxBatchChars:
+                    MAX_BATCH_CHARS
+            }
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| BUSCAR LEGENDA NO STREMIO
+|--------------------------------------------------------------------------
+*/
+
+async function findEnglishSubtitle(
+    type,
+    id
+) {
     const searchUrl =
-        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
+            type
+        )}/${encodeURIComponent(
+            id
+        )}.json`;
 
     console.log(
-        `[STREMIO] Buscando legendas originais: ${searchUrl}`
+        `[STREMIO] Procurando legenda: ${searchUrl}`
     );
 
-    const response = await fetchWithTimeout(
-        searchUrl,
-        {
-            headers: {
-                "Accept": "application/json",
-                "User-Agent":
-                    "Stremio-Gemini-Subtitle-Translator/3.0"
-            }
-        },
-        SOURCE_FETCH_TIMEOUT_MS
-    );
+    const response =
+        await fetchWithTimeout(
+            searchUrl,
+            {
+                headers: {
+                    Accept:
+                        "application/json",
 
-    if (!response.ok) {
+                    "User-Agent":
+                        "Stremio-Gemini-Subtitle-Translator/4.0"
+                }
+            },
+            SOURCE_FETCH_TIMEOUT_MS
+        );
+
+    if (
+        !response.ok
+    ) {
         throw new Error(
             `OpenSubtitles retornou HTTP ${response.status}.`
         );
     }
 
-    const data = await response.json();
+    const data =
+        await response.json();
 
     return selectBestSubtitle(
-        data?.subtitles || []
+        data?.subtitles ||
+            []
     );
 }
 
 /*
 |--------------------------------------------------------------------------
-| ENDPOINT SUBTITLES
+| SUBTITLES HANDLER
 |--------------------------------------------------------------------------
 */
 
-async function subtitlesHandler(req, res) {
-    const type = String(req.params.type || "").trim();
-    const id = String(req.params.id || "").trim();
+async function subtitlesHandler(
+    req,
+    res
+) {
+    const type =
+        String(
+            req.params.type ||
+                ""
+        ).trim();
+
+    const id =
+        String(
+            req.params.id ||
+                ""
+        ).trim();
 
     console.log(
-        `[STREMIO] Pedido de legenda: ${type}/${id}`
+        `[STREMIO] Pedido: ${type}/${id}`
     );
 
-    if (!type || !id) {
-        return safeJson(res, {
-            subtitles: []
-        });
+    if (
+        !type ||
+        !id
+    ) {
+        return safeJson(
+            res,
+            {
+                subtitles: []
+            }
+        );
     }
 
     try {
         /*
-         * 1. Procurar legenda em inglês.
+         * 1. Encontrar inglês.
          */
         const targetSub =
-            await findEnglishSubtitle(type, id);
-
-        if (!targetSub) {
-            console.log(
-                `[STREMIO] Nenhuma legenda em inglês encontrada para ${type}/${id}.`
+            await findEnglishSubtitle(
+                type,
+                id
             );
 
-            return safeJson(res, {
-                subtitles: []
-            });
+        if (
+            !targetSub
+        ) {
+            console.log(
+                "[STREMIO] Nenhuma legenda inglesa."
+            );
+
+            return safeJson(
+                res,
+                {
+                    subtitles: []
+                }
+            );
         }
 
         /*
-         * 2. Baixar o SRT original.
-         *
-         * Fazemos isso ANTES de gerar o job porque
-         * o hash do conteúdo da legenda será a nossa
-         * verdadeira identidade.
+         * 2. Baixar.
          */
         const sourceSrt =
-            await downloadSubtitle(targetSub.url);
-
-        /*
-         * 3. Validar se parece realmente SRT.
-         */
-        const originalBlocks =
-            parseSrt(sourceSrt);
-
-        if (originalBlocks.length === 0) {
-            console.warn(
-                `[STREMIO] Legenda encontrada, mas não parece um SRT válido.`
+            await downloadSubtitle(
+                targetSub.url
             );
 
-            return safeJson(res, {
-                subtitles: []
-            });
+        /*
+         * 3. Validar SRT.
+         */
+        const originalBlocks =
+            parseSrt(
+                sourceSrt
+            );
+
+        if (
+            originalBlocks.length ===
+            0
+        ) {
+            console.warn(
+                "[STREMIO] Legenda não parece SRT válido."
+            );
+
+            return safeJson(
+                res,
+                {
+                    subtitles: []
+                }
+            );
         }
 
         /*
-         * 4. Hash do conteúdo.
-         *
-         * Isso é melhor que usar somente:
-         * type + id
-         *
-         * porque diferentes versões da mesma legenda
-         * podem existir para o mesmo filme/episódio.
+         * 4. Hash.
          */
-        const sourceHash = sha256(sourceSrt);
+        const sourceHash =
+            sha256(
+                sourceSrt
+            );
 
         const cacheKey =
             `${type}:${id}:${sourceHash}`;
 
+        const baseUrl =
+            cleanBaseUrl(
+                req
+            );
+
         /*
-         * 5. Cache já concluído?
+         * 5. Cache pronto.
          */
         const cached =
-            getTranslationCache(cacheKey);
-
-        const baseUrl = cleanBaseUrl(req);
+            getTranslationCache(
+                cacheKey
+            );
 
         if (cached) {
             console.log(
-                `[CACHE] Tradução pronta para ${type}/${id}.`
+                `[CACHE] HIT ${type}/${id}`
             );
 
-            /*
-             * Criamos um job concluído para que a URL
-             * de subtitle seja estável.
-             */
             const existingJobId =
-                `cached-${sourceHash.slice(0, 24)}`;
+                `cached-${sourceHash.slice(
+                    0,
+                    24
+                )}`;
 
             let cachedJob =
-                getJob(existingJobId);
+                getJob(
+                    existingJobId
+                );
 
-            if (!cachedJob) {
-                cachedJob = createJob({
-                    jobId: existingJobId,
+            if (
+                !cachedJob
+            ) {
+                cachedJob =
+                    createJob({
+                        jobId:
+                            existingJobId,
+
+                        cacheKey,
+
+                        type,
+
+                        videoId:
+                            id,
+
+                        sourceHash,
+
+                        sourceSrt
+                    });
+
+                cachedJob.status =
+                    "completed";
+
+                cachedJob.result =
+                    cached;
+            }
+
+            return safeJson(
+                res,
+                {
+                    subtitles: [
+                        {
+                            id:
+                                `${id}-gemini-${sourceHash.slice(
+                                    0,
+                                    12
+                                )}`,
+
+                            url:
+                                `${baseUrl}/subtitle/${encodeURIComponent(
+                                    existingJobId
+                                )}.srt`,
+
+                            lang:
+                                "por"
+                        }
+                    ]
+                }
+            );
+        }
+
+        /*
+         * 6. Procurar job existente.
+         */
+        let job =
+            getJobByCacheKey(
+                cacheKey
+            );
+
+        /*
+         * 7. Se não existe, criar.
+         */
+        if (
+            !job
+        ) {
+            /*
+             * Proteção contra muitos jobs.
+             */
+            const activeJobs =
+                countActiveJobs();
+
+            if (
+                activeJobs >=
+                MAX_ACTIVE_JOBS
+            ) {
+                console.warn(
+                    `[STREMIO] Limite de jobs ativos atingido: ${activeJobs}/${MAX_ACTIVE_JOBS}`
+                );
+
+                return safeJson(
+                    res,
+                    {
+                        subtitles: []
+                    }
+                );
+            }
+
+            const jobId =
+                `job-${sourceHash.slice(
+                    0,
+                    24
+                )}-${randomId(
+                    8
+                )}`;
+
+            job =
+                createJob({
+                    jobId,
+
                     cacheKey,
+
                     type,
-                    videoId: id,
+
+                    videoId:
+                        id,
+
                     sourceHash,
+
                     sourceSrt
                 });
 
-                cachedJob.status = "completed";
-                cachedJob.result = cached;
-            }
+            /*
+             * Dispara em background.
+             */
+            job.promise =
+                processJob(
+                    job
+                ).catch(
+                    error => {
+                        console.error(
+                            `[JOB ${job.id}] Erro inesperado:`,
+                            error
+                        );
 
-            return safeJson(res, {
+                        job.status =
+                            "failed";
+
+                        job.error =
+                            getErrorMessage(
+                                error
+                            );
+
+                        job.updatedAt =
+                            Date.now();
+                    }
+                );
+        }
+
+        /*
+         * 8. URL estável.
+         */
+        const subtitleUrl =
+            `${baseUrl}/subtitle/${encodeURIComponent(
+                job.id
+            )}.srt`;
+
+        console.log(
+            `[STREMIO] Subtitle URL: ${subtitleUrl}`
+        );
+
+        return safeJson(
+            res,
+            {
                 subtitles: [
                     {
                         id:
-                            `${id}-gemini-${sourceHash.slice(0, 12)}`,
+                            `${id}-gemini-${sourceHash.slice(
+                                0,
+                                12
+                            )}`,
 
                         url:
-                            `${baseUrl}/subtitle/${encodeURIComponent(existingJobId)}.srt`,
+                            subtitleUrl,
 
-                        lang: "por"
+                        lang:
+                            "por"
                     }
                 ]
-            });
-        }
-
-        /*
-         * 6. Encontrar job existente.
-         *
-         * Isso impede duas traduções simultâneas da mesma
-         * legenda.
-         */
-        let job = null;
-
-        for (const currentJob of jobs.values()) {
-            if (
-                currentJob.cacheKey === cacheKey &&
-                currentJob.status === "processing"
-            ) {
-                job = currentJob;
-                break;
             }
-        }
-
-        /*
-         * 7. Se não existe job, cria.
-         */
-        if (!job) {
-            const jobId =
-                `job-${sourceHash.slice(0, 24)}-${randomId(8)}`;
-
-            job = createJob({
-                jobId,
-                cacheKey,
-                type,
-                videoId: id,
-                sourceHash,
-                sourceSrt
-            });
-
-            /*
-             * IMPORTANTE:
-             *
-             * Disparamos sem bloquear a resposta do Stremio.
-             */
-            job.promise = processJob(job)
-                .catch(error => {
-                    console.error(
-                        `[JOB ${job.id}] Erro inesperado:`,
-                        error
-                    );
-
-                    job.status = "failed";
-                    job.error =
-                        getErrorMessage(error);
-                });
-        }
-
-        /*
-         * 8. Entregamos uma URL estável.
-         *
-         * O Stremio poderá então pedir esse arquivo.
-         * Esse endpoint consegue esperar a tradução por
-         * alguns segundos antes de devolver a legenda.
-         */
-        const subtitleUrl =
-            `${baseUrl}/subtitle/${encodeURIComponent(job.id)}.srt`;
-
-        console.log(
-            `[STREMIO] Entregando URL de job: ${subtitleUrl}`
         );
-
-        return safeJson(res, {
-            subtitles: [
-                {
-                    id:
-                        `${id}-gemini-${sourceHash.slice(0, 12)}`,
-
-                    url: subtitleUrl,
-
-                    lang: "por"
-                }
-            ]
-        });
-    } catch (error) {
+    } catch (
+        error
+    ) {
         console.error(
-            "[STREMIO] Erro no endpoint de subtitles:",
+            "[STREMIO] Erro:",
             error
         );
 
-        return safeJson(res, {
-            subtitles: []
-        });
+        return safeJson(
+            res,
+            {
+                subtitles: []
+            }
+        );
     }
 }
 
 /*
- * Compatibilidade com as duas formas comuns:
- *
- * /subtitles/movie/tt123.json
- * /subtitles/movie/tt123/qualquer-extra.json
- */
+|--------------------------------------------------------------------------
+| ROTAS SUBTITLES
+|--------------------------------------------------------------------------
+*/
 
 app.get(
     "/subtitles/:type/:id.json",
@@ -1446,26 +2643,55 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| ENTREGA DA LEGENDA TRADUZIDA
+| ENTREGA DA LEGENDA
 |--------------------------------------------------------------------------
 */
 
-async function subtitleResultHandler(req, res) {
+async function subtitleResultHandler(
+    req,
+    res
+) {
     const rawJobId =
-        String(req.params.jobId || "").trim();
+        String(
+            req.params.jobId ||
+                ""
+        ).trim();
 
-    const jobId = decodeURIComponent(rawJobId);
+    let jobId;
 
-    if (!jobId) {
+    try {
+        jobId =
+            decodeURIComponent(
+                rawJobId
+            );
+    } catch {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt("Job inválido.")
+            buildErrorSrt(
+                "Job inválido."
+            )
         );
     }
 
-    const job = getJob(jobId);
+    if (
+        !jobId
+    ) {
+        return sendSubtitleResponse(
+            res,
+            buildErrorSrt(
+                "Job inválido."
+            )
+        );
+    }
 
-    if (!job) {
+    const job =
+        getJob(
+            jobId
+        );
+
+    if (
+        !job
+    ) {
         return sendSubtitleResponse(
             res,
             buildErrorSrt(
@@ -1477,43 +2703,9 @@ async function subtitleResultHandler(req, res) {
     /*
      * Resultado pronto.
      */
-    if (job.status === "completed" && job.result) {
-        return sendSubtitleResponse(
-            res,
-            job.result,
-            "public, max-age=86400"
-        );
-    }
-
-    /*
-     * Falhou.
-     */
-    if (job.status === "failed") {
-        return sendSubtitleResponse(
-            res,
-            buildErrorSrt(job.error),
-            "no-store"
-        );
-    }
-
-    /*
-     * Ainda processando.
-     *
-     * Em vez de responder imediatamente,
-     * aguardamos um pouco.
-     *
-     * Isso aumenta bastante a chance de o Stremio
-     * receber a tradução na primeira tentativa.
-     */
-    const completed =
-        await waitForJob(
-            job,
-            WAIT_FOR_TRANSLATION_MS
-        );
-
     if (
-        completed &&
-        job.status === "completed" &&
+        job.status ===
+            "completed" &&
         job.result
     ) {
         return sendSubtitleResponse(
@@ -1524,18 +2716,61 @@ async function subtitleResultHandler(req, res) {
     }
 
     /*
-     * Ainda não terminou.
-     *
-     * Não devemos devolver erro HTTP para o Stremio.
+     * Falhou.
      */
-    if (job.status === "failed") {
+    if (
+        job.status ===
+        "failed"
+    ) {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(job.error),
+            buildErrorSrt(
+                job.error
+            ),
             "no-store"
         );
     }
 
+    /*
+     * Ainda processando.
+     *
+     * Esperamos antes de responder.
+     */
+    const completed =
+        await waitForJob(
+            job,
+            WAIT_FOR_TRANSLATION_MS
+        );
+
+    if (
+        completed &&
+        job.status ===
+            "completed" &&
+        job.result
+    ) {
+        return sendSubtitleResponse(
+            res,
+            job.result,
+            "public, max-age=86400"
+        );
+    }
+
+    if (
+        job.status ===
+        "failed"
+    ) {
+        return sendSubtitleResponse(
+            res,
+            buildErrorSrt(
+                job.error
+            ),
+            "no-store"
+        );
+    }
+
+    /*
+     * Continua processando.
+     */
     return sendSubtitleResponse(
         res,
         buildProcessingSrt(),
@@ -1545,7 +2780,7 @@ async function subtitleResultHandler(req, res) {
 
 /*
 |--------------------------------------------------------------------------
-| ENDPOINT DA LEGENDA
+| ROTA DA LEGENDA
 |--------------------------------------------------------------------------
 */
 
@@ -1560,41 +2795,109 @@ app.get(
 |--------------------------------------------------------------------------
 */
 
-app.listen(PORT, () => {
-    console.log("==============================================");
-    console.log("  STREMIO GEMINI SUBTITLE TRANSLATOR");
-    console.log("==============================================");
-    console.log(`Porta: ${PORT}`);
-    console.log(`Modelo Gemini: ${GEMINI_MODEL}`);
-    console.log(
-        `PUBLIC_URL: ${PUBLIC_URL || "(automático)"}`
-    );
-    console.log(
-        `Cache TTL: ${CACHE_TTL_MS / 1000 / 60 / 60}h`
-    );
-    console.log(
-        `Batch size: ${BATCH_SIZE}`
-    );
-    console.log("Status: ONLINE");
-    console.log("==============================================");
-});
+app.listen(
+    PORT,
+    () => {
+        console.log(
+            "=============================================="
+        );
+
+        console.log(
+            "  STREMIO GEMINI SUBTITLE TRANSLATOR 4.0"
+        );
+
+        console.log(
+            "=============================================="
+        );
+
+        console.log(
+            `Porta: ${PORT}`
+        );
+
+        console.log(
+            `Modelo Gemini: ${GEMINI_MODEL}`
+        );
+
+        console.log(
+            `PUBLIC_URL: ${
+                PUBLIC_URL ||
+                "(automático)"
+            }`
+        );
+
+        console.log(
+            `Cache TTL: ${
+                CACHE_TTL_MS /
+                1000 /
+                60 /
+                60
+            }h`
+        );
+
+        console.log(
+            `Job TTL: ${
+                JOB_TTL_MS /
+                1000 /
+                60
+            }min`
+        );
+
+        console.log(
+            `Max batch blocks: ${MAX_BATCH_BLOCKS}`
+        );
+
+        console.log(
+            `Max batch chars: ${MAX_BATCH_CHARS}`
+        );
+
+        console.log(
+            `Gemini concorrência: ${MAX_CONCURRENT_GEMINI}`
+        );
+
+        console.log(
+            `Intervalo Gemini: ${MIN_GEMINI_INTERVAL_MS}ms`
+        );
+
+        console.log(
+            `Max retries Gemini: ${MAX_GEMINI_RETRIES}`
+        );
+
+        console.log(
+            `Max jobs ativos: ${MAX_ACTIVE_JOBS}`
+        );
+
+        console.log(
+            "Status: ONLINE"
+        );
+
+        console.log(
+            "=============================================="
+        );
+    }
+);
 
 /*
 |--------------------------------------------------------------------------
-| TRATAMENTO DE PROCESSOS
+| PROCESSOS
 |--------------------------------------------------------------------------
 */
 
-process.on("unhandledRejection", error => {
-    console.error(
-        "[PROCESS] Unhandled rejection:",
-        error
-    );
-});
+process.on(
+    "unhandledRejection",
+    error => {
+        console.error(
+            "[PROCESS] Unhandled rejection:",
+            error
+        );
+    }
+);
 
-process.on("uncaughtException", error => {
-    console.error(
-        "[PROCESS] Uncaught exception:",
-        error
-    );
-});
+process.on(
+    "uncaughtException",
+    error => {
+        console.error(
+            "[PROCESS] Uncaught exception:",
+            error
+        );
+    }
+);
