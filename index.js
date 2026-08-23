@@ -8,10 +8,10 @@ const translationCache = new Map();
 const processingJobs = new Set();
 
 const manifest = {
-    id: "org.tradutor.stateless.gemini.async",
-    version: "2.1.0",
-    name: "Tradutor Gemini Async Otimizado",
-    description: "Traduz legendas em blocos seguros usando Google Gemini.",
+    id: "org.tradutor.stateless.gemini.optimized",
+    version: "3.1.0",
+    name: "Tradutor Gemini 2-Parts",
+    description: "Traduz legendas divididas em duas metades para máxima velocidade e estabilidade.",
     resources: ["subtitles"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -22,14 +22,13 @@ app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
 
-// Função para fatiar o SRT em blocos seguros para o Gemini processar rápido
-function chunkSrt(srtText, maxBlockSize = 40) {
+// Função para dividir o SRT exatamente em 2 metades equilibradas
+function splitSrtInHalves(srtText) {
     const blocks = srtText.replace(/\r\n/g, '\n').split(/\n\s*\n/).filter(b => b.trim() !== '');
-    const chunks = [];
-    for (let i = 0; i < blocks.length; i += maxBlockSize) {
-        chunks.push(blocks.slice(i, i + maxBlockSize).join('\n\n'));
-    }
-    return chunks;
+    const mid = Math.ceil(blocks.length / 2);
+    const half1 = blocks.slice(0, mid).join('\n\n');
+    const half2 = blocks.slice(mid).join('\n\n');
+    return [half1, half2];
 }
 
 async function backgroundTranslate(cacheKey, srtUrl) {
@@ -41,15 +40,15 @@ async function backgroundTranslate(cacheKey, srtUrl) {
         const srtResp = await fetch(srtUrl);
         const srtText = await srtResp.text();
 
-        const chunks = chunkSrt(srtText, 40); // Blocos de 40 legendas por requisição
-        let translatedChunks = [];
+        const halves = splitSrtInHalves(srtText);
+        let translatedHalves = [];
         const apiKey = process.env.GEMINI_API_KEY;
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
 
-        console.log(`[BACKGROUND] Traduzindo ${chunks.chunks?.length || chunks.length} blocos via Gemini...`);
+        console.log(`[BACKGROUND] Traduzindo 2 metades via Gemini...`);
 
-        for (let i = 0; i < chunks.length; i++) {
-            const prompt = `Traduza os blocos de legenda SRT abaixo para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos. Não adicione comentários:\n\n${chunks[i]}`;
+        for (let i = 0; i < halves.length; i++) {
+            const prompt = `Você é um tradutor profissional de legendas para o Português do Brasil. Traduza o texto SRT abaixo mantendo exatamente a mesma estrutura, quebras de linha e números dos blocos. Não adicione comentários:\n\n${halves[i]}`;
 
             const response = await fetch(url, {
                 method: 'POST',
@@ -59,21 +58,21 @@ async function backgroundTranslate(cacheKey, srtUrl) {
 
             const data = await response.json();
             if (data.error) {
-                console.error(`[ERRO GEMINI LOTE ${i+1}]`, data.error.message);
-                translatedChunks.push(chunks[i]); // Mantém o original se falhar
+                console.error(`[ERRO GEMINI METADE ${i+1}]`, data.error.message);
+                translatedHalves.push(halves[i]); // Mantém original se falhar
             } else {
-                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || chunks[i];
-                translatedChunks.push(text);
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || halves[i];
+                translatedHalves.push(text);
             }
 
-            // Pequena pausa para estabilidade
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Pausa rápida de segurança entre as duas metades
+            await new Promise(resolve => setTimeout(resolve, 300));
         }
 
-        const finalTranslatedText = translatedChunks.join('\n\n');
+        const finalTranslatedText = translatedHalves.join('\n\n');
         const base64Sub = Buffer.from(finalTranslatedText, 'utf-8').toString('base64');
         translationCache.set(cacheKey, `data:text/plain;base64,${base64Sub}`);
-        console.log(`[SUCESSO] Tradução completa e salva em cache para ${cacheKey}!`);
+        console.log(`[SUCESSO] Tradução das 2 metades concluída e salva em cache para ${cacheKey}!`);
 
     } catch (err) {
         console.error("[ERRO CRÍTICO BACKGROUND]", err);
@@ -112,7 +111,7 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
             backgroundTranslate(cacheKey, targetSub.url);
         }
 
-        const warningSrt = `1\n00:00:01,000 --> 00:00:08,000\n⏳ Traduzindo com Gemini...\n\n2\n00:00:08,500 --> 00:00:15,000\nAguarde 1 minuto e recarregue a legenda.`;
+        const warningSrt = `1\n00:00:01,000 --> 00:00:08,000\n⏳ Traduzindo com Gemini (2 Partes)...\n\n2\n00:00:08,500 --> 00:00:15,000\nAguarde 10 segundos e recarregue a legenda.`;
         const warningBase64 = Buffer.from(warningSrt, 'utf-8').toString('base64');
 
         res.json({
@@ -131,5 +130,5 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`[SISTEMA] Servidor Async Gemini Otimizado rodando na porta ${PORT}`);
+    console.log(`[SISTEMA] Servidor Gemini 2-Parts rodando na porta ${PORT}`);
 });
