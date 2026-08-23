@@ -27,8 +27,8 @@ async function translateWithGemini(srtText) {
         return srtText;
     }
 
-    // Usando o modelo gemini-2.0-flash (compatível com a sua conta)
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+    // Usando o modelo gemini-3.6-flash indicado pelo próprio Google nos logs
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
 
     const prompt = `Você é um tradutor profissional de legendas de filmes e séries para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos de legenda SRT. Não adicione nenhum comentário, markdown extra ou introdução, devolva apenas o texto traduzido no formato SRT puro:\n\n${srtText}`;
 
