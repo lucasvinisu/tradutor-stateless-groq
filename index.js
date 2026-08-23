@@ -38,7 +38,7 @@ async function translateWithGroq(textBlock) {
                     content: textBlock
                 }
             ],
-            model: "llama-3.1-70b-versatile",
+            model: "llama3-70b-8192",
             temperature: 0.3,
         });
         return completion.choices[0]?.message?.content || textBlock;
