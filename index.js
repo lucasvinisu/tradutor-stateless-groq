@@ -1,17 +1,14 @@
 const express = require('express');
 const cors = require('cors');
-const Groq = require('groq-sdk');
 
 const app = express();
 app.use(cors());
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
 const manifest = {
-    id: "org.tradutor.stateless.groq",
+    id: "org.tradutor.stateless.gemini",
     version: "1.0.0",
-    name: "Tradutor Groq Stateless",
-    description: "Traduz legendas em tempo real usando Groq IA fatiando os blocos na memória.",
+    name: "Tradutor Gemini Stateless",
+    description: "Traduz legendas em tempo real usando Google Gemini direto na memória.",
     resources: ["subtitles"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -22,52 +19,43 @@ app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
 
-// Função para fatiar o SRT em blocos menores (evita o Erro 413 de limite de tokens)
-function chunkSrt(srtText, maxBlockSize = 20) {
-    const blocks = srtText.replace(/\r\n/g, '\n').split(/\n\s*\n/).filter(b => b.trim() !== '');
-    const chunks = [];
-    for (let i = 0; i < blocks.length; i += maxBlockSize) {
-        chunks.push(blocks.slice(i, i + maxBlockSize).join('\n\n'));
+// Função para traduzir o SRT inteiro de uma vez usando a API do Gemini
+async function translateWithGemini(srtText) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        console.error("[ERRO GEMINI] Chave GEMINI_API_KEY não configurada no Render!");
+        return srtText;
     }
-    return chunks;
-}
 
-// Função de tradução em lotes sequenciais com pausa de segurança
-async function translateWithGroq(srtText) {
-    const chunks = chunkSrt(srtText, 20); // Pedaços de 20 blocos por vez
-    let translatedChunks = [];
+    // Usando o modelo gemini-1.5-flash (rápido, estável e com contexto massivo)
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
 
-    console.log(`[TRADUÇÃO] Dividido em ${chunks.length} lotes para envio seguro ao Groq.`);
+    const prompt = `Você é um tradutor profissional de legendas de filmes e séries para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos de legenda SRT. Não adicione nenhum comentário, markdown extra ou introdução, devolva apenas o texto traduzido no formato SRT puro:\n\n${srtText}`;
 
-    for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        try {
-            const completion = await groq.chat.completions.create({
-                messages: [
-                    {
-                        role: "system",
-                        content: "Você é um tradutor profissional de legendas de filmes e séries para o Português do Brasil. Mantenha exatamente a mesma estrutura, quebras de linha e números dos blocos de legenda SRT. Não adicione nenhum comentário ou introdução, apenas traduza o texto."
-                    },
-                    {
-                        role: "user",
-                        content: chunk
-                    }
-                ],
-                model: "openai/gpt-oss-120b",
-                temperature: 0.3,
-            });
-            const translated = completion.choices[0]?.message?.content || chunk;
-            translatedChunks.push(translated);
-            
-            // Pausa rápida de 300ms entre os lotes para respeitar a taxa de requisições por minuto (RPM)
-            await new Promise(resolve => setTimeout(resolve, 300));
-        } catch (error) {
-            console.error(`[ERRO NO LOTE ${i + 1}]`, error.message);
-            translatedChunks.push(chunk); // Mantém o original se der erro em um lote específico
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{
+                    parts: [{ text: prompt }]
+                }]
+            })
+        });
+
+        const data = await response.json();
+        
+        if (data.error) {
+            console.error("[ERRO API GEMINI]", data.error.message);
+            return srtText;
         }
-    }
 
-    return translatedChunks.join('\n\n');
+        const translatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || srtText;
+        return translatedText;
+    } catch (error) {
+        console.error("[ERRO REDE GEMINI]", error.message);
+        return srtText;
+    }
 }
 
 app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
@@ -92,8 +80,8 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
         const srtResp = await fetch(targetSub.url);
         const srtText = await srtResp.text();
 
-        console.log("[TRADUÇÃO] Iniciando fatiamento e tradução via Groq...");
-        const translatedText = await translateWithGroq(srtText);
+        console.log("[TRADUÇÃO] Enviando legenda inteira para o Google Gemini...");
+        const translatedText = await translateWithGemini(srtText);
 
         const base64Sub = Buffer.from(translatedText, 'utf-8').toString('base64');
         const dataUrl = `data:text/plain;base64,${base64Sub}`;
@@ -101,7 +89,7 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
         res.json({
             subtitles: [
                 {
-                    id: `${id}-groq-pt`,
+                    id: `${id}-gemini-pt`,
                     url: dataUrl,
                     lang: 'por'
                 }
@@ -116,5 +104,5 @@ app.get('/subtitles/:type/:id/:extra?.json', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`[SISTEMA] Servidor Stateless rodando na porta ${PORT}`);
+    console.log(`[SISTEMA] Servidor Stateless Gemini rodando na porta ${PORT}`);
 });
