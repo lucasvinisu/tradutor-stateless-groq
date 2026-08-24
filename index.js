@@ -1220,7 +1220,8 @@ async function rawGeminiRequest(
 */
 
 function enqueueGemini(
-    prompt
+    prompt,
+    deadlineAt
 ) {
     return new Promise(
         (
@@ -1229,10 +1230,11 @@ function enqueueGemini(
         ) => {
             geminiQueue.push(
                 {
-                    prompt,
-                    resolve,
-                    reject
-                }
+    prompt,
+    deadlineAt,
+    resolve,
+    reject
+}
             );
 
             processGeminiQueue();
@@ -1541,7 +1543,8 @@ ${JSON.stringify(
 */
 
 async function translateBatch(
-    blocks
+    blocks,
+    deadlineAt
 ) {
     const prompt =
         buildTranslationPrompt(
@@ -1549,9 +1552,10 @@ async function translateBatch(
         );
 
     const raw =
-        await enqueueGemini(
-            prompt
-        );
+    await enqueueGemini(
+        prompt,
+        deadlineAt
+    );
 
     let parsed;
 
@@ -1766,9 +1770,10 @@ const deadlineAt =
         );
 
         const translated =
-            await translateBatch(
-                batch
-            );
+    await translateBatch(
+        batch,
+        deadlineAt
+    );
 
         /*
          * Salva diretamente na posição correta.
