@@ -1711,8 +1711,11 @@ async function translateSrt(
     );
 
     const startedAt =
-        Date.now();
+    Date.now();
 
+const deadlineAt =
+    startedAt +
+    MAX_TRANSLATION_TIME_MS;
     /*
      * Processamento sequencial.
      */
@@ -1726,15 +1729,13 @@ async function translateSrt(
          * Tempo máximo.
          */
         if (
-            Date.now() -
-                startedAt >
-            MAX_TRANSLATION_TIME_MS
-        ) {
-            throw new Error(
-                "Tempo máximo de tradução atingido."
-            );
-        }
-
+    Date.now() >=
+    deadlineAt
+) {
+    throw new Error(
+        "Tempo máximo de tradução atingido."
+    );
+}
         const batch =
             batches[
                 batchIndex
