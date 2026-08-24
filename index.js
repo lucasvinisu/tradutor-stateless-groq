@@ -116,7 +116,11 @@ const MAX_BATCH_CHARS =
  *
  * que eram ruins para a estabilidade.
  */
-const MAX_BATCH_BLOCKS = 60;
+const MAX_BATCH_BLOCKS =
+    Number(
+        process.env.MAX_BATCH_BLOCKS ||
+        60
+    );
 
 /*
 |--------------------------------------------------------------------------
