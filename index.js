@@ -2798,9 +2798,68 @@ async function subtitlesHandler(
                 ""
         ).trim();
 
-    console.log(
+        console.log(
         `[STREMIO] Pedido: ${type}/${id}`
     );
+
+    /*
+     * DIAGNÓSTICO:
+     * mostra quais informações o Stremio
+     * enviou sobre o arquivo em reprodução.
+     *
+     * Isto NÃO chama Gemini.
+     */
+    const rawExtra =
+        String(
+            req.params.extra || ""
+        ).trim();
+
+    if (rawExtra) {
+        const extraParams =
+            new URLSearchParams(
+                rawExtra
+            );
+
+        const videoHash =
+            extraParams.get(
+                "videoHash"
+            ) || "";
+
+        const videoSize =
+            extraParams.get(
+                "videoSize"
+            ) || "";
+
+        const filename =
+            extraParams.get(
+                "filename"
+            ) || "";
+
+        console.log(
+            `[STREMIO EXTRA] filename: ${
+                filename ||
+                "(não enviado)"
+            }`
+        );
+
+        console.log(
+            `[STREMIO EXTRA] videoSize: ${
+                videoSize ||
+                "(não enviado)"
+            }`
+        );
+
+        console.log(
+            `[STREMIO EXTRA] videoHash: ${
+                videoHash ||
+                "(não enviado)"
+            }`
+        );
+    } else {
+        console.log(
+            "[STREMIO EXTRA] Nenhuma informação extra recebida."
+        );
+    }
 
     if (
         !type ||
