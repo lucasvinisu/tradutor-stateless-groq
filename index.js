@@ -8,6 +8,16 @@ app.use(cors());
 app.disable("x-powered-by");
 
 /*
+ * Necessário para receber o SRT enviado
+ * pelo componente local.
+ */
+app.use(
+    express.json({
+        limit: "1mb"
+    })
+);
+
+/*
 |--------------------------------------------------------------------------
 | CONFIGURAÇÃO
 |--------------------------------------------------------------------------
@@ -42,6 +52,15 @@ const PUBLIC_URL =
         process.env.PUBLIC_URL || ""
     )
         .replace(/\/+$/, "");
+
+/*
+ * Segredo compartilhado somente entre
+ * o Render e o componente local.
+ */
+const LOCAL_BRIDGE_SECRET =
+    String(
+        process.env.LOCAL_BRIDGE_SECRET || ""
+    ).trim();
 
 /*
 |--------------------------------------------------------------------------
@@ -272,6 +291,57 @@ function safeJson(
     );
 
     return res.json(data);
+}
+
+/*
+|--------------------------------------------------------------------------
+| AUTENTICAÇÃO DA PONTE LOCAL
+|--------------------------------------------------------------------------
+*/
+
+function isAuthorizedLocalBridge(
+    req
+) {
+    if (
+        !LOCAL_BRIDGE_SECRET
+    ) {
+        return false;
+    }
+
+    const auth =
+        String(
+            req.headers.authorization ||
+                ""
+        ).trim();
+
+    if (!auth) {
+        return false;
+    }
+
+    const expected =
+        `Bearer ${LOCAL_BRIDGE_SECRET}`;
+
+    const authBuffer =
+        Buffer.from(auth);
+
+    const expectedBuffer =
+        Buffer.from(expected);
+
+    /*
+     * timingSafeEqual exige buffers
+     * exatamente do mesmo tamanho.
+     */
+    if (
+        authBuffer.length !==
+        expectedBuffer.length
+    ) {
+        return false;
+    }
+
+    return crypto.timingSafeEqual(
+        authBuffer,
+        expectedBuffer
+    );
 }
 
 /*
@@ -2501,6 +2571,213 @@ async function downloadSubtitle(
 
 /*
 |--------------------------------------------------------------------------
+| JOB DE LEGENDA EMBUTIDA
+|--------------------------------------------------------------------------
+*/
+
+async function createEmbeddedTranslationJob({
+    type,
+    videoId,
+    sourceSrt,
+    sourceName = "embedded"
+}) {
+    const normalizedSrt =
+        normalizeSrt(
+            sourceSrt
+        );
+
+    if (!normalizedSrt) {
+        throw new Error(
+            "A legenda embutida está vazia."
+        );
+    }
+
+    if (
+        normalizedSrt.length >
+        MAX_SOURCE_CHARS
+    ) {
+        throw new Error(
+            `Legenda embutida muito grande: ${normalizedSrt.length} caracteres.`
+        );
+    }
+
+    const blocks =
+        parseSrt(
+            normalizedSrt
+        );
+
+    if (
+        blocks.length ===
+        0
+    ) {
+        throw new Error(
+            "A legenda embutida não possui blocos SRT válidos."
+        );
+    }
+
+    const sourceHash =
+        sha256(
+            normalizedSrt
+        );
+
+    /*
+     * O cache da fonte embutida depende
+     * somente do conteúdo real do SRT.
+     *
+     * Se o mesmo SRT aparecer novamente,
+     * não gastamos outra chamada Gemini.
+     */
+    const cacheKey =
+        `embedded:${sourceHash}`;
+
+    /*
+     * Cache já pronto.
+     */
+    const cached =
+        getTranslationCache(
+            cacheKey
+        );
+
+    if (cached) {
+        const cachedJobId =
+            `embedded-cached-${sourceHash.slice(
+                0,
+                24
+            )}`;
+
+        let cachedJob =
+            getJob(
+                cachedJobId
+            );
+
+        if (!cachedJob) {
+            cachedJob =
+                createJob({
+                    jobId:
+                        cachedJobId,
+
+                    cacheKey,
+
+                    type,
+
+                    videoId,
+
+                    sourceHash,
+
+                    sourceSrt:
+                        normalizedSrt
+                });
+
+            cachedJob.status =
+                "completed";
+
+            cachedJob.result =
+                cached;
+
+            cachedJob.progress =
+                100;
+
+            cachedJob.updatedAt =
+                Date.now();
+        }
+
+        console.log(
+            `[EMBEDDED] Cache utilizado para ${sourceName}.`
+        );
+
+        return cachedJob;
+    }
+
+    /*
+     * Se a mesma legenda já está sendo
+     * traduzida, reutilizamos o job.
+     */
+    const existingJob =
+        findProcessingJob(
+            cacheKey
+        );
+
+    if (existingJob) {
+        console.log(
+            `[EMBEDDED] Job existente reutilizado: ${existingJob.id}`
+        );
+
+        return existingJob;
+    }
+
+    /*
+     * Novo job.
+     */
+    const jobId =
+        `embedded-${sourceHash.slice(
+            0,
+            24
+        )}-${randomId(8)}`;
+
+    const job =
+        createJob({
+            jobId,
+
+            cacheKey,
+
+            type,
+
+            videoId,
+
+            sourceHash,
+
+            sourceSrt:
+                normalizedSrt
+        });
+
+    job.source =
+        sourceName;
+
+    job.totalBatches =
+        splitIntoBatches(
+            blocks
+        ).length;
+
+    /*
+     * Importantíssimo:
+     *
+     * usamos o MESMO processJob() do
+     * fluxo atual. Portanto continuamos
+     * usando a mesma fila Gemini, o mesmo
+     * intervalo, cooldown, cache e limites.
+     */
+    job.promise =
+        processJob(
+            job
+        ).catch(
+            error => {
+                console.error(
+                    `[EMBEDDED JOB ${job.id}] Erro inesperado:`,
+                    error
+                );
+
+                job.status =
+                    "failed";
+
+                job.error =
+                    getErrorMessage(
+                        error
+                    );
+
+                job.updatedAt =
+                    Date.now();
+            }
+        );
+
+    console.log(
+        `[EMBEDDED] Novo job ${job.id} criado.`
+    );
+
+    return job;
+}
+
+/*
+|--------------------------------------------------------------------------
 | ENDPOINT SUBTITLES
 |--------------------------------------------------------------------------
 */
@@ -2814,6 +3091,167 @@ app.get(
 app.get(
     "/subtitles/:type/:id/:extra.json",
     subtitlesHandler
+);
+
+/*
+|--------------------------------------------------------------------------
+| API DA PONTE LOCAL - LEGENDA EMBUTIDA
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/translate-embedded",
+    async (
+        req,
+        res
+    ) => {
+        /*
+         * Segurança.
+         */
+        if (
+            !isAuthorizedLocalBridge(
+                req
+            )
+        ) {
+            console.warn(
+                "[EMBEDDED API] Tentativa não autorizada."
+            );
+
+            return safeJson(
+                res,
+                {
+                    error:
+                        "Unauthorized"
+                },
+                401
+            );
+        }
+
+        try {
+            const {
+                type,
+                id,
+                srt,
+                name
+            } =
+                req.body || {};
+
+            const mediaType =
+                String(
+                    type ||
+                        "unknown"
+                ).trim();
+
+            const videoId =
+                String(
+                    id ||
+                        "unknown"
+                ).trim();
+
+            const sourceName =
+                String(
+                    name ||
+                        "embedded"
+                ).trim();
+
+            if (
+                !srt ||
+                typeof srt !==
+                    "string"
+            ) {
+                return safeJson(
+                    res,
+                    {
+                        error:
+                            "Campo 'srt' é obrigatório."
+                    },
+                    400
+                );
+            }
+
+            /*
+             * Tamanho antes de qualquer
+             * processamento.
+             */
+            if (
+                srt.length >
+                MAX_SOURCE_CHARS
+            ) {
+                return safeJson(
+                    res,
+                    {
+                        error:
+                            `SRT muito grande. Limite: ${MAX_SOURCE_CHARS} caracteres.`
+                    },
+                    413
+                );
+            }
+
+            console.log(
+                `[EMBEDDED API] Recebido SRT de ${sourceName} para ${mediaType}/${videoId}.`
+            );
+
+            const job =
+                await createEmbeddedTranslationJob({
+                    type:
+                        mediaType,
+
+                    videoId,
+
+                    sourceSrt:
+                        srt,
+
+                    sourceName
+                });
+
+            const baseUrl =
+                cleanBaseUrl(
+                    req
+                );
+
+            const subtitleUrl =
+                `${baseUrl}/subtitle/${encodeURIComponent(
+                    job.id
+                )}.srt`;
+
+            return safeJson(
+                res,
+                {
+                    ok:
+                        true,
+
+                    jobId:
+                        job.id,
+
+                    status:
+                        job.status,
+
+                    progress:
+                        job.progress,
+
+                    subtitleUrl
+                }
+            );
+        } catch (
+            error
+        ) {
+            console.error(
+                "[EMBEDDED API] Erro:",
+                error
+            );
+
+            return safeJson(
+                res,
+                {
+                    error:
+                        getErrorMessage(
+                            error
+                        )
+                },
+                500
+            );
+        }
+    }
 );
 
 /*
