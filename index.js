@@ -688,6 +688,260 @@ function stripCodeFences(
 const SDH_CUE_WORDS =
     /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
 
+/*
+|--------------------------------------------------------------------------
+| CONTEXTO OCULTO DE FALANTE - 5.6
+|--------------------------------------------------------------------------
+|
+| Algumas fontes trazem informações úteis como:
+|
+| [Adam] I'm excited.
+| KELLY: I loved it.
+|
+| Antes nós removíamos isso para deixar a legenda limpa e a informação
+| desaparecia completamente antes de chegar ao Gemini.
+|
+| Agora preservamos o nome apenas INTERNAMENTE em um marcador que nunca
+| aparece na legenda final. O parser remove o marcador e envia o nome ao
+| Gemini no campo opcional "speaker".
+|
+| Se um bloco tiver dois nomes diferentes, não atribuímos um único falante
+| ao bloco inteiro, evitando fornecer contexto incorreto.
+|
+*/
+
+const SPEAKER_HINT_MARKER_REGEX =
+    /^@@SPK:([^@]+)@@\s*/u;
+
+function normalizeSpeakerHint(
+    value
+) {
+    const speaker =
+        String(
+            value || ""
+        )
+            .replace(
+                /<[^>]+>/g,
+                " "
+            )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .trim();
+
+    if (
+        !speaker ||
+        speaker.length > 60
+    ) {
+        return "";
+    }
+
+    /*
+     * Não confundimos rubricas SDH com nomes.
+     */
+    if (
+        SDH_CUE_WORDS.test(
+            speaker
+        )
+    ) {
+        return "";
+    }
+
+    /*
+     * Evita guardar frases completas como se fossem nome.
+     */
+    if (
+        /[!?;]/u.test(
+            speaker
+        )
+    ) {
+        return "";
+    }
+
+    return speaker;
+}
+
+function encodeSpeakerHint(
+    speaker
+) {
+    return encodeURIComponent(
+        String(
+            speaker || ""
+        )
+    );
+}
+
+function decodeSpeakerHint(
+    encoded
+) {
+    try {
+        return normalizeSpeakerHint(
+            decodeURIComponent(
+                String(
+                    encoded || ""
+                )
+            )
+        );
+    } catch {
+        return "";
+    }
+}
+
+function extractSpeakerHint(
+    line
+) {
+    const original =
+        String(
+            line || ""
+        );
+
+    /*
+     * Marcador interno já existente.
+     * Isso torna a limpeza idempotente.
+     */
+    const hiddenMatch =
+        original.match(
+            SPEAKER_HINT_MARKER_REGEX
+        );
+
+    if (
+        hiddenMatch
+    ) {
+        return {
+            speaker:
+                decodeSpeakerHint(
+                    hiddenMatch[1]
+                ),
+
+            lineForCleaning:
+                original.replace(
+                    SPEAKER_HINT_MARKER_REGEX,
+                    ""
+                )
+        };
+    }
+
+    /*
+     * [Adam] Hello
+     * - [Kelly Clarkson] Hello
+     */
+    const bracketMatch =
+        original.match(
+            /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*/u
+        );
+
+    if (
+        bracketMatch
+    ) {
+        const speaker =
+            normalizeSpeakerHint(
+                bracketMatch[1]
+            );
+
+        if (speaker) {
+            return {
+                speaker,
+                lineForCleaning:
+                    original
+            };
+        }
+    }
+
+    /*
+     * ADAM: Hello
+     * Kelly Clarkson: Hello
+     *
+     * Esta heurística é conservadora e usa apenas o prefixo curto
+     * que o próprio limpador já tratava como rótulo de falante.
+     */
+    const colonMatch =
+        original.match(
+            /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50}):\s+(?=\S)/u
+        );
+
+    if (
+        colonMatch
+    ) {
+        const speaker =
+            normalizeSpeakerHint(
+                colonMatch[1]
+            );
+
+        if (speaker) {
+            return {
+                speaker,
+                lineForCleaning:
+                    original
+            };
+        }
+    }
+
+    return {
+        speaker:
+            "",
+
+        lineForCleaning:
+            original
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| NORMALIZAÇÃO DE ALONGAMENTOS VOCAIS - 5.6
+|--------------------------------------------------------------------------
+|
+| A duração de uma nota ou de uma sílaba já é transmitida pelo áudio.
+| A legenda deve mostrar a palavra, não desenhar a duração da voz.
+|
+| Exemplos:
+|
+| casa-a-a-a-a-a  -> casa
+| ce-e-e-e-e-rto  -> certo
+| ye-e-e-e-es      -> yes
+| nãããããão         -> não   (pós-tradução)
+|
+| A regra com hífen é extremamente específica: só colapsa a MESMA letra
+| repetida várias vezes. Portanto não mexe em palavras normais como
+| "bem-vindo", "guarda-chuva" ou "segunda-feira".
+|
+*/
+
+function normalizeHyphenatedVocalElongations(
+    text
+) {
+    return String(
+        text ?? ""
+    ).replace(
+        /([A-Za-zÀ-ÖØ-öø-ÿ])(?:[-–—]\1){2,}[-–—]?/giu,
+        "$1"
+    );
+}
+
+function normalizeTranslatedVocalElongations(
+    text
+) {
+    let result =
+        normalizeHyphenatedVocalElongations(
+            text
+        );
+
+    /*
+     * Depois da tradução, quatro ou mais vogais idênticas consecutivas
+     * são quase sempre representação visual de voz prolongada.
+     *
+     * O limiar de 4 é deliberadamente conservador: não toca em palavras
+     * legítimas com vogal dupla, como "voo", "enjoo" ou "creem".
+     */
+    result =
+        result.replace(
+            /([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{3,}/gu,
+            "$1"
+        );
+
+    return result;
+}
+
 function cleanDialogueLine(
     line
 ) {
@@ -787,6 +1041,8 @@ function cleanSrtForTranslation(
 
     let removedBlocks = 0;
     let changedLines = 0;
+    let speakerHintBlocks = 0;
+    let elongatedLines = 0;
 
     for (
         const rawBlock
@@ -817,6 +1073,8 @@ function cleanSrtForTranslation(
             ].trim();
 
         const cleanedDialogue = [];
+        const speakerHints =
+            new Set();
 
         for (
             const line
@@ -824,10 +1082,35 @@ function cleanSrtForTranslation(
                 timingIndex + 1
             )
         ) {
-            const cleaned =
-                cleanDialogueLine(
+            const speakerInfo =
+                extractSpeakerHint(
                     line
                 );
+
+            if (
+                speakerInfo.speaker
+            ) {
+                speakerHints.add(
+                    speakerInfo.speaker
+                );
+            }
+
+            const cleanedBeforeElongation =
+                cleanDialogueLine(
+                    speakerInfo.lineForCleaning
+                );
+
+            const cleaned =
+                normalizeHyphenatedVocalElongations(
+                    cleanedBeforeElongation
+                );
+
+            if (
+                cleaned !==
+                cleanedBeforeElongation
+            ) {
+                elongatedLines++;
+            }
 
             if (
                 cleaned !==
@@ -849,6 +1132,30 @@ function cleanSrtForTranslation(
         ) {
             removedBlocks++;
             continue;
+        }
+
+        /*
+         * Só preservamos um speakerHint quando há exatamente
+         * um único nome confiável no bloco inteiro.
+         */
+        let speakerHint =
+            "";
+
+        if (
+            speakerHints.size ===
+            1
+        ) {
+            speakerHint =
+                Array.from(
+                    speakerHints
+                )[0];
+
+            cleanedDialogue[0] =
+                `@@SPK:${encodeSpeakerHint(
+                    speakerHint
+                )}@@ ${cleanedDialogue[0]}`;
+
+            speakerHintBlocks++;
         }
 
         cleanedBlocks.push({
@@ -876,6 +1183,14 @@ function cleanSrtForTranslation(
 
     console.log(
         `[CLEAN] SDH/CC: ${rawBlocks.length} -> ${cleanedBlocks.length} blocos; ${removedBlocks} removidos; ${changedLines} linha(s) alterada(s).`
+    );
+
+    console.log(
+        `[CLEAN] Contexto de falante: ${speakerHintBlocks} bloco(s) preservado(s).`
+    );
+
+    console.log(
+        `[CLEAN] Alongamentos vocais na fonte: ${elongatedLines} linha(s) normalizada(s).`
     );
 
     return result
@@ -943,6 +1258,37 @@ function parseSrt(srt) {
             continue;
         }
 
+        const textLines =
+            lines.slice(2);
+
+        let speakerHint =
+            "";
+
+        if (
+            textLines.length >
+            0
+        ) {
+            const markerMatch =
+                textLines[0].match(
+                    SPEAKER_HINT_MARKER_REGEX
+                );
+
+            if (
+                markerMatch
+            ) {
+                speakerHint =
+                    decodeSpeakerHint(
+                        markerMatch[1]
+                    );
+
+                textLines[0] =
+                    textLines[0].replace(
+                        SPEAKER_HINT_MARKER_REGEX,
+                        ""
+                    );
+            }
+        }
+
         result.push({
             index:
                 Number(indexLine),
@@ -951,9 +1297,12 @@ function parseSrt(srt) {
                 timingLine,
 
             text:
-                lines
-                    .slice(2)
-                    .join("\n")
+                textLines
+                    .join("\n"),
+
+            speakerHint:
+                speakerHint ||
+                null
         });
     }
 
@@ -1091,6 +1440,49 @@ function cleanAllTranslatedDialogueMarkers(
 
     console.log(
         `[CLEAN] Marcadores de diálogo: ${changedBlocks} bloco(s) ajustado(s).`
+    );
+
+    return cleaned;
+}
+
+/*
+|--------------------------------------------------------------------------
+| POLIMENTO DE ALONGAMENTOS NA TRADUÇÃO - 5.6
+|--------------------------------------------------------------------------
+*/
+
+function cleanAllTranslatedVocalElongations(
+    translatedTexts
+) {
+    let changedBlocks =
+        0;
+
+    const cleaned =
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(
+                        text ?? ""
+                    );
+
+                const result =
+                    normalizeTranslatedVocalElongations(
+                        original
+                    );
+
+                if (
+                    result !==
+                    original
+                ) {
+                    changedBlocks++;
+                }
+
+                return result;
+            }
+        );
+
+    console.log(
+        `[CLEAN] Alongamentos vocais traduzidos: ${changedBlocks} bloco(s) ajustado(s).`
     );
 
     return cleaned;
@@ -1524,6 +1916,9 @@ async function rawGeminiRequest(
                         "Quando houver letra de música realmente transcrita na legenda, traduza seu conteúdo para PT-BR, mesmo que esteja em um idioma diferente do inglês. Não invente letras quando houver apenas marcações como [music], símbolos musicais ou descrições de som. " +
                         "Preserve nomes próprios, marcas, títulos, termos técnicos, palavrões, intensidade emocional e intenção. Não censure. Não resuma. Não explique. " +
                         "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. Traduza somente o campo text e mantenha exatamente os IDs recebidos. " +
+                        "Algumas entradas podem trazer um campo opcional speaker. Esse campo é somente contexto oculto de quem fala: nunca o copie para o campo text e nunca acrescente o nome do falante à legenda final. Quando speaker identificar claramente uma pessoa, respeite o gênero gramatical dessa pessoa em adjetivos, particípios e construções em primeira pessoa. " +
+                        "Quando não houver speaker ou a identidade do falante não estiver clara, NÃO chute masculino ou feminino. Prefira uma formulação brasileira natural sem marca de gênero sempre que isso evitar uma escolha incerta. Por exemplo, em vez de adivinhar entre 'estou empolgado' e 'estou empolgada', uma solução como 'Mal posso esperar', 'Que empolgação' ou outra construção neutra pode ser melhor conforme o contexto. Nunca use formas artificiais como empolgado(a), empolgade ou barras de gênero. " +
+                        "Não reproduza graficamente notas ou sílabas sustentadas. Alongamentos como home-e-e-e, ce-e-e-e-rto, sooooo ou nããããão representam duração da voz e devem virar a palavra normal adequada ao sentido. O áudio já transmite a duração. Preserve apenas vocalizações que tenham valor real de fala, como 'ah', 'oh' ou 'hmm', sem multiplicar letras desnecessariamente. " +
                         "Não acrescente traços, travessões, barras ou marcadores de diálogo que não sejam necessários. Preserve marcadores somente quando forem realmente necessários para distinguir dois ou mais falantes no mesmo bloco. " +
                         "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares."
                 }
@@ -1585,7 +1980,7 @@ async function rawGeminiRequest(
     const remaining =
         remainingBeforeDeadline(
             deadlineAt
-    );
+        );
 
     if (
         remaining <= 0
@@ -2017,13 +2412,29 @@ function buildTranslationPrompt(
 ) {
     const payload =
         blocks.map(
-            block => ({
-                id:
-                    block.index,
+            block => {
+                const item = {
+                    id:
+                        block.index,
 
-                text:
-                    block.text
-            })
+                    text:
+                        block.text
+                };
+
+                /*
+                 * speaker é CONTEXTO OCULTO.
+                 * Só aparece quando a fonte realmente ofereceu
+                 * uma identificação confiável de falante.
+                 */
+                if (
+                    block.speakerHint
+                ) {
+                    item.speaker =
+                        block.speakerHint;
+                }
+
+                return item;
+            }
         );
 
     return `
@@ -2037,38 +2448,59 @@ Preserve a personalidade da pessoa, a intenção da fala, ironia, sarcasmo, shad
 Em reality shows, cultura pop e conversas informais, prefira uma linguagem oral, descontraída e natural em PT-BR quando o contexto pedir isso.
 Não exagere nem invente gírias brasileiras sem necessidade.
 
+CONTEXTO DE FALANTE E GÊNERO:
+
+Algumas entradas podem conter o campo opcional "speaker". Ele é somente uma pista interna de quem está falando e NÃO faz parte da legenda.
+Quando "speaker" identificar claramente uma pessoa, use essa informação para manter concordância natural de gênero em primeira pessoa, adjetivos e particípios.
+Nunca copie, traduza nem acrescente o conteúdo de "speaker" ao texto final.
+Se "speaker" não existir, estiver ambíguo ou não permitir saber com segurança o gênero de quem fala, NÃO ADIVINHE masculino ou feminino.
+Nesse caso, reescreva naturalmente a frase em PT-BR para evitar marca de gênero quando possível, sem mudar o sentido.
+Exemplo: se não souber quem diz "I'm so excited", não escolha aleatoriamente "estou empolgado" ou "estou empolgada"; prefira algo natural ao contexto como "Mal posso esperar", "Que empolgação!" ou outra formulação neutra adequada.
+Nunca use grafias artificiais como "empolgado(a)", "empolgade", "ele/ela" ou barras para contornar o gênero.
+
+POLIMENTO DE FALA E CANTO:
+
+A legenda deve registrar O QUE foi dito ou cantado, não desenhar quanto tempo uma nota ou sílaba durou.
+Se a fonte representar uma voz prolongada repetindo letras, vogais ou segmentos com hífens, normalize para a palavra correta.
+Exemplos de fenômeno, não de tradução literal: "home-e-e-e-e" deve ser entendido como "home"; "ce-e-e-e-rto" deve ficar "certo"; "sooooo" representa apenas "so" prolongado; "nããããão" representa "não" prolongado.
+Não reproduza sequências como "a-a-a-a-a", "e-e-e-e-e" ou vogais multiplicadas só porque a pessoa sustentou a nota.
+Preserve vocalizações reais com função comunicativa, como "ah", "oh", "hmm", quando fizerem parte da fala, mas sem alongamento ortográfico excessivo.
+
 REGRAS OBRIGATÓRIAS:
 
 1. Retorne exatamente um objeto para cada entrada.
 2. Preserve todos os IDs exatamente.
 3. Não crie nem remova IDs.
 4. Traduza somente o campo "text".
-5. Não escreva explicações, markdown ou texto fora do JSON.
-6. Não resuma nem omita informação falada ou cantada presente no texto.
-7. Antes de traduzir uma expressão curta, ambígua ou coloquial, interprete primeiro o SENTIDO e a INTENÇÃO usando os IDs vizinhos como contexto.
-8. Considere que pontuação, vírgulas, quebras de linha e segmentação da legenda-fonte podem estar imperfeitas. Não deixe uma segmentação ruim transformar uma expressão idiomática em uma frase sem sentido.
-9. Use os IDs anteriores e seguintes do mesmo lote somente como contexto. Nunca transfira, duplique ou mova conteúdo de um ID para outro.
-10. Adapte expressões idiomáticas, gírias, humor, piadas, trocadilhos e shade quando houver uma solução brasileira natural que preserve o efeito da fala.
-11. Preserve o humor e a intenção mesmo quando isso exigir se afastar da estrutura gramatical literal do inglês.
-12. Reconheça VOCATIVOS. Em fala informal, palavras como "girl", "bitch", "honey", "sis", "queen", "baby" e "babe" frequentemente são vocativos e não devem ser tratadas automaticamente como substantivos literais.
-13. "girl" NÃO deve virar automaticamente "garota". Conforme o contexto, pode ser "gata", "amiga", "mana", "querida", "bicha" ou simplesmente não precisar de tradução explícita como substantivo.
-14. "bitch" NÃO deve virar automaticamente "vadia". Use "vadia" somente quando houver intenção genuína de insulto. Em contexto camp, afetivo, debochado ou entre queens, considere alternativas naturais como "bicha", "gata", "amiga" ou outra solução adequada ao tom.
-15. Exemplo de sentido: "Kenya got you, girl" em tom de shade deve ser entendido como algo como "Mas a Kenya te pegou, gata", e NÃO como "Kenya pegou a sua garota".
-16. Exemplo de registro: "Vita is quiet, but this bitch is a silent killer" em contexto camp pode ser localizado como "A Vita é calada, mas essa bicha é uma assassina silenciosa", em vez de traduzir "bitch" mecanicamente como "vadia".
-17. Não copie os exemplos mecanicamente. Eles demonstram como interpretar intenção, vocativo e registro; escolha sempre a formulação que melhor encaixar na cena real.
-18. Se uma adaptação de trocadilho, bordão ou termo cunhado ficar forçada, confusa ou sem graça em PT-BR, preserve o termo original em vez de inventar uma palavra nova.
-19. Preserve bordões, nomes próprios, marcas, nomes de personagens, títulos e termos icônicos quando não houver equivalente natural e reconhecível em PT-BR. Exemplo: "Condragulations" deve permanecer "Condragulations".
-20. Não censure palavrões, linguagem sexual, sarcasmo, deboche ou intensidade emocional.
-21. Se houver fala ou letra de música em italiano, espanhol, francês ou qualquer outro idioma, traduza-a para PT-BR também, desde que seja conteúdo real da legenda e não apenas um nome próprio ou título.
-22. Quando houver letra de música realmente transcrita, traduza o conteúdo da letra. Não invente letras para marcações de música, descrições de som ou símbolos musicais.
-23. Preserve vocalizações, nomes de artistas, nomes de músicas e nomes próprios quando funcionarem como nomes, não como frases a serem traduzidas.
-24. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
-25. Não acrescente informações, notas explicativas, nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
-26. Não misture textos entre IDs.
-27. Cada ID deve receber somente a tradução correspondente ao próprio texto.
-28. Não acrescente hífen, travessão, meia-risca ou barra no início de uma fala apenas por estilo. Use marcadores de diálogo somente quando forem realmente necessários para diferenciar dois ou mais falantes dentro do mesmo bloco.
-29. Em diálogos informais, contrações brasileiras como "tá", "tô" e "pra" podem ser usadas quando soarem naturais ao personagem e à situação; não force essas formas em registros formais.
-30. Priorize sempre esta ordem: SENTIDO DA FALA → TOM/INTENÇÃO → NATURALIDADE EM PT-BR → fidelidade à estrutura literal.
+5. O campo opcional "speaker" é apenas contexto e NUNCA deve aparecer na saída.
+6. Não escreva explicações, markdown ou texto fora do JSON.
+7. Não resuma nem omita informação falada ou cantada presente no texto.
+8. Antes de traduzir uma expressão curta, ambígua ou coloquial, interprete primeiro o SENTIDO e a INTENÇÃO usando os IDs vizinhos como contexto.
+9. Considere que pontuação, vírgulas, quebras de linha e segmentação da legenda-fonte podem estar imperfeitas. Não deixe uma segmentação ruim transformar uma expressão idiomática em uma frase sem sentido.
+10. Use os IDs anteriores e seguintes do mesmo lote somente como contexto. Nunca transfira, duplique ou mova conteúdo de um ID para outro.
+11. Adapte expressões idiomáticas, gírias, humor, piadas, trocadilhos e shade quando houver uma solução brasileira natural que preserve o efeito da fala.
+12. Preserve o humor e a intenção mesmo quando isso exigir se afastar da estrutura gramatical literal do inglês.
+13. Reconheça VOCATIVOS. Em fala informal, palavras como "girl", "bitch", "honey", "sis", "queen", "baby" e "babe" frequentemente são vocativos e não devem ser tratadas automaticamente como substantivos literais.
+14. "girl" NÃO deve virar automaticamente "garota". Conforme o contexto, pode ser "gata", "amiga", "mana", "querida", "bicha" ou simplesmente não precisar de tradução explícita como substantivo.
+15. "bitch" NÃO deve virar automaticamente "vadia". Use "vadia" somente quando houver intenção genuína de insulto. Em contexto camp, afetivo, debochado ou entre queens, considere alternativas naturais como "bicha", "gata", "amiga" ou outra solução adequada ao tom.
+16. Exemplo de sentido: "Kenya got you, girl" em tom de shade deve ser entendido como algo como "Mas a Kenya te pegou, gata", e NÃO como "Kenya pegou a sua garota".
+17. Exemplo de registro: "Vita is quiet, but this bitch is a silent killer" em contexto camp pode ser localizado como "A Vita é calada, mas essa bicha é uma assassina silenciosa", em vez de traduzir "bitch" mecanicamente como "vadia".
+18. Não copie os exemplos mecanicamente. Eles demonstram como interpretar intenção, vocativo e registro; escolha sempre a formulação que melhor encaixar na cena real.
+19. Se uma adaptação de trocadilho, bordão ou termo cunhado ficar forçada, confusa ou sem graça em PT-BR, preserve o termo original em vez de inventar uma palavra nova.
+20. Preserve bordões, nomes próprios, marcas, nomes de personagens, títulos e termos icônicos quando não houver equivalente natural e reconhecível em PT-BR. Exemplo: "Condragulations" deve permanecer "Condragulations".
+21. Não censure palavrões, linguagem sexual, sarcasmo, deboche ou intensidade emocional.
+22. Se houver fala ou letra de música em italiano, espanhol, francês ou qualquer outro idioma, traduza-a para PT-BR também, desde que seja conteúdo real da legenda e não apenas um nome próprio ou título.
+23. Quando houver letra de música realmente transcrita, traduza o conteúdo da letra. Não invente letras para marcações de música, descrições de som ou símbolos musicais.
+24. Preserve vocalizações, nomes de artistas, nomes de músicas e nomes próprios quando funcionarem como nomes, não como frases a serem traduzidas.
+25. Normalize alongamentos ortográficos causados por nota sustentada ou fala arrastada; não devolva palavras com letras ou sílabas repetidas apenas para imitar duração sonora.
+26. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
+27. Não acrescente informações, notas explicativas, nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
+28. Não misture textos entre IDs.
+29. Cada ID deve receber somente a tradução correspondente ao próprio texto.
+30. Não acrescente hífen, travessão, meia-risca ou barra no início de uma fala apenas por estilo. Use marcadores de diálogo somente quando forem realmente necessários para diferenciar dois ou mais falantes dentro do mesmo bloco.
+31. Em diálogos informais, contrações brasileiras como "tá", "tô" e "pra" podem ser usadas quando soarem naturais ao personagem e à situação; não force essas formas em registros formais.
+32. Concordância de gênero deve seguir informação confiável do falante ou do próprio contexto. Quando não houver informação confiável, prefira formulação naturalmente neutra a chutar gênero.
+33. Priorize sempre esta ordem: SENTIDO DA FALA → TOM/INTENÇÃO → NATURALIDADE EM PT-BR → CONCORDÂNCIA CONTEXTUAL → fidelidade à estrutura literal.
 
 RETORNE SOMENTE UM ARRAY JSON NO FORMATO:
 
@@ -2081,6 +2513,7 @@ ${JSON.stringify(
 )}
 `;
 }
+
 /*
 |--------------------------------------------------------------------------
 | TRADUZIR LOTE
@@ -2641,9 +3074,14 @@ async function translateSrt(
         `[TRANSLATE] Finalizada em ${(elapsedMs / 1000).toFixed(1)}s.`
     );
 
+    const withoutVocalElongations =
+        cleanAllTranslatedVocalElongations(
+            translatedTexts
+        );
+
     const cleanedTranslatedTexts =
         cleanAllTranslatedDialogueMarkers(
-            translatedTexts
+            withoutVocalElongations
         );
 
     return buildSrt(
@@ -3171,7 +3609,7 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "5.5.0",
+        "5.6.0",
 
     name:
         "Tradutor Gemini PT-BR",
@@ -3479,7 +3917,7 @@ async function findEnglishSubtitle(
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.5"
+                        "Stremio-Gemini-Subtitle-Translator/5.6"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -3521,7 +3959,7 @@ async function downloadSubtitle(
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.5"
+                        "Stremio-Gemini-Subtitle-Translator/5.6"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -4305,8 +4743,8 @@ app.post(
                 }
             );
         } catch (
-            error
-        ) {
+        error
+    ) {
             console.error(
                 "[EMBEDDED API] Erro:",
                 error
@@ -4483,7 +4921,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.5"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.6"
         );
 
         console.log(
@@ -4542,11 +4980,23 @@ app.listen(
         );
 
         console.log(
-            "Adaptação audiovisual 5.5: ATIVA"
+            "Adaptação audiovisual 5.6: ATIVA"
         );
 
         console.log(
             "Localização coloquial/contextual: ATIVA"
+        );
+
+        console.log(
+            "Contexto oculto de falante: ATIVO"
+        );
+
+        console.log(
+            "Proteção contra chute de gênero: ATIVA"
+        );
+
+        console.log(
+            "Normalização de alongamentos vocais: ATIVA"
         );
 
         console.log(
