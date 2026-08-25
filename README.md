@@ -1,1 +1,1 @@
-# tradutor-stateless-groq
+# tradutor-stateless-gemini
