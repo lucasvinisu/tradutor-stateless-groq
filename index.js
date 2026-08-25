@@ -1906,6 +1906,10 @@ async function rawGeminiRequest(
                         "Seu objetivo não é produzir uma tradução de dicionário: é fazer a fala soar como uma pessoa brasileira realmente falaria naquela situação, preservando intenção, humor, personalidade, ironia, shade, camp, provocação, carinho e ritmo cômico. " +
                         "A entrada será majoritariamente em inglês, mas pode conter trechos em italiano, espanhol, francês ou outros idiomas; traduza também esses trechos para PT-BR quando forem conteúdo falado ou cantado relevante. " +
                         "Em reality shows, competição, conversa informal, cultura pop e cenas descontraídas, prefira PT-BR oral, espontâneo e natural. Use gírias brasileiras somente quando combinarem de verdade com o contexto; não force caricaturas nem gírias aleatórias. " +
+                        "O português deve soar contemporâneo e atual para o público brasileiro de hoje, com sensação de legenda profissional de streaming. Evite escolhas lexicais datadas, antiquadas ou com cara de dublagem/tradução antiga. " +
+                        "Evite especialmente, salvo se o próprio personagem ou contexto exigir de forma clara, expressões como balacobaco, qualé, mó, broto, supimpa, jóia como gíria, é o bicho, da hora usado artificialmente e outras fórmulas que hoje possam soar envelhecidas ou deslocadas. Entre uma gíria antiga e uma formulação simples, natural e atual, prefira a formulação atual. " +
+                        "Pode usar linguagem contemporânea associada à cultura LGBTQIA+, drag, camp, shade e cultura pop quando isso combinar de verdade com quem fala e com a cena. Termos como gata, bicha, amiga, mana, serviu, arrasou, entregou ou amassou podem funcionar em contextos específicos, mas nunca devem ser inseridos mecanicamente só para deixar a tradução mais jovem ou queer. " +
+                        "Não transforme todo personagem em alguém da geração Z ou Alpha. A modernidade deve aparecer principalmente no ritmo, nas escolhas de palavras e na naturalidade, e não numa enxurrada de gírias. Preserve idade, personalidade, região, formalidade e contexto social do falante sempre que essas informações estiverem disponíveis. " +
                         "Antes de traduzir literalmente uma expressão curta ou ambígua, interprete a intenção usando os blocos vizinhos. Pontuação, quebras de linha e segmentação da legenda podem ser imperfeitas; trate os blocos próximos como contexto de uma conversa contínua, mas nunca mova conteúdo de um ID para outro. " +
                         "Reconheça vocativos coloquiais. Palavras como girl, bitch, honey, sis, queen, baby e babe nem sempre são substantivos literais. Dependendo do tom, podem equivaler a gata, amiga, mana, bicha, querida, amor ou até ser omitidas quando isso soar mais natural. " +
                         "Nunca traduza automaticamente girl como garota nem bitch como vadia. Use vadia apenas quando houver intenção real de insulto. Em fala camp, afetiva, debochada ou entre queens, escolha a solução brasileira que preserve o humor e o tom. " +
@@ -2447,6 +2451,14 @@ A legenda deve soar como diálogo brasileiro real e contemporâneo, e não como 
 Preserve a personalidade da pessoa, a intenção da fala, ironia, sarcasmo, shade, humor, camp, provocação, flerte, carinho, deboche e ritmo cômico.
 Em reality shows, cultura pop e conversas informais, prefira uma linguagem oral, descontraída e natural em PT-BR quando o contexto pedir isso.
 Não exagere nem invente gírias brasileiras sem necessidade.
+O registro padrão deve soar contemporâneo, atual e elegante para o público brasileiro de hoje, como uma boa legenda profissional de streaming.
+Evite linguagem que soe datada, antiquada, excessivamente regional sem apoio do contexto ou com cara de dublagem/tradução antiga.
+Evite, salvo quando o próprio personagem ou a cena realmente justificarem, expressões como "balacobaco", "qualé", "mó", "broto", "supimpa", "jóia" como gíria, "é o bicho", "da hora" usado artificialmente e outras fórmulas que hoje possam soar envelhecidas ou deslocadas.
+Entre uma gíria antiga e uma formulação simples, natural e atual, prefira a formulação simples e atual.
+Em conteúdos queer, drag, camp, shade, cultura pop ou cenas em que esse registro seja claramente apropriado, você pode usar linguagem contemporânea associada à cultura LGBTQIA+ para preservar humor, intimidade, ironia e identidade de fala.
+Termos como "gata", "bicha", "amiga", "mana", "serviu", "arrasou", "entregou" e "amassou" podem ser adequados em certos contextos, mas NUNCA os acrescente mecanicamente só para deixar a tradução mais jovem, engraçada ou queer.
+Não transforme todo personagem em alguém da geração Z ou Alpha. Preserve idade, personalidade, formalidade, região, intenção e contexto social do falante.
+A sensação de modernidade deve vir principalmente da escolha de palavras, do ritmo e da naturalidade, não do excesso de gírias.
 
 CONTEXTO DE FALANTE E GÊNERO:
 
@@ -2501,6 +2513,13 @@ REGRAS OBRIGATÓRIAS:
 31. Em diálogos informais, contrações brasileiras como "tá", "tô" e "pra" podem ser usadas quando soarem naturais ao personagem e à situação; não force essas formas em registros formais.
 32. Concordância de gênero deve seguir informação confiável do falante ou do próprio contexto. Quando não houver informação confiável, prefira formulação naturalmente neutra a chutar gênero.
 33. Priorize sempre esta ordem: SENTIDO DA FALA → TOM/INTENÇÃO → NATURALIDADE EM PT-BR → CONCORDÂNCIA CONTEXTUAL → fidelidade à estrutura literal.
+34. Prefira vocabulário contemporâneo e de uso corrente no Brasil atual. Não escolha uma gíria apenas porque ela é informal; ela também precisa soar viva e natural hoje.
+35. Evite "balacobaco", "qualé", "mó" e outras expressões percebidas como antigas, datadas ou deslocadas, a menos que o próprio contexto deixe claro que esse registro pertence ao personagem ou à época retratada.
+36. Não substitua automaticamente gíria velha por gíria de internet. Uma tradução simples como "Foi incrível", "Que demais", "Você arrasou" ou equivalente natural pode ser melhor que uma frase carregada de slang.
+37. Em contexto LGBTQIA+, drag, queer, camp ou shade, preserve esse humor e essa identidade de fala com linguagem atual quando apropriado, sem caricaturar e sem transformar qualquer diálogo em bordão de internet.
+38. Expressões contemporâneas como "serviu", "entregou", "amassou", "arrasou", "gata", "bicha", "mana" ou "amiga" só devem aparecer quando forem semanticamente e socialmente adequadas à fala específica.
+39. Não force linguagem de geração Z/Alpha em pessoas ou cenas que não tenham esse registro. Modernize o português sem apagar a personalidade, a idade ou a intenção do falante.
+40. Quando houver dúvida entre uma expressão chamativa e uma formulação mais simples, prefira a solução que pareça mais natural, atual e profissional numa legenda de streaming brasileira.
 
 RETORNE SOMENTE UM ARRAY JSON NO FORMATO:
 
@@ -4249,7 +4268,7 @@ async function subtitlesHandler(
                 ""
         ).trim();
 
-        console.log(
+    console.log(
         `[STREMIO] Pedido: ${type}/${id}`
     );
 
@@ -4743,8 +4762,8 @@ app.post(
                 }
             );
         } catch (
-        error
-    ) {
+            error
+        ) {
             console.error(
                 "[EMBEDDED API] Erro:",
                 error
