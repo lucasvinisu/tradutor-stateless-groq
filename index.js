@@ -56,8 +56,13 @@ const MAX_SOURCE_CHARS = 800_000;
 
 const translationCache = new Map();
 const jobs = new Map();
+
+// Fila de jobs completos: apenas uma legenda inteira é traduzida por vez.
+// A fila Gemini continua existindo como proteção para as chamadas individuais.
+const translationJobQueue = [];
 const geminiQueue = [];
 
+let translationJobWorkerRunning = false;
 let geminiWorkerRunning = false;
 let lastGeminiRequestAt = 0;
 let geminiCooldownUntil = 0;
@@ -335,19 +340,16 @@ function buildSrt(blocks, translatedTexts) {
 
 function setTranslationCache(key, srt) {
     const now = Date.now();
-
     translationCache.set(key, {
         srt,
         createdAt: now,
         expiresAt: now + CACHE_TTL_MS
     });
-
     cleanupMemory();
 }
 
 function getTranslationCache(key) {
     const item = translationCache.get(key);
-
     if (!item) return null;
 
     if (item.expiresAt <= Date.now()) {
@@ -368,15 +370,11 @@ function splitIntoBatches(blocks) {
     let currentChars = 0;
 
     for (const block of blocks) {
-        const blockChars =
-            String(block.text || "").length + 50;
-
+        const blockChars = String(block.text || "").length + 50;
         const exceedChars =
             current.length > 0 &&
             currentChars + blockChars > MAX_BATCH_CHARS;
-
-        const exceedBlocks =
-            current.length >= MAX_BATCH_BLOCKS;
+        const exceedBlocks = current.length >= MAX_BATCH_BLOCKS;
 
         if (exceedChars || exceedBlocks) {
             batches.push(current);
@@ -388,10 +386,7 @@ function splitIntoBatches(blocks) {
         currentChars += blockChars;
     }
 
-    if (current.length) {
-        batches.push(current);
-    }
-
+    if (current.length) batches.push(current);
     return batches;
 }
 
@@ -400,18 +395,12 @@ function splitIntoBatches(blocks) {
 // ============================================================
 
 function getCooldownRemaining() {
-    return Math.max(
-        0,
-        geminiCooldownUntil - Date.now()
-    );
+    return Math.max(0, geminiCooldownUntil - Date.now());
 }
 
 function setGeminiCooldown(ms) {
     const safeMs = Math.min(
-        Math.max(
-            Number(ms) || 30_000,
-            1000
-        ),
+        Math.max(Number(ms) || 30_000, 1000),
         MAX_RATE_LIMIT_COOLDOWN_MS
     );
 
@@ -428,16 +417,11 @@ function setGeminiCooldown(ms) {
 }
 
 function getRetryAfterMs(response, errorData) {
-    const header =
-        response?.headers?.get("retry-after");
+    const header = response?.headers?.get("retry-after");
 
     if (header) {
         const seconds = Number(header);
-
-        if (
-            Number.isFinite(seconds) &&
-            seconds > 0
-        ) {
+        if (Number.isFinite(seconds) && seconds > 0) {
             return Math.min(
                 seconds * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
@@ -445,20 +429,11 @@ function getRetryAfterMs(response, errorData) {
         }
     }
 
-    const message =
-        String(
-            errorData?.error?.message || ""
-        );
+    const message = String(errorData?.error?.message || "");
 
-    let match =
-        message.match(
-            /retry in\s+([\d.]+)s/i
-        );
-
+    let match = message.match(/retry in\s+([\d.]+)s/i);
     if (match) {
-        const seconds =
-            Number(match[1]);
-
+        const seconds = Number(match[1]);
         if (Number.isFinite(seconds)) {
             return Math.min(
                 (seconds + 1) * 1000,
@@ -467,39 +442,20 @@ function getRetryAfterMs(response, errorData) {
         }
     }
 
-    match =
-        message.match(
-            /retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i
-        );
-
+    match = message.match(/retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i);
     if (match) {
-        const minutes =
-            Number(match[1]);
-
-        const seconds =
-            Number(match[2] || 0);
-
+        const minutes = Number(match[1]);
+        const seconds = Number(match[2] || 0);
         return Math.min(
-            (
-                minutes * 60 +
-                seconds +
-                1
-            ) * 1000,
+            (minutes * 60 + seconds + 1) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
 
-    match =
-        message.match(
-            /retry in\s+(\d+)m/i
-        );
-
+    match = message.match(/retry in\s+(\d+)m/i);
     if (match) {
         return Math.min(
-            (
-                Number(match[1]) * 60 +
-                1
-            ) * 1000,
+            (Number(match[1]) * 60 + 1) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
@@ -536,14 +492,9 @@ const SYSTEM_TRANSLATION_INSTRUCTION =
     "Traduza somente o campo text. Mantenha exatamente os IDs recebidos. " +
     "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares.";
 
-async function rawGeminiRequest(
-    prompt,
-    deadlineAt
-) {
+async function rawGeminiRequest(prompt, deadlineAt) {
     if (!GEMINI_API_KEY) {
-        throw new Error(
-            "GEMINI_API_KEY não configurada."
-        );
+        throw new Error("GEMINI_API_KEY não configurada.");
     }
 
     assertBeforeDeadline(deadlineAt);
@@ -555,274 +506,135 @@ async function rawGeminiRequest(
 
     const body = {
         systemInstruction: {
-            parts: [
-                {
-                    text:
-                        SYSTEM_TRANSLATION_INSTRUCTION
-                }
-            ]
+            parts: [{ text: SYSTEM_TRANSLATION_INSTRUCTION }]
         },
-
         contents: [
             {
                 role: "user",
-
-                parts: [
-                    {
-                        text: prompt
-                    }
-                ]
+                parts: [{ text: prompt }]
             }
         ],
-
         generationConfig: {
-            responseMimeType:
-                "application/json",
-
+            responseMimeType: "application/json",
             responseSchema: {
                 type: "ARRAY",
-
                 items: {
                     type: "OBJECT",
-
                     properties: {
-                        id: {
-                            type: "INTEGER"
-                        },
-
-                        text: {
-                            type: "STRING"
-                        }
+                        id: { type: "INTEGER" },
+                        text: { type: "STRING" }
                     },
-
-                    required: [
-                        "id",
-                        "text"
-                    ]
+                    required: ["id", "text"]
                 },
-
                 minItems: 1
             },
-
-            maxOutputTokens:
-                MAX_OUTPUT_TOKENS
+            maxOutputTokens: MAX_OUTPUT_TOKENS
         }
     };
 
-    const remaining =
-        remainingBeforeDeadline(
-            deadlineAt
-        );
+    const remaining = remainingBeforeDeadline(deadlineAt);
+    if (remaining <= 0) throw translationTimeoutError();
 
-    if (remaining <= 0) {
-        throw translationTimeoutError();
-    }
+    const requestTimeoutMs = Math.max(
+        1,
+        Math.min(
+            GEMINI_TIMEOUT_MS,
+            Number.isFinite(remaining) ? remaining : GEMINI_TIMEOUT_MS
+        )
+    );
 
-    const requestTimeoutMs =
-        Math.max(
-            1,
-
-            Math.min(
-                GEMINI_TIMEOUT_MS,
-
-                Number.isFinite(
-                    remaining
-                )
-                    ? remaining
-                    : GEMINI_TIMEOUT_MS
-            )
-        );
-
-    const controller =
-        new AbortController();
-
-    const timer =
-        setTimeout(
-            () =>
-                controller.abort(),
-            requestTimeoutMs
-        );
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
 
     let response;
     let rawText;
 
     try {
-        response =
-            await fetch(
-                endpoint,
-                {
-                    method: "POST",
+        response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
 
-                    headers: {
-                        "Content-Type":
-                            "application/json",
-
-                        "x-goog-api-key":
-                            GEMINI_API_KEY
-                    },
-
-                    body:
-                        JSON.stringify(
-                            body
-                        ),
-
-                    signal:
-                        controller.signal
-                }
-            );
-
-        rawText =
-            await response.text();
+        rawText = await response.text();
     } catch (error) {
-        if (
-            Number.isFinite(
-                deadlineAt
-            ) &&
-            Date.now() >=
-                deadlineAt
-        ) {
+        if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
             throw translationTimeoutError();
         }
-
         throw error;
     } finally {
         clearTimeout(timer);
     }
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     let data;
-
     try {
-        data =
-            JSON.parse(
-                rawText
-            );
+        data = JSON.parse(rawText);
     } catch {
-        const error =
-            new Error(
-                `Resposta não-JSON do Gemini. HTTP ${response.status}.`
-            );
-
-        error.status =
-            response.status;
-
+        const error = new Error(
+            `Resposta não-JSON do Gemini. HTTP ${response.status}.`
+        );
+        error.status = response.status;
         throw error;
     }
 
     if (!response.ok) {
-        const message =
-            data?.error?.message ||
-            `HTTP ${response.status}`;
-
-        const error =
-            new Error(
-                message
-            );
-
-        error.status =
-            response.status;
-
-        error.rateLimit =
-            isRateLimitError(
-                response.status,
-                message
-            );
-
-        error.retryAfterMs =
-            error.rateLimit
-                ? getRetryAfterMs(
-                      response,
-                      data
-                  )
-                : 0;
-
+        const message = data?.error?.message || `HTTP ${response.status}`;
+        const error = new Error(message);
+        error.status = response.status;
+        error.rateLimit = isRateLimitError(response.status, message);
+        error.retryAfterMs = error.rateLimit
+            ? getRetryAfterMs(response, data)
+            : 0;
         throw error;
     }
 
-    const text =
-        data?.candidates?.[0]
-            ?.content?.parts
-            ?.map(
-                part =>
-                    part?.text || ""
-            )
-            .join("")
-            .trim();
+    const text = data?.candidates?.[0]?.content?.parts
+        ?.map(part => part?.text || "")
+        .join("")
+        .trim();
 
-    if (!text) {
-        throw new Error(
-            "Gemini não retornou conteúdo."
-        );
-    }
-
+    if (!text) throw new Error("Gemini não retornou conteúdo.");
     return text;
 }
 
-function enqueueGemini(
-    prompt,
-    deadlineAt
-) {
-    return new Promise(
-        (
+function enqueueGemini(prompt, deadlineAt) {
+    return new Promise((resolve, reject) => {
+        if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+            reject(translationTimeoutError());
+            return;
+        }
+
+        geminiQueue.push({
+            prompt,
+            deadlineAt,
             resolve,
             reject
-        ) => {
-            if (
-                Number.isFinite(
-                    deadlineAt
-                ) &&
-                Date.now() >=
-                    deadlineAt
-            ) {
-                reject(
-                    translationTimeoutError()
-                );
+        });
 
-                return;
-            }
-
-            geminiQueue.push({
-                prompt,
-                deadlineAt,
-                resolve,
-                reject
-            });
-
-            processGeminiQueue();
-        }
-    );
+        processGeminiQueue();
+    });
 }
 
 async function processGeminiQueue() {
-    if (geminiWorkerRunning) {
-        return;
-    }
-
+    if (geminiWorkerRunning) return;
     geminiWorkerRunning = true;
 
     try {
         while (geminiQueue.length) {
-            const item =
-                geminiQueue.shift();
-
-            if (!item) {
-                continue;
-            }
+            const item = geminiQueue.shift();
+            if (!item) continue;
 
             if (
-                Number.isFinite(
-                    item.deadlineAt
-                ) &&
-                Date.now() >=
-                    item.deadlineAt
+                Number.isFinite(item.deadlineAt) &&
+                Date.now() >= item.deadlineAt
             ) {
-                item.reject(
-                    translationTimeoutError()
-                );
-
+                item.reject(translationTimeoutError());
                 continue;
             }
 
@@ -831,45 +643,30 @@ async function processGeminiQueue() {
 
             while (!finished) {
                 try {
-                    assertBeforeDeadline(
-                        item.deadlineAt
-                    );
+                    assertBeforeDeadline(item.deadlineAt);
 
-                    const cooldown =
-                        getCooldownRemaining();
-
+                    const cooldown = getCooldownRemaining();
                     if (cooldown > 0) {
                         console.log(
                             `[GEMINI] Fila aguardando cooldown de ${Math.ceil(
                                 cooldown / 1000
                             )}s.`
                         );
-
-                        await sleepWithDeadline(
-                            cooldown,
-                            item.deadlineAt
-                        );
+                        await sleepWithDeadline(cooldown, item.deadlineAt);
                     }
 
-                    const sinceLast =
-                        Date.now() -
-                        lastGeminiRequestAt;
-
+                    const sinceLast = Date.now() - lastGeminiRequestAt;
                     if (
                         lastGeminiRequestAt > 0 &&
-                        sinceLast <
-                            MIN_REQUEST_INTERVAL_MS
+                        sinceLast < MIN_REQUEST_INTERVAL_MS
                     ) {
                         await sleepWithDeadline(
-                            MIN_REQUEST_INTERVAL_MS -
-                                sinceLast,
+                            MIN_REQUEST_INTERVAL_MS - sinceLast,
                             item.deadlineAt
                         );
                     }
 
-                    assertBeforeDeadline(
-                        item.deadlineAt
-                    );
+                    assertBeforeDeadline(item.deadlineAt);
 
                     console.log(
                         `[GEMINI] Request ${normalAttempt}/${
@@ -877,60 +674,38 @@ async function processGeminiQueue() {
                         }`
                     );
 
-                    lastGeminiRequestAt =
-                        Date.now();
+                    lastGeminiRequestAt = Date.now();
 
-                    const result =
-                        await rawGeminiRequest(
-                            item.prompt,
-                            item.deadlineAt
-                        );
+                    const result = await rawGeminiRequest(
+                        item.prompt,
+                        item.deadlineAt
+                    );
 
                     item.resolve(result);
                     finished = true;
                 } catch (error) {
                     if (
-                        error?.code ===
-                            "TRANSLATION_TIMEOUT" ||
-                        (
-                            Number.isFinite(
-                                item.deadlineAt
-                            ) &&
-                            Date.now() >=
-                                item.deadlineAt
-                        )
+                        error?.code === "TRANSLATION_TIMEOUT" ||
+                        (Number.isFinite(item.deadlineAt) &&
+                            Date.now() >= item.deadlineAt)
                     ) {
-                        item.reject(
-                            translationTimeoutError()
-                        );
-
+                        item.reject(translationTimeoutError());
                         finished = true;
                         continue;
                     }
 
                     console.error(
-                        `[GEMINI] Erro: ${getErrorMessage(
-                            error
-                        )}`
+                        `[GEMINI] Erro: ${getErrorMessage(error)}`
                     );
 
                     // 429 não consome uma tentativa normal.
                     if (error?.rateLimit) {
-                        setGeminiCooldown(
-                            error.retryAfterMs ||
-                            30_000
-                        );
-
+                        setGeminiCooldown(error.retryAfterMs || 30_000);
                         continue;
                     }
 
-                    if (
-                        normalAttempt <=
-                        MAX_NORMAL_RETRIES
-                    ) {
-                        const wait =
-                            1500 *
-                            normalAttempt;
+                    if (normalAttempt <= MAX_NORMAL_RETRIES) {
+                        const wait = 1500 * normalAttempt;
 
                         console.log(
                             `[GEMINI] Retry normal em ${Math.ceil(
@@ -941,17 +716,9 @@ async function processGeminiQueue() {
                         normalAttempt++;
 
                         try {
-                            await sleepWithDeadline(
-                                wait,
-                                item.deadlineAt
-                            );
-                        } catch (
-                            timeoutError
-                        ) {
-                            item.reject(
-                                timeoutError
-                            );
-
+                            await sleepWithDeadline(wait, item.deadlineAt);
+                        } catch (timeoutError) {
+                            item.reject(timeoutError);
                             finished = true;
                         }
 
@@ -965,30 +732,19 @@ async function processGeminiQueue() {
         }
     } finally {
         geminiWorkerRunning = false;
-
-        if (geminiQueue.length) {
-            processGeminiQueue();
-        }
+        if (geminiQueue.length) processGeminiQueue();
     }
 }
 
 // ============================================================
-// PROMPT DE TRADUÇÃO 5.2
+// PROMPT DE TRADUÇÃO 5.3
 // ============================================================
 
-function buildTranslationPrompt(
-    blocks
-) {
-    const payload =
-        blocks.map(
-            block => ({
-                id:
-                    block.index,
-
-                text:
-                    block.text
-            })
-        );
+function buildTranslationPrompt(blocks) {
+    const payload = blocks.map(block => ({
+        id: block.index,
+        text: block.text
+    }));
 
     return `
 Traduza os textos abaixo para Português do Brasil.
@@ -1019,358 +775,164 @@ RETORNE SOMENTE UM ARRAY JSON NO FORMATO:
 [{"id":123,"text":"tradução"}]
 
 ENTRADAS:
-${JSON.stringify(
-    payload
-)}
+${JSON.stringify(payload)}
 `;
 }
 
-function badModelOutputError(
-    message
-) {
-    const error =
-        new Error(
-            message
-        );
-
-    error.code =
-        "BAD_MODEL_OUTPUT";
-
+function badModelOutputError(message) {
+    const error = new Error(message);
+    error.code = "BAD_MODEL_OUTPUT";
     return error;
 }
 
-async function translateBatchOnce(
-    blocks,
-    deadlineAt
-) {
-    assertBeforeDeadline(
+async function translateBatchOnce(blocks, deadlineAt) {
+    assertBeforeDeadline(deadlineAt);
+
+    const raw = await enqueueGemini(
+        buildTranslationPrompt(blocks),
         deadlineAt
     );
 
-    const raw =
-        await enqueueGemini(
-            buildTranslationPrompt(
-                blocks
-            ),
-            deadlineAt
-        );
-
     let parsed;
-
     try {
-        parsed =
-            JSON.parse(
-                stripCodeFences(
-                    raw
-                )
-            );
+        parsed = JSON.parse(stripCodeFences(raw));
     } catch {
-        throw badModelOutputError(
-            "Gemini retornou JSON inválido."
-        );
+        throw badModelOutputError("Gemini retornou JSON inválido.");
     }
 
-    if (
-        !Array.isArray(
-            parsed
-        )
-    ) {
-        throw badModelOutputError(
-            "Gemini não retornou uma lista."
-        );
+    if (!Array.isArray(parsed)) {
+        throw badModelOutputError("Gemini não retornou uma lista.");
     }
 
-    const translatedById =
-        new Map();
+    const translatedById = new Map();
 
-    for (
-        const item
-        of parsed
-    ) {
+    for (const item of parsed) {
         if (
             item &&
-            Number.isInteger(
-                item.id
-            ) &&
-            typeof item.text ===
-                "string"
+            Number.isInteger(item.id) &&
+            typeof item.text === "string"
         ) {
-            translatedById.set(
-                item.id,
-                item.text
-            );
+            translatedById.set(item.id, item.text);
         }
     }
 
-    const translated =
-        blocks.map(
-            block =>
-                translatedById.get(
-                    block.index
-                )
-        );
+    const translated = blocks.map(block =>
+        translatedById.get(block.index)
+    );
 
-    if (
-        translated.some(
-            text =>
-                typeof text !==
-                    "string"
-        )
-    ) {
-        throw badModelOutputError(
-            "Gemini não devolveu todos os blocos."
-        );
+    if (translated.some(text => typeof text !== "string")) {
+        throw badModelOutputError("Gemini não devolveu todos os blocos.");
     }
 
     return translated;
 }
 
-async function translateBatch(
-    blocks,
-    deadlineAt,
-    splitDepth = 0
-) {
+async function translateBatch(blocks, deadlineAt, splitDepth = 0) {
     try {
-        return await translateBatchOnce(
-            blocks,
-            deadlineAt
-        );
+        return await translateBatchOnce(blocks, deadlineAt);
     } catch (error) {
         const canSplit =
-            error?.code ===
-                "BAD_MODEL_OUTPUT" &&
+            error?.code === "BAD_MODEL_OUTPUT" &&
             blocks.length >= 80 &&
             splitDepth < 3;
 
-        if (!canSplit) {
-            throw error;
-        }
+        if (!canSplit) throw error;
 
-        assertBeforeDeadline(
-            deadlineAt
-        );
+        assertBeforeDeadline(deadlineAt);
 
-        const middle =
-            Math.ceil(
-                blocks.length / 2
-            );
-
-        const left =
-            blocks.slice(
-                0,
-                middle
-            );
-
-        const right =
-            blocks.slice(
-                middle
-            );
+        const middle = Math.ceil(blocks.length / 2);
+        const left = blocks.slice(0, middle);
+        const right = blocks.slice(middle);
 
         console.warn(
             `[TRANSLATE] Saída inválida em lote de ${blocks.length} blocos. Dividindo em ${left.length} + ${right.length}.`
         );
 
-        const translatedLeft =
-            await translateBatch(
-                left,
-                deadlineAt,
-                splitDepth + 1
-            );
+        const translatedLeft = await translateBatch(
+            left,
+            deadlineAt,
+            splitDepth + 1
+        );
 
-        const translatedRight =
-            await translateBatch(
-                right,
-                deadlineAt,
-                splitDepth + 1
-            );
+        const translatedRight = await translateBatch(
+            right,
+            deadlineAt,
+            splitDepth + 1
+        );
 
-        return [
-            ...translatedLeft,
-            ...translatedRight
-        ];
+        return [...translatedLeft, ...translatedRight];
     }
 }
 
-async function translateSrt(
-    originalSrt,
-    job
-) {
-    const blocks =
-        parseSrt(
-            originalSrt
-        );
+async function translateSrt(originalSrt, job) {
+    const blocks = parseSrt(originalSrt);
+    if (!blocks.length) throw new Error("Nenhum bloco SRT válido.");
 
-    if (!blocks.length) {
-        throw new Error(
-            "Nenhum bloco SRT válido."
-        );
-    }
-
-    const batches =
-        splitIntoBatches(
-            blocks
-        );
-
-    const translatedTexts =
-        new Array(
-            blocks.length
-        );
-
-    const originalPositions =
-        new Map(
-            blocks.map(
-                (
-                    block,
-                    index
-                ) => [
-                    block,
-                    index
-                ]
-            )
-        );
-
-    const startedAt =
-        Date.now();
-
-    const deadlineAt =
-        Number.isFinite(
-            job?.deadlineAt
-        )
-            ? job.deadlineAt
-            : startedAt +
-              MAX_TRANSLATION_TIME_MS;
-
-    console.log(
-        `[TRANSLATE] ${blocks.length} blocos.`
+    const batches = splitIntoBatches(blocks);
+    const translatedTexts = new Array(blocks.length);
+    const originalPositions = new Map(
+        blocks.map((block, index) => [block, index])
     );
 
-    console.log(
-        `[TRANSLATE] ${batches.length} lote(s).`
-    );
+    const startedAt = Date.now();
+    const deadlineAt = Number.isFinite(job?.deadlineAt)
+        ? job.deadlineAt
+        : startedAt + MAX_TRANSLATION_TIME_MS;
 
+    console.log(`[TRANSLATE] ${blocks.length} blocos.`);
+    console.log(`[TRANSLATE] ${batches.length} lote(s).`);
     console.log(
         `[TRANSLATE] Limite: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} caracteres.`
     );
 
-    for (
-        let batchIndex = 0;
-        batchIndex < batches.length;
-        batchIndex++
-    ) {
-        assertBeforeDeadline(
-            deadlineAt
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        assertBeforeDeadline(deadlineAt);
+
+        const batch = batches[batchIndex];
+        const batchChars = batch.reduce(
+            (total, block) => total + String(block.text || "").length,
+            0
         );
-
-        const batch =
-            batches[
-                batchIndex
-            ];
-
-        const batchChars =
-            batch.reduce(
-                (
-                    total,
-                    block
-                ) =>
-                    total +
-                    String(
-                        block.text ||
-                            ""
-                    ).length,
-                0
-            );
 
         console.log(
-            `[TRANSLATE] Lote ${
-                batchIndex + 1
-            }/${batches.length} - ${
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${
                 batch.length
-            } blocos / ${
-                batchChars
-            } caracteres.`
+            } blocos / ${batchChars} caracteres.`
         );
 
-        const translated =
-            await translateBatch(
-                batch,
-                deadlineAt
-            );
+        const translated = await translateBatch(batch, deadlineAt);
 
-        for (
-            let i = 0;
-            i < batch.length;
-            i++
-        ) {
-            const originalIndex =
-                originalPositions.get(
-                    batch[i]
-                );
-
-            if (
-                originalIndex !==
-                undefined
-            ) {
-                translatedTexts[
-                    originalIndex
-                ] =
-                    translated[i];
+        for (let i = 0; i < batch.length; i++) {
+            const originalIndex = originalPositions.get(batch[i]);
+            if (originalIndex !== undefined) {
+                translatedTexts[originalIndex] = translated[i];
             }
         }
 
-        job.progress =
-            Math.round(
-                (
-                    (
-                        batchIndex +
-                        1
-                    ) /
-                    batches.length
-                ) *
-                    100
-            );
-
-        job.completedBatches =
-            batchIndex + 1;
-
-        job.totalBatches =
-            batches.length;
-
-        job.updatedAt =
-            Date.now();
+        job.progress = Math.round(
+            ((batchIndex + 1) / batches.length) * 100
+        );
+        job.completedBatches = batchIndex + 1;
+        job.totalBatches = batches.length;
+        job.updatedAt = Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${
-                batchIndex + 1
-            }/${batches.length} concluído.`
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} concluído.`
         );
     }
 
-    if (
-        translatedTexts.some(
-            text =>
-                typeof text !==
-                    "string"
-        )
-    ) {
-        throw new Error(
-            "A tradução terminou com blocos ausentes."
-        );
+    if (translatedTexts.some(text => typeof text !== "string")) {
+        throw new Error("A tradução terminou com blocos ausentes.");
     }
 
     console.log(
         `[TRANSLATE] Finalizada em ${(
-            (
-                Date.now() -
-                startedAt
-            ) /
+            (Date.now() - startedAt) /
             1000
         ).toFixed(1)}s.`
     );
 
-    return buildSrt(
-        blocks,
-        translatedTexts
-    );
+    return buildSrt(blocks, translatedTexts);
 }
 
 // ============================================================
@@ -1385,8 +947,7 @@ function createJob({
     sourceHash,
     sourceSrt
 }) {
-    const now =
-        Date.now();
+    const now = Date.now();
 
     const job = {
         id: jobId,
@@ -1395,192 +956,166 @@ function createJob({
         videoId,
         sourceHash,
         sourceSrt,
-
-        status:
-            "processing",
-
-        result:
-            null,
-
-        error:
-            null,
-
-        progress:
-            0,
-
-        completedBatches:
-            0,
-
-        totalBatches:
-            0,
-
-        createdAt:
-            now,
-
-        updatedAt:
-            now,
-
+        status: "processing",
+        result: null,
+        error: null,
+        progress: 0,
+        completedBatches: 0,
+        totalBatches: 0,
+        createdAt: now,
+        updatedAt: now,
         // Tempo em fila também conta no teto total.
-        deadlineAt:
-            now +
-            MAX_TRANSLATION_TIME_MS,
-
-        expiresAt:
-            now +
-            JOB_TTL_MS,
-
-        promise:
-            null
+        deadlineAt: now + MAX_TRANSLATION_TIME_MS,
+        expiresAt: now + JOB_TTL_MS,
+        promise: null
     };
 
-    jobs.set(
-        jobId,
-        job
-    );
-
+    jobs.set(jobId, job);
     cleanupMemory();
-
     return job;
 }
 
-function getJob(
-    jobId
-) {
-    const job =
-        jobs.get(
-            jobId
-        );
+function getJob(jobId) {
+    const job = jobs.get(jobId);
+    if (!job) return null;
 
-    if (!job) {
-        return null;
-    }
-
-    if (
-        job.expiresAt <=
-            Date.now() &&
-        job.status !==
-            "processing"
-    ) {
-        jobs.delete(
-            jobId
-        );
-
+    if (job.expiresAt <= Date.now() && job.status !== "processing") {
+        jobs.delete(jobId);
         return null;
     }
 
     return job;
 }
 
-function findProcessingJob(
-    cacheKey
-) {
-    for (
-        const job
-        of jobs.values()
-    ) {
-        if (
-            job.cacheKey ===
-                cacheKey &&
-            job.status ===
-                "processing"
-        ) {
+function findProcessingJob(cacheKey) {
+    for (const job of jobs.values()) {
+        if (job.cacheKey === cacheKey && job.status === "processing") {
             return job;
         }
     }
-
     return null;
 }
 
-async function processJob(
-    job
-) {
-    console.log(
-        `[JOB ${job.id}] Iniciando.`
-    );
+async function processJob(job) {
+    console.log(`[JOB ${job.id}] Iniciando.`);
 
     try {
-        const cached =
-            getTranslationCache(
-                job.cacheKey
-            );
+        const cached = getTranslationCache(job.cacheKey);
 
         if (cached) {
-            job.status =
-                "completed";
-
-            job.result =
-                cached;
-
-            job.progress =
-                100;
-
-            job.updatedAt =
-                Date.now();
-
-            console.log(
-                `[JOB ${job.id}] Cache utilizado.`
-            );
-
+            job.status = "completed";
+            job.result = cached;
+            job.progress = 100;
+            job.updatedAt = Date.now();
+            console.log(`[JOB ${job.id}] Cache utilizado.`);
             return;
         }
 
-        assertBeforeDeadline(
-            job.deadlineAt
-        );
+        assertBeforeDeadline(job.deadlineAt);
 
-        const translated =
-            await translateSrt(
-                job.sourceSrt,
-                job
-            );
+        const translated = await translateSrt(job.sourceSrt, job);
+        setTranslationCache(job.cacheKey, translated);
 
-        setTranslationCache(
-            job.cacheKey,
-            translated
-        );
+        job.result = translated;
+        job.status = "completed";
+        job.progress = 100;
+        job.updatedAt = Date.now();
 
-        job.result =
-            translated;
-
-        job.status =
-            "completed";
-
-        job.progress =
-            100;
-
-        job.updatedAt =
-            Date.now();
-
-        console.log(
-            `[JOB ${job.id}] Concluído.`
-        );
+        console.log(`[JOB ${job.id}] Concluído.`);
     } catch (error) {
-        job.status =
-            "failed";
+        job.status = "failed";
+        job.error = getErrorMessage(error);
+        job.updatedAt = Date.now();
 
-        job.error =
-            getErrorMessage(
-                error
-            );
-
-        job.updatedAt =
-            Date.now();
-
-        console.error(
-            `[JOB ${job.id}] Falhou: ${job.error}`
-        );
+        console.error(`[JOB ${job.id}] Falhou: ${job.error}`);
     }
 }
 
-function buildProcessingSrt(
-    job
-) {
-    const progress =
-        Number.isFinite(
-            job?.progress
-        )
-            ? job.progress
-            : 0;
+// ============================================================
+// FILA DE JOBS COMPLETOS
+// ============================================================
+
+function enqueueTranslationJob(job) {
+    return new Promise((resolve, reject) => {
+        if (job.status !== "processing") {
+            resolve();
+            return;
+        }
+
+        translationJobQueue.push({
+            job,
+            resolve,
+            reject
+        });
+
+        console.log(
+            `[JOB QUEUE] ${job.id} entrou na fila. ` +
+            `Aguardando: ${translationJobQueue.length}.`
+        );
+
+        processTranslationJobQueue();
+    });
+}
+
+async function processTranslationJobQueue() {
+    if (translationJobWorkerRunning) {
+        return;
+    }
+
+    translationJobWorkerRunning = true;
+
+    try {
+        while (translationJobQueue.length) {
+            const item = translationJobQueue.shift();
+            if (!item) continue;
+
+            const { job, resolve, reject } = item;
+
+            try {
+                if (job.status !== "processing") {
+                    resolve();
+                    continue;
+                }
+
+                // O tempo aguardando na fila continua contando no teto total.
+                if (
+                    Number.isFinite(job.deadlineAt) &&
+                    Date.now() >= job.deadlineAt
+                ) {
+                    job.status = "failed";
+                    job.error = "Tempo máximo de tradução atingido.";
+                    job.updatedAt = Date.now();
+
+                    console.error(
+                        `[JOB ${job.id}] Falhou antes de iniciar: ${job.error}`
+                    );
+
+                    resolve();
+                    continue;
+                }
+
+                console.log(
+                    `[JOB QUEUE] Iniciando job completo ${job.id}. ` +
+                    `Restantes na fila: ${translationJobQueue.length}.`
+                );
+
+                await processJob(job);
+                resolve();
+            } catch (error) {
+                reject(error);
+            }
+        }
+    } finally {
+        translationJobWorkerRunning = false;
+
+        if (translationJobQueue.length) {
+            processTranslationJobQueue();
+        }
+    }
+}
+
+function buildProcessingSrt(job) {
+    const progress = Number.isFinite(job?.progress) ? job.progress : 0;
 
     return [
         "1",
@@ -1593,22 +1128,10 @@ function buildProcessingSrt(
     ].join("\n");
 }
 
-function buildErrorSrt(
-    message
-) {
-    const safe =
-        String(
-            message ||
-            "Erro desconhecido."
-        )
-            .replace(
-                /\s+/g,
-                " "
-            )
-            .slice(
-                0,
-                300
-            );
+function buildErrorSrt(message) {
+    const safe = String(message || "Erro desconhecido.")
+        .replace(/\s+/g, " ")
+        .slice(0, 300);
 
     return [
         "1",
@@ -1621,67 +1144,30 @@ function buildErrorSrt(
     ].join("\n");
 }
 
-function sendSubtitleResponse(
-    res,
-    srt,
-    cacheControl =
-        "no-store"
-) {
+function sendSubtitleResponse(res, srt, cacheControl = "no-store") {
     res.status(200);
-
     res.set({
-        "Content-Type":
-            "text/plain; charset=utf-8",
-
-        "Cache-Control":
-            cacheControl,
-
-        "Access-Control-Allow-Origin":
-            "*"
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": cacheControl,
+        "Access-Control-Allow-Origin": "*"
     });
-
-    return res.send(
-        srt
-    );
+    return res.send(srt);
 }
 
-async function waitForJob(
-    job,
-    timeoutMs
-) {
-    if (
-        job.status ===
-        "completed"
-    ) {
-        return true;
-    }
+async function waitForJob(job, timeoutMs) {
+    if (job.status === "completed") return true;
+    if (job.status === "failed") return false;
 
-    if (
-        job.status ===
-        "failed"
-    ) {
-        return false;
-    }
-
-    const start =
-        Date.now();
+    const start = Date.now();
 
     while (
-        job.status ===
-            "processing" &&
-        Date.now() -
-            start <
-            timeoutMs
+        job.status === "processing" &&
+        Date.now() - start < timeoutMs
     ) {
-        await sleep(
-            500
-        );
+        await sleep(500);
     }
 
-    return (
-        job.status ===
-        "completed"
-    );
+    return job.status === "completed";
 }
 
 // ============================================================
@@ -1689,330 +1175,140 @@ async function waitForJob(
 // ============================================================
 
 const manifest = {
-    id:
-        "org.tradutor.stateless.gemini.free",
-
-    version:
-        "5.2.0",
-
-    name:
-        "Tradutor Gemini PT-BR",
-
+    id: "org.tradutor.stateless.gemini.free",
+    version: "5.3.0",
+    name: "Tradutor Gemini PT-BR",
     description:
         "Traduz automaticamente legendas para Português do Brasil usando Gemini.",
-
-    logo:
-        "",
-
-    resources: [
-        "subtitles"
-    ],
-
-    types: [
-        "movie",
-        "series"
-    ],
-
-    idPrefixes: [
-        "tt"
-    ],
-
+    logo: "",
+    resources: ["subtitles"],
+    types: ["movie", "series"],
+    idPrefixes: ["tt"],
     catalogs: [],
-
     behaviorHints: {
-        configurable:
-            false,
-
-        adult:
-            false
+        configurable: false,
+        adult: false
     }
 };
 
-app.get(
-    "/manifest.json",
-    (
-        req,
-        res
-    ) =>
-        res.json(
-            manifest
-        )
-);
+app.get("/manifest.json", (req, res) => res.json(manifest));
 
-app.get(
-    "/",
-    (
-        req,
-        res
-    ) => {
-        res.json({
-            name:
-                manifest.name,
+app.get("/", (req, res) => {
+    res.json({
+        name: manifest.name,
+        version: manifest.version,
+        status: "online",
+        model: GEMINI_MODEL,
+        translationJobQueue: translationJobQueue.length,
+        activeTranslationJob: translationJobWorkerRunning,
+        queue: geminiQueue.length,
+        cooldownSeconds: Math.ceil(getCooldownRemaining() / 1000)
+    });
+});
 
-            version:
-                manifest.version,
-
-            status:
-                "online",
-
-            model:
-                GEMINI_MODEL,
-
-            queue:
-                geminiQueue.length,
-
-            cooldownSeconds:
-                Math.ceil(
-                    getCooldownRemaining() /
-                    1000
-                )
-        });
-    }
-);
-
-app.get(
-    "/health",
-    (
-        req,
-        res
-    ) => {
-        res.json({
-            status:
-                "ok",
-
-            uptime:
-                process.uptime(),
-
-            model:
-                GEMINI_MODEL,
-
-            jobs:
-                jobs.size,
-
-            cache:
-                translationCache.size,
-
-            geminiQueue:
-                geminiQueue.length,
-
-            geminiCooldownSeconds:
-                Math.ceil(
-                    getCooldownRemaining() /
-                    1000
-                ),
-
-            batchMaxBlocks:
-                MAX_BATCH_BLOCKS,
-
-            batchMaxChars:
-                MAX_BATCH_CHARS,
-
-            requestIntervalMs:
-                MIN_REQUEST_INTERVAL_MS,
-
-            maxOutputTokens:
-                MAX_OUTPUT_TOKENS,
-
-            maxTranslationTimeMs:
-                MAX_TRANSLATION_TIME_MS
-        });
-    }
-);
+app.get("/health", (req, res) => {
+    res.json({
+        status: "ok",
+        uptime: process.uptime(),
+        model: GEMINI_MODEL,
+        jobs: jobs.size,
+        cache: translationCache.size,
+        translationJobQueue: translationJobQueue.length,
+        translationJobWorkerRunning,
+        geminiQueue: geminiQueue.length,
+        geminiCooldownSeconds: Math.ceil(getCooldownRemaining() / 1000),
+        batchMaxBlocks: MAX_BATCH_BLOCKS,
+        batchMaxChars: MAX_BATCH_CHARS,
+        requestIntervalMs: MIN_REQUEST_INTERVAL_MS,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+        maxTranslationTimeMs: MAX_TRANSLATION_TIME_MS
+    });
+});
 
 // ============================================================
 // OPENSUBTITLES
 // ============================================================
 
-function scoreSubtitle(
-    subtitle
-) {
+function scoreSubtitle(subtitle) {
     let score = 0;
+    const lang = String(subtitle?.lang || "").toLowerCase();
 
-    const lang =
-        String(
-            subtitle?.lang ||
-            ""
-        ).toLowerCase();
+    if (lang === "eng") score += 100;
+    else if (lang === "en") score += 90;
 
-    if (lang === "eng") {
-        score += 100;
-    } else if (
-        lang === "en"
-    ) {
-        score += 90;
-    }
-
-    if (
-        subtitle?.hearingImpaired ===
-        false
-    ) {
-        score += 20;
-    }
-
-    if (
-        String(
-            subtitle?.format ||
-            ""
-        ).toLowerCase() ===
-        "srt"
-    ) {
-        score += 20;
-    }
-
-    if (
-        /english/i.test(
-            String(
-                subtitle?.name ||
-                ""
-            )
-        )
-    ) {
-        score += 10;
-    }
+    if (subtitle?.hearingImpaired === false) score += 20;
+    if (String(subtitle?.format || "").toLowerCase() === "srt") score += 20;
+    if (/english/i.test(String(subtitle?.name || ""))) score += 10;
 
     return score;
 }
 
-function selectBestSubtitle(
-    subtitles
-) {
-    if (
-        !Array.isArray(
-            subtitles
-        )
-    ) {
-        return null;
-    }
+function selectBestSubtitle(subtitles) {
+    if (!Array.isArray(subtitles)) return null;
 
     return (
         subtitles
-            .filter(
-                subtitle => {
-                    const lang =
-                        String(
-                            subtitle?.lang ||
-                            ""
-                        ).toLowerCase();
-
-                    return (
-                        (
-                            lang ===
-                                "eng" ||
-                            lang ===
-                                "en"
-                        ) &&
-                        typeof subtitle?.url ===
-                            "string" &&
-                        /^https?:\/\//i.test(
-                            subtitle.url
-                        )
-                    );
-                }
-            )
-            .sort(
-                (
-                    a,
-                    b
-                ) =>
-                    scoreSubtitle(
-                        b
-                    ) -
-                    scoreSubtitle(
-                        a
-                    )
-            )[0] ||
-        null
+            .filter(subtitle => {
+                const lang = String(subtitle?.lang || "").toLowerCase();
+                return (
+                    (lang === "eng" || lang === "en") &&
+                    typeof subtitle?.url === "string" &&
+                    /^https?:\/\//i.test(subtitle.url)
+                );
+            })
+            .sort((a, b) => scoreSubtitle(b) - scoreSubtitle(a))[0] || null
     );
 }
 
-async function findEnglishSubtitle(
-    type,
-    id
-) {
+async function findEnglishSubtitle(type, id) {
     const searchUrl =
         `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
             type
-        )}/${encodeURIComponent(
-            id
-        )}.json`;
+        )}/${encodeURIComponent(id)}.json`;
 
-    console.log(
-        `[STREMIO] Procurando legenda: ${searchUrl}`
+    console.log(`[STREMIO] Procurando legenda: ${searchUrl}`);
+
+    const response = await fetchWithTimeout(
+        searchUrl,
+        {
+            headers: {
+                Accept: "application/json",
+                "User-Agent": "Stremio-Gemini-Subtitle-Translator/5.3"
+            }
+        },
+        SOURCE_FETCH_TIMEOUT_MS
     );
-
-    const response =
-        await fetchWithTimeout(
-            searchUrl,
-            {
-                headers: {
-                    Accept:
-                        "application/json",
-
-                    "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.2"
-                }
-            },
-            SOURCE_FETCH_TIMEOUT_MS
-        );
 
     if (!response.ok) {
-        throw new Error(
-            `OpenSubtitles HTTP ${response.status}.`
-        );
+        throw new Error(`OpenSubtitles HTTP ${response.status}.`);
     }
 
-    const data =
-        await response.json();
-
-    return selectBestSubtitle(
-        data?.subtitles ||
-        []
-    );
+    const data = await response.json();
+    return selectBestSubtitle(data?.subtitles || []);
 }
 
-async function downloadSubtitle(
-    url
-) {
-    console.log(
-        `[SOURCE] Baixando legenda: ${url}`
+async function downloadSubtitle(url) {
+    console.log(`[SOURCE] Baixando legenda: ${url}`);
+
+    const response = await fetchWithTimeout(
+        url,
+        {
+            headers: {
+                "User-Agent": "Stremio-Gemini-Subtitle-Translator/5.3"
+            }
+        },
+        SOURCE_FETCH_TIMEOUT_MS
     );
 
-    const response =
-        await fetchWithTimeout(
-            url,
-            {
-                headers: {
-                    "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.2"
-                }
-            },
-            SOURCE_FETCH_TIMEOUT_MS
-        );
-
     if (!response.ok) {
-        throw new Error(
-            `Falha ao baixar legenda: HTTP ${response.status}.`
-        );
+        throw new Error(`Falha ao baixar legenda: HTTP ${response.status}.`);
     }
 
-    const text =
-        normalizeSrt(
-            await response.text()
-        );
+    const text = normalizeSrt(await response.text());
 
-    if (!text) {
-        throw new Error(
-            "Legenda vazia."
-        );
-    }
-
-    if (
-        text.length >
-        MAX_SOURCE_CHARS
-    ) {
-        throw new Error(
-            `Legenda muito grande: ${text.length} caracteres.`
-        );
+    if (!text) throw new Error("Legenda vazia.");
+    if (text.length > MAX_SOURCE_CHARS) {
+        throw new Error(`Legenda muito grande: ${text.length} caracteres.`);
     }
 
     return text;
@@ -2027,33 +1323,22 @@ function createCachedJob({
     sourceSrt,
     cached
 }) {
-    let job =
-        getJob(
-            jobId
-        );
+    let job = getJob(jobId);
 
     if (!job) {
-        job =
-            createJob({
-                jobId,
-                cacheKey,
-                type,
-                videoId,
-                sourceHash,
-                sourceSrt
-            });
+        job = createJob({
+            jobId,
+            cacheKey,
+            type,
+            videoId,
+            sourceHash,
+            sourceSrt
+        });
 
-        job.status =
-            "completed";
-
-        job.result =
-            cached;
-
-        job.progress =
-            100;
-
-        job.updatedAt =
-            Date.now();
+        job.status = "completed";
+        job.result = cached;
+        job.progress = 100;
+        job.updatedAt = Date.now();
     }
 
     return job;
@@ -2067,157 +1352,75 @@ async function createEmbeddedTranslationJob({
     type,
     videoId,
     sourceSrt,
-    sourceName =
-        "embedded"
+    sourceName = "embedded"
 }) {
-    const rawSrt =
-        normalizeSrt(
-            sourceSrt
-        );
+    const rawSrt = normalizeSrt(sourceSrt);
 
-    if (!rawSrt) {
-        throw new Error(
-            "A legenda embutida está vazia."
-        );
-    }
-
-    if (
-        rawSrt.length >
-        MAX_SOURCE_CHARS
-    ) {
+    if (!rawSrt) throw new Error("A legenda embutida está vazia.");
+    if (rawSrt.length > MAX_SOURCE_CHARS) {
         throw new Error(
             `Legenda embutida muito grande: ${rawSrt.length} caracteres.`
         );
     }
 
-    const normalizedSrt =
-        cleanSrtForTranslation(
-            rawSrt
-        );
-
+    const normalizedSrt = cleanSrtForTranslation(rawSrt);
     if (!normalizedSrt) {
-        throw new Error(
-            "A legenda ficou vazia após a limpeza SDH/CC."
-        );
+        throw new Error("A legenda ficou vazia após a limpeza SDH/CC.");
     }
 
-    const blocks =
-        parseSrt(
-            normalizedSrt
-        );
-
+    const blocks = parseSrt(normalizedSrt);
     if (!blocks.length) {
-        throw new Error(
-            "A legenda embutida não possui blocos SRT válidos."
-        );
+        throw new Error("A legenda embutida não possui blocos SRT válidos.");
     }
 
-    const sourceHash =
-        sha256(
-            normalizedSrt
-        );
-
-    const cacheKey =
-        `embedded:${sourceHash}`;
-
-    const cached =
-        getTranslationCache(
-            cacheKey
-        );
+    const sourceHash = sha256(normalizedSrt);
+    const cacheKey = `embedded:${sourceHash}`;
+    const cached = getTranslationCache(cacheKey);
 
     if (cached) {
-        const cachedJobId =
-            `embedded-cached-${sourceHash.slice(
-                0,
-                24
-            )}`;
-
-        console.log(
-            `[EMBEDDED] Cache utilizado para ${sourceName}.`
-        );
+        const cachedJobId = `embedded-cached-${sourceHash.slice(0, 24)}`;
+        console.log(`[EMBEDDED] Cache utilizado para ${sourceName}.`);
 
         return createCachedJob({
-            jobId:
-                cachedJobId,
-
+            jobId: cachedJobId,
             cacheKey,
             type,
             videoId,
             sourceHash,
-
-            sourceSrt:
-                normalizedSrt,
-
+            sourceSrt: normalizedSrt,
             cached
         });
     }
 
-    const existingJob =
-        findProcessingJob(
-            cacheKey
-        );
-
+    const existingJob = findProcessingJob(cacheKey);
     if (existingJob) {
         console.log(
             `[EMBEDDED] Job existente reutilizado: ${existingJob.id}`
         );
-
         return existingJob;
     }
 
-    const jobId =
-        `embedded-${sourceHash.slice(
-            0,
-            24
-        )}-${randomId(8)}`;
+    const jobId = `embedded-${sourceHash.slice(0, 24)}-${randomId(8)}`;
 
-    const job =
-        createJob({
-            jobId,
-            cacheKey,
-            type,
-            videoId,
-            sourceHash,
+    const job = createJob({
+        jobId,
+        cacheKey,
+        type,
+        videoId,
+        sourceHash,
+        sourceSrt: normalizedSrt
+    });
 
-            sourceSrt:
-                normalizedSrt
-        });
+    job.source = sourceName;
+    job.totalBatches = splitIntoBatches(blocks).length;
+    job.promise = enqueueTranslationJob(job).catch(error => {
+        console.error(`[EMBEDDED JOB ${job.id}] Erro inesperado:`, error);
+        job.status = "failed";
+        job.error = getErrorMessage(error);
+        job.updatedAt = Date.now();
+    });
 
-    job.source =
-        sourceName;
-
-    job.totalBatches =
-        splitIntoBatches(
-            blocks
-        ).length;
-
-    job.promise =
-        processJob(
-            job
-        ).catch(
-            error => {
-                console.error(
-                    `[EMBEDDED JOB ${job.id}] Erro inesperado:`,
-                    error
-                );
-
-                job.status =
-                    "failed";
-
-                job.error =
-                    getErrorMessage(
-                        error
-                    );
-
-                job.updatedAt =
-                    Date.now();
-            }
-        );
-
-    console.log(
-        `[EMBEDDED] Novo job ${job.id} criado.`
-    );
-
+    console.log(`[EMBEDDED] Novo job ${job.id} criado.`);
     return job;
 }
 
@@ -2225,516 +1428,229 @@ async function createEmbeddedTranslationJob({
 // STREMIO / OPENSUBTITLES
 // ============================================================
 
-async function subtitlesHandler(
-    req,
-    res
-) {
-    const type =
-        String(
-            req.params.type ||
-            ""
-        ).trim();
+async function subtitlesHandler(req, res) {
+    const type = String(req.params.type || "").trim();
+    const id = String(req.params.id || "").trim();
 
-    const id =
-        String(
-            req.params.id ||
-            ""
-        ).trim();
+    console.log(`[STREMIO] Pedido: ${type}/${id}`);
 
-    console.log(
-        `[STREMIO] Pedido: ${type}/${id}`
-    );
-
-    const rawExtra =
-        String(
-            req.params.extra ||
-            ""
-        ).trim();
+    const rawExtra = String(req.params.extra || "").trim();
 
     if (rawExtra) {
-        const params =
-            new URLSearchParams(
-                rawExtra
-            );
+        const params = new URLSearchParams(rawExtra);
 
         console.log(
             `[STREMIO EXTRA] filename: ${
-                params.get(
-                    "filename"
-                ) ||
-                "(não enviado)"
+                params.get("filename") || "(não enviado)"
             }`
         );
-
         console.log(
             `[STREMIO EXTRA] videoSize: ${
-                params.get(
-                    "videoSize"
-                ) ||
-                "(não enviado)"
+                params.get("videoSize") || "(não enviado)"
             }`
         );
-
         console.log(
             `[STREMIO EXTRA] videoHash: ${
-                params.get(
-                    "videoHash"
-                ) ||
-                "(não enviado)"
+                params.get("videoHash") || "(não enviado)"
             }`
         );
     } else {
-        console.log(
-            "[STREMIO EXTRA] Nenhuma informação extra recebida."
-        );
+        console.log("[STREMIO EXTRA] Nenhuma informação extra recebida.");
     }
 
-    if (!type || !id) {
-        return safeJson(
-            res,
-            {
-                subtitles: []
-            }
-        );
-    }
+    if (!type || !id) return safeJson(res, { subtitles: [] });
 
     try {
-        const target =
-            await findEnglishSubtitle(
-                type,
-                id
-            );
+        const target = await findEnglishSubtitle(type, id);
 
         if (!target) {
-            console.log(
-                "[STREMIO] Nenhuma legenda inglesa encontrada."
-            );
-
-            return safeJson(
-                res,
-                {
-                    subtitles: []
-                }
-            );
+            console.log("[STREMIO] Nenhuma legenda inglesa encontrada.");
+            return safeJson(res, { subtitles: [] });
         }
 
-        const downloadedSrt =
-            await downloadSubtitle(
-                target.url
-            );
-
-        const sourceSrt =
-            cleanSrtForTranslation(
-                downloadedSrt
-            );
+        const downloadedSrt = await downloadSubtitle(target.url);
+        const sourceSrt = cleanSrtForTranslation(downloadedSrt);
 
         if (!sourceSrt) {
-            console.log(
-                "[STREMIO] Legenda vazia após limpeza SDH/CC."
-            );
-
-            return safeJson(
-                res,
-                {
-                    subtitles: []
-                }
-            );
+            console.log("[STREMIO] Legenda vazia após limpeza SDH/CC.");
+            return safeJson(res, { subtitles: [] });
         }
 
-        const blocks =
-            parseSrt(
-                sourceSrt
-            );
+        const blocks = parseSrt(sourceSrt);
+        if (!blocks.length) return safeJson(res, { subtitles: [] });
 
-        if (!blocks.length) {
-            return safeJson(
-                res,
-                {
-                    subtitles: []
-                }
-            );
-        }
-
-        const sourceHash =
-            sha256(
-                sourceSrt
-            );
-
-        const cacheKey =
-            `${type}:${id}:${sourceHash}`;
-
-        const baseUrl =
-            cleanBaseUrl(
-                req
-            );
-
-        const cached =
-            getTranslationCache(
-                cacheKey
-            );
+        const sourceHash = sha256(sourceSrt);
+        const cacheKey = `${type}:${id}:${sourceHash}`;
+        const baseUrl = cleanBaseUrl(req);
+        const cached = getTranslationCache(cacheKey);
 
         if (cached) {
-            const jobId =
-                `cached-${sourceHash.slice(
-                    0,
-                    24
-                )}`;
+            const jobId = `cached-${sourceHash.slice(0, 24)}`;
 
             createCachedJob({
                 jobId,
                 cacheKey,
                 type,
-
-                videoId:
-                    id,
-
+                videoId: id,
                 sourceHash,
                 sourceSrt,
                 cached
             });
 
-            console.log(
-                "[CACHE] Tradução pronta."
-            );
+            console.log("[CACHE] Tradução pronta.");
 
-            return safeJson(
-                res,
-                {
-                    subtitles: [
-                        {
-                            id:
-                                `${id}-gemini-${sourceHash.slice(
-                                    0,
-                                    12
-                                )}`,
-
-                            url:
-                                `${baseUrl}/subtitle/${encodeURIComponent(
-                                    jobId
-                                )}.srt`,
-
-                            lang:
-                                "por"
-                        }
-                    ]
-                }
-            );
-        }
-
-        let job =
-            findProcessingJob(
-                cacheKey
-            );
-
-        if (!job) {
-            const jobId =
-                `job-${sourceHash.slice(
-                    0,
-                    24
-                )}-${randomId(8)}`;
-
-            job =
-                createJob({
-                    jobId,
-                    cacheKey,
-                    type,
-
-                    videoId:
-                        id,
-
-                    sourceHash,
-                    sourceSrt
-                });
-
-            job.totalBatches =
-                splitIntoBatches(
-                    blocks
-                ).length;
-
-            job.promise =
-                processJob(
-                    job
-                ).catch(
-                    error => {
-                        console.error(
-                            `[JOB ${job.id}] Erro inesperado:`,
-                            error
-                        );
-
-                        job.status =
-                            "failed";
-
-                        job.error =
-                            getErrorMessage(
-                                error
-                            );
-
-                        job.updatedAt =
-                            Date.now();
-                    }
-                );
-        }
-
-        const subtitleUrl =
-            `${baseUrl}/subtitle/${encodeURIComponent(
-                job.id
-            )}.srt`;
-
-        console.log(
-            `[STREMIO] Subtitle URL: ${subtitleUrl}`
-        );
-
-        return safeJson(
-            res,
-            {
+            return safeJson(res, {
                 subtitles: [
                     {
-                        id:
-                            `${id}-gemini-${sourceHash.slice(
-                                0,
-                                12
-                            )}`,
-
-                        url:
-                            subtitleUrl,
-
-                        lang:
-                            "por"
+                        id: `${id}-gemini-${sourceHash.slice(0, 12)}`,
+                        url: `${baseUrl}/subtitle/${encodeURIComponent(
+                            jobId
+                        )}.srt`,
+                        lang: "por"
                     }
                 ]
-            }
-        );
-    } catch (error) {
-        console.error(
-            `[STREMIO] Erro: ${getErrorMessage(
-                error
-            )}`
-        );
+            });
+        }
 
-        return safeJson(
-            res,
-            {
-                subtitles: []
-            }
-        );
+        let job = findProcessingJob(cacheKey);
+
+        if (!job) {
+            const jobId = `job-${sourceHash.slice(0, 24)}-${randomId(8)}`;
+
+            job = createJob({
+                jobId,
+                cacheKey,
+                type,
+                videoId: id,
+                sourceHash,
+                sourceSrt
+            });
+
+            job.totalBatches = splitIntoBatches(blocks).length;
+            job.promise = enqueueTranslationJob(job).catch(error => {
+                console.error(`[JOB ${job.id}] Erro inesperado:`, error);
+                job.status = "failed";
+                job.error = getErrorMessage(error);
+                job.updatedAt = Date.now();
+            });
+        }
+
+        const subtitleUrl = `${baseUrl}/subtitle/${encodeURIComponent(
+            job.id
+        )}.srt`;
+
+        console.log(`[STREMIO] Subtitle URL: ${subtitleUrl}`);
+
+        return safeJson(res, {
+            subtitles: [
+                {
+                    id: `${id}-gemini-${sourceHash.slice(0, 12)}`,
+                    url: subtitleUrl,
+                    lang: "por"
+                }
+            ]
+        });
+    } catch (error) {
+        console.error(`[STREMIO] Erro: ${getErrorMessage(error)}`);
+        return safeJson(res, { subtitles: [] });
     }
 }
 
-app.get(
-    "/subtitles/:type/:id.json",
-    subtitlesHandler
-);
-
-app.get(
-    "/subtitles/:type/:id/:extra.json",
-    subtitlesHandler
-);
+app.get("/subtitles/:type/:id.json", subtitlesHandler);
+app.get("/subtitles/:type/:id/:extra.json", subtitlesHandler);
 
 // ============================================================
 // API LOCAL -> RENDER
 // ============================================================
 
-app.post(
-    "/api/translate-embedded",
-    async (
-        req,
-        res
-    ) => {
-        if (
-            !isAuthorizedLocalBridge(
-                req
-            )
-        ) {
-            console.warn(
-                "[EMBEDDED API] Tentativa não autorizada."
-            );
-
-            return safeJson(
-                res,
-                {
-                    error:
-                        "Unauthorized"
-                },
-                401
-            );
-        }
-
-        try {
-            const {
-                type,
-                id,
-                srt,
-                name
-            } =
-                req.body ||
-                {};
-
-            const mediaType =
-                String(
-                    type ||
-                    "unknown"
-                ).trim();
-
-            const videoId =
-                String(
-                    id ||
-                    "unknown"
-                ).trim();
-
-            const sourceName =
-                String(
-                    name ||
-                    "embedded"
-                ).trim();
-
-            if (
-                !srt ||
-                typeof srt !==
-                    "string"
-            ) {
-                return safeJson(
-                    res,
-                    {
-                        error:
-                            "Campo 'srt' é obrigatório."
-                    },
-                    400
-                );
-            }
-
-            if (
-                srt.length >
-                MAX_SOURCE_CHARS
-            ) {
-                return safeJson(
-                    res,
-                    {
-                        error:
-                            `SRT muito grande. Limite: ${MAX_SOURCE_CHARS} caracteres.`
-                    },
-                    413
-                );
-            }
-
-            console.log(
-                `[EMBEDDED API] Recebido SRT de ${sourceName} para ${mediaType}/${videoId}.`
-            );
-
-            const job =
-                await createEmbeddedTranslationJob({
-                    type:
-                        mediaType,
-
-                    videoId,
-
-                    sourceSrt:
-                        srt,
-
-                    sourceName
-                });
-
-            const baseUrl =
-                cleanBaseUrl(
-                    req
-                );
-
-            const subtitleUrl =
-                `${baseUrl}/subtitle/${encodeURIComponent(
-                    job.id
-                )}.srt`;
-
-            return safeJson(
-                res,
-                {
-                    ok:
-                        true,
-
-                    jobId:
-                        job.id,
-
-                    status:
-                        job.status,
-
-                    progress:
-                        job.progress,
-
-                    subtitleUrl
-                }
-            );
-        } catch (error) {
-            console.error(
-                "[EMBEDDED API] Erro:",
-                error
-            );
-
-            return safeJson(
-                res,
-                {
-                    error:
-                        getErrorMessage(
-                            error
-                        )
-                },
-                500
-            );
-        }
+app.post("/api/translate-embedded", async (req, res) => {
+    if (!isAuthorizedLocalBridge(req)) {
+        console.warn("[EMBEDDED API] Tentativa não autorizada.");
+        return safeJson(res, { error: "Unauthorized" }, 401);
     }
-);
+
+    try {
+        const { type, id, srt, name } = req.body || {};
+
+        const mediaType = String(type || "unknown").trim();
+        const videoId = String(id || "unknown").trim();
+        const sourceName = String(name || "embedded").trim();
+
+        if (!srt || typeof srt !== "string") {
+            return safeJson(
+                res,
+                { error: "Campo 'srt' é obrigatório." },
+                400
+            );
+        }
+
+        if (srt.length > MAX_SOURCE_CHARS) {
+            return safeJson(
+                res,
+                {
+                    error: `SRT muito grande. Limite: ${MAX_SOURCE_CHARS} caracteres.`
+                },
+                413
+            );
+        }
+
+        console.log(
+            `[EMBEDDED API] Recebido SRT de ${sourceName} para ${mediaType}/${videoId}.`
+        );
+
+        const job = await createEmbeddedTranslationJob({
+            type: mediaType,
+            videoId,
+            sourceSrt: srt,
+            sourceName
+        });
+
+        const baseUrl = cleanBaseUrl(req);
+        const subtitleUrl = `${baseUrl}/subtitle/${encodeURIComponent(
+            job.id
+        )}.srt`;
+
+        return safeJson(res, {
+            ok: true,
+            jobId: job.id,
+            status: job.status,
+            progress: job.progress,
+            subtitleUrl
+        });
+    } catch (error) {
+        console.error("[EMBEDDED API] Erro:", error);
+        return safeJson(res, { error: getErrorMessage(error) }, 500);
+    }
+});
 
 // ============================================================
 // RESULTADO SRT
 // ============================================================
 
-async function subtitleResultHandler(
-    req,
-    res
-) {
-    const raw =
-        String(
-            req.params.jobId ||
-            ""
-        ).trim();
-
+async function subtitleResultHandler(req, res) {
+    const raw = String(req.params.jobId || "").trim();
     let jobId;
 
     try {
-        jobId =
-            decodeURIComponent(
-                raw
-            );
+        jobId = decodeURIComponent(raw);
     } catch {
-        jobId =
-            raw;
+        jobId = raw;
     }
 
     if (!jobId) {
-        return sendSubtitleResponse(
-            res,
-            buildErrorSrt(
-                "Job inválido."
-            )
-        );
+        return sendSubtitleResponse(res, buildErrorSrt("Job inválido."));
     }
 
-    const job =
-        getJob(
-            jobId
-        );
+    const job = getJob(jobId);
 
     if (!job) {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(
-                "Esta tradução expirou. Recarregue as legendas."
-            )
+            buildErrorSrt("Esta tradução expirou. Recarregue as legendas.")
         );
     }
 
-    if (
-        job.status ===
-            "completed" &&
-        job.result
-    ) {
+    if (job.status === "completed" && job.result) {
         return sendSubtitleResponse(
             res,
             job.result,
@@ -2742,31 +1658,17 @@ async function subtitleResultHandler(
         );
     }
 
-    if (
-        job.status ===
-        "failed"
-    ) {
+    if (job.status === "failed") {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(
-                job.error
-            ),
+            buildErrorSrt(job.error),
             "no-store"
         );
     }
 
-    const completed =
-        await waitForJob(
-            job,
-            15_000
-        );
+    const completed = await waitForJob(job, 15_000);
 
-    if (
-        completed &&
-        job.status ===
-            "completed" &&
-        job.result
-    ) {
+    if (completed && job.status === "completed" && job.result) {
         return sendSubtitleResponse(
             res,
             job.result,
@@ -2774,136 +1676,53 @@ async function subtitleResultHandler(
         );
     }
 
-    if (
-        job.status ===
-        "failed"
-    ) {
+    if (job.status === "failed") {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(
-                job.error
-            ),
+            buildErrorSrt(job.error),
             "no-store"
         );
     }
 
     return sendSubtitleResponse(
         res,
-        buildProcessingSrt(
-            job
-        ),
+        buildProcessingSrt(job),
         "no-store, no-cache, must-revalidate"
     );
 }
 
-app.get(
-    "/subtitle/:jobId.srt",
-    subtitleResultHandler
-);
+app.get("/subtitle/:jobId.srt", subtitleResultHandler);
 
 // ============================================================
 // START
 // ============================================================
 
-app.listen(
-    PORT,
-    () => {
-        console.log(
-            "=============================================="
-        );
+app.listen(PORT, () => {
+    console.log("==============================================");
+    console.log(" STREMIO GEMINI SUBTITLE TRANSLATOR 5.3");
+    console.log("==============================================");
+    console.log(`Porta: ${PORT}`);
+    console.log(`Modelo Gemini: ${GEMINI_MODEL}`);
+    console.log(`PUBLIC_URL: ${PUBLIC_URL || "(automático)"}`);
+    console.log(`Batch máximo: ${MAX_BATCH_BLOCKS} blocos`);
+    console.log(`Batch máximo: ${MAX_BATCH_CHARS} caracteres`);
+    console.log(`Saída máxima Gemini: ${MAX_OUTPUT_TOKENS} tokens`);
+    console.log(`Intervalo Gemini: ${MIN_REQUEST_INTERVAL_MS}ms`);
+    console.log(`Concorrência Gemini: ${GEMINI_CONCURRENCY}`);
+    console.log(`Timeout por request Gemini: ${GEMINI_TIMEOUT_MS}ms`);
+    console.log(`Teto total tradução: ${MAX_TRANSLATION_TIME_MS}ms`);
+    console.log(`Cache TTL: ${CACHE_TTL_MS / 3600000}h`);
+    console.log("Limpeza SDH/CC: ATIVA");
+    console.log("Adaptação audiovisual 5.3: ATIVA");
+    console.log("Fila de jobs completos: SEQUENCIAL (1 por vez)");
+    console.log("Status: ONLINE");
+    console.log("==============================================");
+});
 
-        console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.2"
-        );
+process.on("unhandledRejection", error => {
+    console.error("[PROCESS] Unhandled rejection:", error);
+});
 
-        console.log(
-            "=============================================="
-        );
-
-        console.log(
-            `Porta: ${PORT}`
-        );
-
-        console.log(
-            `Modelo Gemini: ${GEMINI_MODEL}`
-        );
-
-        console.log(
-            `PUBLIC_URL: ${
-                PUBLIC_URL ||
-                "(automático)"
-            }`
-        );
-
-        console.log(
-            `Batch máximo: ${MAX_BATCH_BLOCKS} blocos`
-        );
-
-        console.log(
-            `Batch máximo: ${MAX_BATCH_CHARS} caracteres`
-        );
-
-        console.log(
-            `Saída máxima Gemini: ${MAX_OUTPUT_TOKENS} tokens`
-        );
-
-        console.log(
-            `Intervalo Gemini: ${MIN_REQUEST_INTERVAL_MS}ms`
-        );
-
-        console.log(
-            `Concorrência Gemini: ${GEMINI_CONCURRENCY}`
-        );
-
-        console.log(
-            `Timeout por request Gemini: ${GEMINI_TIMEOUT_MS}ms`
-        );
-
-        console.log(
-            `Teto total tradução: ${MAX_TRANSLATION_TIME_MS}ms`
-        );
-
-        console.log(
-            `Cache TTL: ${
-                CACHE_TTL_MS /
-                3600000
-            }h`
-        );
-
-        console.log(
-            "Limpeza SDH/CC: ATIVA"
-        );
-
-        console.log(
-            "Adaptação audiovisual 5.2: ATIVA"
-        );
-
-        console.log(
-            "Status: ONLINE"
-        );
-
-        console.log(
-            "=============================================="
-        );
-    }
-);
-
-process.on(
-    "unhandledRejection",
-    error => {
-        console.error(
-            "[PROCESS] Unhandled rejection:",
-            error
-        );
-    }
-);
-
-process.on(
-    "uncaughtException",
-    error => {
-        console.error(
-            "[PROCESS] Uncaught exception:",
-            error
-        );
-    }
-);
+process.on("uncaughtException", error => {
+    console.error("[PROCESS] Uncaught exception:", error);
+});
