@@ -962,6 +962,142 @@ function parseSrt(srt) {
 
 /*
 |--------------------------------------------------------------------------
+| LIMPEZA DE MARCADORES DE DIÁLOGO TRADUZIDOS
+|--------------------------------------------------------------------------
+|
+| Remove hífen, meia-risca, travessão ou barra quando aparecem apenas
+| como marcador solto no começo de uma fala.
+|
+| Exemplo:
+|
+| - Eu não acredito nisso.
+|
+| vira:
+|
+| Eu não acredito nisso.
+|
+| Mas um bloco com dois falantes continua preservado:
+|
+| - Você está pronta?
+| - Estou.
+|
+| Assim não destruímos a indicação real de troca de falante.
+|
+*/
+
+function cleanTranslatedDialogueMarkers(
+    text
+) {
+    const normalized =
+        String(
+            text ?? ""
+        )
+            .replace(
+                /\r\n/g,
+                "\n"
+            )
+            .replace(
+                /\r/g,
+                "\n"
+            );
+
+    const lines =
+        normalized.split(
+            "\n"
+        );
+
+    const markerRegex =
+        /^\s*[-–—/]+\s+(?=\S)/u;
+
+    let markedDialogueLines =
+        0;
+
+    let nonEmptyLines =
+        0;
+
+    for (
+        const line
+        of lines
+    ) {
+        if (
+            line.trim()
+        ) {
+            nonEmptyLines++;
+        }
+
+        if (
+            markerRegex.test(
+                line
+            )
+        ) {
+            markedDialogueLines++;
+        }
+    }
+
+    /*
+     * Dois ou mais marcadores em linhas distintas
+     * normalmente significam troca real de falantes.
+     */
+    const isRealMultiSpeakerBlock =
+        nonEmptyLines >= 2 &&
+        markedDialogueLines >= 2;
+
+    if (
+        isRealMultiSpeakerBlock
+    ) {
+        return normalized;
+    }
+
+    return lines
+        .map(
+            line =>
+                line.replace(
+                    /^\s*[-–—/]+\s+(?=\S)/u,
+                    ""
+                )
+        )
+        .join("\n");
+}
+
+function cleanAllTranslatedDialogueMarkers(
+    translatedTexts
+) {
+    let changedBlocks =
+        0;
+
+    const cleaned =
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(
+                        text ?? ""
+                    );
+
+                const result =
+                    cleanTranslatedDialogueMarkers(
+                        original
+                    );
+
+                if (
+                    result !==
+                    original
+                ) {
+                    changedBlocks++;
+                }
+
+                return result;
+            }
+        );
+
+    console.log(
+        `[CLEAN] Marcadores de diálogo: ${changedBlocks} bloco(s) ajustado(s).`
+    );
+
+    return cleaned;
+}
+
+/*
+|--------------------------------------------------------------------------
 | CONSTRUTOR SRT
 |--------------------------------------------------------------------------
 */
@@ -1374,19 +1510,21 @@ async function rawGeminiRequest(
             parts: [
                 {
                     text:
-                        "Você é um tradutor e adaptador profissional de legendas para Português do Brasil, especializado em linguagem audiovisual. " +
+                        "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, especializado em diálogo audiovisual contemporâneo. " +
+                        "Seu objetivo não é produzir uma tradução de dicionário: é fazer a fala soar como uma pessoa brasileira realmente falaria naquela situação, preservando intenção, humor, personalidade, ironia, shade, camp, provocação, carinho e ritmo cômico. " +
                         "A entrada será majoritariamente em inglês, mas pode conter trechos em italiano, espanhol, francês ou outros idiomas; traduza também esses trechos para PT-BR quando forem conteúdo falado ou cantado relevante. " +
-                        "Use português brasileiro natural, fluente, idiomático e adequado ao contexto, evitando traduções literais artificiais. " +
-                        "Adapte gírias, expressões idiomáticas, piadas e trocadilhos quando existir uma solução natural em PT-BR que preserve a intenção. " +
-                        "Quando um bordão, termo cunhado, nome de marca, nome próprio ou expressão icônica não tiver equivalente natural e reconhecível em PT-BR, preserve o original em vez de inventar uma tradução estranha. " +
+                        "Em reality shows, competição, conversa informal, cultura pop e cenas descontraídas, prefira PT-BR oral, espontâneo e natural. Use gírias brasileiras somente quando combinarem de verdade com o contexto; não force caricaturas nem gírias aleatórias. " +
+                        "Antes de traduzir literalmente uma expressão curta ou ambígua, interprete a intenção usando os blocos vizinhos. Pontuação, quebras de linha e segmentação da legenda podem ser imperfeitas; trate os blocos próximos como contexto de uma conversa contínua, mas nunca mova conteúdo de um ID para outro. " +
+                        "Reconheça vocativos coloquiais. Palavras como girl, bitch, honey, sis, queen, baby e babe nem sempre são substantivos literais. Dependendo do tom, podem equivaler a gata, amiga, mana, bicha, querida, amor ou até ser omitidas quando isso soar mais natural. " +
+                        "Nunca traduza automaticamente girl como garota nem bitch como vadia. Use vadia apenas quando houver intenção real de insulto. Em fala camp, afetiva, debochada ou entre queens, escolha a solução brasileira que preserve o humor e o tom. " +
+                        "Exemplo de interpretação: 'Kenya got you, girl' em tom de shade significa algo como 'Mas a Kenya te pegou, gata', e não 'Kenya pegou a sua garota'. " +
+                        "Exemplo de registro: 'Vita is quiet, but this bitch is a silent killer' em contexto camp pode soar como 'A Vita é calada, mas essa bicha é uma assassina silenciosa', em vez de traduzir bitch mecanicamente como vadia. " +
+                        "Adapte expressões idiomáticas, piadas e trocadilhos quando existir uma solução natural em PT-BR que preserve a intenção e a graça. Se a adaptação ficar forçada, confusa ou perder um bordão reconhecível, preserve o termo original. " +
                         "Exemplo: preserve 'Condragulations' como 'Condragulations'; não invente neologismos como 'Parabravas'. " +
-                        "Use os blocos vizinhos como contexto para entender gírias, referências, humor e intenção, mas nunca misture conteúdo entre IDs. " +
-                        "Quando houver letra de música realmente transcrita na legenda, traduza seu conteúdo para PT-BR, mesmo que esteja em um idioma diferente do inglês. " +
-                        "Não invente letras quando houver apenas marcações como [music], símbolos musicais ou descrições de som. " +
-                        "Preserve nomes próprios, marcas, títulos, termos técnicos, palavrões, intensidade emocional e intenção. " +
-                        "Não censure. Não resuma. Não explique. " +
-                        "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. " +
-                        "Traduza somente o campo text. Mantenha exatamente os IDs recebidos. " +
+                        "Quando houver letra de música realmente transcrita na legenda, traduza seu conteúdo para PT-BR, mesmo que esteja em um idioma diferente do inglês. Não invente letras quando houver apenas marcações como [music], símbolos musicais ou descrições de som. " +
+                        "Preserve nomes próprios, marcas, títulos, termos técnicos, palavrões, intensidade emocional e intenção. Não censure. Não resuma. Não explique. " +
+                        "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. Traduza somente o campo text e mantenha exatamente os IDs recebidos. " +
+                        "Não acrescente traços, travessões, barras ou marcadores de diálogo que não sejam necessários. Preserve marcadores somente quando forem realmente necessários para distinguir dois ou mais falantes no mesmo bloco. " +
                         "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares."
                 }
             ]
@@ -1447,7 +1585,7 @@ async function rawGeminiRequest(
     const remaining =
         remainingBeforeDeadline(
             deadlineAt
-        );
+    );
 
     if (
         remaining <= 0
@@ -1889,8 +2027,15 @@ function buildTranslationPrompt(
         );
 
     return `
-Traduza os textos abaixo para Português do Brasil.
-A entrada será principalmente em inglês, mas pode conter trechos em outros idiomas. Traduza também esses trechos quando forem fala ou letra de música transcrita.
+Traduza e localize os textos abaixo para Português do Brasil natural.
+A entrada será principalmente em inglês, mas pode conter trechos em outros idiomas. Traduza também esses trechos quando forem fala ou letra de música realmente transcrita.
+
+OBJETIVO DE ESTILO:
+
+A legenda deve soar como diálogo brasileiro real e contemporâneo, e não como tradução literal de dicionário.
+Preserve a personalidade da pessoa, a intenção da fala, ironia, sarcasmo, shade, humor, camp, provocação, flerte, carinho, deboche e ritmo cômico.
+Em reality shows, cultura pop e conversas informais, prefira uma linguagem oral, descontraída e natural em PT-BR quando o contexto pedir isso.
+Não exagere nem invente gírias brasileiras sem necessidade.
 
 REGRAS OBRIGATÓRIAS:
 
@@ -1900,19 +2045,30 @@ REGRAS OBRIGATÓRIAS:
 4. Traduza somente o campo "text".
 5. Não escreva explicações, markdown ou texto fora do JSON.
 6. Não resuma nem omita informação falada ou cantada presente no texto.
-7. Use Português do Brasil natural, fluente e idiomático; evite tradução palavra por palavra quando soar artificial.
-8. Adapte gírias, expressões idiomáticas, humor, piadas e trocadilhos quando houver uma adaptação natural que preserve a intenção.
-9. Se uma adaptação de trocadilho, bordão ou termo cunhado ficar forçada, confusa ou sem sentido em PT-BR, preserve o termo original em vez de inventar uma palavra nova.
-10. Preserve bordões, nomes próprios, marcas, nomes de personagens, títulos e termos icônicos quando não houver equivalente natural e reconhecível em PT-BR. Exemplo: "Condragulations" deve permanecer "Condragulations".
-11. Não censure palavrões, linguagem sexual, sarcasmo, deboche ou intensidade emocional.
-12. Use os IDs anteriores e seguintes do mesmo lote apenas como contexto para entender significado, gírias, referências, pronomes, humor e continuidade; não transfira texto de um ID para outro.
-13. Se houver fala ou letra de música em italiano, espanhol, francês ou qualquer outro idioma, traduza-a para PT-BR também, desde que seja conteúdo real da legenda e não apenas um nome próprio ou título.
-14. Quando houver letra de música realmente transcrita, traduza o conteúdo da letra. Não invente letras para marcações de música, descrições de som ou símbolos musicais.
-15. Preserve vocalizações, nomes de artistas, nomes de músicas e nomes próprios quando funcionarem como nomes, não como frases a serem traduzidas.
-16. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
-17. Não acrescente informações, notas explicativas, nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
-18. Não misture textos entre IDs.
-19. Cada ID deve receber somente a tradução correspondente ao próprio texto.
+7. Antes de traduzir uma expressão curta, ambígua ou coloquial, interprete primeiro o SENTIDO e a INTENÇÃO usando os IDs vizinhos como contexto.
+8. Considere que pontuação, vírgulas, quebras de linha e segmentação da legenda-fonte podem estar imperfeitas. Não deixe uma segmentação ruim transformar uma expressão idiomática em uma frase sem sentido.
+9. Use os IDs anteriores e seguintes do mesmo lote somente como contexto. Nunca transfira, duplique ou mova conteúdo de um ID para outro.
+10. Adapte expressões idiomáticas, gírias, humor, piadas, trocadilhos e shade quando houver uma solução brasileira natural que preserve o efeito da fala.
+11. Preserve o humor e a intenção mesmo quando isso exigir se afastar da estrutura gramatical literal do inglês.
+12. Reconheça VOCATIVOS. Em fala informal, palavras como "girl", "bitch", "honey", "sis", "queen", "baby" e "babe" frequentemente são vocativos e não devem ser tratadas automaticamente como substantivos literais.
+13. "girl" NÃO deve virar automaticamente "garota". Conforme o contexto, pode ser "gata", "amiga", "mana", "querida", "bicha" ou simplesmente não precisar de tradução explícita como substantivo.
+14. "bitch" NÃO deve virar automaticamente "vadia". Use "vadia" somente quando houver intenção genuína de insulto. Em contexto camp, afetivo, debochado ou entre queens, considere alternativas naturais como "bicha", "gata", "amiga" ou outra solução adequada ao tom.
+15. Exemplo de sentido: "Kenya got you, girl" em tom de shade deve ser entendido como algo como "Mas a Kenya te pegou, gata", e NÃO como "Kenya pegou a sua garota".
+16. Exemplo de registro: "Vita is quiet, but this bitch is a silent killer" em contexto camp pode ser localizado como "A Vita é calada, mas essa bicha é uma assassina silenciosa", em vez de traduzir "bitch" mecanicamente como "vadia".
+17. Não copie os exemplos mecanicamente. Eles demonstram como interpretar intenção, vocativo e registro; escolha sempre a formulação que melhor encaixar na cena real.
+18. Se uma adaptação de trocadilho, bordão ou termo cunhado ficar forçada, confusa ou sem graça em PT-BR, preserve o termo original em vez de inventar uma palavra nova.
+19. Preserve bordões, nomes próprios, marcas, nomes de personagens, títulos e termos icônicos quando não houver equivalente natural e reconhecível em PT-BR. Exemplo: "Condragulations" deve permanecer "Condragulations".
+20. Não censure palavrões, linguagem sexual, sarcasmo, deboche ou intensidade emocional.
+21. Se houver fala ou letra de música em italiano, espanhol, francês ou qualquer outro idioma, traduza-a para PT-BR também, desde que seja conteúdo real da legenda e não apenas um nome próprio ou título.
+22. Quando houver letra de música realmente transcrita, traduza o conteúdo da letra. Não invente letras para marcações de música, descrições de som ou símbolos musicais.
+23. Preserve vocalizações, nomes de artistas, nomes de músicas e nomes próprios quando funcionarem como nomes, não como frases a serem traduzidas.
+24. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
+25. Não acrescente informações, notas explicativas, nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
+26. Não misture textos entre IDs.
+27. Cada ID deve receber somente a tradução correspondente ao próprio texto.
+28. Não acrescente hífen, travessão, meia-risca ou barra no início de uma fala apenas por estilo. Use marcadores de diálogo somente quando forem realmente necessários para diferenciar dois ou mais falantes dentro do mesmo bloco.
+29. Em diálogos informais, contrações brasileiras como "tá", "tô" e "pra" podem ser usadas quando soarem naturais ao personagem e à situação; não force essas formas em registros formais.
+30. Priorize sempre esta ordem: SENTIDO DA FALA → TOM/INTENÇÃO → NATURALIDADE EM PT-BR → fidelidade à estrutura literal.
 
 RETORNE SOMENTE UM ARRAY JSON NO FORMATO:
 
@@ -1925,7 +2081,6 @@ ${JSON.stringify(
 )}
 `;
 }
-
 /*
 |--------------------------------------------------------------------------
 | TRADUZIR LOTE
@@ -2470,7 +2625,7 @@ async function translateSrt(
         translatedTexts.some(
             text =>
                 typeof text !==
-                "string"
+                    "string"
         )
     ) {
         throw new Error(
@@ -2486,9 +2641,14 @@ async function translateSrt(
         `[TRANSLATE] Finalizada em ${(elapsedMs / 1000).toFixed(1)}s.`
     );
 
+    const cleanedTranslatedTexts =
+        cleanAllTranslatedDialogueMarkers(
+            translatedTexts
+        );
+
     return buildSrt(
         blocks,
-        translatedTexts
+        cleanedTranslatedTexts
     );
 }
 
@@ -3011,7 +3171,7 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "5.4.0",
+        "5.5.0",
 
     name:
         "Tradutor Gemini PT-BR",
@@ -3319,7 +3479,7 @@ async function findEnglishSubtitle(
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.4"
+                        "Stremio-Gemini-Subtitle-Translator/5.5"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -3361,7 +3521,7 @@ async function downloadSubtitle(
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.4"
+                        "Stremio-Gemini-Subtitle-Translator/5.5"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -3651,7 +3811,7 @@ async function subtitlesHandler(
                 ""
         ).trim();
 
-    console.log(
+        console.log(
         `[STREMIO] Pedido: ${type}/${id}`
     );
 
@@ -4323,7 +4483,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.4"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.5"
         );
 
         console.log(
@@ -4382,7 +4542,15 @@ app.listen(
         );
 
         console.log(
-            "Adaptação audiovisual 5.4: ATIVA"
+            "Adaptação audiovisual 5.5: ATIVA"
+        );
+
+        console.log(
+            "Localização coloquial/contextual: ATIVA"
+        );
+
+        console.log(
+            "Limpeza de traços soltos: ATIVA"
         );
 
         console.log(
