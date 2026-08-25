@@ -3,7 +3,6 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
-
 app.use(cors());
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
@@ -12,391 +11,150 @@ app.use(express.json({ limit: "1mb" }));
 // CONFIGURAÇÃO
 // ============================================================
 
-const PORT = Number(
-    process.env.PORT || 10000
+const PORT = Number(process.env.PORT || 10000);
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
+const GEMINI_MODEL = String(
+    process.env.GEMINI_MODEL || "gemini-3.5-flash-lite"
+).trim();
+const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const LOCAL_BRIDGE_SECRET = String(
+    process.env.LOCAL_BRIDGE_SECRET || ""
+).trim();
+
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const GEMINI_TIMEOUT_MS = 90_000;
+const MAX_TRANSLATION_TIME_MS = Number(
+    process.env.MAX_TRANSLATION_TIME_MS || 480_000
 );
 
-const GEMINI_API_KEY =
-    String(
-        process.env.GEMINI_API_KEY || ""
-    ).trim();
-
-const GEMINI_MODEL =
-    String(
-        process.env.GEMINI_MODEL ||
-        "gemini-3.5-flash-lite"
-    ).trim();
-
-const PUBLIC_URL =
-    String(
-        process.env.PUBLIC_URL || ""
-    ).replace(/\/+$/, "");
-
-const LOCAL_BRIDGE_SECRET =
-    String(
-        process.env.LOCAL_BRIDGE_SECRET || ""
-    ).trim();
-
-const SOURCE_FETCH_TIMEOUT_MS =
-    20_000;
-
-const GEMINI_TIMEOUT_MS =
-    90_000;
-
-const MAX_TRANSLATION_TIME_MS =
-    Number(
-        process.env.MAX_TRANSLATION_TIME_MS ||
-        480_000
-    );
-
-const MAX_BATCH_BLOCKS =
-    Number(
-        process.env.MAX_BATCH_BLOCKS ||
-        300
-    );
-
-const MAX_BATCH_CHARS =
-    Number(
-        process.env.MAX_BATCH_CHARS ||
-        28_000
-    );
-
-const MIN_REQUEST_INTERVAL_MS =
-    Number(
-        process.env.MIN_REQUEST_INTERVAL_MS ||
-        3000
-    );
-
-const MAX_OUTPUT_TOKENS =
-    Number(
-        process.env.MAX_OUTPUT_TOKENS ||
-        16_000
-    );
+const MAX_BATCH_BLOCKS = Number(
+    process.env.MAX_BATCH_BLOCKS || 250
+);
+const MAX_BATCH_CHARS = Number(
+    process.env.MAX_BATCH_CHARS || 28_000
+);
+const MIN_REQUEST_INTERVAL_MS = Number(
+    process.env.MIN_REQUEST_INTERVAL_MS || 3000
+);
+const MAX_OUTPUT_TOKENS = Number(
+    process.env.MAX_OUTPUT_TOKENS || 16_000
+);
 
 const GEMINI_CONCURRENCY = 1;
-
 const MAX_NORMAL_RETRIES = 2;
+const MAX_RATE_LIMIT_COOLDOWN_MS = 120_000;
 
-const MAX_RATE_LIMIT_COOLDOWN_MS =
-    120_000;
-
-const CACHE_TTL_MS =
-    7 *
-    24 *
-    60 *
-    60 *
-    1000;
-
-const JOB_TTL_MS =
-    24 *
-    60 *
-    60 *
-    1000;
-
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 200;
-
 const MAX_JOBS = 300;
-
-const MAX_SOURCE_CHARS =
-    800_000;
+const MAX_SOURCE_CHARS = 800_000;
 
 // ============================================================
 // MEMÓRIA / FILA
 // ============================================================
 
-const translationCache =
-    new Map();
-
-const jobs =
-    new Map();
-
+const translationCache = new Map();
+const jobs = new Map();
 const geminiQueue = [];
 
-let geminiWorkerRunning =
-    false;
-
-let lastGeminiRequestAt =
-    0;
-
-let geminiCooldownUntil =
-    0;
+let geminiWorkerRunning = false;
+let lastGeminiRequestAt = 0;
+let geminiCooldownUntil = 0;
 
 // ============================================================
-// HELPERS GERAIS
+// HELPERS
 // ============================================================
 
-const sleep =
-    ms =>
-        new Promise(
-            resolve =>
-                setTimeout(
-                    resolve,
-                    ms
-                )
-        );
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sha256(text) {
     return crypto
-        .createHash(
-            "sha256"
-        )
-        .update(
-            String(text),
-            "utf8"
-        )
-        .digest(
-            "hex"
-        );
+        .createHash("sha256")
+        .update(String(text), "utf8")
+        .digest("hex");
 }
 
-function randomId(
-    length = 8
-) {
-    return crypto
-        .randomBytes(
-            length
-        )
-        .toString(
-            "hex"
-        );
+function randomId(length = 8) {
+    return crypto.randomBytes(length).toString("hex");
 }
 
-function getErrorMessage(
-    error
-) {
-    if (!error) {
-        return "Erro desconhecido.";
-    }
-
-    if (
-        typeof error ===
-        "string"
-    ) {
-        return error;
-    }
-
-    return (
-        error.message ||
-        error.statusText ||
-        "Erro desconhecido."
-    );
+function getErrorMessage(error) {
+    if (!error) return "Erro desconhecido.";
+    if (typeof error === "string") return error;
+    return error.message || error.statusText || "Erro desconhecido.";
 }
 
 function translationTimeoutError() {
-    const error =
-        new Error(
-            "Tempo máximo de tradução atingido."
-        );
-
-    error.code =
-        "TRANSLATION_TIMEOUT";
-
+    const error = new Error("Tempo máximo de tradução atingido.");
+    error.code = "TRANSLATION_TIMEOUT";
     return error;
 }
 
-function assertBeforeDeadline(
-    deadlineAt
-) {
-    if (
-        Number.isFinite(
-            deadlineAt
-        ) &&
-        Date.now() >=
-        deadlineAt
-    ) {
+function assertBeforeDeadline(deadlineAt) {
+    if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
         throw translationTimeoutError();
     }
 }
 
-function remainingBeforeDeadline(
-    deadlineAt
-) {
-    if (
-        !Number.isFinite(
-            deadlineAt
-        )
-    ) {
-        return Infinity;
-    }
-
-    return Math.max(
-        0,
-        deadlineAt -
-        Date.now()
-    );
+function remainingBeforeDeadline(deadlineAt) {
+    if (!Number.isFinite(deadlineAt)) return Infinity;
+    return Math.max(0, deadlineAt - Date.now());
 }
 
-async function sleepWithDeadline(
-    ms,
-    deadlineAt
-) {
-    const wait =
-        Math.max(
-            0,
-            Number(ms) || 0
-        );
+async function sleepWithDeadline(ms, deadlineAt) {
+    const wait = Math.max(0, Number(ms) || 0);
+    const remaining = remainingBeforeDeadline(deadlineAt);
 
-    const remaining =
-        remainingBeforeDeadline(
-            deadlineAt
-        );
-
-    if (
-        Number.isFinite(
-            remaining
-        ) &&
-        remaining <=
-        wait
-    ) {
-        if (
-            remaining >
-            0
-        ) {
-            await sleep(
-                remaining
-            );
-        }
-
+    if (Number.isFinite(remaining) && remaining <= wait) {
+        if (remaining > 0) await sleep(remaining);
         throw translationTimeoutError();
     }
 
-    if (
-        wait >
-        0
-    ) {
-        await sleep(
-            wait
-        );
-    }
-
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    if (wait > 0) await sleep(wait);
+    assertBeforeDeadline(deadlineAt);
 }
 
-function cleanBaseUrl(
-    req
-) {
-    if (
-        PUBLIC_URL
-    ) {
-        return PUBLIC_URL;
-    }
+function cleanBaseUrl(req) {
+    if (PUBLIC_URL) return PUBLIC_URL;
 
     const protocol =
-        req.headers[
-            "x-forwarded-proto"
-        ] ||
-        req.protocol ||
-        "https";
-
-    const host =
-        req.headers[
-            "x-forwarded-host"
-        ] ||
-        req.get(
-            "host"
-        );
-
+        req.headers["x-forwarded-proto"] || req.protocol || "https";
+    const host = req.headers["x-forwarded-host"] || req.get("host");
     return `${protocol}://${host}`;
 }
 
-function safeJson(
-    res,
-    data,
-    status = 200
-) {
-    res.status(
-        status
-    );
-
-    res.set(
-        "Cache-Control",
-        "no-store, no-cache, must-revalidate"
-    );
-
-    return res.json(
-        data
-    );
+function safeJson(res, data, status = 200) {
+    res.status(status);
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+    return res.json(data);
 }
 
-function isAuthorizedLocalBridge(
-    req
-) {
-    if (
-        !LOCAL_BRIDGE_SECRET
-    ) {
-        return false;
-    }
+function isAuthorizedLocalBridge(req) {
+    if (!LOCAL_BRIDGE_SECRET) return false;
 
-    const auth =
-        String(
-            req.headers.authorization ||
-            ""
-        ).trim();
+    const auth = String(req.headers.authorization || "").trim();
+    const expected = `Bearer ${LOCAL_BRIDGE_SECRET}`;
+    if (!auth) return false;
 
-    const expected =
-        `Bearer ${LOCAL_BRIDGE_SECRET}`;
+    const a = Buffer.from(auth);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return false;
 
-    if (
-        !auth
-    ) {
-        return false;
-    }
-
-    const a =
-        Buffer.from(
-            auth
-        );
-
-    const b =
-        Buffer.from(
-            expected
-        );
-
-    if (
-        a.length !==
-        b.length
-    ) {
-        return false;
-    }
-
-    return crypto
-        .timingSafeEqual(
-            a,
-            b
-        );
+    return crypto.timingSafeEqual(a, b);
 }
 
-async function fetchWithTimeout(
-    url,
-    options = {},
-    timeoutMs = 20_000
-) {
-    const controller =
-        new AbortController();
-
-    const timer =
-        setTimeout(
-            () =>
-                controller.abort(),
-            timeoutMs
-        );
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-        return await fetch(
-            url,
-            {
-                ...options,
-
-                signal:
-                    controller.signal
-            }
-        );
+        return await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
     } finally {
-        clearTimeout(
-            timer
-        );
+        clearTimeout(timer);
     }
 }
 
@@ -405,414 +163,139 @@ async function fetchWithTimeout(
 // ============================================================
 
 function cleanupMemory() {
-    const now =
-        Date.now();
+    const now = Date.now();
 
-    for (
-        const [
-            key,
-            item
-        ]
-        of translationCache.entries()
-    ) {
-        if (
-            item.expiresAt <=
-            now
-        ) {
-            translationCache.delete(
-                key
-            );
+    for (const [key, item] of translationCache.entries()) {
+        if (item.expiresAt <= now) translationCache.delete(key);
+    }
+
+    for (const [key, job] of jobs.entries()) {
+        if (job.expiresAt <= now && job.status !== "processing") {
+            jobs.delete(key);
         }
     }
 
-    for (
-        const [
-            key,
-            job
-        ]
-        of jobs.entries()
-    ) {
-        if (
-            job.expiresAt <=
-            now &&
-            job.status !==
-            "processing"
-        ) {
-            jobs.delete(
-                key
-            );
-        }
+    while (translationCache.size > MAX_CACHE_ENTRIES) {
+        const key = translationCache.keys().next().value;
+        if (key === undefined) break;
+        translationCache.delete(key);
     }
 
-    while (
-        translationCache.size >
-        MAX_CACHE_ENTRIES
-    ) {
-        const key =
-            translationCache
-                .keys()
-                .next()
-                .value;
-
-        if (
-            key ===
-            undefined
-        ) {
-            break;
-        }
-
-        translationCache.delete(
-            key
-        );
-    }
-
-    if (
-        jobs.size >
-        MAX_JOBS
-    ) {
-        for (
-            const [
-                key,
-                job
-            ]
-            of jobs.entries()
-        ) {
-            if (
-                jobs.size <=
-                MAX_JOBS
-            ) {
-                break;
-            }
-
-            if (
-                job.status !==
-                "processing"
-            ) {
-                jobs.delete(
-                    key
-                );
-            }
+    if (jobs.size > MAX_JOBS) {
+        for (const [key, job] of jobs.entries()) {
+            if (jobs.size <= MAX_JOBS) break;
+            if (job.status !== "processing") jobs.delete(key);
         }
     }
 }
 
-setInterval(
-    cleanupMemory,
-    5 *
-    60 *
-    1000
-).unref();
+setInterval(cleanupMemory, 5 * 60 * 1000).unref();
 
 // ============================================================
 // SRT + LIMPEZA SDH/CC
 // ============================================================
 
-function normalizeSrt(
-    text
-) {
-    return String(
-        text || ""
-    )
-        .replace(
-            /^\uFEFF/,
-            ""
-        )
-        .replace(
-            /\r\n/g,
-            "\n"
-        )
-        .replace(
-            /\r/g,
-            "\n"
-        )
+function normalizeSrt(text) {
+    return String(text || "")
+        .replace(/^\uFEFF/, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
         .trim();
 }
 
-function stripCodeFences(
-    text
-) {
-    return String(
-        text || ""
-    )
-        .replace(
-            /^```(?:json|srt|text|plaintext)?\s*/i,
-            ""
-        )
-        .replace(
-            /\s*```$/i,
-            ""
-        )
+function stripCodeFences(text) {
+    return String(text || "")
+        .replace(/^```(?:json|srt|text|plaintext)?\s*/i, "")
+        .replace(/\s*```$/i, "")
         .trim();
 }
 
 const SDH_CUE_WORDS =
     /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
 
-function cleanDialogueLine(
-    line
-) {
-    let text =
-        String(
-            line || ""
-        ).trim();
+function cleanDialogueLine(line) {
+    let text = String(line || "").trim();
+    if (!text) return "";
 
-    if (
-        !text
-    ) {
-        return "";
-    }
+    // [Heidi] Hello / [laughing] / Hello [laughs]
+    text = text.replace(/\s*\[[^\]]+\]\s*/gu, " ");
 
-    /*
-     * Exemplos:
-     *
-     * [Heidi] Hello
-     * [laughing]
-     * Hello [laughs]
-     */
-    text =
-        text.replace(
-            /\s*\[[^\]]+\]\s*/gu,
-            " "
-        );
+    // Remove parênteses só quando parecem rubrica de som/ação.
+    text = text.replace(/\s*\(([^)]*)\)\s*/gu, (match, inside) => {
+        return SDH_CUE_WORDS.test(String(inside || "")) ? " " : match;
+    });
 
-    /*
-     * Remove:
-     *
-     * (laughing)
-     * (music playing)
-     *
-     * mas preserva frases normais:
-     *
-     * (I know.)
-     */
-    text =
-        text.replace(
-            /\s*\(([^)]*)\)\s*/gu,
-            (
-                match,
-                inside
-            ) => {
-                return SDH_CUE_WORDS.test(
-                    String(
-                        inside || ""
-                    )
-                )
-                    ? " "
-                    : match;
-            }
-        );
+    // PRODUCER: Hello / HEIDI: Hello / Lucas: Hello
+    text = text.replace(
+        /^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,
+        ""
+    );
 
-    /*
-     * PRODUCER: Hello
-     * HEIDI: Hello
-     * Lucas: Hello
-     */
-    text =
-        text.replace(
-            /^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,
-            ""
-        );
+    text = text.replace(/[ \t]{2,}/g, " ").trim();
 
-    text =
-        text
-            .replace(
-                /[ \t]{2,}/g,
-                " "
-            )
-            .trim();
-
-    /*
-     * Se restou apenas um hífen,
-     * símbolo musical ou espaços.
-     */
-    if (
-        /^[-–—♪♫♬\s]*$/u.test(
-            text
-        )
-    ) {
-        return "";
-    }
-
+    if (/^[-–—♪♫♬\s]*$/u.test(text)) return "";
     return text;
 }
 
-function cleanSrtForTranslation(
-    srt
-) {
-    const normalized =
-        normalizeSrt(
-            srt
-        );
+function cleanSrtForTranslation(srt) {
+    const normalized = normalizeSrt(srt);
+    if (!normalized) return "";
 
-    if (
-        !normalized
-    ) {
-        return "";
-    }
-
-    const rawBlocks =
-        normalized.split(
-            /\n{2,}/
-        );
-
+    const rawBlocks = normalized.split(/\n{2,}/);
     const cleanedBlocks = [];
-
     let removedBlocks = 0;
     let changedLines = 0;
 
-    for (
-        const rawBlock
-        of rawBlocks
-    ) {
-        const lines =
-            rawBlock
-                .trim()
-                .split(
-                    "\n"
-                );
+    for (const rawBlock of rawBlocks) {
+        const lines = rawBlock.trim().split("\n");
+        const timingIndex = lines.findIndex(line => /-->/.test(line));
+        if (timingIndex === -1) continue;
 
-        const timingIndex =
-            lines.findIndex(
-                line =>
-                    /-->/.test(
-                        line
-                    )
-            );
-
-        if (
-            timingIndex ===
-            -1
-        ) {
-            continue;
-        }
-
-        const timing =
-            lines[
-                timingIndex
-            ].trim();
-
+        const timing = lines[timingIndex].trim();
         const dialogue = [];
 
-        for (
-            const line
-            of lines.slice(
-                timingIndex + 1
-            )
-        ) {
-            const cleaned =
-                cleanDialogueLine(
-                    line
-                );
-
-            if (
-                cleaned !==
-                line.trim()
-            ) {
-                changedLines++;
-            }
-
-            if (
-                cleaned
-            ) {
-                dialogue.push(
-                    cleaned
-                );
-            }
+        for (const line of lines.slice(timingIndex + 1)) {
+            const cleaned = cleanDialogueLine(line);
+            if (cleaned !== line.trim()) changedLines++;
+            if (cleaned) dialogue.push(cleaned);
         }
 
-        if (
-            !dialogue.length
-        ) {
+        if (!dialogue.length) {
             removedBlocks++;
-
             continue;
         }
 
-        cleanedBlocks.push({
-            timing,
-            dialogue
-        });
+        cleanedBlocks.push({ timing, dialogue });
     }
 
-    const result =
-        cleanedBlocks
-            .map(
-                (
-                    block,
-                    index
-                ) =>
-                    [
-                        index + 1,
-                        block.timing,
-                        ...block.dialogue
-                    ].join(
-                        "\n"
-                    )
-            )
-            .join(
-                "\n\n"
-            )
-            .trim();
+    const result = cleanedBlocks
+        .map((block, index) =>
+            [index + 1, block.timing, ...block.dialogue].join("\n")
+        )
+        .join("\n\n")
+        .trim();
 
     console.log(
         `[CLEAN] SDH/CC: ${rawBlocks.length} -> ${cleanedBlocks.length} blocos; ${removedBlocks} removidos; ${changedLines} linha(s) alterada(s).`
     );
 
-    return result
-        ? `${result}\n`
-        : "";
+    return result ? `${result}\n` : "";
 }
 
-function parseSrt(
-    srt
-) {
-    const normalized =
-        normalizeSrt(
-            srt
-        );
-
-    if (
-        !normalized
-    ) {
-        return [];
-    }
+function parseSrt(srt) {
+    const normalized = normalizeSrt(srt);
+    if (!normalized) return [];
 
     const result = [];
 
-    for (
-        const raw
-        of normalized.split(
-            /\n{2,}/
-        )
-    ) {
-        const lines =
-            raw
-                .trim()
-                .split(
-                    "\n"
-                );
+    for (const raw of normalized.split(/\n{2,}/)) {
+        const lines = raw.trim().split("\n");
+        if (lines.length < 3) continue;
 
-        if (
-            lines.length <
-            3
-        ) {
-            continue;
-        }
+        const indexLine = lines[0].trim();
+        const timingLine = lines[1].trim();
 
-        const indexLine =
-            lines[0].trim();
-
-        const timingLine =
-            lines[1].trim();
-
-        if (
-            !/^\d+$/.test(
-                indexLine
-            )
-        ) {
-            continue;
-        }
-
+        if (!/^\d+$/.test(indexLine)) continue;
         if (
             !/^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/.test(
                 timingLine
@@ -822,55 +305,27 @@ function parseSrt(
         }
 
         result.push({
-            index:
-                Number(
-                    indexLine
-                ),
-
-            timing:
-                timingLine,
-
-            text:
-                lines
-                    .slice(
-                        2
-                    )
-                    .join(
-                        "\n"
-                    )
+            index: Number(indexLine),
+            timing: timingLine,
+            text: lines.slice(2).join("\n")
         });
     }
 
     return result;
 }
 
-function buildSrt(
-    blocks,
-    translatedTexts
-) {
+function buildSrt(blocks, translatedTexts) {
     return (
         blocks
-            .map(
-                (
-                    block,
-                    index
-                ) =>
-                    [
-                        block.index,
-                        block.timing,
-                        translatedTexts[
-                            index
-                        ] ??
-                        block.text
-                    ].join(
-                        "\n"
-                    )
+            .map((block, index) =>
+                [
+                    block.index,
+                    block.timing,
+                    translatedTexts[index] ?? block.text
+                ].join("\n")
             )
-            .join(
-                "\n\n"
-            )
-            .trim() +
-        "\n"
+            .join("\n\n")
+            .trim() + "\n"
     );
 }
 
@@ -878,52 +333,25 @@ function buildSrt(
 // CACHE
 // ============================================================
 
-function setTranslationCache(
-    key,
-    srt
-) {
-    const now =
-        Date.now();
+function setTranslationCache(key, srt) {
+    const now = Date.now();
 
-    translationCache.set(
-        key,
-        {
-            srt,
-
-            createdAt:
-                now,
-
-            expiresAt:
-                now +
-                CACHE_TTL_MS
-        }
-    );
+    translationCache.set(key, {
+        srt,
+        createdAt: now,
+        expiresAt: now + CACHE_TTL_MS
+    });
 
     cleanupMemory();
 }
 
-function getTranslationCache(
-    key
-) {
-    const item =
-        translationCache.get(
-            key
-        );
+function getTranslationCache(key) {
+    const item = translationCache.get(key);
 
-    if (
-        !item
-    ) {
-        return null;
-    }
+    if (!item) return null;
 
-    if (
-        item.expiresAt <=
-        Date.now()
-    ) {
-        translationCache.delete(
-            key
-        );
-
+    if (item.expiresAt <= Date.now()) {
+        translationCache.delete(key);
         return null;
     }
 
@@ -934,63 +362,34 @@ function getTranslationCache(
 // LOTES
 // ============================================================
 
-function splitIntoBatches(
-    blocks
-) {
+function splitIntoBatches(blocks) {
     const batches = [];
-
     let current = [];
-
     let currentChars = 0;
 
-    for (
-        const block
-        of blocks
-    ) {
+    for (const block of blocks) {
         const blockChars =
-            String(
-                block.text || ""
-            ).length +
-            50;
+            String(block.text || "").length + 50;
 
         const exceedChars =
-            current.length >
-            0 &&
-            currentChars +
-            blockChars >
-            MAX_BATCH_CHARS;
+            current.length > 0 &&
+            currentChars + blockChars > MAX_BATCH_CHARS;
 
         const exceedBlocks =
-            current.length >=
-            MAX_BATCH_BLOCKS;
+            current.length >= MAX_BATCH_BLOCKS;
 
-        if (
-            exceedChars ||
-            exceedBlocks
-        ) {
-            batches.push(
-                current
-            );
-
+        if (exceedChars || exceedBlocks) {
+            batches.push(current);
             current = [];
-
             currentChars = 0;
         }
 
-        current.push(
-            block
-        );
-
-        currentChars +=
-            blockChars;
+        current.push(block);
+        currentChars += blockChars;
     }
 
-    if (
-        current.length
-    ) {
-        batches.push(
-            current
-        );
+    if (current.length) {
+        batches.push(current);
     }
 
     return batches;
@@ -1003,30 +402,23 @@ function splitIntoBatches(
 function getCooldownRemaining() {
     return Math.max(
         0,
-        geminiCooldownUntil -
-        Date.now()
+        geminiCooldownUntil - Date.now()
     );
 }
 
-function setGeminiCooldown(
-    ms
-) {
-    const safeMs =
-        Math.min(
-            Math.max(
-                Number(ms) ||
-                30_000,
-                1000
-            ),
-            MAX_RATE_LIMIT_COOLDOWN_MS
-        );
-
-    geminiCooldownUntil =
+function setGeminiCooldown(ms) {
+    const safeMs = Math.min(
         Math.max(
-            geminiCooldownUntil,
-            Date.now() +
-            safeMs
-        );
+            Number(ms) || 30_000,
+            1000
+        ),
+        MAX_RATE_LIMIT_COOLDOWN_MS
+    );
+
+    geminiCooldownUntil = Math.max(
+        geminiCooldownUntil,
+        Date.now() + safeMs
+    );
 
     console.log(
         `[GEMINI] RATE LIMIT. Cooldown global de ${Math.ceil(
@@ -1035,33 +427,19 @@ function setGeminiCooldown(
     );
 }
 
-function getRetryAfterMs(
-    response,
-    errorData
-) {
+function getRetryAfterMs(response, errorData) {
     const header =
-        response?.headers?.get(
-            "retry-after"
-        );
+        response?.headers?.get("retry-after");
 
-    if (
-        header
-    ) {
-        const seconds =
-            Number(
-                header
-            );
+    if (header) {
+        const seconds = Number(header);
 
         if (
-            Number.isFinite(
-                seconds
-            ) &&
-            seconds >
-            0
+            Number.isFinite(seconds) &&
+            seconds > 0
         ) {
             return Math.min(
-                seconds *
-                1000,
+                seconds * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
             );
         }
@@ -1069,10 +447,7 @@ function getRetryAfterMs(
 
     const message =
         String(
-            errorData
-                ?.error
-                ?.message ||
-            ""
+            errorData?.error?.message || ""
         );
 
     let match =
@@ -1080,25 +455,13 @@ function getRetryAfterMs(
             /retry in\s+([\d.]+)s/i
         );
 
-    if (
-        match
-    ) {
+    if (match) {
         const seconds =
-            Number(
-                match[1]
-            );
+            Number(match[1]);
 
-        if (
-            Number.isFinite(
-                seconds
-            )
-        ) {
+        if (Number.isFinite(seconds)) {
             return Math.min(
-                (
-                    seconds +
-                    1
-                ) *
-                1000,
+                (seconds + 1) * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
             );
         }
@@ -1109,28 +472,19 @@ function getRetryAfterMs(
             /retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i
         );
 
-    if (
-        match
-    ) {
+    if (match) {
         const minutes =
-            Number(
-                match[1]
-            );
+            Number(match[1]);
 
         const seconds =
-            Number(
-                match[2] ||
-                0
-            );
+            Number(match[2] || 0);
 
         return Math.min(
             (
-                minutes *
-                60 +
+                minutes * 60 +
                 seconds +
                 1
-            ) *
-            1000,
+            ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
@@ -1140,18 +494,12 @@ function getRetryAfterMs(
             /retry in\s+(\d+)m/i
         );
 
-    if (
-        match
-    ) {
+    if (match) {
         return Math.min(
             (
-                Number(
-                    match[1]
-                ) *
-                60 +
+                Number(match[1]) * 60 +
                 1
-            ) *
-            1000,
+            ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
@@ -1159,17 +507,11 @@ function getRetryAfterMs(
     return 30_000;
 }
 
-function isRateLimitError(
-    status,
-    message
-) {
+function isRateLimitError(status, message) {
     return (
-        status ===
-        429 ||
+        status === 429 ||
         /quota|rate.?limit|resource.?exhausted|too many requests/i.test(
-            String(
-                message || ""
-            )
+            String(message || "")
         )
     );
 }
@@ -1178,21 +520,33 @@ function isRateLimitError(
 // GEMINI
 // ============================================================
 
+const SYSTEM_TRANSLATION_INSTRUCTION =
+    "Você é um tradutor e adaptador profissional de legendas para Português do Brasil, especializado em linguagem audiovisual. " +
+    "A entrada será majoritariamente em inglês, mas pode conter trechos em italiano, espanhol, francês ou outros idiomas; traduza também esses trechos para PT-BR quando forem conteúdo falado ou cantado relevante. " +
+    "Use português brasileiro natural, fluente, idiomático e adequado ao contexto, evitando traduções literais artificiais. " +
+    "Adapte gírias, expressões idiomáticas, piadas e trocadilhos quando existir uma solução natural em PT-BR que preserve a intenção. " +
+    "Quando um bordão, termo cunhado, nome de marca, nome próprio ou expressão icônica não tiver equivalente natural e reconhecível em PT-BR, preserve o original em vez de inventar uma tradução estranha. " +
+    "Exemplo: preserve 'Condragulations' como 'Condragulations'; não invente neologismos como 'Parabravas'. " +
+    "Use os blocos vizinhos como contexto para entender gírias, referências, humor e intenção, mas nunca misture conteúdo entre IDs. " +
+    "Quando houver letra de música realmente transcrita na legenda, traduza seu conteúdo para PT-BR, mesmo que esteja em um idioma diferente do inglês. " +
+    "Não invente letras quando houver apenas marcações como [music], símbolos musicais ou descrições de som. " +
+    "Preserve nomes próprios, marcas, títulos, termos técnicos, palavrões, intensidade emocional e intenção. " +
+    "Não censure. Não resuma. Não explique. " +
+    "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. " +
+    "Traduza somente o campo text. Mantenha exatamente os IDs recebidos. " +
+    "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares.";
+
 async function rawGeminiRequest(
     prompt,
     deadlineAt
 ) {
-    if (
-        !GEMINI_API_KEY
-    ) {
+    if (!GEMINI_API_KEY) {
         throw new Error(
             "GEMINI_API_KEY não configurada."
         );
     }
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     const endpoint =
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -1204,27 +558,18 @@ async function rawGeminiRequest(
             parts: [
                 {
                     text:
-                        "Você é um tradutor profissional de legendas cinematográficas. " +
-                        "Traduza inglês para Português do Brasil. " +
-                        "Seja natural, fluente e fiel ao significado. " +
-                        "Preserve nomes próprios, marcas, termos técnicos, humor, gírias, palavrões, intensidade emocional e intenção. " +
-                        "Não censure. Não resuma. Não explique. " +
-                        "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. " +
-                        "Traduza somente o campo text. Mantenha exatamente os IDs recebidos. " +
-                        "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares."
+                        SYSTEM_TRANSLATION_INSTRUCTION
                 }
             ]
         },
 
         contents: [
             {
-                role:
-                    "user",
+                role: "user",
 
                 parts: [
                     {
-                        text:
-                            prompt
+                        text: prompt
                     }
                 ]
             }
@@ -1235,22 +580,18 @@ async function rawGeminiRequest(
                 "application/json",
 
             responseSchema: {
-                type:
-                    "ARRAY",
+                type: "ARRAY",
 
                 items: {
-                    type:
-                        "OBJECT",
+                    type: "OBJECT",
 
                     properties: {
                         id: {
-                            type:
-                                "INTEGER"
+                            type: "INTEGER"
                         },
 
                         text: {
-                            type:
-                                "STRING"
+                            type: "STRING"
                         }
                     },
 
@@ -1260,8 +601,7 @@ async function rawGeminiRequest(
                     ]
                 },
 
-                minItems:
-                    1
+                minItems: 1
             },
 
             maxOutputTokens:
@@ -1274,10 +614,7 @@ async function rawGeminiRequest(
             deadlineAt
         );
 
-    if (
-        remaining <=
-        0
-    ) {
+    if (remaining <= 0) {
         throw translationTimeoutError();
     }
 
@@ -1314,8 +651,7 @@ async function rawGeminiRequest(
             await fetch(
                 endpoint,
                 {
-                    method:
-                        "POST",
+                    method: "POST",
 
                     headers: {
                         "Content-Type":
@@ -1337,24 +673,20 @@ async function rawGeminiRequest(
 
         rawText =
             await response.text();
-    } catch (
-        error
-    ) {
+    } catch (error) {
         if (
             Number.isFinite(
                 deadlineAt
             ) &&
             Date.now() >=
-            deadlineAt
+                deadlineAt
         ) {
             throw translationTimeoutError();
         }
 
         throw error;
     } finally {
-        clearTimeout(
-            timer
-        );
+        clearTimeout(timer);
     }
 
     assertBeforeDeadline(
@@ -1380,13 +712,9 @@ async function rawGeminiRequest(
         throw error;
     }
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         const message =
-            data
-                ?.error
-                ?.message ||
+            data?.error?.message ||
             `HTTP ${response.status}`;
 
         const error =
@@ -1406,33 +734,25 @@ async function rawGeminiRequest(
         error.retryAfterMs =
             error.rateLimit
                 ? getRetryAfterMs(
-                    response,
-                    data
-                )
+                      response,
+                      data
+                  )
                 : 0;
 
         throw error;
     }
 
     const text =
-        data
-            ?.candidates
-            ?.[0]
-            ?.content
-            ?.parts
+        data?.candidates?.[0]
+            ?.content?.parts
             ?.map(
                 part =>
-                    part?.text ||
-                    ""
+                    part?.text || ""
             )
-            .join(
-                ""
-            )
+            .join("")
             .trim();
 
-    if (
-        !text
-    ) {
+    if (!text) {
         throw new Error(
             "Gemini não retornou conteúdo."
         );
@@ -1455,7 +775,7 @@ function enqueueGemini(
                     deadlineAt
                 ) &&
                 Date.now() >=
-                deadlineAt
+                    deadlineAt
             ) {
                 reject(
                     translationTimeoutError()
@@ -1477,25 +797,18 @@ function enqueueGemini(
 }
 
 async function processGeminiQueue() {
-    if (
-        geminiWorkerRunning
-    ) {
+    if (geminiWorkerRunning) {
         return;
     }
 
-    geminiWorkerRunning =
-        true;
+    geminiWorkerRunning = true;
 
     try {
-        while (
-            geminiQueue.length
-        ) {
+        while (geminiQueue.length) {
             const item =
                 geminiQueue.shift();
 
-            if (
-                !item
-            ) {
+            if (!item) {
                 continue;
             }
 
@@ -1504,7 +817,7 @@ async function processGeminiQueue() {
                     item.deadlineAt
                 ) &&
                 Date.now() >=
-                item.deadlineAt
+                    item.deadlineAt
             ) {
                 item.reject(
                     translationTimeoutError()
@@ -1514,12 +827,9 @@ async function processGeminiQueue() {
             }
 
             let normalAttempt = 1;
-
             let finished = false;
 
-            while (
-                !finished
-            ) {
+            while (!finished) {
                 try {
                     assertBeforeDeadline(
                         item.deadlineAt
@@ -1528,14 +838,10 @@ async function processGeminiQueue() {
                     const cooldown =
                         getCooldownRemaining();
 
-                    if (
-                        cooldown >
-                        0
-                    ) {
+                    if (cooldown > 0) {
                         console.log(
                             `[GEMINI] Fila aguardando cooldown de ${Math.ceil(
-                                cooldown /
-                                1000
+                                cooldown / 1000
                             )}s.`
                         );
 
@@ -1550,15 +856,13 @@ async function processGeminiQueue() {
                         lastGeminiRequestAt;
 
                     if (
-                        lastGeminiRequestAt >
-                        0 &&
+                        lastGeminiRequestAt > 0 &&
                         sinceLast <
-                        MIN_REQUEST_INTERVAL_MS
+                            MIN_REQUEST_INTERVAL_MS
                     ) {
                         await sleepWithDeadline(
                             MIN_REQUEST_INTERVAL_MS -
-                            sinceLast,
-
+                                sinceLast,
                             item.deadlineAt
                         );
                     }
@@ -1568,7 +872,9 @@ async function processGeminiQueue() {
                     );
 
                     console.log(
-                        `[GEMINI] Request ${normalAttempt}/${MAX_NORMAL_RETRIES + 1}`
+                        `[GEMINI] Request ${normalAttempt}/${
+                            MAX_NORMAL_RETRIES + 1
+                        }`
                     );
 
                     lastGeminiRequestAt =
@@ -1580,33 +886,25 @@ async function processGeminiQueue() {
                             item.deadlineAt
                         );
 
-                    item.resolve(
-                        result
-                    );
-
-                    finished =
-                        true;
-                } catch (
-                    error
-                ) {
+                    item.resolve(result);
+                    finished = true;
+                } catch (error) {
                     if (
                         error?.code ===
-                        "TRANSLATION_TIMEOUT" ||
+                            "TRANSLATION_TIMEOUT" ||
                         (
                             Number.isFinite(
                                 item.deadlineAt
                             ) &&
                             Date.now() >=
-                            item.deadlineAt
+                                item.deadlineAt
                         )
                     ) {
                         item.reject(
                             translationTimeoutError()
                         );
 
-                        finished =
-                            true;
-
+                        finished = true;
                         continue;
                     }
 
@@ -1616,13 +914,8 @@ async function processGeminiQueue() {
                         )}`
                     );
 
-                    /*
-                     * 429 NÃO consome
-                     * uma tentativa normal.
-                     */
-                    if (
-                        error?.rateLimit
-                    ) {
+                    // 429 não consome uma tentativa normal.
+                    if (error?.rateLimit) {
                         setGeminiCooldown(
                             error.retryAfterMs ||
                             30_000
@@ -1641,8 +934,7 @@ async function processGeminiQueue() {
 
                         console.log(
                             `[GEMINI] Retry normal em ${Math.ceil(
-                                wait /
-                                1000
+                                wait / 1000
                             )}s.`
                         );
 
@@ -1660,33 +952,29 @@ async function processGeminiQueue() {
                                 timeoutError
                             );
 
-                            finished =
-                                true;
+                            finished = true;
                         }
 
                         continue;
                     }
 
-                    item.reject(
-                        error
-                    );
-
-                    finished =
-                        true;
+                    item.reject(error);
+                    finished = true;
                 }
             }
         }
     } finally {
-        geminiWorkerRunning =
-            false;
+        geminiWorkerRunning = false;
 
-        if (
-            geminiQueue.length
-        ) {
+        if (geminiQueue.length) {
             processGeminiQueue();
         }
     }
 }
+
+// ============================================================
+// PROMPT DE TRADUÇÃO 5.2
+// ============================================================
 
 function buildTranslationPrompt(
     blocks
@@ -1703,33 +991,34 @@ function buildTranslationPrompt(
         );
 
     return `
-Traduza os textos abaixo do inglês para Português do Brasil.
+Traduza os textos abaixo para Português do Brasil.
+A entrada será principalmente em inglês, mas pode conter trechos em outros idiomas. Traduza também esses trechos quando forem fala ou letra de música transcrita.
 
 REGRAS OBRIGATÓRIAS:
-
 1. Retorne exatamente um objeto para cada entrada.
 2. Preserve todos os IDs exatamente.
 3. Não crie nem remova IDs.
 4. Traduza somente o campo "text".
 5. Não escreva explicações, markdown ou texto fora do JSON.
-6. Não resuma.
-7. Preserve toda informação falada presente no texto recebido.
-8. Preserve nomes próprios, marcas, termos técnicos, humor, gírias e palavrões.
-9. Não censure.
-10. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
-11. Use Português do Brasil natural, não tradução literal artificial.
-12. Preserve sentido, intenção e intensidade emocional.
-13. Não acrescente informações.
-14. Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
-15. Não misture textos entre IDs.
-16. Cada ID deve receber somente a tradução do próprio texto.
+6. Não resuma nem omita informação falada ou cantada presente no texto.
+7. Use Português do Brasil natural, fluente e idiomático; evite tradução palavra por palavra quando soar artificial.
+8. Adapte gírias, expressões idiomáticas, humor, piadas e trocadilhos quando houver uma adaptação natural que preserve a intenção.
+9. Se uma adaptação de trocadilho, bordão ou termo cunhado ficar forçada, confusa ou sem sentido em PT-BR, preserve o termo original em vez de inventar uma palavra nova.
+10. Preserve bordões, nomes próprios, marcas, nomes de personagens, títulos e termos icônicos quando não houver equivalente natural e reconhecível em PT-BR. Exemplo: "Condragulations" deve permanecer "Condragulations".
+11. Não censure palavrões, linguagem sexual, sarcasmo, deboche ou intensidade emocional.
+12. Use os IDs anteriores e seguintes do mesmo lote apenas como contexto para entender significado, gírias, referências, pronomes, humor e continuidade; não transfira texto de um ID para outro.
+13. Se houver fala ou letra de música em italiano, espanhol, francês ou qualquer outro idioma, traduza-a para PT-BR também, desde que seja conteúdo real da legenda e não apenas um nome próprio ou título.
+14. Quando houver letra de música realmente transcrita, traduza o conteúdo da letra. Não invente letras para marcações de música, descrições de som ou símbolos musicais.
+15. Preserve vocalizações, nomes de artistas, nomes de músicas e nomes próprios quando funcionarem como nomes, não como frases a serem traduzidas.
+16. Preserve tags HTML/ASS como <i>, </i>, <b>, </b>, {\\i1}, {\\i0}.
+17. Não acrescente informações, notas explicativas, nomes de falantes, descrições de sons, rubricas SDH/CC ou observações.
+18. Não misture textos entre IDs.
+19. Cada ID deve receber somente a tradução correspondente ao próprio texto.
 
 RETORNE SOMENTE UM ARRAY JSON NO FORMATO:
-
 [{"id":123,"text":"tradução"}]
 
 ENTRADAS:
-
 ${JSON.stringify(
     payload
 )}
@@ -1763,7 +1052,6 @@ async function translateBatchOnce(
             buildTranslationPrompt(
                 blocks
             ),
-
             deadlineAt
         );
 
@@ -1805,7 +1093,7 @@ async function translateBatchOnce(
                 item.id
             ) &&
             typeof item.text ===
-            "string"
+                "string"
         ) {
             translatedById.set(
                 item.id,
@@ -1826,7 +1114,7 @@ async function translateBatchOnce(
         translated.some(
             text =>
                 typeof text !==
-                "string"
+                    "string"
         )
     ) {
         throw badModelOutputError(
@@ -1847,20 +1135,14 @@ async function translateBatch(
             blocks,
             deadlineAt
         );
-    } catch (
-        error
-    ) {
+    } catch (error) {
         const canSplit =
             error?.code ===
-            "BAD_MODEL_OUTPUT" &&
-            blocks.length >=
-            80 &&
-            splitDepth <
-            3;
+                "BAD_MODEL_OUTPUT" &&
+            blocks.length >= 80 &&
+            splitDepth < 3;
 
-        if (
-            !canSplit
-        ) {
+        if (!canSplit) {
             throw error;
         }
 
@@ -1870,8 +1152,7 @@ async function translateBatch(
 
         const middle =
             Math.ceil(
-                blocks.length /
-                2
+                blocks.length / 2
             );
 
         const left =
@@ -1919,9 +1200,7 @@ async function translateSrt(
             originalSrt
         );
 
-    if (
-        !blocks.length
-    ) {
+    if (!blocks.length) {
         throw new Error(
             "Nenhum bloco SRT válido."
         );
@@ -1943,11 +1222,10 @@ async function translateSrt(
                 (
                     block,
                     index
-                ) =>
-                    [
-                        block,
-                        index
-                    ]
+                ) => [
+                    block,
+                    index
+                ]
             )
         );
 
@@ -1960,7 +1238,7 @@ async function translateSrt(
         )
             ? job.deadlineAt
             : startedAt +
-            MAX_TRANSLATION_TIME_MS;
+              MAX_TRANSLATION_TIME_MS;
 
     console.log(
         `[TRANSLATE] ${blocks.length} blocos.`
@@ -1976,8 +1254,7 @@ async function translateSrt(
 
     for (
         let batchIndex = 0;
-        batchIndex <
-        batches.length;
+        batchIndex < batches.length;
         batchIndex++
     ) {
         assertBeforeDeadline(
@@ -1998,13 +1275,19 @@ async function translateSrt(
                     total +
                     String(
                         block.text ||
-                        ""
+                            ""
                     ).length,
                 0
             );
 
         console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
+            `[TRANSLATE] Lote ${
+                batchIndex + 1
+            }/${batches.length} - ${
+                batch.length
+            } blocos / ${
+                batchChars
+            } caracteres.`
         );
 
         const translated =
@@ -2015,8 +1298,7 @@ async function translateSrt(
 
         for (
             let i = 0;
-            i <
-            batch.length;
+            i < batch.length;
             i++
         ) {
             const originalIndex =
@@ -2044,12 +1326,11 @@ async function translateSrt(
                     ) /
                     batches.length
                 ) *
-                100
+                    100
             );
 
         job.completedBatches =
-            batchIndex +
-            1;
+            batchIndex + 1;
 
         job.totalBatches =
             batches.length;
@@ -2058,7 +1339,9 @@ async function translateSrt(
             Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} concluído.`
+            `[TRANSLATE] Lote ${
+                batchIndex + 1
+            }/${batches.length} concluído.`
         );
     }
 
@@ -2066,7 +1349,7 @@ async function translateSrt(
         translatedTexts.some(
             text =>
                 typeof text !==
-                "string"
+                    "string"
         )
     ) {
         throw new Error(
@@ -2081,9 +1364,7 @@ async function translateSrt(
                 startedAt
             ) /
             1000
-        ).toFixed(
-            1
-        )}s.`
+        ).toFixed(1)}s.`
     );
 
     return buildSrt(
@@ -2108,17 +1389,11 @@ function createJob({
         Date.now();
 
     const job = {
-        id:
-            jobId,
-
+        id: jobId,
         cacheKey,
-
         type,
-
         videoId,
-
         sourceHash,
-
         sourceSrt,
 
         status:
@@ -2145,13 +1420,7 @@ function createJob({
         updatedAt:
             now,
 
-        /*
-         * O prazo total começa
-         * no momento em que o job nasce.
-         *
-         * Portanto tempo na fila
-         * também conta nos 8 minutos.
-         */
+        // Tempo em fila também conta no teto total.
         deadlineAt:
             now +
             MAX_TRANSLATION_TIME_MS,
@@ -2182,17 +1451,15 @@ function getJob(
             jobId
         );
 
-    if (
-        !job
-    ) {
+    if (!job) {
         return null;
     }
 
     if (
         job.expiresAt <=
-        Date.now() &&
+            Date.now() &&
         job.status !==
-        "processing"
+            "processing"
     ) {
         jobs.delete(
             jobId
@@ -2213,9 +1480,9 @@ function findProcessingJob(
     ) {
         if (
             job.cacheKey ===
-            cacheKey &&
+                cacheKey &&
             job.status ===
-            "processing"
+                "processing"
         ) {
             return job;
         }
@@ -2237,9 +1504,7 @@ async function processJob(
                 job.cacheKey
             );
 
-        if (
-            cached
-        ) {
+        if (cached) {
             job.status =
                 "completed";
 
@@ -2289,9 +1554,7 @@ async function processJob(
         console.log(
             `[JOB ${job.id}] Concluído.`
         );
-    } catch (
-        error
-    ) {
+    } catch (error) {
         job.status =
             "failed";
 
@@ -2327,9 +1590,7 @@ function buildProcessingSrt(
         "2",
         "00:00:06,500 --> 00:00:12,000",
         `Progresso: ${progress}%. Aguarde alguns instantes.`
-    ].join(
-        "\n"
-    );
+    ].join("\n");
 }
 
 function buildErrorSrt(
@@ -2357,9 +1618,7 @@ function buildErrorSrt(
         "2",
         "00:00:08,500 --> 00:00:18,000",
         safe
-    ].join(
-        "\n"
-    );
+    ].join("\n");
 }
 
 function sendSubtitleResponse(
@@ -2368,9 +1627,7 @@ function sendSubtitleResponse(
     cacheControl =
         "no-store"
 ) {
-    res.status(
-        200
-    );
+    res.status(200);
 
     res.set({
         "Content-Type":
@@ -2411,10 +1668,10 @@ async function waitForJob(
 
     while (
         job.status ===
-        "processing" &&
+            "processing" &&
         Date.now() -
-        start <
-        timeoutMs
+            start <
+            timeoutMs
     ) {
         await sleep(
             500
@@ -2436,13 +1693,13 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "5.1.0",
+        "5.2.0",
 
     name:
         "Tradutor Gemini PT-BR",
 
     description:
-        "Traduz automaticamente legendas em inglês para Português do Brasil usando Gemini.",
+        "Traduz automaticamente legendas para Português do Brasil usando Gemini.",
 
     logo:
         "",
@@ -2553,6 +1810,9 @@ app.get(
             requestIntervalMs:
                 MIN_REQUEST_INTERVAL_MS,
 
+            maxOutputTokens:
+                MAX_OUTPUT_TOKENS,
+
             maxTranslationTimeMs:
                 MAX_TRANSLATION_TIME_MS
         });
@@ -2574,26 +1834,19 @@ function scoreSubtitle(
             ""
         ).toLowerCase();
 
-    if (
-        lang ===
-        "eng"
-    ) {
-        score +=
-            100;
+    if (lang === "eng") {
+        score += 100;
     } else if (
-        lang ===
-        "en"
+        lang === "en"
     ) {
-        score +=
-            90;
+        score += 90;
     }
 
     if (
         subtitle?.hearingImpaired ===
         false
     ) {
-        score +=
-            20;
+        score += 20;
     }
 
     if (
@@ -2603,8 +1856,7 @@ function scoreSubtitle(
         ).toLowerCase() ===
         "srt"
     ) {
-        score +=
-            20;
+        score += 20;
     }
 
     if (
@@ -2615,8 +1867,7 @@ function scoreSubtitle(
             )
         )
     ) {
-        score +=
-            10;
+        score += 10;
     }
 
     return score;
@@ -2646,12 +1897,12 @@ function selectBestSubtitle(
                     return (
                         (
                             lang ===
-                            "eng" ||
+                                "eng" ||
                             lang ===
-                            "en"
+                                "en"
                         ) &&
                         typeof subtitle?.url ===
-                        "string" &&
+                            "string" &&
                         /^https?:\/\//i.test(
                             subtitle.url
                         )
@@ -2692,23 +1943,19 @@ async function findEnglishSubtitle(
     const response =
         await fetchWithTimeout(
             searchUrl,
-
             {
                 headers: {
                     Accept:
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.1"
+                        "Stremio-Gemini-Subtitle-Translator/5.2"
                 }
             },
-
             SOURCE_FETCH_TIMEOUT_MS
         );
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         throw new Error(
             `OpenSubtitles HTTP ${response.status}.`
         );
@@ -2733,20 +1980,16 @@ async function downloadSubtitle(
     const response =
         await fetchWithTimeout(
             url,
-
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.1"
+                        "Stremio-Gemini-Subtitle-Translator/5.2"
                 }
             },
-
             SOURCE_FETCH_TIMEOUT_MS
         );
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         throw new Error(
             `Falha ao baixar legenda: HTTP ${response.status}.`
         );
@@ -2757,9 +2000,7 @@ async function downloadSubtitle(
             await response.text()
         );
 
-    if (
-        !text
-    ) {
+    if (!text) {
         throw new Error(
             "Legenda vazia."
         );
@@ -2791,9 +2032,7 @@ function createCachedJob({
             jobId
         );
 
-    if (
-        !job
-    ) {
+    if (!job) {
         job =
             createJob({
                 jobId,
@@ -2836,9 +2075,7 @@ async function createEmbeddedTranslationJob({
             sourceSrt
         );
 
-    if (
-        !rawSrt
-    ) {
+    if (!rawSrt) {
         throw new Error(
             "A legenda embutida está vazia."
         );
@@ -2853,18 +2090,12 @@ async function createEmbeddedTranslationJob({
         );
     }
 
-    /*
-     * Limpeza antes do hash
-     * e antes do Gemini.
-     */
     const normalizedSrt =
         cleanSrtForTranslation(
             rawSrt
         );
 
-    if (
-        !normalizedSrt
-    ) {
+    if (!normalizedSrt) {
         throw new Error(
             "A legenda ficou vazia após a limpeza SDH/CC."
         );
@@ -2875,9 +2106,7 @@ async function createEmbeddedTranslationJob({
             normalizedSrt
         );
 
-    if (
-        !blocks.length
-    ) {
+    if (!blocks.length) {
         throw new Error(
             "A legenda embutida não possui blocos SRT válidos."
         );
@@ -2888,10 +2117,6 @@ async function createEmbeddedTranslationJob({
             normalizedSrt
         );
 
-    /*
-     * Cache baseado no conteúdo
-     * limpo da legenda.
-     */
     const cacheKey =
         `embedded:${sourceHash}`;
 
@@ -2900,9 +2125,7 @@ async function createEmbeddedTranslationJob({
             cacheKey
         );
 
-    if (
-        cached
-    ) {
+    if (cached) {
         const cachedJobId =
             `embedded-cached-${sourceHash.slice(
                 0,
@@ -2918,11 +2141,8 @@ async function createEmbeddedTranslationJob({
                 cachedJobId,
 
             cacheKey,
-
             type,
-
             videoId,
-
             sourceHash,
 
             sourceSrt:
@@ -2937,9 +2157,7 @@ async function createEmbeddedTranslationJob({
             cacheKey
         );
 
-    if (
-        existingJob
-    ) {
+    if (existingJob) {
         console.log(
             `[EMBEDDED] Job existente reutilizado: ${existingJob.id}`
         );
@@ -2951,20 +2169,14 @@ async function createEmbeddedTranslationJob({
         `embedded-${sourceHash.slice(
             0,
             24
-        )}-${randomId(
-            8
-        )}`;
+        )}-${randomId(8)}`;
 
     const job =
         createJob({
             jobId,
-
             cacheKey,
-
             type,
-
             videoId,
-
             sourceHash,
 
             sourceSrt:
@@ -3039,9 +2251,7 @@ async function subtitlesHandler(
             ""
         ).trim();
 
-    if (
-        rawExtra
-    ) {
+    if (rawExtra) {
         const params =
             new URLSearchParams(
                 rawExtra
@@ -3079,10 +2289,7 @@ async function subtitlesHandler(
         );
     }
 
-    if (
-        !type ||
-        !id
-    ) {
+    if (!type || !id) {
         return safeJson(
             res,
             {
@@ -3098,9 +2305,7 @@ async function subtitlesHandler(
                 id
             );
 
-        if (
-            !target
-        ) {
+        if (!target) {
             console.log(
                 "[STREMIO] Nenhuma legenda inglesa encontrada."
             );
@@ -3113,26 +2318,17 @@ async function subtitlesHandler(
             );
         }
 
-        /*
-         * Baixa a legenda original.
-         */
         const downloadedSrt =
             await downloadSubtitle(
                 target.url
             );
 
-        /*
-         * Limpeza SDH/CC também vale
-         * para OpenSubtitles.
-         */
         const sourceSrt =
             cleanSrtForTranslation(
                 downloadedSrt
             );
 
-        if (
-            !sourceSrt
-        ) {
+        if (!sourceSrt) {
             console.log(
                 "[STREMIO] Legenda vazia após limpeza SDH/CC."
             );
@@ -3150,9 +2346,7 @@ async function subtitlesHandler(
                 sourceSrt
             );
 
-        if (
-            !blocks.length
-        ) {
+        if (!blocks.length) {
             return safeJson(
                 res,
                 {
@@ -3179,9 +2373,7 @@ async function subtitlesHandler(
                 cacheKey
             );
 
-        if (
-            cached
-        ) {
+        if (cached) {
             const jobId =
                 `cached-${sourceHash.slice(
                     0,
@@ -3234,30 +2426,23 @@ async function subtitlesHandler(
                 cacheKey
             );
 
-        if (
-            !job
-        ) {
+        if (!job) {
             const jobId =
                 `job-${sourceHash.slice(
                     0,
                     24
-                )}-${randomId(
-                    8
-                )}`;
+                )}-${randomId(8)}`;
 
             job =
                 createJob({
                     jobId,
-
                     cacheKey,
-
                     type,
 
                     videoId:
                         id,
 
                     sourceHash,
-
                     sourceSrt
                 });
 
@@ -3319,9 +2504,7 @@ async function subtitlesHandler(
                 ]
             }
         );
-    } catch (
-        error
-    ) {
+    } catch (error) {
         console.error(
             `[STREMIO] Erro: ${getErrorMessage(
                 error
@@ -3407,7 +2590,7 @@ app.post(
             if (
                 !srt ||
                 typeof srt !==
-                "string"
+                    "string"
             ) {
                 return safeJson(
                     res,
@@ -3478,9 +2661,7 @@ app.post(
                     subtitleUrl
                 }
             );
-        } catch (
-            error
-        ) {
+        } catch (error) {
             console.error(
                 "[EMBEDDED API] Erro:",
                 error
@@ -3526,12 +2707,9 @@ async function subtitleResultHandler(
             raw;
     }
 
-    if (
-        !jobId
-    ) {
+    if (!jobId) {
         return sendSubtitleResponse(
             res,
-
             buildErrorSrt(
                 "Job inválido."
             )
@@ -3543,12 +2721,9 @@ async function subtitleResultHandler(
             jobId
         );
 
-    if (
-        !job
-    ) {
+    if (!job) {
         return sendSubtitleResponse(
             res,
-
             buildErrorSrt(
                 "Esta tradução expirou. Recarregue as legendas."
             )
@@ -3557,7 +2732,7 @@ async function subtitleResultHandler(
 
     if (
         job.status ===
-        "completed" &&
+            "completed" &&
         job.result
     ) {
         return sendSubtitleResponse(
@@ -3573,21 +2748,13 @@ async function subtitleResultHandler(
     ) {
         return sendSubtitleResponse(
             res,
-
             buildErrorSrt(
                 job.error
             ),
-
             "no-store"
         );
     }
 
-    /*
-     * Esperamos até 15 segundos
-     * nesta conexão.
-     *
-     * O job continua no Render.
-     */
     const completed =
         await waitForJob(
             job,
@@ -3597,7 +2764,7 @@ async function subtitleResultHandler(
     if (
         completed &&
         job.status ===
-        "completed" &&
+            "completed" &&
         job.result
     ) {
         return sendSubtitleResponse(
@@ -3613,22 +2780,18 @@ async function subtitleResultHandler(
     ) {
         return sendSubtitleResponse(
             res,
-
             buildErrorSrt(
                 job.error
             ),
-
             "no-store"
         );
     }
 
     return sendSubtitleResponse(
         res,
-
         buildProcessingSrt(
             job
         ),
-
         "no-store, no-cache, must-revalidate"
     );
 }
@@ -3650,7 +2813,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.1"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.2"
         );
 
         console.log(
@@ -3709,6 +2872,10 @@ app.listen(
 
         console.log(
             "Limpeza SDH/CC: ATIVA"
+        );
+
+        console.log(
+            "Adaptação audiovisual 5.2: ATIVA"
         );
 
         console.log(
