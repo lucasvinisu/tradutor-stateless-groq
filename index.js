@@ -3263,25 +3263,28 @@ async function translateSrt(
     const startedAt =
         Date.now();
 
+    /*
+     * 5.8.1:
+     * O teto de tradução começa SOMENTE quando este job realmente
+     * entra em translateSrt. Tempo aguardando translationJobQueue
+     * não consome mais os 8 minutos de processamento.
+     */
     const deadlineAt =
-        Number.isFinite(
-            job?.deadlineAt
-        )
-            ? job.deadlineAt
-            : startedAt +
-              MAX_TRANSLATION_TIME_MS;
+        startedAt +
+        MAX_TRANSLATION_TIME_MS;
 
     job.startedAt =
         startedAt;
 
-    if (
-        !Number.isFinite(
-            job.deadlineAt
-        )
-    ) {
-        job.deadlineAt =
-            deadlineAt;
-    }
+    job.deadlineAt =
+        deadlineAt;
+
+    job.updatedAt =
+        startedAt;
+
+    console.log(
+        `[JOB ${job.id}] Cronômetro de tradução iniciado agora: ${MAX_TRANSLATION_TIME_MS}ms disponíveis; espera anterior na fila não contabilizada.`
+    );
 
     assertBeforeDeadline(
         deadlineAt
@@ -3494,8 +3497,10 @@ function createJob({
             now,
 
         deadlineAt:
-            now +
-            MAX_TRANSLATION_TIME_MS,
+            null,
+
+        queuedAt:
+            null,
 
         expiresAt:
             now +
@@ -3666,6 +3671,9 @@ function enqueueTranslationJob(
                 return;
             }
 
+            job.queuedAt =
+                Date.now();
+
             translationJobQueue.push({
                 job,
                 resolve,
@@ -3718,32 +3726,19 @@ async function processTranslationJobQueue() {
                     continue;
                 }
 
-                if (
+                const queueWaitMs =
                     Number.isFinite(
-                        job.deadlineAt
-                    ) &&
-                    Date.now() >=
-                        job.deadlineAt
-                ) {
-                    job.status =
-                        "failed";
-
-                    job.error =
-                        "Tempo máximo de tradução atingido.";
-
-                    job.updatedAt =
-                        Date.now();
-
-                    console.error(
-                        `[JOB ${job.id}] Falhou antes de iniciar: ${job.error}`
-                    );
-
-                    resolve();
-                    continue;
-                }
+                        job.queuedAt
+                    )
+                        ? Math.max(
+                              0,
+                              Date.now() -
+                                  job.queuedAt
+                          )
+                        : 0;
 
                 console.log(
-                    `[JOB QUEUE] Iniciando job completo ${job.id}. Restantes na fila: ${translationJobQueue.length}.`
+                    `[JOB QUEUE] Iniciando job completo ${job.id}. Restantes na fila: ${translationJobQueue.length}. Espera na fila: ${(queueWaitMs / 1000).toFixed(1)}s — não consumiu o teto de tradução.`
                 );
 
                 await processJob(
@@ -3917,7 +3912,7 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "5.8.0",
+        "5.8.1",
 
     name:
         "Tradutor Gemini PT-BR",
@@ -4473,7 +4468,7 @@ async function findEnglishSubtitle(
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.8"
+                        "Stremio-Gemini-Subtitle-Translator/5.8.1"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -4542,7 +4537,7 @@ async function downloadSubtitle(
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.8"
+                        "Stremio-Gemini-Subtitle-Translator/5.8.1"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -5362,7 +5357,7 @@ async function subtitleResultHandler(
 
     if (
         job.status ===
-        "failed"
+            "failed"
     ) {
         return sendSubtitleResponse(
             res,
@@ -5439,7 +5434,7 @@ async function subtitleResultHandler(
 
     if (
         job.status ===
-        "failed"
+            "failed"
     ) {
         return sendSubtitleResponse(
             res,
@@ -5478,7 +5473,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.8"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.8.1"
         );
 
         console.log(
@@ -5523,6 +5518,10 @@ app.listen(
 
         console.log(
             `Teto total tradução: ${MAX_TRANSLATION_TIME_MS}ms`
+        );
+
+        console.log(
+            "Relógio do teto: INICIA AO COMEÇAR O PROCESSAMENTO (fila não conta)"
         );
 
         console.log(
