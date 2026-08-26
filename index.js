@@ -2,46 +2,69 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const app = express();
-
 app.use(cors());
 app.disable("x-powered-by");
 app.use(express.json({
     limit: "1mb"
 }));
 
+/*
+|--------------------------------------------------------------------------
+| CONFIGURAÇÃO
+|--------------------------------------------------------------------------
+*/
+
 const PORT = Number(process.env.PORT || 10000);
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
-const GEMINI_MODEL = String(
-    process.env.GEMINI_MODEL || "gemini-3.5-flash-lite"
-).trim();
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL ||
+    "gemini-3.5-flash-lite").trim();
 const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
-
 const SOURCE_FETCH_TIMEOUT_MS = 20000;
 
-const TRANSLATION_REQUEST_TIMEOUT_MS = 30000;
-const RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS = 16000;
-const SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS = 13000;
-const SINGLE_LAST_TRANSLATION_REQUEST_TIMEOUT_MS = 20000;
-const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 10000;
+/*
+ * 6.3 FAST-FIRST / SAFE-FINAL:
+ * - traduz TODOS os lotes primeiro;
+ * - protocolo compacto i/l/t;
+ * - ID + lock + ordem + quantidade validados em 100%;
+ * - auditoria Gemini somente ao final, em chunks curtos de 24;
+ * - detector local seletivo: fronteiras sintáticas fortes, fronteiras de lote,
+ *   proporção anormal, duplicação suspeita e canários;
+ * - f=false/m=i é rechecado antes de qualquer reparo;
+ * - migração m!=i repara apenas a janela afetada;
+ * - erro estrutural recebe uma única repetição do mesmo lote antes de RESCUE;
+ * - timeout entra em RESCUE fixo, sem árvore longa;
+ * - Ponte Local 2.5.1 permanece compatível.
+ */
 
-const MAX_INDEPENDENT_AUDIT_BLOCKS = 48;
+const TRANSLATION_REQUEST_TIMEOUT_MS = 30000;
+const STRUCTURE_RETRY_TIMEOUT_MS = 30000;
+const RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS = 15000;
+const REPAIR_TRANSLATION_REQUEST_TIMEOUT_MS = 15000;
+const SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS = 12000;
+const SINGLE_LAST_TRANSLATION_REQUEST_TIMEOUT_MS = 18000;
+const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 8000;
+
+const MAX_INDEPENDENT_AUDIT_BLOCKS = 24;
 const AUDIT_CANARY_STRIDE = 9;
 const HIGH_RISK_AUDIT_SCORE = 3;
 
-const RESCUE_BATCH_BLOCKS = 12;
-const RESCUE_BATCH_CHARS = 1200;
-const MAX_RESCUE_SPLIT_DEPTH = 2;
+const RESCUE_BATCH_BLOCKS = 24;
+const RESCUE_BATCH_CHARS = 2400;
+const MAX_RESCUE_SPLIT_DEPTH = 1;
+const MAX_REPAIR_WINDOW_BLOCKS = 6;
 
 const PERFORMANCE_TARGET_MS = 180000;
 const LAZY_OPENSUB_START_GRACE_MS = 1500;
 
 const MAX_TRANSLATION_TIME_MS = Number(
-    process.env.MAX_TRANSLATION_TIME_MS || 480000
+    process.env.MAX_TRANSLATION_TIME_MS ||
+    480000
 );
 
 const configuredMaxBatchChars = Number(
-    process.env.MAX_BATCH_CHARS || 7000
+    process.env.MAX_BATCH_CHARS ||
+    7000
 );
 
 const MAX_BATCH_CHARS =
@@ -51,23 +74,29 @@ const MAX_BATCH_CHARS =
         : 7000;
 
 const configuredMaxBatchBlocks = Number(
-    process.env.MAX_BATCH_BLOCKS || 96
+    process.env.MAX_BATCH_BLOCKS ||
+    96
 );
 
 const MAX_BATCH_BLOCKS =
     Number.isFinite(configuredMaxBatchBlocks) &&
     configuredMaxBatchBlocks > 0
-        ? Math.min(Math.floor(configuredMaxBatchBlocks), 96)
+        ? Math.min(
+              Math.floor(configuredMaxBatchBlocks),
+              96
+          )
         : 96;
 
 const GEMINI_CONCURRENCY = 1;
 
 const MIN_REQUEST_INTERVAL_MS = Number(
-    process.env.MIN_REQUEST_INTERVAL_MS || 3000
+    process.env.MIN_REQUEST_INTERVAL_MS ||
+    3000
 );
 
 const MAX_OUTPUT_TOKENS = Number(
-    process.env.MAX_OUTPUT_TOKENS || 16000
+    process.env.MAX_OUTPUT_TOKENS ||
+    16000
 );
 
 const AUDIT_MAX_OUTPUT_TOKENS = 4096;
@@ -78,17 +107,31 @@ const MAX_SINGLE_BLOCK_OUTPUT_RETRIES = 1;
 const MAX_SINGLE_BLOCK_AUDIT_RETRIES = 1;
 const MAX_RATE_LIMIT_COOLDOWN_MS = 120000;
 
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const JOB_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_TTL_MS =
+    7 * 24 * 60 * 60 * 1000;
+
+const JOB_TTL_MS =
+    24 * 60 * 60 * 1000;
 
 const MAX_CACHE_ENTRIES = 200;
 const MAX_JOBS = 300;
 const MAX_SOURCE_CHARS = 800000;
 
+/*
+ * Cache/lock continuam em 5.8 para compatibilidade direta com a
+ * Ponte Local 2.5.1. O protocolo da Ponte não muda.
+ */
+
 const TRANSLATION_CACHE_VERSION = "5.8";
 const BLOCK_LOCK_VERSION = "5.8";
 const SEMANTIC_AUDIT_ENABLED = true;
-const RENDER_ENGINE_VERSION = "6.2-fast-safe";
+const RENDER_ENGINE_VERSION = "6.3-fast-first-safe-final";
+
+/*
+|--------------------------------------------------------------------------
+| MEMÓRIA
+|--------------------------------------------------------------------------
+*/
 
 const translationCache = new Map();
 const jobs = new Map();
@@ -102,13 +145,24 @@ let geminiWorkerRunning = false;
 let lastGeminiRequestAt = 0;
 let geminiCooldownUntil = 0;
 
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function translationTimeoutError() {
-    const error = new Error("Tempo máximo de tradução atingido.");
-    error.code = "TRANSLATION_TIMEOUT";
+    const error = new Error(
+        "Tempo máximo de tradução atingido."
+    );
+
+    error.code =
+        "TRANSLATION_TIMEOUT";
+
     return error;
 }
 
@@ -116,14 +170,23 @@ function geminiRequestTimeoutError(requestKind) {
     const error = new Error(
         `Timeout da chamada Gemini (${requestKind || "request"}).`
     );
-    error.code = "GEMINI_REQUEST_TIMEOUT";
-    error.requestKind = requestKind || "request";
+
+    error.code =
+        "GEMINI_REQUEST_TIMEOUT";
+
+    error.requestKind =
+        requestKind ||
+        "request";
+
     return error;
 }
 
 function timestampIntegrityError(message) {
     const error = new Error(message);
-    error.code = "TIMESTAMP_INTEGRITY_ERROR";
+
+    error.code =
+        "TIMESTAMP_INTEGRITY_ERROR";
+
     return error;
 }
 
@@ -147,15 +210,25 @@ function remainingBeforeDeadline(deadlineAt) {
     );
 }
 
-async function sleepWithDeadline(ms, deadlineAt) {
-    const safeMs = Math.max(0, Number(ms) || 0);
+async function sleepWithDeadline(
+    ms,
+    deadlineAt
+) {
+    const safeMs =
+        Math.max(
+            0,
+            Number(ms) || 0
+        );
 
     if (safeMs === 0) {
         assertBeforeDeadline(deadlineAt);
         return;
     }
 
-    const remaining = remainingBeforeDeadline(deadlineAt);
+    const remaining =
+        remainingBeforeDeadline(
+            deadlineAt
+        );
 
     if (
         Number.isFinite(remaining) &&
@@ -175,7 +248,10 @@ async function sleepWithDeadline(ms, deadlineAt) {
 function sha256(text) {
     return crypto
         .createHash("sha256")
-        .update(String(text), "utf8")
+        .update(
+            String(text),
+            "utf8"
+        )
         .digest("hex");
 }
 
@@ -218,33 +294,55 @@ function cleanBaseUrl(req) {
     return `${protocol}://${host}`;
 }
 
-function safeJson(res, data, status = 200) {
+function safeJson(
+    res,
+    data,
+    status = 200
+) {
     res.status(status);
+
     res.set(
         "Cache-Control",
         "no-store, no-cache, must-revalidate"
     );
+
     return res.json(data);
 }
+
+/*
+|--------------------------------------------------------------------------
+| AUTENTICAÇÃO DA PONTE LOCAL
+|--------------------------------------------------------------------------
+*/
 
 function isAuthorizedLocalBridge(req) {
     if (!LOCAL_BRIDGE_SECRET) {
         return false;
     }
 
-    const auth = String(
-        req.headers.authorization || ""
-    ).trim();
+    const auth =
+        String(
+            req.headers.authorization ||
+            ""
+        ).trim();
 
     if (!auth) {
         return false;
     }
 
-    const expected = `Bearer ${LOCAL_BRIDGE_SECRET}`;
-    const authBuffer = Buffer.from(auth);
-    const expectedBuffer = Buffer.from(expected);
+    const expected =
+        `Bearer ${LOCAL_BRIDGE_SECRET}`;
 
-    if (authBuffer.length !== expectedBuffer.length) {
+    const authBuffer =
+        Buffer.from(auth);
+
+    const expectedBuffer =
+        Buffer.from(expected);
+
+    if (
+        authBuffer.length !==
+        expectedBuffer.length
+    ) {
         return false;
     }
 
@@ -254,38 +352,66 @@ function isAuthorizedLocalBridge(req) {
     );
 }
 
+/*
+|--------------------------------------------------------------------------
+| FETCH COM TIMEOUT
+|--------------------------------------------------------------------------
+*/
+
 async function fetchWithTimeout(
     url,
     options = {},
     timeoutMs = 20000
 ) {
-    const controller = new AbortController();
+    const controller =
+        new AbortController();
 
-    const timer = setTimeout(
-        () => controller.abort(),
-        timeoutMs
-    );
+    const timer =
+        setTimeout(
+            () => controller.abort(),
+            timeoutMs
+        );
 
     try {
-        return await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
+        return await fetch(
+            url,
+            {
+                ...options,
+                signal:
+                    controller.signal
+            }
+        );
     } finally {
         clearTimeout(timer);
     }
 }
 
+/*
+|--------------------------------------------------------------------------
+| LIMPEZA DE MEMÓRIA
+|--------------------------------------------------------------------------
+*/
+
 function cleanupMemory() {
     const now = Date.now();
 
-    for (const [key, item] of translationCache.entries()) {
+    for (
+        const [
+            key,
+            item
+        ] of translationCache.entries()
+    ) {
         if (item.expiresAt <= now) {
             translationCache.delete(key);
         }
     }
 
-    for (const [key, job] of jobs.entries()) {
+    for (
+        const [
+            key,
+            job
+        ] of jobs.entries()
+    ) {
         if (
             job.expiresAt <= now &&
             job.status !== "processing"
@@ -294,8 +420,14 @@ function cleanupMemory() {
         }
     }
 
-    while (translationCache.size > MAX_CACHE_ENTRIES) {
-        const key = translationCache.keys().next().value;
+    while (
+        translationCache.size >
+        MAX_CACHE_ENTRIES
+    ) {
+        const key =
+            translationCache.keys()
+                .next()
+                .value;
 
         if (key === undefined) {
             break;
@@ -305,13 +437,17 @@ function cleanupMemory() {
     }
 
     while (jobs.size > MAX_JOBS) {
-        const key = jobs.keys().next().value;
+        const key =
+            jobs.keys()
+                .next()
+                .value;
 
         if (key === undefined) {
             break;
         }
 
-        const job = jobs.get(key);
+        const job =
+            jobs.get(key);
 
         if (
             job &&
@@ -329,6 +465,12 @@ setInterval(
     5 * 60 * 1000
 ).unref();
 
+/*
+|--------------------------------------------------------------------------
+| SRT
+|--------------------------------------------------------------------------
+*/
+
 function normalizeSrt(text) {
     return String(text || "")
         .replace(/^\uFEFF/, "")
@@ -343,9 +485,18 @@ function stripCodeFences(text) {
             /^```(?:json|srt|text|plaintext)?\s*/i,
             ""
         )
-        .replace(/\s*```$/i, "")
+        .replace(
+            /\s*```$/i,
+            ""
+        )
         .trim();
 }
+
+/*
+|--------------------------------------------------------------------------
+| HIGIENIZAÇÃO CONSERVADORA DE CARACTERES
+|--------------------------------------------------------------------------
+*/
 
 function createCharacterSanitizationStats() {
     return {
@@ -358,19 +509,31 @@ function createCharacterSanitizationStats() {
     };
 }
 
-function addCharacterSanitizationStats(target, source) {
-    for (const key of Object.keys(target)) {
-        target[key] += Number(source?.[key] || 0);
+function addCharacterSanitizationStats(
+    target,
+    source
+) {
+    for (
+        const key of Object.keys(target)
+    ) {
+        target[key] +=
+            Number(
+                source?.[key] || 0
+            );
     }
 
     return target;
 }
 
 function sanitizeSubtitleText(value) {
-    const stats = createCharacterSanitizationStats();
-    let text = String(value ?? "");
+    const stats =
+        createCharacterSanitizationStats();
 
-    const normalizedNfc = text.normalize("NFC");
+    let text =
+        String(value ?? "");
+
+    const normalizedNfc =
+        text.normalize("NFC");
 
     if (normalizedNfc !== text) {
         stats.nfcChanges++;
@@ -425,16 +588,20 @@ function sanitizeSubtitleText(value) {
         }
     );
 
-    text = text
-        .split("\n")
-        .map(
-            line =>
-                line
-                    .replace(/[ \t]{2,}/g, " ")
-                    .trimEnd()
-        )
-        .join("\n")
-        .trim();
+    text =
+        text
+            .split("\n")
+            .map(
+                line =>
+                    line
+                        .replace(
+                            /[ \t]{2,}/g,
+                            " "
+                        )
+                        .trimEnd()
+            )
+            .join("\n")
+            .trim();
 
     return {
         text,
@@ -453,25 +620,48 @@ function characterSanitizationTotal(stats) {
     );
 }
 
-function logCharacterSanitization(stage, stats) {
-    const total = characterSanitizationTotal(stats);
+function logCharacterSanitization(
+    stage,
+    stats
+) {
+    const total =
+        characterSanitizationTotal(stats);
 
     console.log(
         `[CLEAN CHAR] ${stage}: ${total} ajuste(s); controles=${stats.controlChars}, invisíveis=${stats.invisibleChars}, espaços=${stats.normalizedSpaces}, replacement=${stats.replacementChars}, ASS=${stats.assTags}, NFC=${stats.nfcChanges}.`
     );
 }
 
+/*
+|--------------------------------------------------------------------------
+| LIMPEZA SDH / CC
+|--------------------------------------------------------------------------
+*/
+
 const SDH_CUE_WORDS =
     /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
+
+/*
+|--------------------------------------------------------------------------
+| CONTEXTO OCULTO DE FALANTE
+|--------------------------------------------------------------------------
+*/
 
 const SPEAKER_HINT_MARKER_REGEX =
     /^@@SPK:([^@]+)@@\s*/u;
 
 function normalizeSpeakerHint(value) {
-    const speaker = String(value || "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+    const speaker =
+        String(value || "")
+            .replace(
+                /<[^>]+>/g,
+                " "
+            )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .trim();
 
     if (
         !speaker ||
@@ -510,7 +700,8 @@ function decodeSpeakerHint(encoded) {
 }
 
 function extractSpeakerHint(line) {
-    const original = String(line || "");
+    const original =
+        String(line || "");
 
     const hiddenMatch =
         original.match(
@@ -519,11 +710,16 @@ function extractSpeakerHint(line) {
 
     if (hiddenMatch) {
         return {
-            speaker: decodeSpeakerHint(hiddenMatch[1]),
-            lineForCleaning: original.replace(
-                SPEAKER_HINT_MARKER_REGEX,
-                ""
-            )
+            speaker:
+                decodeSpeakerHint(
+                    hiddenMatch[1]
+                ),
+
+            lineForCleaning:
+                original.replace(
+                    SPEAKER_HINT_MARKER_REGEX,
+                    ""
+                )
         };
     }
 
@@ -534,12 +730,15 @@ function extractSpeakerHint(line) {
 
     if (bracketMatch) {
         const speaker =
-            normalizeSpeakerHint(bracketMatch[1]);
+            normalizeSpeakerHint(
+                bracketMatch[1]
+            );
 
         if (speaker) {
             return {
                 speaker,
-                lineForCleaning: original
+                lineForCleaning:
+                    original
             };
         }
     }
@@ -551,21 +750,31 @@ function extractSpeakerHint(line) {
 
     if (colonMatch) {
         const speaker =
-            normalizeSpeakerHint(colonMatch[1]);
+            normalizeSpeakerHint(
+                colonMatch[1]
+            );
 
         if (speaker) {
             return {
                 speaker,
-                lineForCleaning: original
+                lineForCleaning:
+                    original
             };
         }
     }
 
     return {
         speaker: "",
-        lineForCleaning: original
+        lineForCleaning:
+            original
     };
 }
+
+/*
+|--------------------------------------------------------------------------
+| NORMALIZAÇÃO DE ALONGAMENTOS VOCAIS
+|--------------------------------------------------------------------------
+*/
 
 function normalizeHyphenatedVocalElongations(text) {
     return String(text ?? "").replace(
@@ -576,7 +785,9 @@ function normalizeHyphenatedVocalElongations(text) {
 
 function normalizeTranslatedVocalElongations(text) {
     let result =
-        normalizeHyphenatedVocalElongations(text);
+        normalizeHyphenatedVocalElongations(
+            text
+        );
 
     result = result.replace(
         /([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{3,}/gu,
@@ -587,7 +798,8 @@ function normalizeTranslatedVocalElongations(text) {
 }
 
 function cleanDialogueLine(line) {
-    let text = String(line || "").trim();
+    let text =
+        String(line || "").trim();
 
     if (!text) {
         return "";
@@ -600,7 +812,10 @@ function cleanDialogueLine(line) {
 
     text = text.replace(
         /\s*\(([^)]*)\)\s*/gu,
-        (match, inside) =>
+        (
+            match,
+            inside
+        ) =>
             SDH_CUE_WORDS.test(
                 String(inside || "")
             )
@@ -613,16 +828,28 @@ function cleanDialogueLine(line) {
         ""
     );
 
-    text = text
-        .replace(/[ \t]{2,}/g, " ")
-        .trim();
+    text =
+        text
+            .replace(
+                /[ \t]{2,}/g,
+                " "
+            )
+            .trim();
 
-    if (/^[-–—♪♫♬\s]*$/u.test(text)) {
+    if (
+        /^[-–—♪♫♬\s]*$/u.test(text)
+    ) {
         return "";
     }
 
     return text;
 }
+
+/*
+|--------------------------------------------------------------------------
+| AUDITORIA ABSOLUTA DE TIMESTAMPS
+|--------------------------------------------------------------------------
+*/
 
 const TIMING_LINE_REGEX =
     /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
@@ -632,7 +859,9 @@ function extractTimingLines(srt) {
         .replace(/\r\n/g, "\n")
         .replace(/\r/g, "\n")
         .split("\n")
-        .map(line => line.trim())
+        .map(
+            line => line.trim()
+        )
         .filter(
             line =>
                 TIMING_LINE_REGEX.test(line)
@@ -650,7 +879,9 @@ function auditCleaningTimestamps(
     cleanedSrt,
     label = "SOURCE"
 ) {
-    const rawTimings = extractTimingLines(rawSrt);
+    const rawTimings =
+        extractTimingLines(rawSrt);
+
     const cleanedTimings =
         extractTimingLines(cleanedSrt);
 
@@ -661,7 +892,8 @@ function auditCleaningTimestamps(
         i < cleanedTimings.length;
         i++
     ) {
-        const wanted = cleanedTimings[i];
+        const wanted =
+            cleanedTimings[i];
 
         while (
             cursor < rawTimings.length &&
@@ -670,7 +902,9 @@ function auditCleaningTimestamps(
             cursor++;
         }
 
-        if (cursor >= rawTimings.length) {
+        if (
+            cursor >= rawTimings.length
+        ) {
             throw timestampIntegrityError(
                 `Auditoria de timestamps falhou na limpeza (${label}) no bloco preservado ${i + 1}.`
             );
@@ -691,8 +925,11 @@ function auditFinalTimestamps(
     finalSrt,
     label = "FINAL"
 ) {
-    const sourceBlocks = parseSrt(sourceSrt);
-    const finalBlocks = parseSrt(finalSrt);
+    const sourceBlocks =
+        parseSrt(sourceSrt);
+
+    const finalBlocks =
+        parseSrt(finalSrt);
 
     if (
         sourceBlocks.length !==
@@ -708,12 +945,17 @@ function auditFinalTimestamps(
         i < sourceBlocks.length;
         i++
     ) {
-        const source = sourceBlocks[i];
-        const final = finalBlocks[i];
+        const source =
+            sourceBlocks[i];
+
+        const final =
+            finalBlocks[i];
 
         if (
-            source.index !== final.index ||
-            source.timing !== final.timing
+            source.index !==
+                final.index ||
+            source.timing !==
+                final.timing
         ) {
             throw timestampIntegrityError(
                 `Auditoria de timestamps falhou (${label}) no bloco ${i + 1}: índice/timing divergente.`
@@ -739,7 +981,8 @@ function auditFinalTimestamps(
 }
 
 function cleanSrtForTranslation(srt) {
-    const normalized = normalizeSrt(srt);
+    const normalized =
+        normalizeSrt(srt);
 
     if (!normalized) {
         return "";
@@ -766,7 +1009,8 @@ function cleanSrtForTranslation(srt) {
 
         const timingIndex =
             lines.findIndex(
-                line => /-->/.test(line)
+                line =>
+                    /-->/.test(line)
             );
 
         if (timingIndex === -1) {
@@ -777,7 +1021,8 @@ function cleanSrtForTranslation(srt) {
             lines[timingIndex].trim();
 
         const cleanedDialogue = [];
-        const speakerHints = new Set();
+        const speakerHints =
+            new Set();
 
         for (
             const line
@@ -822,40 +1067,54 @@ function cleanSrtForTranslation(srt) {
                 elongatedLines++;
             }
 
-            if (cleaned !== line.trim()) {
+            if (
+                cleaned !== line.trim()
+            ) {
                 changedLines++;
             }
 
             if (cleaned) {
-                cleanedDialogue.push(cleaned);
+                cleanedDialogue.push(
+                    cleaned
+                );
             }
         }
 
-        if (cleanedDialogue.length === 0) {
+        if (
+            cleanedDialogue.length === 0
+        ) {
             removedBlocks++;
             continue;
         }
 
         if (speakerHints.size === 1) {
             const speakerHint =
-                Array.from(speakerHints)[0];
+                Array.from(
+                    speakerHints
+                )[0];
 
             cleanedDialogue[0] =
-                `@@SPK:${encodeSpeakerHint(speakerHint)}@@ ${cleanedDialogue[0]}`;
+                `@@SPK:${encodeSpeakerHint(
+                    speakerHint
+                )}@@ ${cleanedDialogue[0]}`;
 
             speakerHintBlocks++;
         }
 
         cleanedBlocks.push({
             timing,
-            dialogue: cleanedDialogue
+            dialogue:
+                cleanedDialogue
         });
     }
 
     const result =
         cleanedBlocks
             .map(
-                (block, index) => [
+                (
+                    block,
+                    index
+                ) => [
                     index + 1,
                     block.timing,
                     ...block.dialogue
@@ -882,7 +1141,9 @@ function cleanSrtForTranslation(srt) {
     );
 
     const finalResult =
-        result ? result + "\n" : "";
+        result
+            ? result + "\n"
+            : "";
 
     if (finalResult) {
         auditCleaningTimestamps(
@@ -895,8 +1156,15 @@ function cleanSrtForTranslation(srt) {
     return finalResult;
 }
 
+/*
+|--------------------------------------------------------------------------
+| PARSER SRT
+|--------------------------------------------------------------------------
+*/
+
 function parseSrt(srt) {
-    const normalized = normalizeSrt(srt);
+    const normalized =
+        normalizeSrt(srt);
 
     if (!normalized) {
         return [];
@@ -905,30 +1173,43 @@ function parseSrt(srt) {
     const blocks =
         normalized
             .split(/\n{2,}/)
-            .map(block => block.trim())
+            .map(
+                block =>
+                    block.trim()
+            )
             .filter(Boolean);
 
     const result = [];
 
     for (const block of blocks) {
-        const lines = block.split("\n");
+        const lines =
+            block.split("\n");
 
         if (lines.length < 3) {
             continue;
         }
 
-        const indexLine = lines[0].trim();
-        const timingLine = lines[1].trim();
+        const indexLine =
+            lines[0].trim();
+
+        const timingLine =
+            lines[1].trim();
 
         if (!/^\d+$/.test(indexLine)) {
             continue;
         }
 
-        if (!TIMING_LINE_REGEX.test(timingLine)) {
+        if (
+            !TIMING_LINE_REGEX.test(
+                timingLine
+            )
+        ) {
             continue;
         }
 
-        const textLines = lines.slice(2);
+        const textLines =
+            lines.slice(2);
+
         let speakerHint = "";
 
         if (textLines.length > 0) {
@@ -952,15 +1233,28 @@ function parseSrt(srt) {
         }
 
         result.push({
-            index: Number(indexLine),
-            timing: timingLine,
-            text: textLines.join("\n"),
-            speakerHint: speakerHint || null
+            index:
+                Number(indexLine),
+
+            timing:
+                timingLine,
+
+            text:
+                textLines.join("\n"),
+
+            speakerHint:
+                speakerHint || null
         });
     }
 
     return result;
 }
+
+/*
+|--------------------------------------------------------------------------
+| LIMPEZA DE CARACTERES APÓS TRADUÇÃO
+|--------------------------------------------------------------------------
+*/
 
 function cleanAllTranslatedCharacters(
     translatedTexts
@@ -971,24 +1265,31 @@ function cleanAllTranslatedCharacters(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(text => {
-            const original =
-                String(text ?? "");
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(text ?? "");
 
-            const sanitized =
-                sanitizeSubtitleText(original);
+                const sanitized =
+                    sanitizeSubtitleText(
+                        original
+                    );
 
-            addCharacterSanitizationStats(
-                stats,
-                sanitized.stats
-            );
+                addCharacterSanitizationStats(
+                    stats,
+                    sanitized.stats
+                );
 
-            if (sanitized.text !== original) {
-                changedBlocks++;
+                if (
+                    sanitized.text !==
+                    original
+                ) {
+                    changedBlocks++;
+                }
+
+                return sanitized.text;
             }
-
-            return sanitized.text;
-        });
+        );
 
     logCharacterSanitization(
         `TRADUÇÃO (${changedBlocks} bloco(s) alterado(s))`,
@@ -998,13 +1299,20 @@ function cleanAllTranslatedCharacters(
     return cleaned;
 }
 
+/*
+|--------------------------------------------------------------------------
+| LIMPEZA DE MARCADORES DE DIÁLOGO TRADUZIDOS
+|--------------------------------------------------------------------------
+*/
+
 function cleanTranslatedDialogueMarkers(text) {
     const normalized =
         String(text ?? "")
             .replace(/\r\n/g, "\n")
             .replace(/\r/g, "\n");
 
-    const lines = normalized.split("\n");
+    const lines =
+        normalized.split("\n");
 
     const markerRegex =
         /^\s*[-–—/]+\s+(?=\S)/u;
@@ -1047,20 +1355,23 @@ function cleanAllTranslatedDialogueMarkers(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(text => {
-            const original = String(text ?? "");
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(text ?? "");
 
-            const result =
-                cleanTranslatedDialogueMarkers(
-                    original
-                );
+                const result =
+                    cleanTranslatedDialogueMarkers(
+                        original
+                    );
 
-            if (result !== original) {
-                changedBlocks++;
+                if (result !== original) {
+                    changedBlocks++;
+                }
+
+                return result;
             }
-
-            return result;
-        });
+        );
 
     console.log(
         `[CLEAN] Marcadores de diálogo: ${changedBlocks} bloco(s) ajustado(s).`
@@ -1075,20 +1386,23 @@ function cleanAllTranslatedVocalElongations(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(text => {
-            const original = String(text ?? "");
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(text ?? "");
 
-            const result =
-                normalizeTranslatedVocalElongations(
-                    original
-                );
+                const result =
+                    normalizeTranslatedVocalElongations(
+                        original
+                    );
 
-            if (result !== original) {
-                changedBlocks++;
+                if (result !== original) {
+                    changedBlocks++;
+                }
+
+                return result;
             }
-
-            return result;
-        });
+        );
 
     console.log(
         `[CLEAN] Alongamentos vocais traduzidos: ${changedBlocks} bloco(s) ajustado(s).`
@@ -1097,37 +1411,69 @@ function cleanAllTranslatedVocalElongations(
     return cleaned;
 }
 
-function buildSrt(blocks, translatedTexts) {
+/*
+|--------------------------------------------------------------------------
+| CONSTRUTOR SRT
+|--------------------------------------------------------------------------
+*/
+
+function buildSrt(
+    blocks,
+    translatedTexts
+) {
     return (
         blocks
-            .map((block, index) => {
-                const translated =
-                    translatedTexts[index] ??
-                    block.text;
+            .map(
+                (
+                    block,
+                    index
+                ) => {
+                    const translated =
+                        translatedTexts[index] ??
+                        block.text;
 
-                return [
-                    block.index,
-                    block.timing,
-                    translated
-                ].join("\n");
-            })
+                    return [
+                        block.index,
+                        block.timing,
+                        translated
+                    ].join("\n");
+                }
+            )
             .join("\n\n")
             .trim() +
         "\n"
     );
 }
 
-function setTranslationCache(key, srt) {
-    const now = Date.now();
+/*
+|--------------------------------------------------------------------------
+| CACHE
+|--------------------------------------------------------------------------
+*/
+
+function setTranslationCache(
+    key,
+    srt
+) {
+    const now =
+        Date.now();
 
     translationCache.set(
         key,
         {
             srt,
-            version: TRANSLATION_CACHE_VERSION,
-            contentAuditPassed: true,
-            createdAt: now,
-            expiresAt: now + CACHE_TTL_MS
+
+            version:
+                TRANSLATION_CACHE_VERSION,
+
+            contentAuditPassed:
+                true,
+
+            createdAt:
+                now,
+
+            expiresAt:
+                now + CACHE_TTL_MS
         }
     );
 
@@ -1151,13 +1497,22 @@ function getTranslationCache(key) {
         return null;
     }
 
-    if (item.expiresAt <= Date.now()) {
+    if (
+        item.expiresAt <=
+        Date.now()
+    ) {
         translationCache.delete(key);
         return null;
     }
 
     return item.srt;
 }
+
+/*
+|--------------------------------------------------------------------------
+| DIVISÃO INTELIGENTE DE LOTES
+|--------------------------------------------------------------------------
+*/
 
 function splitIntoBatches(blocks) {
     const batches = [];
@@ -1174,11 +1529,13 @@ function splitIntoBatches(blocks) {
 
         const wouldExceedChars =
             current.length > 0 &&
-            currentChars + blockChars >
+            currentChars +
+                blockChars >
                 MAX_BATCH_CHARS;
 
         const wouldExceedBlocks =
-            current.length >= MAX_BATCH_BLOCKS;
+            current.length >=
+            MAX_BATCH_BLOCKS;
 
         if (
             wouldExceedChars ||
@@ -1191,7 +1548,9 @@ function splitIntoBatches(blocks) {
         }
 
         current.push(block);
-        currentChars += blockChars;
+
+        currentChars +=
+            blockChars;
     }
 
     if (current.length > 0) {
@@ -1201,10 +1560,17 @@ function splitIntoBatches(blocks) {
     return batches;
 }
 
+/*
+|--------------------------------------------------------------------------
+| COOLDOWN / RETRY-AFTER / RATE LIMIT
+|--------------------------------------------------------------------------
+*/
+
 function getCooldownRemaining() {
     return Math.max(
         0,
-        geminiCooldownUntil - Date.now()
+        geminiCooldownUntil -
+            Date.now()
     );
 }
 
@@ -1218,23 +1584,32 @@ function setGeminiCooldown(ms) {
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
 
-    const until = Date.now() + safeMs;
+    const until =
+        Date.now() + safeMs;
 
     if (until > geminiCooldownUntil) {
         geminiCooldownUntil = until;
     }
 
     console.log(
-        `[GEMINI] RATE LIMIT. Cooldown global de ${Math.ceil(safeMs / 1000)}s.`
+        `[GEMINI] RATE LIMIT. Cooldown global de ${Math.ceil(
+            safeMs / 1000
+        )}s.`
     );
 }
 
-function getRetryAfterMs(response, errorData) {
+function getRetryAfterMs(
+    response,
+    errorData
+) {
     const header =
-        response?.headers?.get("retry-after");
+        response?.headers?.get(
+            "retry-after"
+        );
 
     if (header) {
-        const seconds = Number(header);
+        const seconds =
+            Number(header);
 
         if (
             Number.isFinite(seconds) &&
@@ -1249,7 +1624,8 @@ function getRetryAfterMs(response, errorData) {
 
     const message =
         String(
-            errorData?.error?.message || ""
+            errorData?.error?.message ||
+            ""
         );
 
     const secondsMatch =
@@ -1276,7 +1652,9 @@ function getRetryAfterMs(response, errorData) {
 
     if (minuteSecondMatch) {
         const minutes =
-            Number(minuteSecondMatch[1]);
+            Number(
+                minuteSecondMatch[1]
+            );
 
         const seconds =
             Number(
@@ -1301,7 +1679,9 @@ function getRetryAfterMs(response, errorData) {
     if (minuteMatch) {
         return Math.min(
             (
-                Number(minuteMatch[1]) * 60 +
+                Number(
+                    minuteMatch[1]
+                ) * 60 +
                 1
             ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
@@ -1311,14 +1691,21 @@ function getRetryAfterMs(response, errorData) {
     return 30000;
 }
 
-function isRateLimitError(status, message) {
+function isRateLimitError(
+    status,
+    message
+) {
     return (
         status === 429 ||
         /quota|rate.?limit|resource.?exhausted|too many requests/i.test(
             String(message || "")
         )
     );
-}
+}/*
+|--------------------------------------------------------------------------
+| REQUEST GEMINI
+|--------------------------------------------------------------------------
+*/
 
 async function rawGeminiRequest(
     prompt,
@@ -1334,166 +1721,181 @@ async function rawGeminiRequest(
     assertBeforeDeadline(deadlineAt);
 
     const endpoint =
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+            GEMINI_MODEL
+        )}:generateContent`;
 
     const isAudit =
         requestKind === "semantic-audit";
 
-    const body =
-        isAudit
-            ? {
-                systemInstruction: {
-                    parts: [
-                        {
-                            text:
-                                "Você é um auditor bilíngue rigoroso de integridade de legendas EN→PT-BR. " +
-                                "NÃO traduza nem reescreva. Cada registro usa chaves compactas: i=id, l=lock, s=source, t=translation, h=speaker, p=source anterior, n=source seguinte. " +
-                                "Os registros do array podem ser esparsos e de momentos diferentes: NUNCA use a posição no array como vizinhança; use somente p/n do próprio registro. " +
-                                "A tradução t deve corresponder exclusivamente ao source s do mesmo i. Conteúdo antecipado de n ou atrasado de p é falha. " +
-                                "Aceite paráfrase natural, localização idiomática, gíria contemporânea e linguagem LGBTQIAPN+/drag/camp/shade quando preservarem o sentido. " +
-                                "Fragmentos podem continuar fragmentários. Se t corresponde ao próprio s, retorne m=i e f=true; se migrou para outro ID, m deve ser esse ID e f=false. " +
-                                "Preserve i e l exatamente. Retorne somente JSON compacto no formato solicitado."
-                        }
-                    ]
-                },
+    const body = isAudit
+        ? {
+              systemInstruction: {
+                  parts: [
+                      {
+                          text:
+                              "Você é um auditor bilíngue rigoroso de integridade de legendas EN→PT-BR. " +
+                              "NÃO traduza nem reescreva. Cada registro usa chaves compactas: i=id, l=lock, s=source, t=translation, h=speaker, p=source anterior, n=source seguinte. " +
+                              "Os registros podem ser esparsos: NUNCA use a posição no array como vizinhança; use somente p/n do próprio registro. " +
+                              "t deve corresponder exclusivamente a s do mesmo i. Conteúdo antecipado de n ou atrasado de p é falha. " +
+                              "Aceite paráfrase natural, localização idiomática, humor, gíria contemporânea e linguagem LGBTQIAPN+/drag/camp/shade quando preservarem o sentido do próprio ID. " +
+                              "Fragmentos podem permanecer fragmentários. Se t corresponde ao próprio s e está semanticamente correta, m=i e f=true. " +
+                              "Se t pertence inequivocamente a outro ID, m aponta para esse ID e f=false. Se t permanece no próprio ID mas contém erro semântico relevante, m=i e f=false. " +
+                              "Preserve i e l exatamente. Retorne somente JSON compacto."
+                      }
+                  ]
+              },
 
-                contents: [
-                    {
-                        role: "user",
-                        parts: [
-                            {
-                                text: prompt
-                            }
-                        ]
-                    }
-                ],
+              contents: [
+                  {
+                      role: "user",
 
-                generationConfig: {
-                    thinkingConfig: {
-                        thinkingLevel: "MINIMAL"
-                    },
+                      parts: [
+                          {
+                              text: prompt
+                          }
+                      ]
+                  }
+              ],
 
-                    responseMimeType:
-                        "application/json",
+              generationConfig: {
+                  thinkingConfig: {
+                      thinkingLevel:
+                          "MINIMAL"
+                  },
 
-                    responseSchema: {
-                        type: "ARRAY",
+                  responseMimeType:
+                      "application/json",
 
-                        items: {
-                            type: "OBJECT",
+                  responseSchema: {
+                      type: "ARRAY",
 
-                            properties: {
-                                i: {
-                                    type: "INTEGER"
-                                },
+                      items: {
+                          type: "OBJECT",
 
-                                l: {
-                                    type: "STRING"
-                                },
+                          properties: {
+                              i: {
+                                  type:
+                                      "INTEGER"
+                              },
 
-                                m: {
-                                    type: "INTEGER"
-                                },
+                              l: {
+                                  type:
+                                      "STRING"
+                              },
 
-                                f: {
-                                    type: "BOOLEAN"
-                                }
-                            },
+                              m: {
+                                  type:
+                                      "INTEGER"
+                              },
 
-                            required: [
-                                "i",
-                                "l",
-                                "m",
-                                "f"
-                            ]
-                        },
+                              f: {
+                                  type:
+                                      "BOOLEAN"
+                              }
+                          },
 
-                        minItems: 1
-                    },
+                          required: [
+                              "i",
+                              "l",
+                              "m",
+                              "f"
+                          ]
+                      },
 
-                    maxOutputTokens:
-                        AUDIT_MAX_OUTPUT_TOKENS
-                }
-            }
-            : {
-                systemInstruction: {
-                    parts: [
-                        {
-                            text:
-                                "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, com padrão premium de streaming. " +
-                                "A prioridade é: INTEGRIDADE DO CONTEÚDO POR ID → sentido/intenção → voz do personagem → naturalidade contemporânea → humor/ritmo → literalidade. " +
-                                "Cada ID é uma unidade atômica e imutável: traduza SOMENTE o texto daquele ID. Nunca antecipe, atrase, complete ou transfira conteúdo entre IDs, mesmo quando uma frase continuar no bloco seguinte. Vizinhos existem só para contexto. " +
-                                "O PT-BR deve soar vivo, oral, atual e brasileiro de verdade. Prefira vocabulário contemporâneo compatível com 2026 e, quando idade/cena/personagem pedirem, use naturalmente repertório de geração Z e Alpha, cultura digital, memes e oralidade jovem — sem transformar todo mundo em adolescente nem forçar gíria. " +
-                                "Evite vocabulário artificialmente datado. Modernidade vem de ritmo, escolhas de palavras e registro, não de uma lista fixa de bordões. " +
-                                "Em contextos LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, traduza com letramento cultural e carinho: preserve identidade, nome escolhido, pronome, gênero, ironia, afeto, provocação, termos ressignificados e intensidade. Não heteronormativize nem higienize linguagem queer. " +
-                                "girl, bitch, honey, sis, queen, baby e babe podem ser vocativos afetivos/camp; nunca traduza automaticamente girl como garota nem bitch como vadia. Escolha gata, amiga, mana, bicha, querida, amor, mona ou omissão somente quando o contexto sustentar. 'vadia' apenas quando houver insulto real ou uso ressignificado inequivocamente equivalente. " +
-                                "Adapte expressões idiomáticas, piadas, trocadilhos, shade e referências culturais quando houver solução brasileira natural que preserve intenção e graça. Se adaptar piorar, preserve o original. Preserve bordões consagrados como Condragulations. " +
-                                "Não censure palavrões nem intensidade emocional. Preserve nomes próprios, marcas, títulos e termos técnicos. Traduza falas ou letras efetivamente transcritas em outros idiomas para PT-BR; não invente letra para marcações de música. " +
-                                "speaker é contexto oculto: nunca copie o nome para a tradução. Se identificar claramente a pessoa, respeite gênero/pronomes; se não estiver claro, NÃO chute gênero — prefira construção brasileira natural que evite marcação. " +
-                                "Não acrescente SDH/CC, sons, nomes de falantes ou explicações. Não reproduza alongamentos gráficos desnecessários. Preserve formatação útil. " +
-                                "Antes de responder, confira silenciosamente cada ID para garantir que nenhum conteúdo do vizinho migrou para ele. " +
-                                "A entrada usa chaves compactas: i=id, l=lock, x=texto e s=speaker opcional; p/n são contexto externo. " +
-                                "Retorne somente JSON compacto, exatamente na ordem recebida, usando i=id, l=lock e t=tradução. Preserve i e l sem qualquer alteração."
-                        }
-                    ]
-                },
+                      minItems: 1
+                  },
 
-                contents: [
-                    {
-                        role: "user",
-                        parts: [
-                            {
-                                text: prompt
-                            }
-                        ]
-                    }
-                ],
+                  maxOutputTokens:
+                      AUDIT_MAX_OUTPUT_TOKENS
+              }
+          }
+        : {
+              systemInstruction: {
+                  parts: [
+                      {
+                          text:
+                              "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, com padrão premium de streaming. " +
+                              "A prioridade é: INTEGRIDADE DO CONTEÚDO POR ID → sentido/intenção → voz do personagem → naturalidade contemporânea → humor/ritmo → literalidade. " +
+                              "Cada ID é uma unidade atômica e imutável: traduza SOMENTE o texto daquele ID. Nunca antecipe, atrase, complete ou transfira conteúdo entre IDs, mesmo quando uma frase continuar no bloco seguinte. Vizinhos existem só para contexto. " +
+                              "O PT-BR deve soar vivo, oral, atual e brasileiro de verdade. Prefira vocabulário contemporâneo compatível com 2026 e, quando idade/cena/personagem pedirem, use naturalmente repertório de geração Z e Alpha, cultura digital, memes e oralidade jovem — sem transformar todo mundo em adolescente nem forçar gíria. " +
+                              "Evite vocabulário artificialmente datado. Modernidade vem de ritmo, escolhas de palavras e registro. " +
+                              "Em contextos LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, traduza com letramento cultural e carinho: preserve identidade, nome escolhido, pronome, gênero, ironia, afeto, provocação, termos ressignificados e intensidade. Não heteronormativize nem higienize linguagem queer. " +
+                              "girl, bitch, honey, sis, queen, baby e babe podem ser vocativos afetivos/camp; nunca traduza automaticamente girl como garota nem bitch como vadia. Escolha gata, amiga, mana, bicha, querida, amor, mona ou omissão somente quando o contexto sustentar. 'vadia' apenas quando houver insulto real ou uso ressignificado inequivocamente equivalente. " +
+                              "Adapte expressões idiomáticas, piadas, trocadilhos, shade e referências culturais quando houver solução brasileira natural que preserve intenção e graça. Se adaptar piorar, preserve o original. Preserve bordões consagrados como Condragulations. " +
+                              "Não censure palavrões nem intensidade emocional. Preserve nomes próprios, marcas, títulos e termos técnicos. Traduza falas ou letras efetivamente transcritas em outros idiomas para PT-BR; não invente letra para marcações de música. " +
+                              "speaker é contexto oculto: nunca copie o nome para a tradução. Se identificar claramente a pessoa, respeite gênero/pronomes; se não estiver claro, NÃO chute gênero — prefira construção brasileira natural que evite marcação. " +
+                              "Não acrescente SDH/CC, sons, nomes de falantes ou explicações. Não reproduza alongamentos gráficos desnecessários. Preserve formatação útil. " +
+                              "Antes de responder, confira silenciosamente cada ID para garantir que nenhum conteúdo do vizinho migrou para ele. " +
+                              "A entrada usa chaves compactas: i=id, l=lock, x=texto e s=speaker opcional; p/n são contexto externo. " +
+                              "Retorne somente JSON compacto, exatamente na ordem recebida, usando i=id, l=lock e t=tradução. Preserve i e l sem qualquer alteração."
+                      }
+                  ]
+              },
 
-                generationConfig: {
-                    thinkingConfig: {
-                        thinkingLevel: "MINIMAL"
-                    },
+              contents: [
+                  {
+                      role: "user",
 
-                    responseMimeType:
-                        "application/json",
+                      parts: [
+                          {
+                              text: prompt
+                          }
+                      ]
+                  }
+              ],
 
-                    responseSchema: {
-                        type: "ARRAY",
+              generationConfig: {
+                  thinkingConfig: {
+                      thinkingLevel:
+                          "MINIMAL"
+                  },
 
-                        items: {
-                            type: "OBJECT",
+                  responseMimeType:
+                      "application/json",
 
-                            properties: {
-                                i: {
-                                    type: "INTEGER"
-                                },
+                  responseSchema: {
+                      type: "ARRAY",
 
-                                l: {
-                                    type: "STRING"
-                                },
+                      items: {
+                          type: "OBJECT",
 
-                                t: {
-                                    type: "STRING"
-                                }
-                            },
+                          properties: {
+                              i: {
+                                  type:
+                                      "INTEGER"
+                              },
 
-                            required: [
-                                "i",
-                                "l",
-                                "t"
-                            ]
-                        },
+                              l: {
+                                  type:
+                                      "STRING"
+                              },
 
-                        minItems: 1
-                    },
+                              t: {
+                                  type:
+                                      "STRING"
+                              }
+                          },
 
-                    maxOutputTokens:
-                        MAX_OUTPUT_TOKENS
-                }
-            };
+                          required: [
+                              "i",
+                              "l",
+                              "t"
+                          ]
+                      },
+
+                      minItems: 1
+                  },
+
+                  maxOutputTokens:
+                      MAX_OUTPUT_TOKENS
+              }
+          };
 
     const remaining =
-        remainingBeforeDeadline(deadlineAt);
+        remainingBeforeDeadline(
+            deadlineAt
+        );
 
     if (remaining <= 0) {
         throw translationTimeoutError();
@@ -1502,24 +1904,44 @@ async function rawGeminiRequest(
     let kindTimeoutMs =
         TRANSLATION_REQUEST_TIMEOUT_MS;
 
-    if (requestKind === "semantic-audit") {
+    if (
+        requestKind ===
+        "semantic-audit"
+    ) {
         kindTimeoutMs =
             SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS;
 
     } else if (
-        requestKind === "translation-rescue"
+        requestKind ===
+        "translation-structure-retry"
+    ) {
+        kindTimeoutMs =
+            STRUCTURE_RETRY_TIMEOUT_MS;
+
+    } else if (
+        requestKind ===
+        "translation-rescue"
     ) {
         kindTimeoutMs =
             RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS;
 
     } else if (
-        requestKind === "translation-single"
+        requestKind ===
+        "translation-repair"
+    ) {
+        kindTimeoutMs =
+            REPAIR_TRANSLATION_REQUEST_TIMEOUT_MS;
+
+    } else if (
+        requestKind ===
+        "translation-single"
     ) {
         kindTimeoutMs =
             SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS;
 
     } else if (
-        requestKind === "translation-single-last"
+        requestKind ===
+        "translation-single-last"
     ) {
         kindTimeoutMs =
             SINGLE_LAST_TRANSLATION_REQUEST_TIMEOUT_MS;
@@ -1528,8 +1950,10 @@ async function rawGeminiRequest(
     const requestTimeoutMs =
         Math.max(
             1,
+
             Math.min(
                 kindTimeoutMs,
+
                 Number.isFinite(remaining)
                     ? remaining
                     : kindTimeoutMs
@@ -1541,35 +1965,42 @@ async function rawGeminiRequest(
 
     let requestTimedOut = false;
 
-    const timer = setTimeout(
-        () => {
-            requestTimedOut = true;
-            controller.abort();
-        },
-        requestTimeoutMs
-    );
+    const timer =
+        setTimeout(
+            () => {
+                requestTimedOut = true;
+                controller.abort();
+            },
+
+            requestTimeoutMs
+        );
 
     let response;
     let rawText;
 
     try {
-        response = await fetch(
-            endpoint,
-            {
-                method: "POST",
+        response =
+            await fetch(
+                endpoint,
 
-                headers: {
-                    "Content-Type":
-                        "application/json",
+                {
+                    method: "POST",
 
-                    "x-goog-api-key":
-                        GEMINI_API_KEY
-                },
+                    headers: {
+                        "Content-Type":
+                            "application/json",
 
-                body: JSON.stringify(body),
-                signal: controller.signal
-            }
-        );
+                        "x-goog-api-key":
+                            GEMINI_API_KEY
+                    },
+
+                    body:
+                        JSON.stringify(body),
+
+                    signal:
+                        controller.signal
+                }
+            );
 
         rawText =
             await response.text();
@@ -1599,14 +2030,18 @@ async function rawGeminiRequest(
     let data;
 
     try {
-        data = JSON.parse(rawText);
+        data =
+            JSON.parse(rawText);
 
     } catch {
-        const error = new Error(
-            `Resposta não-JSON do Gemini. HTTP ${response.status}.`
-        );
+        const error =
+            new Error(
+                `Resposta não-JSON do Gemini. HTTP ${response.status}.`
+            );
 
-        error.status = response.status;
+        error.status =
+            response.status;
+
         throw error;
     }
 
@@ -1615,9 +2050,11 @@ async function rawGeminiRequest(
             data?.error?.message ||
             `HTTP ${response.status}`;
 
-        const error = new Error(message);
+        const error =
+            new Error(message);
 
-        error.status = response.status;
+        error.status =
+            response.status;
 
         error.rateLimit =
             isRateLimitError(
@@ -1640,7 +2077,8 @@ async function rawGeminiRequest(
         data?.candidates?.[0]
             ?.content?.parts
             ?.map(
-                part => part?.text || ""
+                part =>
+                    part?.text || ""
             )
             .join("")
             .trim();
@@ -1654,13 +2092,22 @@ async function rawGeminiRequest(
     return text;
 }
 
+/*
+|--------------------------------------------------------------------------
+| FILA GEMINI
+|--------------------------------------------------------------------------
+*/
+
 function enqueueGemini(
     prompt,
     deadlineAt,
     requestKind = "translation"
 ) {
     return new Promise(
-        (resolve, reject) => {
+        (
+            resolve,
+            reject
+        ) => {
             if (
                 Number.isFinite(deadlineAt) &&
                 Date.now() >= deadlineAt
@@ -1668,6 +2115,7 @@ function enqueueGemini(
                 reject(
                     translationTimeoutError()
                 );
+
                 return;
             }
 
@@ -1692,20 +2140,27 @@ async function processGeminiQueue() {
     geminiWorkerRunning = true;
 
     try {
-        while (geminiQueue.length > 0) {
-            const item = geminiQueue.shift();
+        while (
+            geminiQueue.length > 0
+        ) {
+            const item =
+                geminiQueue.shift();
 
             if (!item) {
                 continue;
             }
 
             if (
-                Number.isFinite(item.deadlineAt) &&
-                Date.now() >= item.deadlineAt
+                Number.isFinite(
+                    item.deadlineAt
+                ) &&
+                Date.now() >=
+                    item.deadlineAt
             ) {
                 item.reject(
                     translationTimeoutError()
                 );
+
                 continue;
             }
 
@@ -1723,7 +2178,9 @@ async function processGeminiQueue() {
 
                     if (cooldown > 0) {
                         console.log(
-                            `[GEMINI] Fila aguardando cooldown de ${Math.ceil(cooldown / 1000)}s.`
+                            `[GEMINI] Fila aguardando cooldown de ${Math.ceil(
+                                cooldown / 1000
+                            )}s.`
                         );
 
                         await sleepWithDeadline(
@@ -1798,10 +2255,11 @@ async function processGeminiQueue() {
                         "GEMINI_REQUEST_TIMEOUT"
                     ) {
                         console.warn(
-                            `[GEMINI] Timeout curto (${item.requestKind || "translation"}); request será tratado pelo RESCUE 6.2.`
+                            `[GEMINI] Timeout curto (${item.requestKind || "translation"}); request será tratado pelo fluxo FAST/RESCUE 6.3.`
                         );
 
                         item.reject(error);
+
                         finished = true;
                         continue;
                     }
@@ -1818,6 +2276,7 @@ async function processGeminiQueue() {
                             Math.min(
                                 error.retryAfterMs ||
                                 30000,
+
                                 MAX_RATE_LIMIT_COOLDOWN_MS
                             );
 
@@ -1833,10 +2292,13 @@ async function processGeminiQueue() {
                         MAX_NORMAL_RETRIES
                     ) {
                         const wait =
-                            1500 * normalAttempt;
+                            1500 *
+                            normalAttempt;
 
                         console.log(
-                            `[GEMINI] Retry normal em ${Math.ceil(wait / 1000)}s.`
+                            `[GEMINI] Retry normal em ${Math.ceil(
+                                wait / 1000
+                            )}s.`
                         );
 
                         normalAttempt++;
@@ -1875,6 +2337,12 @@ async function processGeminiQueue() {
     }
 }
 
+/*
+|--------------------------------------------------------------------------
+| PROMPT DE TRADUÇÃO
+|--------------------------------------------------------------------------
+*/
+
 function blockTranslationLock(block) {
     return sha256(
         JSON.stringify([
@@ -1900,42 +2368,88 @@ function contextBlockPayload(block) {
 
 function buildTranslationPrompt(
     blocks,
-    context = {}
+    context = {},
+    options = {}
 ) {
     const payload =
-        blocks.map(block => {
-            const item = {
-                i: block.index,
-                l: blockTranslationLock(block),
-                x: block.text
-            };
+        blocks.map(
+            block => {
+                const item = {
+                    i: block.index,
 
-            if (block.speakerHint) {
-                item.s = block.speakerHint;
+                    l:
+                        blockTranslationLock(
+                            block
+                        ),
+
+                    x: block.text
+                };
+
+                if (block.speakerHint) {
+                    item.s =
+                        block.speakerHint;
+                }
+
+                return item;
             }
+        );
 
-            return item;
-        });
+    let mode =
+        "TRADUÇÃO NORMAL. Seja rigoroso com a separação semântica entre IDs.";
 
-    return `TRADUZA b para PT-BR premium seguindo integralmente as regras do sistema.
-p e n são SOMENTE contexto externo: nunca absorva o conteúdo deles em b.
+    if (options.strictStructure) {
+        mode =
+            "REPETIÇÃO ESTRUTURAL. A resposta anterior quebrou o contrato. Não omita, duplique, reordene ou altere nenhum i/l. Traduza todos os itens exatamente uma vez.";
+    }
+
+    if (options.repairMode) {
+        mode =
+            "REPARO SEMÂNTICO CIRÚRGICO. Traduza APENAS os IDs listados em b. Cada ID deve conter exclusivamente o sentido do próprio x. Não absorva fala anterior/posterior. Preserve fragmentos quando a frase continua fora da janela.";
+    }
+
+    return `${mode}
+Siga integralmente as regras premium do sistema.
+p e n são SOMENTE contexto externo e nunca devem ser absorvidos em b.
 SAÍDA EXATA: [{"i":123,"l":"abc","t":"tradução"}]
 ENTRADA: ${JSON.stringify({
-        p: contextBlockPayload(context.before),
-        b: payload,
-        n: contextBlockPayload(context.after)
+        p:
+            contextBlockPayload(
+                context.before
+            ),
+
+        b:
+            payload,
+
+        n:
+            contextBlockPayload(
+                context.after
+            )
     })}`;
 }
 
+/*
+|--------------------------------------------------------------------------
+| 6.3 FAST-FIRST / SAFE-FINAL
+|--------------------------------------------------------------------------
+*/
+
 function badModelOutputError(message) {
-    const error = new Error(message);
-    error.code = "BAD_MODEL_OUTPUT";
+    const error =
+        new Error(message);
+
+    error.code =
+        "BAD_MODEL_OUTPUT";
+
     return error;
 }
 
 function badAuditOutputError(message) {
-    const error = new Error(message);
-    error.code = "BAD_AUDIT_OUTPUT";
+    const error =
+        new Error(message);
+
+    error.code =
+        "BAD_AUDIT_OUTPUT";
+
     return error;
 }
 
@@ -1945,7 +2459,10 @@ function normalizedRiskText(value) {
             /<[^>]+>|\{[^}]+\}/g,
             " "
         )
-        .replace(/\s+/g, " ")
+        .replace(
+            /\s+/g,
+            " "
+        )
         .trim();
 }
 
@@ -1955,10 +2472,65 @@ function strongSentenceEnd(text) {
     );
 }
 
-function fragmentTail(text) {
-    return /(?:[,;:–—-]|\b(?:and|but|or|because|so|to|of|for|with|that|which|who|when|if|than|as|like|a|an|the|my|your|our|their|his|her|its|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|can|could|should|may|might|must))\s*$/iu.test(
-        normalizedRiskText(text)
+function strictFragmentTail(text) {
+    const value =
+        normalizedRiskText(text);
+
+    return (
+        /[,;:–—-]\s*$/u.test(value) ||
+        /\b(?:and|but|or|because|so|to|of|for|with|that|which|who|when|if|than|as)\s*$/iu.test(
+            value
+        )
     );
+}
+
+function startsLikeContinuation(text) {
+    const value =
+        normalizedRiskText(text);
+
+    return (
+        /^[a-z]/u.test(value) ||
+        /^(?:and|but|or|so|because|then|that|which|who|when|if|to|of|for|with)\b/iu.test(
+            value
+        )
+    );
+}
+
+function strongBoundaryRisk(
+    leftBlock,
+    rightBlock
+) {
+    if (!leftBlock || !rightBlock) {
+        return false;
+    }
+
+    const left =
+        normalizedRiskText(
+            leftBlock.text
+        );
+
+    const right =
+        normalizedRiskText(
+            rightBlock.text
+        );
+
+    if (!left || !right) {
+        return false;
+    }
+
+    if (strictFragmentTail(left)) {
+        return true;
+    }
+
+    if (
+        !strongSentenceEnd(left) &&
+        left.length <= 45 &&
+        startsLikeContinuation(right)
+    ) {
+        return true;
+    }
+
+    return false;
 }
 
 function translationLengthRisk(
@@ -1966,10 +2538,14 @@ function translationLengthRisk(
     translated
 ) {
     const sourceLength =
-        normalizedRiskText(source).length;
+        normalizedRiskText(
+            source
+        ).length;
 
     const translatedLength =
-        normalizedRiskText(translated).length;
+        normalizedRiskText(
+            translated
+        ).length;
 
     if (
         sourceLength < 18 ||
@@ -1979,7 +2555,8 @@ function translationLengthRisk(
     }
 
     const ratio =
-        translatedLength / sourceLength;
+        translatedLength /
+        sourceLength;
 
     return (
         ratio < 0.28 ||
@@ -1988,13 +2565,13 @@ function translationLengthRisk(
 }
 
 function suspiciousNeighborDuplicate(
-    translatedItems,
+    translatedTexts,
     index,
     blocks
 ) {
     const current =
         normalizedRiskText(
-            translatedItems[index]?.text
+            translatedTexts[index]
         ).toLowerCase();
 
     if (current.length < 14) {
@@ -2003,21 +2580,24 @@ function suspiciousNeighborDuplicate(
 
     for (
         const neighborIndex
-        of [index - 1, index + 1]
+        of [
+            index - 1,
+            index + 1
+        ]
     ) {
         if (
             neighborIndex < 0 ||
             neighborIndex >=
-                translatedItems.length
+                translatedTexts.length
         ) {
             continue;
         }
 
         const neighbor =
             normalizedRiskText(
-                translatedItems[
+                translatedTexts[
                     neighborIndex
-                ]?.text
+                ]
             ).toLowerCase();
 
         const source =
@@ -2043,175 +2623,22 @@ function suspiciousNeighborDuplicate(
     return false;
 }
 
-function startsLikeContinuation(text) {
-    const value =
-        normalizedRiskText(text);
-
-    return (
-        /^[a-z]/u.test(value) ||
-        /^(?:and|but|or|so|because|then|that|which|who|when|if|to|of|for|with)\b/iu.test(value)
-    );
-}
-
-function boundaryPairRisk(
-    leftBlock,
-    rightBlock
-) {
-    if (!leftBlock || !rightBlock) {
-        return false;
-    }
-
-    const left =
-        normalizedRiskText(
-            leftBlock.text
-        );
-
-    const right =
-        normalizedRiskText(
-            rightBlock.text
-        );
-
-    if (!left || !right) {
-        return false;
-    }
-
-    if (fragmentTail(left)) {
-        return true;
-    }
-
-    if (
-        !strongSentenceEnd(left) &&
-        startsLikeContinuation(right)
-    ) {
-        return true;
-    }
-
-    if (/[,;:–—-]\s*$/u.test(left)) {
-        return true;
-    }
-
-    const leftWords =
-        left
-            .split(/\s+/)
-            .filter(Boolean)
-            .length;
-
-    if (
-        !strongSentenceEnd(left) &&
-        leftWords <= 5
-    ) {
-        return true;
-    }
-
-    return false;
-}
-
-function auditRiskScore(
+function selectFinalAuditIndices(
     blocks,
-    translatedItems,
-    index
+    translatedTexts,
+    batchBoundaryStarts
 ) {
-    const block = blocks[index];
+    const selected =
+        new Set();
 
-    const source =
-        normalizedRiskText(
-            block?.text
-        );
+    const risk =
+        new Set();
 
-    const words =
-        source
-            .split(/\s+/)
-            .filter(Boolean);
+    const boundary =
+        new Set();
 
-    let score = 0;
-
-    if (fragmentTail(source)) {
-        score += 3;
-    }
-
-    if (
-        index > 0 &&
-        fragmentTail(
-            blocks[index - 1]?.text
-        )
-    ) {
-        score += 3;
-    }
-
-    if (
-        index < blocks.length - 1 &&
-        boundaryPairRisk(
-            block,
-            blocks[index + 1]
-        )
-    ) {
-        score += 3;
-    }
-
-    if (
-        index > 0 &&
-        boundaryPairRisk(
-            blocks[index - 1],
-            block
-        )
-    ) {
-        score += 3;
-    }
-
-    if (
-        words.length <= 3 &&
-        !strongSentenceEnd(source)
-    ) {
-        score += 1;
-    }
-
-    if (
-        translationLengthRisk(
-            block?.text,
-            translatedItems[index]?.text
-        )
-    ) {
-        score += 3;
-    }
-
-    if (
-        suspiciousNeighborDuplicate(
-            translatedItems,
-            index,
-            blocks
-        )
-    ) {
-        score += 3;
-    }
-
-    return score;
-}
-
-function selectIndependentAuditIndices(
-    blocks,
-    translatedItems
-) {
-    const selected = new Set();
-    const riskSelected = new Set();
-
-    let canaryCount = 0;
-
-    for (
-        let i = 0;
-        i < blocks.length;
-        i++
-    ) {
-        if (
-            auditRiskScore(
-                blocks,
-                translatedItems,
-                i
-            ) >= HIGH_RISK_AUDIT_SCORE
-        ) {
-            selected.add(i);
-            riskSelected.add(i);
-        }
-    }
+    const canary =
+        new Set();
 
     for (
         let i = 0;
@@ -2219,7 +2646,7 @@ function selectIndependentAuditIndices(
         i++
     ) {
         if (
-            boundaryPairRisk(
+            strongBoundaryRisk(
                 blocks[i],
                 blocks[i + 1]
             )
@@ -2227,8 +2654,52 @@ function selectIndependentAuditIndices(
             selected.add(i);
             selected.add(i + 1);
 
-            riskSelected.add(i);
-            riskSelected.add(i + 1);
+            risk.add(i);
+            risk.add(i + 1);
+        }
+    }
+
+    for (
+        const startIndex
+        of batchBoundaryStarts
+    ) {
+        if (startIndex > 0) {
+            selected.add(
+                startIndex - 1
+            );
+
+            boundary.add(
+                startIndex - 1
+            );
+        }
+
+        if (
+            startIndex <
+            blocks.length
+        ) {
+            selected.add(startIndex);
+            boundary.add(startIndex);
+        }
+    }
+
+    for (
+        let i = 0;
+        i < blocks.length;
+        i++
+    ) {
+        if (
+            translationLengthRisk(
+                blocks[i]?.text,
+                translatedTexts[i]
+            ) ||
+            suspiciousNeighborDuplicate(
+                translatedTexts,
+                i,
+                blocks
+            )
+        ) {
+            selected.add(i);
+            risk.add(i);
         }
     }
 
@@ -2242,109 +2713,113 @@ function selectIndependentAuditIndices(
             i === blocks.length - 1 ||
             i % AUDIT_CANARY_STRIDE === 0
         ) {
-            if (!selected.has(i)) {
-                canaryCount++;
-            }
-
             selected.add(i);
+            canary.add(i);
         }
     }
 
     return {
         indices:
             Array.from(selected)
-                .sort((a, b) => a - b),
+                .sort(
+                    (a, b) =>
+                        a - b
+                ),
 
-        riskCount: riskSelected.size,
-        canaryCount
+        riskCount:
+            risk.size,
+
+        boundaryCount:
+            boundary.size,
+
+        canaryCount:
+            canary.size
     };
 }
 
-function blockAtWithOuterContext(
+function buildIndependentAuditRecord(
     blocks,
-    index,
-    context
+    translatedTexts,
+    index
 ) {
-    if (
-        index >= 0 &&
-        index < blocks.length
-    ) {
-        return blocks[index];
-    }
+    const block =
+        blocks[index];
 
-    if (index < 0) {
-        return context?.before || null;
-    }
+    const previous =
+        index > 0
+            ? blocks[index - 1]
+            : null;
 
-    return context?.after || null;
-}
+    const next =
+        index <
+        blocks.length - 1
+            ? blocks[index + 1]
+            : null;
 
-function buildIndependentAuditRecords(
-    blocks,
-    translatedItems,
-    indices,
-    context
-) {
-    return indices.map(index => {
-        const block = blocks[index];
+    return {
+        id:
+            block.index,
 
-        const previous =
-            blockAtWithOuterContext(
-                blocks,
-                index - 1,
-                context
-            );
+        lock:
+            blockTranslationLock(
+                block
+            ),
 
-        const next =
-            blockAtWithOuterContext(
-                blocks,
-                index + 1,
-                context
-            );
+        source:
+            block.text,
 
-        return {
-            id: block.index,
+        translation:
+            translatedTexts[index],
 
-            lock:
-                blockTranslationLock(block),
+        speaker:
+            block.speakerHint ||
+            null,
 
-            source: block.text,
+        prev:
+            previous
+                ? {
+                      id:
+                          previous.index,
 
-            translation:
-                translatedItems[index].text,
+                      source:
+                          previous.text
+                  }
+                : null,
 
-            speaker:
-                block.speakerHint || null,
+        next:
+            next
+                ? {
+                      id:
+                          next.index,
 
-            prev:
-                previous
-                    ? {
-                        id: previous.index,
-                        source: previous.text
-                    }
-                    : null,
+                      source:
+                          next.text
+                  }
+                : null,
 
-            next:
-                next
-                    ? {
-                        id: next.index,
-                        source: next.text
-                    }
-                    : null
-        };
-    });
+        _index:
+            index
+    };
 }
 
 function auditRecordForModel(record) {
     const item = {
-        i: record.id,
-        l: record.lock,
-        s: record.source,
-        t: record.translation
+        i:
+            record.id,
+
+        l:
+            record.lock,
+
+        s:
+            record.source,
+
+        t:
+            record.translation
     };
 
     if (record.speaker) {
-        item.h = record.speaker;
+        item.h =
+            record.speaker;
     }
 
     if (record.prev) {
@@ -2365,29 +2840,16 @@ function auditRecordForModel(record) {
 }
 
 function buildSemanticAuditPrompt(records) {
-    return `AUDITE os registros abaixo. Eles podem ser esparsos; use SOMENTE p/n do próprio registro como vizinhos.
-Falha = t contém sentido pertencente a p/n ou não corresponde ao source s do próprio i.
-Aceite localização natural, gíria, humor e linguagem LGBTQIAPN+/drag/camp/shade quando o sentido do próprio i estiver preservado.
+    return `AUDITORIA FINAL FAST-SAFE.
+Os registros podem ser esparsos. Use SOMENTE p/n do próprio registro como vizinhos.
+Falha de migração = t contém sentido pertencente a p/n. Falha semântica própria = t permanece no próprio i, mas não preserva adequadamente s.
+Aceite localização natural, humor, gíria e linguagem LGBTQIAPN+/drag/camp/shade quando o sentido do próprio i estiver preservado.
 SAÍDA EXATA: [{"i":123,"l":"abc","m":123,"f":true}]
 REGISTROS: ${JSON.stringify(
-        records.map(auditRecordForModel)
+        records.map(
+            auditRecordForModel
+        )
     )}`;
-}
-
-function semanticAuditFailureError(failures) {
-    const error = new Error(
-        `Auditoria independente detectou ${failures.length} bloco(s) semanticamente suspeito(s).`
-    );
-
-    error.code =
-        "SEMANTIC_AUDIT_FAILURE";
-
-    error.failures = failures;
-
-    error.failedIds =
-        failures.map(item => item.id);
-
-    return error;
 }
 
 async function auditIndependentRecordsOnce(
@@ -2396,8 +2858,12 @@ async function auditIndependentRecordsOnce(
 ) {
     const raw =
         await enqueueGemini(
-            buildSemanticAuditPrompt(records),
+            buildSemanticAuditPrompt(
+                records
+            ),
+
             deadlineAt,
+
             "semantic-audit"
         );
 
@@ -2417,7 +2883,8 @@ async function auditIndependentRecordsOnce(
 
     if (
         !Array.isArray(parsed) ||
-        parsed.length !== records.length
+        parsed.length !==
+            records.length
     ) {
         throw badAuditOutputError(
             `Auditoria independente incompleta: esperado=${records.length}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`
@@ -2431,15 +2898,21 @@ async function auditIndependentRecordsOnce(
         i < records.length;
         i++
     ) {
-        const expected = records[i];
-        const item = parsed[i];
+        const expected =
+            records[i];
+
+        const item =
+            parsed[i];
 
         if (
             !item ||
             item.i !== expected.id ||
             item.l !== expected.lock ||
-            !Number.isInteger(item.m) ||
-            typeof item.f !== "boolean"
+            !Number.isInteger(
+                item.m
+            ) ||
+            typeof item.f !==
+                "boolean"
         ) {
             throw badAuditOutputError(
                 `Auditoria independente quebrou o contrato no ID ${expected.id}.`
@@ -2451,13 +2924,29 @@ async function auditIndependentRecordsOnce(
             item.m !== expected.id
         ) {
             failures.push({
-                id: expected.id,
-                matchedSourceId: item.m
+                id:
+                    expected.id,
+
+                matchedSourceId:
+                    item.m,
+
+                faithful:
+                    item.f,
+
+                _index:
+                    expected._index
             });
         }
     }
 
-    if (failures.length > 0) {
+    if (
+        failures.length === 0
+    ) {
+        console.log(
+            `[AUDIT FINAL] OK — ${records.length}/${records.length} bloco(s).`
+        );
+
+    } else {
         const sample =
             failures
                 .slice(0, 8)
@@ -2468,22 +2957,12 @@ async function auditIndependentRecordsOnce(
                 .join(", ");
 
         console.warn(
-            `[AUDIT FAST] FALHA — ${failures.length}/${records.length} suspeito(s); ${sample}.`
-        );
-
-        throw semanticAuditFailureError(
-            failures
+            `[AUDIT FINAL] ${failures.length}/${records.length} suspeito(s): ${sample}.`
         );
     }
 
-    console.log(
-        `[AUDIT FAST] OK — ${records.length}/${records.length} bloco(s) verificados.`
-    );
-
-    return true;
-}
-
-async function auditIndependentRecords(
+    return failures;
+}async function auditIndependentRecords(
     records,
     deadlineAt,
     splitDepth = 0,
@@ -2498,13 +2977,6 @@ async function auditIndependentRecords(
         );
 
     } catch (error) {
-        if (
-            error?.code ===
-            "SEMANTIC_AUDIT_FAILURE"
-        ) {
-            throw error;
-        }
-
         const recoverable =
             error?.code ===
                 "BAD_AUDIT_OUTPUT" ||
@@ -2523,7 +2995,7 @@ async function auditIndependentRecords(
                 MAX_SINGLE_BLOCK_AUDIT_RETRIES
             ) {
                 console.warn(
-                    "[AUDIT FAST] Retry único de auditoria atômica."
+                    "[AUDIT FINAL] Retry único de auditoria atômica."
                 );
 
                 return auditIndependentRecords(
@@ -2550,73 +3022,55 @@ async function auditIndependentRecords(
             );
 
         const left =
-            records.slice(0, middle);
+            records.slice(
+                0,
+                middle
+            );
 
         const right =
-            records.slice(middle);
+            records.slice(
+                middle
+            );
 
         console.warn(
-            `[AUDIT FAST] Request lenta/inválida (${records.length}); split curto ${left.length} + ${right.length}.`
+            `[AUDIT FINAL] Request lenta/inválida (${records.length}); split curto ${left.length} + ${right.length}.`
         );
 
-        await auditIndependentRecords(
-            left,
-            deadlineAt,
-            splitDepth + 1,
-            0
-        );
+        const leftFailures =
+            await auditIndependentRecords(
+                left,
+                deadlineAt,
+                splitDepth + 1,
+                0
+            );
 
-        await auditIndependentRecords(
-            right,
-            deadlineAt,
-            splitDepth + 1,
-            0
-        );
+        const rightFailures =
+            await auditIndependentRecords(
+                right,
+                deadlineAt,
+                splitDepth + 1,
+                0
+            );
 
-        return true;
+        return [
+            ...leftFailures,
+            ...rightFailures
+        ];
     }
 }
 
-function prepareAuditSelection(
-    blocks,
-    translatedItems,
-    context
-) {
-    const selection =
-        selectIndependentAuditIndices(
-            blocks,
-            translatedItems
-        );
-
-    console.log(
-        `[GUARD 6.2] Scan local ${blocks.length}/${blocks.length}; auditoria independente selecionada=${selection.indices.length}/${blocks.length} (risco=${selection.riskCount}, canários=${selection.canaryCount}).`
-    );
-
-    return {
-        records:
-            buildIndependentAuditRecords(
-                blocks,
-                translatedItems,
-                selection.indices,
-                context
-            ),
-
-        riskCount:
-            selection.riskCount,
-
-        canaryCount:
-            selection.canaryCount
-    };
-}
-
-async function auditSelectionImmediate(
+async function runFinalAudit(
     records,
     deadlineAt
 ) {
+    const failures = [];
+    let requests = 0;
+
     for (
         let offset = 0;
         offset < records.length;
-        offset += MAX_INDEPENDENT_AUDIT_BLOCKS
+        offset +=
+            MAX_INDEPENDENT_AUDIT_BLOCKS
     ) {
         const chunk =
             records.slice(
@@ -2625,45 +3079,43 @@ async function auditSelectionImmediate(
                     MAX_INDEPENDENT_AUDIT_BLOCKS
             );
 
-        try {
+        requests++;
+
+        const chunkFailures =
             await auditIndependentRecords(
                 chunk,
                 deadlineAt
             );
 
-        } catch (error) {
-            if (
-                error?.code ===
-                "SEMANTIC_AUDIT_FAILURE"
-            ) {
-                throw badModelOutputError(
-                    getErrorMessage(error)
-                );
-            }
-
-            throw error;
-        }
+        failures.push(
+            ...chunkFailures
+        );
     }
 
-    return true;
+    return {
+        failures,
+        requests
+    };
 }
 
-function contextForSlice(
+function contextForGlobalWindow(
     blocks,
-    start,
-    endExclusive,
-    context
+    startIndex,
+    endIndexInclusive
 ) {
     return {
         before:
-            start > 0
-                ? blocks[start - 1]
-                : context?.before || null,
+            startIndex > 0
+                ? blocks[startIndex - 1]
+                : null,
 
         after:
-            endExclusive < blocks.length
-                ? blocks[endExclusive]
-                : context?.after || null
+            endIndexInclusive <
+            blocks.length - 1
+                ? blocks[
+                      endIndexInclusive + 1
+                  ]
+                : null
     };
 }
 
@@ -2671,8 +3123,7 @@ async function translateBatchOnce(
     blocks,
     deadlineAt,
     context = {},
-    auditMode = "deferred",
-    requestKind = "translation"
+    options = {}
 ) {
     assertBeforeDeadline(deadlineAt);
 
@@ -2680,10 +3131,14 @@ async function translateBatchOnce(
         await enqueueGemini(
             buildTranslationPrompt(
                 blocks,
-                context
+                context,
+                options
             ),
+
             deadlineAt,
-            requestKind
+
+            options.requestKind ||
+            "translation"
         );
 
     let parsed;
@@ -2707,85 +3162,60 @@ async function translateBatchOnce(
     }
 
     if (
-        parsed.length !== blocks.length
+        parsed.length !==
+        blocks.length
     ) {
         throw badModelOutputError(
             `Quantidade incorreta de blocos: esperado=${blocks.length}, recebido=${parsed.length}. Resposta inteira descartada.`
         );
     }
 
-    const translatedItems = [];
-    const seenIds = new Set();
+    const texts = [];
+    const seenIds =
+        new Set();
 
     for (
         let i = 0;
         i < blocks.length;
         i++
     ) {
-        const block = blocks[i];
-        const item = parsed[i];
+        const block =
+            blocks[i];
+
+        const item =
+            parsed[i];
 
         const expectedLock =
-            blockTranslationLock(block);
+            blockTranslationLock(
+                block
+            );
 
         if (
             !item ||
             !Number.isInteger(item.i) ||
             item.i !== block.index ||
             seenIds.has(item.i) ||
-            typeof item.l !== "string" ||
+            typeof item.l !==
+                "string" ||
             item.l !== expectedLock ||
-            typeof item.t !== "string" ||
+            typeof item.t !==
+                "string" ||
             item.t.trim().length === 0
         ) {
             throw badModelOutputError(
-                `Contrato compacto ID/lock inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}. Resposta inteira descartada.`
+                `Contrato compacto ID/lock inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}.`
             );
         }
 
         seenIds.add(item.i);
-
-        translatedItems.push({
-            text: item.t
-        });
+        texts.push(item.t);
     }
 
     console.log(
         `[AUDIT ID] OK — ${blocks.length}/${blocks.length} bloco(s); ordem, IDs e locks preservados exatamente.`
     );
 
-    const auditSelection =
-        prepareAuditSelection(
-            blocks,
-            translatedItems,
-            context
-        );
-
-    if (auditMode === "immediate") {
-        await auditSelectionImmediate(
-            auditSelection.records,
-            deadlineAt
-        );
-
-        return {
-            texts:
-                translatedItems.map(
-                    item => item.text
-                ),
-
-            auditRecords: []
-        };
-    }
-
-    return {
-        texts:
-            translatedItems.map(
-                item => item.text
-            ),
-
-        auditRecords:
-            auditSelection.records
-    };
+    return texts;
 }
 
 function splitFixedRescueBatches(blocks) {
@@ -2796,7 +3226,9 @@ function splitFixedRescueBatches(blocks) {
 
     for (const block of blocks) {
         const size =
-            String(block.text || "").length +
+            String(
+                block.text || ""
+            ).length +
             20;
 
         if (
@@ -2825,19 +3257,48 @@ function splitFixedRescueBatches(blocks) {
     return result;
 }
 
+function contextForLocalSlice(
+    blocks,
+    start,
+    endExclusive,
+    outerContext
+) {
+    return {
+        before:
+            start > 0
+                ? blocks[start - 1]
+                : outerContext?.before ||
+                  null,
+
+        after:
+            endExclusive <
+            blocks.length
+                ? blocks[endExclusive]
+                : outerContext?.after ||
+                  null
+    };
+}
+
 async function translateSingleLastChance(
     block,
     deadlineAt,
     context,
-    auditMode
+    repairMode = false
 ) {
     try {
         return await translateBatchOnce(
             [block],
+
             deadlineAt,
+
             context,
-            auditMode,
-            "translation-single"
+
+            {
+                requestKind:
+                    "translation-single",
+
+                repairMode
+            }
         );
 
     } catch (error) {
@@ -2854,15 +3315,25 @@ async function translateSingleLastChance(
         assertBeforeDeadline(deadlineAt);
 
         console.warn(
-            `[RESCUE 6.2] ID ${block.index}: última tentativa atômica.`
+            `[RESCUE 6.3] ID ${block.index}: última tentativa atômica.`
         );
 
         return translateBatchOnce(
             [block],
+
             deadlineAt,
+
             context,
-            auditMode,
-            "translation-single-last"
+
+            {
+                requestKind:
+                    "translation-single-last",
+
+                strictStructure:
+                    true,
+
+                repairMode
+            }
         );
     }
 }
@@ -2871,16 +3342,23 @@ async function translateRescueChunk(
     blocks,
     deadlineAt,
     context,
-    auditMode,
     splitDepth = 0
 ) {
     try {
         return await translateBatchOnce(
             blocks,
+
             deadlineAt,
+
             context,
-            auditMode,
-            "translation-rescue"
+
+            {
+                requestKind:
+                    "translation-rescue",
+
+                strictStructure:
+                    true
+            }
         );
 
     } catch (error) {
@@ -2901,7 +3379,7 @@ async function translateRescueChunk(
                 blocks[0],
                 deadlineAt,
                 context,
-                auditMode
+                false
             );
         }
 
@@ -2910,11 +3388,10 @@ async function translateRescueChunk(
             MAX_RESCUE_SPLIT_DEPTH
         ) {
             console.warn(
-                `[RESCUE 6.2] Micro-lote de ${blocks.length} ainda falhou; indo direto para IDs atômicos, sem nova árvore de timeout.`
+                `[RESCUE 6.3] Micro-lote ${blocks.length} ainda falhou; indo para IDs atômicos sem nova árvore.`
             );
 
             const texts = [];
-            const auditRecords = [];
 
             for (
                 let i = 0;
@@ -2922,34 +3399,25 @@ async function translateRescueChunk(
                 i++
             ) {
                 const singleContext =
-                    contextForSlice(
+                    contextForLocalSlice(
                         blocks,
                         i,
                         i + 1,
                         context
                     );
 
-                const result =
+                const single =
                     await translateSingleLastChance(
                         blocks[i],
                         deadlineAt,
                         singleContext,
-                        auditMode
+                        false
                     );
 
-                texts.push(
-                    ...result.texts
-                );
-
-                auditRecords.push(
-                    ...result.auditRecords
-                );
+                texts.push(...single);
             }
 
-            return {
-                texts,
-                auditRecords
-            };
+            return texts;
         }
 
         const middle =
@@ -2958,81 +3426,88 @@ async function translateRescueChunk(
             );
 
         const left =
-            blocks.slice(0, middle);
+            blocks.slice(
+                0,
+                middle
+            );
 
         const right =
-            blocks.slice(middle);
+            blocks.slice(
+                middle
+            );
 
         console.warn(
-            `[RESCUE 6.2] Micro-lote ${blocks.length} falhou; split curto ${left.length} + ${right.length} (nível ${splitDepth + 1}/${MAX_RESCUE_SPLIT_DEPTH}).`
+            `[RESCUE 6.3] Micro-lote ${blocks.length} falhou; split único ${left.length} + ${right.length}.`
         );
 
-        const leftResult =
+        const leftTexts =
             await translateRescueChunk(
                 left,
+
                 deadlineAt,
-                contextForSlice(
+
+                contextForLocalSlice(
                     blocks,
                     0,
                     middle,
                     context
                 ),
-                auditMode,
+
                 splitDepth + 1
             );
 
-        const rightResult =
+        const rightTexts =
             await translateRescueChunk(
                 right,
+
                 deadlineAt,
-                contextForSlice(
+
+                contextForLocalSlice(
                     blocks,
                     middle,
                     blocks.length,
                     context
                 ),
-                auditMode,
+
                 splitDepth + 1
             );
 
-        return {
-            texts: [
-                ...leftResult.texts,
-                ...rightResult.texts
-            ],
-
-            auditRecords: [
-                ...leftResult.auditRecords,
-                ...rightResult.auditRecords
-            ]
-        };
+        return [
+            ...leftTexts,
+            ...rightTexts
+        ];
     }
 }
 
 async function translateBatchRescue(
     blocks,
     deadlineAt,
-    context,
-    auditMode
+    context
 ) {
     const rescueBatches =
-        splitFixedRescueBatches(blocks);
+        splitFixedRescueBatches(
+            blocks
+        );
 
     console.warn(
-        `[RESCUE 6.2] Entrando em modo fixo: ${blocks.length} bloco(s) -> ${rescueBatches.length} micro-lote(s), máx ${RESCUE_BATCH_BLOCKS} blocos/${RESCUE_BATCH_CHARS} chars.`
+        `[RESCUE 6.3] ${blocks.length} bloco(s) -> ${rescueBatches.length} micro-lote(s), máx ${RESCUE_BATCH_BLOCKS}/${RESCUE_BATCH_CHARS}.`
     );
 
     const texts = [];
-    const auditRecords = [];
     let cursor = 0;
 
-    for (const chunk of rescueBatches) {
-        const start = cursor;
+    for (
+        const chunk
+        of rescueBatches
+    ) {
+        const start =
+            cursor;
+
         const end =
             start + chunk.length;
 
         const chunkContext =
-            contextForSlice(
+            contextForLocalSlice(
                 blocks,
                 start,
                 end,
@@ -3044,83 +3519,101 @@ async function translateBatchRescue(
                 chunk,
                 deadlineAt,
                 chunkContext,
-                auditMode,
                 0
             );
 
-        texts.push(
-            ...result.texts
-        );
-
-        auditRecords.push(
-            ...result.auditRecords
-        );
+        texts.push(...result);
 
         cursor = end;
     }
 
-    return {
-        texts,
-        auditRecords
-    };
+    return texts;
 }
 
-async function translateBatch(
+async function translateMainBatch(
     blocks,
     deadlineAt,
-    context = {},
-    auditMode = "deferred",
-    options = {}
+    context
 ) {
-    assertBeforeDeadline(deadlineAt);
-
-    if (options.forceRescue === true) {
-        return translateBatchRescue(
-            blocks,
-            deadlineAt,
-            context,
-            auditMode
-        );
-    }
-
     try {
         return await translateBatchOnce(
             blocks,
+
             deadlineAt,
+
             context,
-            auditMode,
-            "translation"
+
+            {
+                requestKind:
+                    "translation"
+            }
         );
 
     } catch (error) {
-        const recoverable =
+        if (
             error?.code ===
-                "BAD_MODEL_OUTPUT" ||
-            error?.code ===
-                "GEMINI_REQUEST_TIMEOUT";
+            "BAD_MODEL_OUTPUT"
+        ) {
+            console.warn(
+                `[TRANSLATE] Lote ${blocks.length}: contrato inválido. Repetindo UMA vez o mesmo lote com contrato reforçado.`
+            );
 
-        if (!recoverable) {
-            throw error;
+            try {
+                return await translateBatchOnce(
+                    blocks,
+
+                    deadlineAt,
+
+                    context,
+
+                    {
+                        requestKind:
+                            "translation-structure-retry",
+
+                        strictStructure:
+                            true
+                    }
+                );
+
+            } catch (retryError) {
+                const recoverable =
+                    retryError?.code ===
+                        "BAD_MODEL_OUTPUT" ||
+                    retryError?.code ===
+                        "GEMINI_REQUEST_TIMEOUT";
+
+                if (!recoverable) {
+                    throw retryError;
+                }
+
+                console.warn(
+                    "[TRANSLATE] Repetição estrutural falhou; entrando no RESCUE fixo 6.3."
+                );
+
+                return translateBatchRescue(
+                    blocks,
+                    deadlineAt,
+                    context
+                );
+            }
         }
 
-        assertBeforeDeadline(deadlineAt);
-
-        const reason =
+        if (
             error?.code ===
             "GEMINI_REQUEST_TIMEOUT"
-                ? "timeout"
-                : "contrato";
+        ) {
+            console.warn(
+                `[TRANSLATE] Lote ${blocks.length}: timeout normal. Indo direto ao RESCUE fixo 6.3.`
+            );
 
-        console.warn(
-            `[TRANSLATE] Lote normal de ${blocks.length} falhou por ${reason}. Sem árvore binária longa: entrando diretamente no RESCUE 6.2.`
-        );
+            return translateBatchRescue(
+                blocks,
+                deadlineAt,
+                context
+            );
+        }
 
-        return translateBatchRescue(
-            blocks,
-            deadlineAt,
-            context,
-            auditMode
-        );
+        throw error;
     }
 }
 
@@ -3140,193 +3633,405 @@ function writeTranslatedBatch(
                 batch[i]
             );
 
-        if (originalIndex !== undefined) {
+        if (
+            originalIndex !==
+            undefined
+        ) {
             translatedTexts[
                 originalIndex
-            ] = translated[i];
+            ] =
+                translated[i];
         }
     }
 }
 
-async function recoverBatchWithImmediateAudit(
-    batchState,
-    deadlineAt,
-    translatedTexts,
-    originalPositions
+function buildRepairWindows(
+    failures,
+    blocks
 ) {
-    console.warn(
-        `[AUDIT FAST] Retraduzindo lote ${batchState.batchIndex + 1} em RESCUE fail-closed + auditoria imediata.`
-    );
-
-    const recovered =
-        await translateBatch(
-            batchState.batch,
-            deadlineAt,
-            batchState.context,
-            "immediate",
-            {
-                forceRescue: true
-            }
+    const idToIndex =
+        new Map(
+            blocks.map(
+                (
+                    block,
+                    index
+                ) => [
+                    block.index,
+                    index
+                ]
+            )
         );
 
-    writeTranslatedBatch(
-        batchState.batch,
-        recovered.texts,
-        translatedTexts,
-        originalPositions
-    );
+    const suspectIndices =
+        new Set();
 
-    batchState.translated =
-        recovered.texts;
+    for (
+        const failure
+        of failures
+    ) {
+        const ownIndex =
+            idToIndex.get(
+                failure.id
+            );
 
-    batchState.recovered = true;
+        if (
+            Number.isInteger(
+                ownIndex
+            )
+        ) {
+            suspectIndices.add(
+                ownIndex
+            );
+        }
 
-    console.log(
-        `[AUDIT FAST] Lote ${batchState.batchIndex + 1} recuperado e aprovado.`
+        if (
+            failure.matchedSourceId !==
+            failure.id
+        ) {
+            const matchedIndex =
+                idToIndex.get(
+                    failure.matchedSourceId
+                );
+
+            if (
+                Number.isInteger(
+                    matchedIndex
+                ) &&
+                Number.isInteger(
+                    ownIndex
+                ) &&
+                Math.abs(
+                    matchedIndex -
+                    ownIndex
+                ) <= 2
+            ) {
+                suspectIndices.add(
+                    matchedIndex
+                );
+            }
+        }
+    }
+
+    const sorted =
+        Array.from(
+            suspectIndices
+        ).sort(
+            (
+                a,
+                b
+            ) =>
+                a - b
+        );
+
+    const windows = [];
+    let current = [];
+
+    for (
+        const index
+        of sorted
+    ) {
+        if (
+            current.length === 0 ||
+            (
+                index <=
+                    current[
+                        current.length -
+                        1
+                    ] +
+                        1 &&
+                current.length <
+                    MAX_REPAIR_WINDOW_BLOCKS
+            )
+        ) {
+            current.push(index);
+
+        } else {
+            windows.push(current);
+            current = [index];
+        }
+    }
+
+    if (current.length) {
+        windows.push(current);
+    }
+
+    return windows;
+}
+
+async function auditSpecificIndices(
+    blocks,
+    translatedTexts,
+    indices,
+    deadlineAt
+) {
+    const records =
+        indices.map(
+            index =>
+                buildIndependentAuditRecord(
+                    blocks,
+                    translatedTexts,
+                    index
+                )
+        );
+
+    return runFinalAudit(
+        records,
+        deadlineAt
     );
 }
 
-async function flushAuditBuffer(
-    buffer,
-    batchStates,
-    deadlineAt,
+async function repairWindow(
+    blocks,
     translatedTexts,
-    originalPositions,
-    job,
-    totals,
-    force = false
+    indices,
+    deadlineAt
 ) {
-    if (!SEMANTIC_AUDIT_ENABLED) {
-        buffer.length = 0;
+    const start =
+        indices[0];
+
+    const end =
+        indices[
+            indices.length - 1
+        ];
+
+    const repairBlocks =
+        indices.map(
+            index =>
+                blocks[index]
+        );
+
+    const context =
+        contextForGlobalWindow(
+            blocks,
+            start,
+            end
+        );
+
+    console.warn(
+        `[REPAIR 6.3] Janela IDs ${repairBlocks.map(
+            block => block.index
+        ).join(",")} (${repairBlocks.length} bloco(s)).`
+    );
+
+    let repaired;
+
+    try {
+        repaired =
+            await translateBatchOnce(
+                repairBlocks,
+
+                deadlineAt,
+
+                context,
+
+                {
+                    requestKind:
+                        "translation-repair",
+
+                    repairMode:
+                        true,
+
+                    strictStructure:
+                        true
+                }
+            );
+
+    } catch (error) {
+        const recoverable =
+            error?.code ===
+                "BAD_MODEL_OUTPUT" ||
+            error?.code ===
+                "GEMINI_REQUEST_TIMEOUT";
+
+        if (!recoverable) {
+            throw error;
+        }
+
+        repaired = [];
+
+        for (
+            let i = 0;
+            i < repairBlocks.length;
+            i++
+        ) {
+            const globalIndex =
+                indices[i];
+
+            const singleContext =
+                contextForGlobalWindow(
+                    blocks,
+                    globalIndex,
+                    globalIndex
+                );
+
+            const single =
+                await translateSingleLastChance(
+                    repairBlocks[i],
+                    deadlineAt,
+                    singleContext,
+                    true
+                );
+
+            repaired.push(
+                ...single
+            );
+        }
+    }
+
+    for (
+        let i = 0;
+        i < indices.length;
+        i++
+    ) {
+        translatedTexts[
+            indices[i]
+        ] =
+            repaired[i];
+    }
+
+    const check =
+        await auditSpecificIndices(
+            blocks,
+            translatedTexts,
+            indices,
+            deadlineAt
+        );
+
+    if (
+        check.failures.length === 0
+    ) {
+        console.log(
+            "[REPAIR 6.3] Janela aprovada após reparo."
+        );
+
         return;
     }
 
-    while (
-        buffer.length >=
-            MAX_INDEPENDENT_AUDIT_BLOCKS ||
-        (
-            force &&
-            buffer.length > 0
-        )
+    console.warn(
+        `[REPAIR 6.3] ${check.failures.length} ID(s) ainda suspeito(s); última correção atômica.`
+    );
+
+    for (
+        const failure
+        of check.failures
     ) {
-        const take =
-            Math.min(
-                MAX_INDEPENDENT_AUDIT_BLOCKS,
-                buffer.length
+        const index =
+            blocks.findIndex(
+                block =>
+                    block.index ===
+                    failure.id
             );
 
-        const chunk =
-            buffer.splice(0, take);
+        if (index < 0) {
+            throw badModelOutputError(
+                `ID ${failure.id} não encontrado no reparo.`
+            );
+        }
 
-        totals.requests++;
+        const singleContext =
+            contextForGlobalWindow(
+                blocks,
+                index,
+                index
+            );
 
-        console.log(
-            `[AUDIT BUFFER] Flush ${chunk.length} registro(s); restantes=${buffer.length}.`
-        );
+        const single =
+            await translateSingleLastChance(
+                blocks[index],
+                deadlineAt,
+                singleContext,
+                true
+            );
 
-        try {
-            await auditIndependentRecords(
-                chunk,
+        translatedTexts[index] =
+            single[0];
+
+        const finalCheck =
+            await auditSpecificIndices(
+                blocks,
+                translatedTexts,
+                [index],
                 deadlineAt
             );
 
-            totals.verified +=
-                chunk.length;
-
-        } catch (error) {
-            if (
-                error?.code !==
-                "SEMANTIC_AUDIT_FAILURE"
-            ) {
-                throw error;
-            }
-
-            const failedIds =
-                new Set(
-                    error.failedIds || []
-                );
-
-            const affectedBatchIndices =
-                new Set();
-
-            for (const record of chunk) {
-                if (
-                    failedIds.has(record.id) &&
-                    Number.isInteger(
-                        record._batchIndex
-                    )
-                ) {
-                    affectedBatchIndices.add(
-                        record._batchIndex
-                    );
-                }
-            }
-
-            if (
-                affectedBatchIndices.size === 0
-            ) {
-                throw badModelOutputError(
-                    "Auditoria agrupada detectou falha sem associação ao lote original."
-                );
-            }
-
-            for (
-                const batchIndex
-                of affectedBatchIndices
-            ) {
-                const state =
-                    batchStates[batchIndex];
-
-                if (!state) {
-                    throw badModelOutputError(
-                        `Lote ${batchIndex + 1} não encontrado para recuperação.`
-                    );
-                }
-
-                await recoverBatchWithImmediateAudit(
-                    state,
-                    deadlineAt,
-                    translatedTexts,
-                    originalPositions
-                );
-
-                totals.recoveredBatches++;
-
-                for (
-                    let i =
-                        buffer.length - 1;
-                    i >= 0;
-                    i--
-                ) {
-                    if (
-                        buffer[i]._batchIndex ===
-                        batchIndex
-                    ) {
-                        buffer.splice(i, 1);
-                    }
-                }
-            }
-
-            totals.verified +=
-                chunk.filter(
-                    record =>
-                        !affectedBatchIndices.has(
-                            record._batchIndex
-                        )
-                ).length;
-        }
-
-        if (job) {
-            job.updatedAt = Date.now();
+        if (
+            finalCheck.failures.length >
+            0
+        ) {
+            throw badModelOutputError(
+                `Reparo semântico fail-closed não conseguiu aprovar o ID ${failure.id}.`
+            );
         }
     }
+}
+
+async function confirmOwnIdFailures(
+    failures,
+    blocks,
+    translatedTexts,
+    deadlineAt
+) {
+    const migrationFailures =
+        failures.filter(
+            item =>
+                item.matchedSourceId !==
+                item.id
+        );
+
+    const ownFailures =
+        failures.filter(
+            item =>
+                item.matchedSourceId ===
+                item.id
+        );
+
+    if (
+        ownFailures.length === 0
+    ) {
+        return migrationFailures;
+    }
+
+    const ownIndices =
+        ownFailures
+            .map(
+                item =>
+                    blocks.findIndex(
+                        block =>
+                            block.index ===
+                            item.id
+                    )
+            )
+            .filter(
+                index =>
+                    index >= 0
+            );
+
+    console.log(
+        `[AUDIT FINAL] ${ownIndices.length} suspeita(s) f=false/m=i serão rechecadas antes de qualquer reparo.`
+    );
+
+    const recheck =
+        await auditSpecificIndices(
+            blocks,
+            translatedTexts,
+            ownIndices,
+            deadlineAt
+        );
+
+    return [
+        ...migrationFailures,
+        ...recheck.failures
+    ];
 }
 
 async function translateSrt(
     originalSrt,
     job
 ) {
-    const blocks = parseSrt(originalSrt);
+    const blocks =
+        parseSrt(
+            originalSrt
+        );
 
     if (blocks.length === 0) {
         throw new Error(
@@ -3334,78 +4039,80 @@ async function translateSrt(
         );
     }
 
+    const batches =
+        splitIntoBatches(
+            blocks
+        );
+
     console.log(
         `[TRANSLATE] ${blocks.length} blocos.`
     );
-
-    const batches =
-        splitIntoBatches(blocks);
 
     console.log(
         `[TRANSLATE] ${batches.length} lote(s).`
     );
 
     console.log(
-        `[TRANSLATE] FAST-SAFE: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} caracteres; meta=${Math.round(PERFORMANCE_TARGET_MS / 1000)}s.`
+        `[TRANSLATE] 6.3 FAST-FIRST: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} caracteres; SAFE-FINAL só depois da tradução completa.`
     );
 
     const translatedTexts =
-        new Array(blocks.length);
+        new Array(
+            blocks.length
+        );
 
     const originalPositions =
         new Map();
 
     blocks.forEach(
-        (block, index) =>
+        (
+            block,
+            index
+        ) => {
             originalPositions.set(
                 block,
                 index
-            )
+            );
+        }
     );
 
-    const startedAt = Date.now();
+    const startedAt =
+        Date.now();
 
     const deadlineAt =
         startedAt +
         MAX_TRANSLATION_TIME_MS;
 
-    job.startedAt = startedAt;
-    job.deadlineAt = deadlineAt;
-    job.updatedAt = startedAt;
+    job.startedAt =
+        startedAt;
+
+    job.deadlineAt =
+        deadlineAt;
+
+    job.updatedAt =
+        startedAt;
 
     console.log(
         `[JOB ${job.id}] Cronômetro iniciado: teto ${MAX_TRANSLATION_TIME_MS}ms; fila anterior não contabilizada.`
     );
 
-    const auditBuffer = [];
-    const batchStates = [];
+    const batchBoundaryStarts = [];
 
-    const auditTotals = {
-        selected: 0,
-        verified: 0,
-        requests: 0,
-        recoveredBatches: 0
-    };
+    console.log(
+        "[PHASE FAST] Iniciando tradução de todos os lotes; nenhuma auditoria Gemini interromperá esta fase."
+    );
 
     for (
         let batchIndex = 0;
         batchIndex < batches.length;
         batchIndex++
     ) {
-        assertBeforeDeadline(deadlineAt);
+        assertBeforeDeadline(
+            deadlineAt
+        );
 
         const batch =
             batches[batchIndex];
-
-        const batchChars =
-            batch.reduce(
-                (total, block) =>
-                    total +
-                    String(
-                        block.text || ""
-                    ).length,
-                0
-            );
 
         const batchStart =
             originalPositions.get(
@@ -3419,73 +4126,74 @@ async function translateSrt(
                 ]
             );
 
+        if (
+            batchIndex > 0 &&
+            Number.isInteger(
+                batchStart
+            )
+        ) {
+            batchBoundaryStarts.push(
+                batchStart
+            );
+        }
+
         const context = {
             before:
-                Number.isInteger(batchStart) &&
+                Number.isInteger(
+                    batchStart
+                ) &&
                 batchStart > 0
-                    ? blocks[batchStart - 1]
+                    ? blocks[
+                          batchStart - 1
+                      ]
                     : null,
 
             after:
-                Number.isInteger(batchEnd) &&
+                Number.isInteger(
+                    batchEnd
+                ) &&
                 batchEnd <
                     blocks.length - 1
-                    ? blocks[batchEnd + 1]
+                    ? blocks[
+                          batchEnd + 1
+                      ]
                     : null
         };
+
+        const batchChars =
+            batch.reduce(
+                (
+                    total,
+                    block
+                ) =>
+                    total +
+                    String(
+                        block.text ||
+                        ""
+                    ).length,
+
+                0
+            );
 
         const batchStartedAt =
             Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
+            `[PHASE FAST] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
         );
 
-        const result =
-            await translateBatch(
+        const translated =
+            await translateMainBatch(
                 batch,
                 deadlineAt,
-                context,
-                "deferred"
+                context
             );
 
         writeTranslatedBatch(
             batch,
-            result.texts,
+            translated,
             translatedTexts,
             originalPositions
-        );
-
-        batchStates[batchIndex] = {
-            batchIndex,
-            batch,
-            context,
-            translated: result.texts,
-            recovered: false
-        };
-
-        for (
-            const record
-            of result.auditRecords
-        ) {
-            auditBuffer.push({
-                ...record,
-                _batchIndex: batchIndex
-            });
-        }
-
-        auditTotals.selected +=
-            result.auditRecords.length;
-
-        await flushAuditBuffer(
-            auditBuffer,
-            batchStates,
-            deadlineAt,
-            translatedTexts,
-            originalPositions,
-            job,
-            auditTotals,
-            false
         );
 
         job.progress =
@@ -3496,7 +4204,7 @@ async function translateSrt(
                     ) /
                     batches.length
                 ) *
-                92
+                82
             );
 
         job.completedBatches =
@@ -3509,43 +4217,109 @@ async function translateSrt(
             Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} OK em ${((Date.now() - batchStartedAt) / 1000).toFixed(1)}s; auditBuffer=${auditBuffer.length}.`
+            `[PHASE FAST] Lote ${batchIndex + 1}/${batches.length} OK em ${((Date.now() - batchStartedAt) / 1000).toFixed(1)}s.`
         );
     }
-
-    await flushAuditBuffer(
-        auditBuffer,
-        batchStates,
-        deadlineAt,
-        translatedTexts,
-        originalPositions,
-        job,
-        auditTotals,
-        true
-    );
-
-    assertBeforeDeadline(deadlineAt);
 
     if (
         translatedTexts.some(
             text =>
-                typeof text !== "string"
+                typeof text !==
+                "string"
         )
     ) {
         throw new Error(
-            "A tradução terminou com blocos ausentes."
+            "A fase FAST terminou com blocos ausentes."
         );
     }
 
+    const fastElapsed =
+        Date.now() -
+        startedAt;
+
+    console.log(
+        `[PHASE FAST] Tradução completa em ${(fastElapsed / 1000).toFixed(1)}s. Iniciando SAFE-FINAL.`
+    );
+
+    assertBeforeDeadline(
+        deadlineAt
+    );
+
+    const selection =
+        selectFinalAuditIndices(
+            blocks,
+            translatedTexts,
+            batchBoundaryStarts
+        );
+
+    console.log(
+        `[PHASE SAFE] Selecionados ${selection.indices.length}/${blocks.length} bloco(s): risco=${selection.riskCount}, fronteiras-de-lote=${selection.boundaryCount}, canários=${selection.canaryCount}; chunks máx=${MAX_INDEPENDENT_AUDIT_BLOCKS}.`
+    );
+
+    const auditRecords =
+        selection.indices.map(
+            index =>
+                buildIndependentAuditRecord(
+                    blocks,
+                    translatedTexts,
+                    index
+                )
+        );
+
+    const initialAudit =
+        await runFinalAudit(
+            auditRecords,
+            deadlineAt
+        );
+
+    let confirmedFailures =
+        await confirmOwnIdFailures(
+            initialAudit.failures,
+            blocks,
+            translatedTexts,
+            deadlineAt
+        );
+
+    if (
+        confirmedFailures.length > 0
+    ) {
+        console.warn(
+            `[PHASE SAFE] ${confirmedFailures.length} falha(s) confirmada(s); reparo cirúrgico, sem retraduzir lotes inteiros.`
+        );
+
+        const windows =
+            buildRepairWindows(
+                confirmedFailures,
+                blocks
+            );
+
+        for (
+            const windowIndices
+            of windows
+        ) {
+            await repairWindow(
+                blocks,
+                translatedTexts,
+                windowIndices,
+                deadlineAt
+            );
+        }
+    }
+
+    assertBeforeDeadline(
+        deadlineAt
+    );
+
     const elapsedMs =
-        Date.now() - startedAt;
+        Date.now() -
+        startedAt;
 
     console.log(
         `[TRANSLATE] Finalizada em ${(elapsedMs / 1000).toFixed(1)}s.`
     );
 
     console.log(
-        `[AUDIT FAST] selecionados=${auditTotals.selected}; verificados=${auditTotals.verified}; requests=${auditTotals.requests}; lotes recuperados=${auditTotals.recoveredBatches}.`
+        `[PERF] FAST=${(fastElapsed / 1000).toFixed(1)}s | TOTAL=${(elapsedMs / 1000).toFixed(1)}s | auditorias-base=${initialAudit.requests} request(s) | reparos=${confirmedFailures.length}.`
     );
 
     if (
@@ -3589,16 +4363,26 @@ async function translateSrt(
         "TRADUÇÃO FINAL"
     );
 
-    job.timestampAuditPassed = true;
-    job.contentAuditPassed = true;
+    job.timestampAuditPassed =
+        true;
+
+    job.contentAuditPassed =
+        true;
+
     job.progress = 100;
 
     console.log(
-        "[AUDIT CONTENT] TRADUÇÃO FINAL: OK — ID/lock 100%, guard local 100% e fronteiras de risco + canários aprovados pela auditoria independente."
+        "[AUDIT CONTENT] TRADUÇÃO FINAL: OK — ID/lock 100%; SAFE-FINAL seletivo concluído; falhas confirmadas foram reparadas e reauditaram fail-closed."
     );
 
     return finalSrt;
 }
+
+/*
+|--------------------------------------------------------------------------
+| JOBS
+|--------------------------------------------------------------------------
+*/
 
 function createJob({
     jobId,
@@ -3608,60 +4392,95 @@ function createJob({
     sourceHash,
     sourceSrt
 }) {
-    const now = Date.now();
+    const now =
+        Date.now();
 
     const job = {
-        id: jobId,
+        id:
+            jobId,
+
         cacheKey,
         type,
         videoId,
         sourceHash,
         sourceSrt,
 
-        status: "processing",
-        result: null,
-        error: null,
-        progress: 0,
+        status:
+            "processing",
 
-        completedBatches: 0,
-        totalBatches: 0,
+        result:
+            null,
 
-        createdAt: now,
-        updatedAt: now,
+        error:
+            null,
 
-        deadlineAt: null,
-        queuedAt: null,
+        progress:
+            0,
 
-        priority: 50,
-        jobKind: "generic",
+        completedBatches:
+            0,
 
-        lazyStartScheduled: false,
+        totalBatches:
+            0,
+
+        createdAt:
+            now,
+
+        updatedAt:
+            now,
+
+        deadlineAt:
+            null,
+
+        queuedAt:
+            null,
+
+        priority:
+            50,
+
+        jobKind:
+            "generic",
+
+        lazyStartScheduled:
+            false,
 
         expiresAt:
-            now + JOB_TTL_MS,
+            now +
+            JOB_TTL_MS,
 
-        timestampAuditPassed: false,
-        contentAuditPassed: false,
+        timestampAuditPassed:
+            false,
 
-        promise: null
+        contentAuditPassed:
+            false,
+
+        promise:
+            null
     };
 
-    jobs.set(jobId, job);
+    jobs.set(
+        jobId,
+        job
+    );
+
     cleanupMemory();
 
     return job;
 }
 
 function getJob(jobId) {
-    const job = jobs.get(jobId);
+    const job =
+        jobs.get(jobId);
 
     if (!job) {
         return null;
     }
 
     if (
-        job.expiresAt <= Date.now() &&
-        job.status !== "processing"
+        job.expiresAt <=
+            Date.now() &&
+        job.status !==
+            "processing"
     ) {
         jobs.delete(jobId);
         return null;
@@ -3688,12 +4507,23 @@ async function processJob(job) {
                 "CACHE"
             );
 
-            job.timestampAuditPassed = true;
-            job.contentAuditPassed = true;
-            job.status = "completed";
-            job.result = cached;
-            job.progress = 100;
-            job.updatedAt = Date.now();
+            job.timestampAuditPassed =
+                true;
+
+            job.contentAuditPassed =
+                true;
+
+            job.status =
+                "completed";
+
+            job.result =
+                cached;
+
+            job.progress =
+                100;
+
+            job.updatedAt =
+                Date.now();
 
             console.log(
                 `[JOB ${job.id}] Cache utilizado.`
@@ -3717,30 +4547,48 @@ async function processJob(job) {
             translated
         );
 
-        job.result = translated;
-        job.status = "completed";
-        job.progress = 100;
-        job.updatedAt = Date.now();
+        job.result =
+            translated;
+
+        job.status =
+            "completed";
+
+        job.progress =
+            100;
+
+        job.updatedAt =
+            Date.now();
 
         console.log(
             `[JOB ${job.id}] Concluído.`
         );
 
     } catch (error) {
-        job.status = "failed";
+        job.status =
+            "failed";
+
         job.error =
             getErrorMessage(error);
-        job.updatedAt = Date.now();
+
+        job.updatedAt =
+            Date.now();
 
         console.error(
             `[JOB ${job.id}] Falhou: ${job.error}`
         );
     }
-}
+}/*
+|--------------------------------------------------------------------------
+| FILA DE JOBS COMPLETOS
+|--------------------------------------------------------------------------
+*/
 
 function enqueueTranslationJob(job) {
     return new Promise(
-        (resolve, reject) => {
+        (
+            resolve,
+            reject
+        ) => {
             if (
                 job.status !==
                 "processing"
@@ -3749,7 +4597,8 @@ function enqueueTranslationJob(job) {
                 return;
             }
 
-            job.queuedAt = Date.now();
+            job.queuedAt =
+                Date.now();
 
             const queueItem = {
                 job,
@@ -3796,11 +4645,13 @@ async function processTranslationJobQueue() {
         return;
     }
 
-    translationJobWorkerRunning = true;
+    translationJobWorkerRunning =
+        true;
 
     try {
         while (
-            translationJobQueue.length > 0
+            translationJobQueue.length >
+            0
         ) {
             const item =
                 translationJobQueue.shift();
@@ -3829,10 +4680,10 @@ async function processTranslationJobQueue() {
                         job.queuedAt
                     )
                         ? Math.max(
-                            0,
-                            Date.now() -
-                                job.queuedAt
-                        )
+                              0,
+                              Date.now() -
+                              job.queuedAt
+                          )
                         : 0;
 
                 console.log(
@@ -3840,6 +4691,7 @@ async function processTranslationJobQueue() {
                 );
 
                 await processJob(job);
+
                 resolve();
 
             } catch (error) {
@@ -3848,10 +4700,12 @@ async function processTranslationJobQueue() {
         }
 
     } finally {
-        translationJobWorkerRunning = false;
+        translationJobWorkerRunning =
+            false;
 
         if (
-            translationJobQueue.length > 0
+            translationJobQueue.length >
+            0
         ) {
             processTranslationJobQueue();
         }
@@ -3867,8 +4721,10 @@ function startTranslationJob(
     }
 
     if (
-        job.status === "completed" ||
-        job.status === "failed"
+        job.status ===
+            "completed" ||
+        job.status ===
+            "failed"
     ) {
         return job.promise;
     }
@@ -3877,23 +4733,37 @@ function startTranslationJob(
         return job.promise;
     }
 
-    if (job.status === "pending") {
-        job.status = "processing";
-        job.updatedAt = Date.now();
+    if (
+        job.status ===
+        "pending"
+    ) {
+        job.status =
+            "processing";
+
+        job.updatedAt =
+            Date.now();
     }
 
     job.promise =
-        enqueueTranslationJob(job).catch(
+        enqueueTranslationJob(
+            job
+        ).catch(
             error => {
                 console.error(
                     `[${label} ${job.id}] Erro inesperado:`,
                     error
                 );
 
-                job.status = "failed";
+                job.status =
+                    "failed";
+
                 job.error =
-                    getErrorMessage(error);
-                job.updatedAt = Date.now();
+                    getErrorMessage(
+                        error
+                    );
+
+                job.updatedAt =
+                    Date.now();
             }
         );
 
@@ -3901,12 +4771,18 @@ function startTranslationJob(
 }
 
 function findProcessingJob(cacheKey) {
-    for (const job of jobs.values()) {
+    for (
+        const job
+        of jobs.values()
+    ) {
         if (
-            job.cacheKey === cacheKey &&
+            job.cacheKey ===
+                cacheKey &&
             (
-                job.status === "processing" ||
-                job.status === "pending"
+                job.status ===
+                    "processing" ||
+                job.status ===
+                    "pending"
             )
         ) {
             return job;
@@ -3918,7 +4794,9 @@ function findProcessingJob(cacheKey) {
 
 function buildProcessingSrt(job) {
     const progress =
-        Number.isFinite(job?.progress)
+        Number.isFinite(
+            job?.progress
+        )
             ? job.progress
             : 0;
 
@@ -3939,8 +4817,14 @@ function buildErrorSrt(message) {
             message ||
             "Erro desconhecido."
         )
-            .replace(/\s+/g, " ")
-            .slice(0, 300);
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .slice(
+                0,
+                300
+            );
 
     return [
         "1",
@@ -3978,31 +4862,51 @@ async function waitForJob(
     job,
     timeoutMs
 ) {
-    if (job.status === "completed") {
+    if (
+        job.status ===
+        "completed"
+    ) {
         return true;
     }
 
-    if (job.status === "failed") {
+    if (
+        job.status ===
+        "failed"
+    ) {
         return false;
     }
 
-    const start = Date.now();
+    const start =
+        Date.now();
 
     while (
-        job.status === "processing" &&
-        Date.now() - start < timeoutMs
+        job.status ===
+            "processing" &&
+        Date.now() -
+            start <
+            timeoutMs
     ) {
         await sleep(500);
     }
 
-    return job.status === "completed";
+    return (
+        job.status ===
+        "completed"
+    );
 }
+
+/*
+|--------------------------------------------------------------------------
+| MANIFEST STREMIO
+|--------------------------------------------------------------------------
+*/
 
 const manifest = {
     id:
         "org.tradutor.stateless.gemini.free",
 
-    version: "6.2.0",
+    version:
+        "6.3.0",
 
     name:
         "Tradutor Gemini PT-BR",
@@ -4010,7 +4914,8 @@ const manifest = {
     description:
         "Traduz automaticamente legendas para Português do Brasil usando Gemini.",
 
-    logo: "",
+    logo:
+        "",
 
     resources: [
         "subtitles"
@@ -4025,173 +4930,220 @@ const manifest = {
         "tt"
     ],
 
-    catalogs: [],
+    catalogs:
+        [],
 
     behaviorHints: {
-        configurable: false,
-        adult: false
+        configurable:
+            false,
+
+        adult:
+            false
     }
 };
 
 app.get(
     "/manifest.json",
-    (req, res) => {
+
+    (
+        req,
+        res
+    ) => {
         res.json(manifest);
     }
 );
 
-app.get("/", (req, res) => {
-    res.json({
-        name: manifest.name,
-        version: manifest.version,
-        status: "online",
-        model: GEMINI_MODEL,
+app.get(
+    "/",
 
-        releaseAwareOpenSubtitles: true,
-        timestampAudit: true,
+    (
+        req,
+        res
+    ) => {
+        res.json({
+            name:
+                manifest.name,
 
-        conservativeCharacterSanitization: true,
+            version:
+                manifest.version,
 
-        translationCacheVersion:
-            TRANSLATION_CACHE_VERSION,
+            status:
+                "online",
 
-        renderEngineVersion:
-            RENDER_ENGINE_VERSION,
+            model:
+                GEMINI_MODEL,
 
-        structuralIdLock: true,
+            renderEngineVersion:
+                RENDER_ENGINE_VERSION,
 
-        semanticContentAudit:
-            SEMANTIC_AUDIT_ENABLED,
+            thinkingLevel:
+                "MINIMAL",
 
-        semanticAuditMode:
-            "id-lock-100%-plus-boundary-risk-canary",
+            performanceMode:
+                "fast-first-safe-final",
 
-        groupedIndependentAudit: true,
+            releaseAwareOpenSubtitles:
+                true,
 
-        independentAuditMaxBlocks:
-            MAX_INDEPENDENT_AUDIT_BLOCKS,
+            timestampAudit:
+                true,
 
-        auditCanaryStride:
-            AUDIT_CANARY_STRIDE,
+            conservativeCharacterSanitization:
+                true,
 
-        highRiskAuditScore:
-            HIGH_RISK_AUDIT_SCORE,
+            translationCacheVersion:
+                TRANSLATION_CACHE_VERSION,
 
-        thinkingLevel: "MINIMAL",
+            structuralIdLock:
+                true,
 
-        performanceMode:
-            "6.2-fast-safe",
+            semanticContentAudit:
+                SEMANTIC_AUDIT_ENABLED,
 
-        lazyOpenSubtitles: true,
+            semanticAuditMode:
+                "safe-final-selective-boundary-risk-canary",
 
-        bridgeCompatibleCacheVersion:
-            "5.8",
+            independentAuditMaxBlocks:
+                MAX_INDEPENDENT_AUDIT_BLOCKS,
 
-        translationJobQueue:
-            translationJobQueue.length,
+            auditCanaryStride:
+                AUDIT_CANARY_STRIDE,
 
-        activeTranslationJob:
+            lazyOpenSubtitles:
+                true,
+
+            bridgeCompatibleCacheVersion:
+                "5.8",
+
+            translationJobQueue:
+                translationJobQueue.length,
+
+            activeTranslationJob:
+                translationJobWorkerRunning,
+
+            queue:
+                geminiQueue.length,
+
+            cooldownSeconds:
+                Math.ceil(
+                    getCooldownRemaining() /
+                    1000
+                )
+        });
+    }
+);
+
+app.get(
+    "/health",
+
+    (
+        req,
+        res
+    ) => {
+        res.json({
+            status:
+                "ok",
+
+            uptime:
+                process.uptime(),
+
+            model:
+                GEMINI_MODEL,
+
+            jobs:
+                jobs.size,
+
+            cache:
+                translationCache.size,
+
+            renderEngineVersion:
+                RENDER_ENGINE_VERSION,
+
+            thinkingLevel:
+                "MINIMAL",
+
+            performanceMode:
+                "fast-first-safe-final",
+
+            releaseAwareOpenSubtitles:
+                true,
+
+            timestampAudit:
+                true,
+
+            conservativeCharacterSanitization:
+                true,
+
+            translationCacheVersion:
+                TRANSLATION_CACHE_VERSION,
+
+            structuralIdLock:
+                true,
+
+            semanticContentAudit:
+                SEMANTIC_AUDIT_ENABLED,
+
+            semanticAuditMode:
+                "safe-final-selective-boundary-risk-canary",
+
+            independentAuditMaxBlocks:
+                MAX_INDEPENDENT_AUDIT_BLOCKS,
+
+            auditCanaryStride:
+                AUDIT_CANARY_STRIDE,
+
+            lazyOpenSubtitles:
+                true,
+
+            bridgeCompatibleCacheVersion:
+                "5.8",
+
+            translationJobQueue:
+                translationJobQueue.length,
+
             translationJobWorkerRunning,
 
-        queue: geminiQueue.length,
+            geminiQueue:
+                geminiQueue.length,
 
-        cooldownSeconds:
-            Math.ceil(
-                getCooldownRemaining() /
-                1000
-            )
-    });
-});
+            geminiCooldownSeconds:
+                Math.ceil(
+                    getCooldownRemaining() /
+                    1000
+                ),
 
-app.get("/health", (req, res) => {
-    res.json({
-        status: "ok",
-        uptime: process.uptime(),
+            batchMaxBlocks:
+                MAX_BATCH_BLOCKS,
 
-        model: GEMINI_MODEL,
+            batchMaxChars:
+                MAX_BATCH_CHARS,
 
-        jobs: jobs.size,
-        cache: translationCache.size,
+            requestIntervalMs:
+                MIN_REQUEST_INTERVAL_MS,
 
-        releaseAwareOpenSubtitles: true,
-        timestampAudit: true,
+            translationRequestTimeoutMs:
+                TRANSLATION_REQUEST_TIMEOUT_MS,
 
-        conservativeCharacterSanitization: true,
+            semanticAuditRequestTimeoutMs:
+                SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS,
 
-        translationCacheVersion:
-            TRANSLATION_CACHE_VERSION,
+            maxOutputTokens:
+                MAX_OUTPUT_TOKENS,
 
-        renderEngineVersion:
-            RENDER_ENGINE_VERSION,
+            translationTimeoutMs:
+                MAX_TRANSLATION_TIME_MS,
 
-        structuralIdLock: true,
+            maxTranslationTimeMs:
+                MAX_TRANSLATION_TIME_MS
+        });
+    }
+);
 
-        semanticContentAudit:
-            SEMANTIC_AUDIT_ENABLED,
-
-        semanticAuditMode:
-            "id-lock-100%-plus-boundary-risk-canary",
-
-        groupedIndependentAudit: true,
-
-        independentAuditMaxBlocks:
-            MAX_INDEPENDENT_AUDIT_BLOCKS,
-
-        auditCanaryStride:
-            AUDIT_CANARY_STRIDE,
-
-        highRiskAuditScore:
-            HIGH_RISK_AUDIT_SCORE,
-
-        thinkingLevel: "MINIMAL",
-
-        performanceMode:
-            "6.2-fast-safe",
-
-        lazyOpenSubtitles: true,
-
-        bridgeCompatibleCacheVersion:
-            "5.8",
-
-        translationJobQueue:
-            translationJobQueue.length,
-
-        translationJobWorkerRunning,
-
-        geminiQueue:
-            geminiQueue.length,
-
-        geminiCooldownSeconds:
-            Math.ceil(
-                getCooldownRemaining() /
-                1000
-            ),
-
-        batchMaxBlocks:
-            MAX_BATCH_BLOCKS,
-
-        batchMaxChars:
-            MAX_BATCH_CHARS,
-
-        requestIntervalMs:
-            MIN_REQUEST_INTERVAL_MS,
-
-        translationRequestTimeoutMs:
-            TRANSLATION_REQUEST_TIMEOUT_MS,
-
-        semanticAuditRequestTimeoutMs:
-            SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS,
-
-        maxOutputTokens:
-            MAX_OUTPUT_TOKENS,
-
-        translationTimeoutMs:
-            MAX_TRANSLATION_TIME_MS,
-
-        maxTranslationTimeMs:
-            MAX_TRANSLATION_TIME_MS
-    });
-});
+/*
+|--------------------------------------------------------------------------
+| OPEN SUBTITLES - RELEASE AWARE
+|--------------------------------------------------------------------------
+*/
 
 function scoreSubtitle(subtitle) {
     let score = 0;
@@ -4209,7 +5161,8 @@ function scoreSubtitle(subtitle) {
     }
 
     if (
-        subtitle?.hearingImpaired === false
+        subtitle?.hearingImpaired ===
+        false
     ) {
         score += 20;
     }
@@ -4217,7 +5170,8 @@ function scoreSubtitle(subtitle) {
     if (
         String(
             subtitle?.format || ""
-        ).toLowerCase() === "srt"
+        ).toLowerCase() ===
+        "srt"
     ) {
         score += 20;
     }
@@ -4225,7 +5179,8 @@ function scoreSubtitle(subtitle) {
     if (
         /english/i.test(
             String(
-                subtitle?.name || ""
+                subtitle?.name ||
+                ""
             )
         )
     ) {
@@ -4280,7 +5235,10 @@ function selectBestSubtitle(
     return (
         usable
             .sort(
-                (a, b) =>
+                (
+                    a,
+                    b
+                ) =>
                     scoreSubtitle(b) -
                     scoreSubtitle(a)
             )[0] ||
@@ -4309,46 +5267,70 @@ function rawSubtitleExtraSegment(req) {
     }
 
     return String(
-        req.params.extra || ""
+        req.params.extra ||
+        ""
     ).trim();
 }
 
 function parseStremioSubtitleExtra(req) {
     const rawExtra =
-        rawSubtitleExtraSegment(req);
+        rawSubtitleExtraSegment(
+            req
+        );
 
     if (!rawExtra) {
         return {
-            rawExtra: "",
-            videoHash: "",
-            videoSize: "",
-            filename: ""
+            rawExtra:
+                "",
+
+            videoHash:
+                "",
+
+            videoSize:
+                "",
+
+            filename:
+                ""
         };
     }
 
     const params =
-        new URLSearchParams(rawExtra);
+        new URLSearchParams(
+            rawExtra
+        );
 
     const rawVideoHash =
         String(
-            params.get("videoHash") || ""
+            params.get(
+                "videoHash"
+            ) ||
+            ""
         ).trim();
 
     const rawVideoSize =
         String(
-            params.get("videoSize") || ""
+            params.get(
+                "videoSize"
+            ) ||
+            ""
         ).trim();
 
     const filename =
         String(
-            params.get("filename") || ""
+            params.get(
+                "filename"
+            ) ||
+            ""
         )
             .replace(
                 /[\u0000-\u001F\u007F]/g,
                 ""
             )
             .trim()
-            .slice(0, 1000);
+            .slice(
+                0,
+                1000
+            );
 
     const videoHash =
         /^[a-f0-9]{16}$/i.test(
@@ -4365,7 +5347,9 @@ function parseStremioSubtitleExtra(req) {
             videoSizeNumber
         ) &&
         videoSizeNumber > 0
-            ? String(videoSizeNumber)
+            ? String(
+                  videoSizeNumber
+              )
             : "";
 
     return {
@@ -4386,7 +5370,11 @@ function buildOpenSubtitlesSearchUrl(
     } = {}
 ) {
     const base =
-        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
+        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
+            type
+        )}/${encodeURIComponent(
+            id
+        )}`;
 
     const extra =
         new URLSearchParams();
@@ -4426,15 +5414,21 @@ function releaseIdentityDescription(extra) {
     const parts = [];
 
     if (extra.videoHash) {
-        parts.push("videoHash");
+        parts.push(
+            "videoHash"
+        );
     }
 
     if (extra.videoSize) {
-        parts.push("videoSize");
+        parts.push(
+            "videoSize"
+        );
     }
 
     if (extra.filename) {
-        parts.push("filename");
+        parts.push(
+            "filename"
+        );
     }
 
     return parts.length
@@ -4472,15 +5466,17 @@ async function findEnglishSubtitle(
     const response =
         await fetchWithTimeout(
             searchUrl,
+
             {
                 headers: {
                     Accept:
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/6.2"
+                        "Stremio-Gemini-Subtitle-Translator/6.3"
                 }
             },
+
             SOURCE_FETCH_TIMEOUT_MS
         );
 
@@ -4494,13 +5490,16 @@ async function findEnglishSubtitle(
         await response.json();
 
     const subtitles =
-        Array.isArray(data?.subtitles)
+        Array.isArray(
+            data?.subtitles
+        )
             ? data.subtitles
             : [];
 
     const target =
         selectBestSubtitle(
             subtitles,
+
             {
                 releaseAware
             }
@@ -4508,7 +5507,9 @@ async function findEnglishSubtitle(
 
     if (target) {
         const upstreamIndex =
-            subtitles.indexOf(target);
+            subtitles.indexOf(
+                target
+            );
 
         console.log(
             `[OPENSUBTITLES MATCH] Selecionada posição upstream ${upstreamIndex >= 0 ? upstreamIndex + 1 : "?"}/${subtitles.length}; id=${String(target.id || "(sem id)")}; nome=${String(target.name || "(sem nome)")}.`
@@ -4523,6 +5524,12 @@ async function findEnglishSubtitle(
     return target;
 }
 
+/*
+|--------------------------------------------------------------------------
+| DOWNLOAD SRT
+|--------------------------------------------------------------------------
+*/
+
 async function downloadSubtitle(url) {
     console.log(
         `[SOURCE] Baixando legenda: ${url}`
@@ -4531,12 +5538,14 @@ async function downloadSubtitle(url) {
     const response =
         await fetchWithTimeout(
             url,
+
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/6.2"
+                        "Stremio-Gemini-Subtitle-Translator/6.3"
                 }
             },
+
             SOURCE_FETCH_TIMEOUT_MS
         );
 
@@ -4580,6 +5589,12 @@ async function downloadSubtitle(url) {
     return text;
 }
 
+/*
+|--------------------------------------------------------------------------
+| JOB DE LEGENDA EMBUTIDA
+|--------------------------------------------------------------------------
+*/
+
 async function createEmbeddedTranslationJob({
     type,
     videoId,
@@ -4587,7 +5602,9 @@ async function createEmbeddedTranslationJob({
     sourceName = "embedded"
 }) {
     const rawNormalizedSrt =
-        normalizeSrt(sourceSrt);
+        normalizeSrt(
+            sourceSrt
+        );
 
     if (!rawNormalizedSrt) {
         throw new Error(
@@ -4616,7 +5633,9 @@ async function createEmbeddedTranslationJob({
     }
 
     const blocks =
-        parseSrt(normalizedSrt);
+        parseSrt(
+            normalizedSrt
+        );
 
     if (blocks.length === 0) {
         throw new Error(
@@ -4625,7 +5644,9 @@ async function createEmbeddedTranslationJob({
     }
 
     const sourceHash =
-        sha256(normalizedSrt);
+        sha256(
+            normalizedSrt
+        );
 
     const cacheKey =
         `${TRANSLATION_CACHE_VERSION}:embedded:${sourceHash}`;
@@ -4643,26 +5664,39 @@ async function createEmbeddedTranslationJob({
         );
 
         const cachedJobId =
-            `embedded-cached-${sourceHash.slice(0, 24)}`;
+            `embedded-cached-${sourceHash.slice(
+                0,
+                24
+            )}`;
 
         let cachedJob =
-            getJob(cachedJobId);
+            getJob(
+                cachedJobId
+            );
 
         if (!cachedJob) {
             cachedJob =
                 createJob({
-                    jobId: cachedJobId,
+                    jobId:
+                        cachedJobId,
+
                     cacheKey,
                     type,
                     videoId,
                     sourceHash,
+
                     sourceSrt:
                         normalizedSrt
                 });
 
-            cachedJob.status = "completed";
-            cachedJob.result = cached;
-            cachedJob.progress = 100;
+            cachedJob.status =
+                "completed";
+
+            cachedJob.result =
+                cached;
+
+            cachedJob.progress =
+                100;
 
             cachedJob.timestampAuditPassed =
                 true;
@@ -4682,7 +5716,9 @@ async function createEmbeddedTranslationJob({
     }
 
     const existingJob =
-        findProcessingJob(cacheKey);
+        findProcessingJob(
+            cacheKey
+        );
 
     if (existingJob) {
         console.log(
@@ -4693,7 +5729,10 @@ async function createEmbeddedTranslationJob({
     }
 
     const jobId =
-        `embedded-${sourceHash.slice(0, 24)}-${randomId(8)}`;
+        `embedded-${sourceHash.slice(
+            0,
+            24
+        )}-${randomId(8)}`;
 
     const job =
         createJob({
@@ -4702,16 +5741,24 @@ async function createEmbeddedTranslationJob({
             type,
             videoId,
             sourceHash,
+
             sourceSrt:
                 normalizedSrt
         });
 
-    job.source = sourceName;
-    job.priority = 100;
-    job.jobKind = "embedded";
+    job.source =
+        sourceName;
+
+    job.priority =
+        100;
+
+    job.jobKind =
+        "embedded";
 
     job.totalBatches =
-        splitIntoBatches(blocks).length;
+        splitIntoBatches(
+            blocks
+        ).length;
 
     startTranslationJob(
         job,
@@ -4725,15 +5772,26 @@ async function createEmbeddedTranslationJob({
     return job;
 }
 
-async function subtitlesHandler(req, res) {
+/*
+|--------------------------------------------------------------------------
+| ENDPOINT SUBTITLES
+|--------------------------------------------------------------------------
+*/
+
+async function subtitlesHandler(
+    req,
+    res
+) {
     const type =
         String(
-            req.params.type || ""
+            req.params.type ||
+            ""
         ).trim();
 
     const id =
         String(
-            req.params.id || ""
+            req.params.id ||
+            ""
         ).trim();
 
     console.log(
@@ -4741,7 +5799,9 @@ async function subtitlesHandler(req, res) {
     );
 
     const extra =
-        parseStremioSubtitleExtra(req);
+        parseStremioSubtitleExtra(
+            req
+        );
 
     console.log(
         `[STREMIO EXTRA] filename: ${extra.filename || "(não enviado)"}`
@@ -4791,7 +5851,9 @@ async function subtitlesHandler(req, res) {
             );
 
         const blocks =
-            parseSrt(sourceSrt);
+            parseSrt(
+                sourceSrt
+            );
 
         if (blocks.length === 0) {
             return safeJson(
@@ -4803,13 +5865,17 @@ async function subtitlesHandler(req, res) {
         }
 
         const sourceHash =
-            sha256(sourceSrt);
+            sha256(
+                sourceSrt
+            );
 
         const cacheKey =
             `${TRANSLATION_CACHE_VERSION}:${type}:${id}:${sourceHash}`;
 
         const baseUrl =
-            cleanBaseUrl(req);
+            cleanBaseUrl(
+                req
+            );
 
         const cached =
             getTranslationCache(
@@ -4824,9 +5890,15 @@ async function subtitlesHandler(req, res) {
             );
 
             const jobId =
-                `cached-${sourceHash.slice(0, 24)}`;
+                `cached-${sourceHash.slice(
+                    0,
+                    24
+                )}`;
 
-            let job = getJob(jobId);
+            let job =
+                getJob(
+                    jobId
+                );
 
             if (!job) {
                 job =
@@ -4834,14 +5906,22 @@ async function subtitlesHandler(req, res) {
                         jobId,
                         cacheKey,
                         type,
-                        videoId: id,
+
+                        videoId:
+                            id,
+
                         sourceHash,
                         sourceSrt
                     });
 
-                job.status = "completed";
-                job.result = cached;
-                job.progress = 100;
+                job.status =
+                    "completed";
+
+                job.result =
+                    cached;
+
+                job.progress =
+                    100;
 
                 job.timestampAuditPassed =
                     true;
@@ -4860,12 +5940,18 @@ async function subtitlesHandler(req, res) {
                     subtitles: [
                         {
                             id:
-                                `${id}-gemini-${sourceHash.slice(0, 12)}`,
+                                `${id}-gemini-${sourceHash.slice(
+                                    0,
+                                    12
+                                )}`,
 
                             url:
-                                `${baseUrl}/subtitle/${encodeURIComponent(jobId)}.srt`,
+                                `${baseUrl}/subtitle/${encodeURIComponent(
+                                    jobId
+                                )}.srt`,
 
-                            lang: "por"
+                            lang:
+                                "por"
                         }
                     ]
                 }
@@ -4873,18 +5959,26 @@ async function subtitlesHandler(req, res) {
         }
 
         let job =
-            findProcessingJob(cacheKey);
+            findProcessingJob(
+                cacheKey
+            );
 
         if (!job) {
             const jobId =
-                `job-${sourceHash.slice(0, 24)}-${randomId(8)}`;
+                `job-${sourceHash.slice(
+                    0,
+                    24
+                )}-${randomId(8)}`;
 
             job =
                 createJob({
                     jobId,
                     cacheKey,
                     type,
-                    videoId: id,
+
+                    videoId:
+                        id,
+
                     sourceHash,
                     sourceSrt
                 });
@@ -4894,11 +5988,20 @@ async function subtitlesHandler(req, res) {
                     blocks
                 ).length;
 
-            job.priority = 10;
-            job.jobKind = "opensubtitles";
-            job.status = "pending";
-            job.lazyStart = true;
-            job.updatedAt = Date.now();
+            job.priority =
+                10;
+
+            job.jobKind =
+                "opensubtitles";
+
+            job.status =
+                "pending";
+
+            job.lazyStart =
+                true;
+
+            job.updatedAt =
+                Date.now();
 
             console.log(
                 `[LAZY] Job OpenSubtitles ${job.id} criado sem consumir Gemini; aguardando acesso à URL da legenda.`
@@ -4906,7 +6009,9 @@ async function subtitlesHandler(req, res) {
         }
 
         const subtitleUrl =
-            `${baseUrl}/subtitle/${encodeURIComponent(job.id)}.srt`;
+            `${baseUrl}/subtitle/${encodeURIComponent(
+                job.id
+            )}.srt`;
 
         console.log(
             `[STREMIO] Subtitle URL: ${subtitleUrl}`
@@ -4918,10 +6023,16 @@ async function subtitlesHandler(req, res) {
                 subtitles: [
                     {
                         id:
-                            `${id}-gemini-${sourceHash.slice(0, 12)}`,
+                            `${id}-gemini-${sourceHash.slice(
+                                0,
+                                12
+                            )}`,
 
-                        url: subtitleUrl,
-                        lang: "por"
+                        url:
+                            subtitleUrl,
+
+                        lang:
+                            "por"
                     }
                 ]
             }
@@ -4929,7 +6040,9 @@ async function subtitlesHandler(req, res) {
 
     } catch (error) {
         console.error(
-            `[STREMIO] Erro: ${getErrorMessage(error)}`
+            `[STREMIO] Erro: ${getErrorMessage(
+                error
+            )}`
         );
 
         return safeJson(
@@ -4949,13 +6062,23 @@ app.get(
 app.get(
     "/subtitles/:type/:id/:extra.json",
     subtitlesHandler
-);
+);/*
+|--------------------------------------------------------------------------
+| API DA PONTE LOCAL - LEGENDA EMBUTIDA
+|--------------------------------------------------------------------------
+*/
 
 app.post(
     "/api/translate-embedded",
-    async (req, res) => {
+
+    async (
+        req,
+        res
+    ) => {
         if (
-            !isAuthorizedLocalBridge(req)
+            !isAuthorizedLocalBridge(
+                req
+            )
         ) {
             console.warn(
                 "[EMBEDDED API] Tentativa não autorizada."
@@ -4963,9 +6086,12 @@ app.post(
 
             return safeJson(
                 res,
+
                 {
-                    error: "Unauthorized"
+                    error:
+                        "Unauthorized"
                 },
+
                 401
             );
         }
@@ -4976,33 +6102,41 @@ app.post(
                 id,
                 srt,
                 name
-            } = req.body || {};
+            } =
+                req.body ||
+                {};
 
             const mediaType =
                 String(
-                    type || "unknown"
+                    type ||
+                    "unknown"
                 ).trim();
 
             const videoId =
                 String(
-                    id || "unknown"
+                    id ||
+                    "unknown"
                 ).trim();
 
             const sourceName =
                 String(
-                    name || "embedded"
+                    name ||
+                    "embedded"
                 ).trim();
 
             if (
                 !srt ||
-                typeof srt !== "string"
+                typeof srt !==
+                    "string"
             ) {
                 return safeJson(
                     res,
+
                     {
                         error:
                             "Campo 'srt' é obrigatório."
                     },
+
                     400
                 );
             }
@@ -5013,10 +6147,12 @@ app.post(
             ) {
                 return safeJson(
                     res,
+
                     {
                         error:
                             `SRT muito grande. Limite: ${MAX_SOURCE_CHARS} caracteres.`
                     },
+
                     413
                 );
             }
@@ -5027,25 +6163,43 @@ app.post(
 
             const job =
                 await createEmbeddedTranslationJob({
-                    type: mediaType,
+                    type:
+                        mediaType,
+
                     videoId,
-                    sourceSrt: srt,
+
+                    sourceSrt:
+                        srt,
+
                     sourceName
                 });
 
             const baseUrl =
-                cleanBaseUrl(req);
+                cleanBaseUrl(
+                    req
+                );
 
             const subtitleUrl =
-                `${baseUrl}/subtitle/${encodeURIComponent(job.id)}.srt`;
+                `${baseUrl}/subtitle/${encodeURIComponent(
+                    job.id
+                )}.srt`;
 
             return safeJson(
                 res,
+
                 {
-                    ok: true,
-                    jobId: job.id,
-                    status: job.status,
-                    progress: job.progress,
+                    ok:
+                        true,
+
+                    jobId:
+                        job.id,
+
+                    status:
+                        job.status,
+
+                    progress:
+                        job.progress,
+
                     subtitleUrl
                 }
             );
@@ -5058,56 +6212,86 @@ app.post(
 
             return safeJson(
                 res,
+
                 {
                     error:
-                        getErrorMessage(error)
+                        getErrorMessage(
+                            error
+                        )
                 },
+
                 500
             );
         }
     }
 );
 
-async function subtitleResultHandler(req, res) {
+/*
+|--------------------------------------------------------------------------
+| RESULTADO DA LEGENDA
+|--------------------------------------------------------------------------
+*/
+
+async function subtitleResultHandler(
+    req,
+    res
+) {
     const raw =
         String(
-            req.params.jobId || ""
+            req.params.jobId ||
+            ""
         ).trim();
 
     let jobId;
 
     try {
         jobId =
-            decodeURIComponent(raw);
+            decodeURIComponent(
+                raw
+            );
 
     } catch {
-        jobId = raw;
+        jobId =
+            raw;
     }
 
     if (!jobId) {
         return sendSubtitleResponse(
             res,
+
             buildErrorSrt(
                 "Job inválido."
             )
         );
     }
 
-    const job = getJob(jobId);
+    const job =
+        getJob(
+            jobId
+        );
 
     if (!job) {
         return sendSubtitleResponse(
             res,
+
             buildErrorSrt(
                 "Esta tradução expirou. Recarregue as legendas."
             )
         );
     }
 
-    if (job.status === "pending") {
-        if (!job.lazyStartScheduled) {
-            job.lazyStartScheduled = true;
-            job.updatedAt = Date.now();
+    if (
+        job.status ===
+        "pending"
+    ) {
+        if (
+            !job.lazyStartScheduled
+        ) {
+            job.lazyStartScheduled =
+                true;
+
+            job.updatedAt =
+                Date.now();
 
             console.log(
                 `[LAZY] URL OpenSubtitles ${job.id} requisitada; grace de ${LAZY_OPENSUB_START_GRACE_MS}ms para priorizar Embedded, se ele chegar.`
@@ -5123,7 +6307,8 @@ async function subtitleResultHandler(req, res) {
                             job.status ===
                             "pending"
                         ) {
-                            job.lazyStart = false;
+                            job.lazyStart =
+                                false;
 
                             startTranslationJob(
                                 job,
@@ -5131,6 +6316,7 @@ async function subtitleResultHandler(req, res) {
                             );
                         }
                     },
+
                     LAZY_OPENSUB_START_GRACE_MS
                 );
 
@@ -5144,10 +6330,13 @@ async function subtitleResultHandler(req, res) {
     }
 
     if (
-        job.status === "completed" &&
+        job.status ===
+            "completed" &&
         job.result
     ) {
-        if (!job.timestampAuditPassed) {
+        if (
+            !job.timestampAuditPassed
+        ) {
             try {
                 auditFinalTimestamps(
                     job.sourceSrt,
@@ -5165,24 +6354,30 @@ async function subtitleResultHandler(req, res) {
 
                 return sendSubtitleResponse(
                     res,
+
                     buildErrorSrt(
                         "A auditoria de timestamps detectou uma divergência e bloqueou esta legenda."
                     ),
+
                     "no-store"
                 );
             }
         }
 
-        if (!job.contentAuditPassed) {
+        if (
+            !job.contentAuditPassed
+        ) {
             console.error(
                 `[AUDIT CONTENT] Bloqueando legenda ${job.id}: auditoria semântica não confirmada.`
             );
 
             return sendSubtitleResponse(
                 res,
+
                 buildErrorSrt(
                     "A auditoria semântica não confirmou a correspondência EN↔PT-BR desta legenda."
                 ),
+
                 "no-store"
             );
         }
@@ -5194,10 +6389,17 @@ async function subtitleResultHandler(req, res) {
         );
     }
 
-    if (job.status === "failed") {
+    if (
+        job.status ===
+        "failed"
+    ) {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(job.error),
+
+            buildErrorSrt(
+                job.error
+            ),
+
             "no-store"
         );
     }
@@ -5210,10 +6412,13 @@ async function subtitleResultHandler(req, res) {
 
     if (
         completed &&
-        job.status === "completed" &&
+        job.status ===
+            "completed" &&
         job.result
     ) {
-        if (!job.timestampAuditPassed) {
+        if (
+            !job.timestampAuditPassed
+        ) {
             try {
                 auditFinalTimestamps(
                     job.sourceSrt,
@@ -5231,24 +6436,30 @@ async function subtitleResultHandler(req, res) {
 
                 return sendSubtitleResponse(
                     res,
+
                     buildErrorSrt(
                         "A auditoria de timestamps detectou uma divergência e bloqueou esta legenda."
                     ),
+
                     "no-store"
                 );
             }
         }
 
-        if (!job.contentAuditPassed) {
+        if (
+            !job.contentAuditPassed
+        ) {
             console.error(
                 `[AUDIT CONTENT] Bloqueando legenda ${job.id}: auditoria semântica não confirmada.`
             );
 
             return sendSubtitleResponse(
                 res,
+
                 buildErrorSrt(
                     "A auditoria semântica não confirmou a correspondência EN↔PT-BR desta legenda."
                 ),
+
                 "no-store"
             );
         }
@@ -5260,17 +6471,28 @@ async function subtitleResultHandler(req, res) {
         );
     }
 
-    if (job.status === "failed") {
+    if (
+        job.status ===
+        "failed"
+    ) {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(job.error),
+
+            buildErrorSrt(
+                job.error
+            ),
+
             "no-store"
         );
     }
 
     return sendSubtitleResponse(
         res,
-        buildProcessingSrt(job),
+
+        buildProcessingSrt(
+            job
+        ),
+
         "no-store, no-cache, must-revalidate"
     );
 }
@@ -5280,15 +6502,22 @@ app.get(
     subtitleResultHandler
 );
 
+/*
+|--------------------------------------------------------------------------
+| START
+|--------------------------------------------------------------------------
+*/
+
 app.listen(
     PORT,
+
     () => {
         console.log(
             "=============================================="
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 6.2 FAST-SAFE"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 6.3 FAST-FIRST / SAFE-FINAL"
         );
 
         console.log(
@@ -5336,11 +6565,19 @@ app.listen(
         );
 
         console.log(
-            `Timeout request tradução: ${TRANSLATION_REQUEST_TIMEOUT_MS}ms`
+            `Timeout tradução normal: ${TRANSLATION_REQUEST_TIMEOUT_MS}ms`
         );
 
         console.log(
-            `Timeout request RESCUE: ${RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS}ms | auditoria: ${SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS}ms`
+            `Timeout auditoria SAFE-FINAL: ${SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS}ms`
+        );
+
+        console.log(
+            `Auditoria SAFE-FINAL: máx ${MAX_INDEPENDENT_AUDIT_BLOCKS} blocos/request`
+        );
+
+        console.log(
+            `Canário determinístico: 1 a cada ${AUDIT_CANARY_STRIDE} blocos + extremidades`
         );
 
         console.log(
@@ -5353,6 +6590,34 @@ app.listen(
 
         console.log(
             `Cache TTL: ${CACHE_TTL_MS / 3600000}h`
+        );
+
+        console.log(
+            "FASE FAST: TRADUZ TUDO PRIMEIRO / SEM AUDITORIA GEMINI ENTRE LOTES ✅"
+        );
+
+        console.log(
+            "FASE SAFE-FINAL: FRONTEIRAS FORTES + FRONTEIRAS DE LOTE + RISCO + CANÁRIOS ✅"
+        );
+
+        console.log(
+            "f=false + m=i: RECHECAGEM ANTES DE REPARAR ✅"
+        );
+
+        console.log(
+            "m!=i: REPARO CIRÚRGICO DO PAR/JANELA, NÃO DO LOTE INTEIRO ✅"
+        );
+
+        console.log(
+            "Erro estrutural: 1 REPETIÇÃO DO MESMO LOTE antes do RESCUE ✅"
+        );
+
+        console.log(
+            "Timeout: RESCUE FIXO / SEM ÁRVORE LONGA ✅"
+        );
+
+        console.log(
+            "Trava estrutural ID + lock: 100% DOS BLOCOS ✅"
         );
 
         console.log(
@@ -5389,30 +6654,6 @@ app.listen(
 
         console.log(
             "Recuperação parcial de IDs: DESATIVADA (fail-closed)"
-        );
-
-        console.log(
-            "Trava estrutural ID + lock: ATIVA"
-        );
-
-        console.log(
-            "Protocolo compacto i/l/t + ID/lock: 100% DOS BLOCOS ✅"
-        );
-
-        console.log(
-            `Auditoria independente: FRONTEIRAS DE RISCO + CANÁRIOS; máx ${MAX_INDEPENDENT_AUDIT_BLOCKS}/request ✅`
-        );
-
-        console.log(
-            "Auditoria em buffer: FLUSH DURANTE A TRADUÇÃO / MENOS REQUESTS ✅"
-        );
-
-        console.log(
-            "Falha semântica: RESCUE SOMENTE DO LOTE DE ORIGEM ✅"
-        );
-
-        console.log(
-            "Timeout: RESCUE FIXO / SEM ÁRVORE BINÁRIA LONGA ✅"
         );
 
         console.log(
@@ -5455,6 +6696,7 @@ app.listen(
 
 process.on(
     "unhandledRejection",
+
     error => {
         console.error(
             "[PROCESS] Unhandled rejection:",
@@ -5465,6 +6707,7 @@ process.on(
 
 process.on(
     "uncaughtException",
+
     error => {
         console.error(
             "[PROCESS] Uncaught exception:",
