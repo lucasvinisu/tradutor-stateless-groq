@@ -1,162 +1,94 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-
 const app = express();
 
 app.use(cors());
 app.disable("x-powered-by");
+app.use(express.json({
+    limit: "1mb"
+}));
 
-app.use(
-    express.json({
-        limit: "1mb"
-    })
-);
+const PORT = Number(process.env.PORT || 10000);
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
+const GEMINI_MODEL = String(
+    process.env.GEMINI_MODEL || "gemini-3.5-flash-lite"
+).trim();
+const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 
-/*
-|--------------------------------------------------------------------------
-| CONFIGURAÇÃO
-|--------------------------------------------------------------------------
-*/
+const SOURCE_FETCH_TIMEOUT_MS = 20000;
 
-const PORT = Number(
-    process.env.PORT || 10000
-);
-
-const GEMINI_API_KEY =
-    String(
-        process.env.GEMINI_API_KEY || ""
-    ).trim();
-
-const GEMINI_MODEL =
-    String(
-        process.env.GEMINI_MODEL ||
-        "gemini-3.5-flash-lite"
-    ).trim();
-
-const PUBLIC_URL =
-    String(
-        process.env.PUBLIC_URL || ""
-    ).replace(/\/+$/, "");
-
-const LOCAL_BRIDGE_SECRET =
-    String(
-        process.env.LOCAL_BRIDGE_SECRET || ""
-    ).trim();
-
-const SOURCE_FETCH_TIMEOUT_MS = 20_000;
-
-/*
- * 6.1 QUALITY + SPEED:
- * - tradução em lotes menores e estáveis;
- * - timeout curto para matar chamadas travadas cedo;
- * - autoauditoria estrutural/semântica no MESMO passe da tradução;
- * - auditoria independente nos mesmos blocos de risco + canários;
- * - auditorias independentes são agrupadas entre lotes;
- * - qualquer falha independente continua fail-closed;
- * - somente o lote de origem da falha é retraduzido.
- */
-
-const TRANSLATION_REQUEST_TIMEOUT_MS = 26_000;
-const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 12_000;
+const TRANSLATION_REQUEST_TIMEOUT_MS = 30000;
+const RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS = 16000;
+const SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS = 13000;
+const SINGLE_LAST_TRANSLATION_REQUEST_TIMEOUT_MS = 20000;
+const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 10000;
 
 const MAX_INDEPENDENT_AUDIT_BLOCKS = 48;
 const AUDIT_CANARY_STRIDE = 9;
 const HIGH_RISK_AUDIT_SCORE = 3;
 
+const RESCUE_BATCH_BLOCKS = 12;
+const RESCUE_BATCH_CHARS = 1200;
+const MAX_RESCUE_SPLIT_DEPTH = 2;
+
+const PERFORMANCE_TARGET_MS = 180000;
 const LAZY_OPENSUB_START_GRACE_MS = 1500;
 
-const MAX_TRANSLATION_TIME_MS =
-    Number(
-        process.env.MAX_TRANSLATION_TIME_MS ||
-        480_000
-    );
+const MAX_TRANSLATION_TIME_MS = Number(
+    process.env.MAX_TRANSLATION_TIME_MS || 480000
+);
 
-const configuredMaxBatchChars =
-    Number(
-        process.env.MAX_BATCH_CHARS ||
-        5200
-    );
+const configuredMaxBatchChars = Number(
+    process.env.MAX_BATCH_CHARS || 7000
+);
 
 const MAX_BATCH_CHARS =
-    Number.isFinite(
-        configuredMaxBatchChars
-    ) &&
+    Number.isFinite(configuredMaxBatchChars) &&
     configuredMaxBatchChars > 0
-        ? Math.min(
-              configuredMaxBatchChars,
-              5200
-          )
-        : 5200;
+        ? Math.min(configuredMaxBatchChars, 7000)
+        : 7000;
 
-const configuredMaxBatchBlocks =
-    Number(
-        process.env.MAX_BATCH_BLOCKS ||
-        72
-    );
+const configuredMaxBatchBlocks = Number(
+    process.env.MAX_BATCH_BLOCKS || 96
+);
 
 const MAX_BATCH_BLOCKS =
-    Number.isFinite(
-        configuredMaxBatchBlocks
-    ) &&
+    Number.isFinite(configuredMaxBatchBlocks) &&
     configuredMaxBatchBlocks > 0
-        ? Math.min(
-              Math.floor(
-                  configuredMaxBatchBlocks
-              ),
-              72
-          )
-        : 72;
+        ? Math.min(Math.floor(configuredMaxBatchBlocks), 96)
+        : 96;
 
 const GEMINI_CONCURRENCY = 1;
 
-const MIN_REQUEST_INTERVAL_MS =
-    Number(
-        process.env.MIN_REQUEST_INTERVAL_MS ||
-        3000
-    );
+const MIN_REQUEST_INTERVAL_MS = Number(
+    process.env.MIN_REQUEST_INTERVAL_MS || 3000
+);
 
-const MAX_OUTPUT_TOKENS =
-    Number(
-        process.env.MAX_OUTPUT_TOKENS ||
-        16_000
-    );
+const MAX_OUTPUT_TOKENS = Number(
+    process.env.MAX_OUTPUT_TOKENS || 16000
+);
 
 const AUDIT_MAX_OUTPUT_TOKENS = 4096;
 
 const MAX_NORMAL_RETRIES = 1;
-const MAX_BAD_OUTPUT_SPLIT_DEPTH = 8;
-const MAX_AUDIT_SPLIT_DEPTH = 8;
+const MAX_AUDIT_SPLIT_DEPTH = 2;
 const MAX_SINGLE_BLOCK_OUTPUT_RETRIES = 1;
 const MAX_SINGLE_BLOCK_AUDIT_RETRIES = 1;
-const MAX_RATE_LIMIT_COOLDOWN_MS = 120_000;
+const MAX_RATE_LIMIT_COOLDOWN_MS = 120000;
 
-const CACHE_TTL_MS =
-    7 * 24 * 60 * 60 * 1000;
-
-const JOB_TTL_MS =
-    24 * 60 * 60 * 1000;
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 
 const MAX_CACHE_ENTRIES = 200;
 const MAX_JOBS = 300;
-const MAX_SOURCE_CHARS = 800_000;
-
-/*
- * 6.1 mantém o namespace 5.8 para compatibilidade direta com a
- * Ponte Local 2.5.1 e com os IDs/cache persistentes que ela calcula.
- *
- * O protocolo e o endpoint da Ponte permanecem inalterados.
- */
+const MAX_SOURCE_CHARS = 800000;
 
 const TRANSLATION_CACHE_VERSION = "5.8";
 const BLOCK_LOCK_VERSION = "5.8";
 const SEMANTIC_AUDIT_ENABLED = true;
-
-/*
-|--------------------------------------------------------------------------
-| MEMÓRIA
-|--------------------------------------------------------------------------
-*/
+const RENDER_ENGINE_VERSION = "6.2-fast-safe";
 
 const translationCache = new Map();
 const jobs = new Map();
@@ -170,87 +102,42 @@ let geminiWorkerRunning = false;
 let lastGeminiRequestAt = 0;
 let geminiCooldownUntil = 0;
 
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
-
 function sleep(ms) {
-    return new Promise(
-        resolve =>
-            setTimeout(
-                resolve,
-                ms
-            )
-    );
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function translationTimeoutError() {
-    const error =
-        new Error(
-            "Tempo máximo de tradução atingido."
-        );
-
-    error.code =
-        "TRANSLATION_TIMEOUT";
-
+    const error = new Error("Tempo máximo de tradução atingido.");
+    error.code = "TRANSLATION_TIMEOUT";
     return error;
 }
 
-function geminiRequestTimeoutError(
-    requestKind
-) {
-    const error =
-        new Error(
-            `Timeout da chamada Gemini (${requestKind || "request"}).`
-        );
-
-    error.code =
-        "GEMINI_REQUEST_TIMEOUT";
-
-    error.requestKind =
-        requestKind ||
-        "request";
-
+function geminiRequestTimeoutError(requestKind) {
+    const error = new Error(
+        `Timeout da chamada Gemini (${requestKind || "request"}).`
+    );
+    error.code = "GEMINI_REQUEST_TIMEOUT";
+    error.requestKind = requestKind || "request";
     return error;
 }
 
-function timestampIntegrityError(
-    message
-) {
-    const error =
-        new Error(
-            message
-        );
-
-    error.code =
-        "TIMESTAMP_INTEGRITY_ERROR";
-
+function timestampIntegrityError(message) {
+    const error = new Error(message);
+    error.code = "TIMESTAMP_INTEGRITY_ERROR";
     return error;
 }
 
-function assertBeforeDeadline(
-    deadlineAt
-) {
+function assertBeforeDeadline(deadlineAt) {
     if (
-        Number.isFinite(
-            deadlineAt
-        ) &&
+        Number.isFinite(deadlineAt) &&
         Date.now() >= deadlineAt
     ) {
         throw translationTimeoutError();
     }
 }
 
-function remainingBeforeDeadline(
-    deadlineAt
-) {
-    if (
-        !Number.isFinite(
-            deadlineAt
-        )
-    ) {
+function remainingBeforeDeadline(deadlineAt) {
+    if (!Number.isFinite(deadlineAt)) {
         return Infinity;
     }
 
@@ -260,60 +147,35 @@ function remainingBeforeDeadline(
     );
 }
 
-async function sleepWithDeadline(
-    ms,
-    deadlineAt
-) {
-    const safeMs =
-        Math.max(
-            0,
-            Number(ms) || 0
-        );
+async function sleepWithDeadline(ms, deadlineAt) {
+    const safeMs = Math.max(0, Number(ms) || 0);
 
     if (safeMs === 0) {
-        assertBeforeDeadline(
-            deadlineAt
-        );
-
+        assertBeforeDeadline(deadlineAt);
         return;
     }
 
-    const remaining =
-        remainingBeforeDeadline(
-            deadlineAt
-        );
+    const remaining = remainingBeforeDeadline(deadlineAt);
 
     if (
-        Number.isFinite(
-            remaining
-        ) &&
+        Number.isFinite(remaining) &&
         remaining <= safeMs
     ) {
         if (remaining > 0) {
-            await sleep(
-                remaining
-            );
+            await sleep(remaining);
         }
 
         throw translationTimeoutError();
     }
 
-    await sleep(
-        safeMs
-    );
-
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    await sleep(safeMs);
+    assertBeforeDeadline(deadlineAt);
 }
 
 function sha256(text) {
     return crypto
         .createHash("sha256")
-        .update(
-            String(text),
-            "utf8"
-        )
+        .update(String(text), "utf8")
         .digest("hex");
 }
 
@@ -328,10 +190,7 @@ function getErrorMessage(error) {
         return "Erro desconhecido.";
     }
 
-    if (
-        typeof error ===
-        "string"
-    ) {
+    if (typeof error === "string") {
         return error;
     }
 
@@ -348,74 +207,44 @@ function cleanBaseUrl(req) {
     }
 
     const protocol =
-        req.headers[
-            "x-forwarded-proto"
-        ] ||
+        req.headers["x-forwarded-proto"] ||
         req.protocol ||
         "https";
 
     const host =
-        req.headers[
-            "x-forwarded-host"
-        ] ||
+        req.headers["x-forwarded-host"] ||
         req.get("host");
 
     return `${protocol}://${host}`;
 }
 
-function safeJson(
-    res,
-    data,
-    status = 200
-) {
+function safeJson(res, data, status = 200) {
     res.status(status);
-
     res.set(
         "Cache-Control",
         "no-store, no-cache, must-revalidate"
     );
-
     return res.json(data);
 }
 
-/*
-|--------------------------------------------------------------------------
-| AUTENTICAÇÃO DA PONTE LOCAL
-|--------------------------------------------------------------------------
-*/
-
-function isAuthorizedLocalBridge(
-    req
-) {
-    if (
-        !LOCAL_BRIDGE_SECRET
-    ) {
+function isAuthorizedLocalBridge(req) {
+    if (!LOCAL_BRIDGE_SECRET) {
         return false;
     }
 
-    const auth =
-        String(
-            req.headers.authorization ||
-            ""
-        ).trim();
+    const auth = String(
+        req.headers.authorization || ""
+    ).trim();
 
     if (!auth) {
         return false;
     }
 
-    const expected =
-        `Bearer ${LOCAL_BRIDGE_SECRET}`;
+    const expected = `Bearer ${LOCAL_BRIDGE_SECRET}`;
+    const authBuffer = Buffer.from(auth);
+    const expectedBuffer = Buffer.from(expected);
 
-    const authBuffer =
-        Buffer.from(auth);
-
-    const expectedBuffer =
-        Buffer.from(expected);
-
-    if (
-        authBuffer.length !==
-        expectedBuffer.length
-    ) {
+    if (authBuffer.length !== expectedBuffer.length) {
         return false;
     }
 
@@ -425,121 +254,68 @@ function isAuthorizedLocalBridge(
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| FETCH COM TIMEOUT
-|--------------------------------------------------------------------------
-*/
-
 async function fetchWithTimeout(
     url,
     options = {},
-    timeoutMs = 20_000
+    timeoutMs = 20000
 ) {
-    const controller =
-        new AbortController();
+    const controller = new AbortController();
 
-    const timer =
-        setTimeout(
-            () =>
-                controller.abort(),
-            timeoutMs
-        );
+    const timer = setTimeout(
+        () => controller.abort(),
+        timeoutMs
+    );
 
     try {
-        return await fetch(
-            url,
-            {
-                ...options,
-                signal:
-                    controller.signal
-            }
-        );
+        return await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
     } finally {
         clearTimeout(timer);
     }
 }
 
-/*
-|--------------------------------------------------------------------------
-| LIMPEZA DE MEMÓRIA
-|--------------------------------------------------------------------------
-*/
-
 function cleanupMemory() {
     const now = Date.now();
 
-    for (
-        const [
-            key,
-            item
-        ] of translationCache.entries()
-    ) {
-        if (
-            item.expiresAt <= now
-        ) {
-            translationCache.delete(
-                key
-            );
+    for (const [key, item] of translationCache.entries()) {
+        if (item.expiresAt <= now) {
+            translationCache.delete(key);
         }
     }
 
-    for (
-        const [
-            key,
-            job
-        ] of jobs.entries()
-    ) {
+    for (const [key, job] of jobs.entries()) {
         if (
             job.expiresAt <= now &&
-            job.status !==
-                "processing"
+            job.status !== "processing"
         ) {
             jobs.delete(key);
         }
     }
 
-    while (
-        translationCache.size >
-        MAX_CACHE_ENTRIES
-    ) {
-        const key =
-            translationCache.keys()
-                .next()
-                .value;
+    while (translationCache.size > MAX_CACHE_ENTRIES) {
+        const key = translationCache.keys().next().value;
 
-        if (
-            key === undefined
-        ) {
+        if (key === undefined) {
             break;
         }
 
-        translationCache.delete(
-            key
-        );
+        translationCache.delete(key);
     }
 
-    while (
-        jobs.size > MAX_JOBS
-    ) {
-        const key =
-            jobs.keys()
-                .next()
-                .value;
+    while (jobs.size > MAX_JOBS) {
+        const key = jobs.keys().next().value;
 
-        if (
-            key === undefined
-        ) {
+        if (key === undefined) {
             break;
         }
 
-        const job =
-            jobs.get(key);
+        const job = jobs.get(key);
 
         if (
             job &&
-            job.status ===
-                "processing"
+            job.status === "processing"
         ) {
             break;
         }
@@ -553,53 +329,23 @@ setInterval(
     5 * 60 * 1000
 ).unref();
 
-/*
-|--------------------------------------------------------------------------
-| SRT
-|--------------------------------------------------------------------------
-*/
-
 function normalizeSrt(text) {
-    return String(
-        text || ""
-    )
-        .replace(
-            /^\uFEFF/,
-            ""
-        )
-        .replace(
-            /\r\n/g,
-            "\n"
-        )
-        .replace(
-            /\r/g,
-            "\n"
-        )
+    return String(text || "")
+        .replace(/^\uFEFF/, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
         .trim();
 }
 
-function stripCodeFences(
-    text
-) {
-    return String(
-        text || ""
-    )
+function stripCodeFences(text) {
+    return String(text || "")
         .replace(
             /^```(?:json|srt|text|plaintext)?\s*/i,
             ""
         )
-        .replace(
-            /\s*```$/i,
-            ""
-        )
+        .replace(/\s*```$/i, "")
         .trim();
 }
-
-/*
-|--------------------------------------------------------------------------
-| HIGIENIZAÇÃO CONSERVADORA DE CARACTERES
-|--------------------------------------------------------------------------
-*/
 
 function createCharacterSanitizationStats() {
     return {
@@ -612,113 +358,83 @@ function createCharacterSanitizationStats() {
     };
 }
 
-function addCharacterSanitizationStats(
-    target,
-    source
-) {
-    for (
-        const key of Object.keys(
-            target
-        )
-    ) {
-        target[key] +=
-            Number(
-                source?.[key] || 0
-            );
+function addCharacterSanitizationStats(target, source) {
+    for (const key of Object.keys(target)) {
+        target[key] += Number(source?.[key] || 0);
     }
 
     return target;
 }
 
-function sanitizeSubtitleText(
-    value
-) {
-    const stats =
-        createCharacterSanitizationStats();
+function sanitizeSubtitleText(value) {
+    const stats = createCharacterSanitizationStats();
+    let text = String(value ?? "");
 
-    let text =
-        String(
-            value ?? ""
-        );
+    const normalizedNfc = text.normalize("NFC");
 
-    const normalizedNfc =
-        text.normalize("NFC");
-
-    if (
-        normalizedNfc !== text
-    ) {
+    if (normalizedNfc !== text) {
         stats.nfcChanges++;
         text = normalizedNfc;
     }
 
-    text =
-        text.replace(
-            /[\u00A0\u202F]/gu,
-            () => {
-                stats.normalizedSpaces++;
-                return " ";
-            }
-        );
+    text = text.replace(
+        /[\u00A0\u202F]/gu,
+        () => {
+            stats.normalizedSpaces++;
+            return " ";
+        }
+    );
 
-    text =
-        text.replace(
-            /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu,
-            () => {
-                stats.controlChars++;
-                return "";
-            }
-        );
+    text = text.replace(
+        /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu,
+        () => {
+            stats.controlChars++;
+            return "";
+        }
+    );
 
-    text =
-        text.replace(
-            /[\u00AD\u200B\u2060\uFEFF]/gu,
-            () => {
-                stats.invisibleChars++;
-                return "";
-            }
-        );
+    text = text.replace(
+        /[\u00AD\u200B\u2060\uFEFF]/gu,
+        () => {
+            stats.invisibleChars++;
+            return "";
+        }
+    );
 
-    text =
-        text.replace(
-            /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
-            () => {
-                stats.invisibleChars++;
-                return "";
-            }
-        );
+    text = text.replace(
+        /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
+        () => {
+            stats.invisibleChars++;
+            return "";
+        }
+    );
 
-    text =
-        text.replace(
-            /\uFFFD/gu,
-            () => {
-                stats.replacementChars++;
-                return "";
-            }
-        );
+    text = text.replace(
+        /\uFFFD/gu,
+        () => {
+            stats.replacementChars++;
+            return "";
+        }
+    );
 
-    text =
-        text.replace(
-            /\{\\[^}\r\n]*\}/gu,
-            () => {
-                stats.assTags++;
-                return "";
-            }
-        );
+    text = text.replace(
+        /\{\\[^}\r\n]*\}/gu,
+        () => {
+            stats.assTags++;
+            return "";
+        }
+    );
 
-    text =
-        text
-            .split("\n")
-            .map(
-                line =>
-                    line
-                        .replace(
-                            /[ \t]{2,}/g,
-                            " "
-                        )
-                        .trimEnd()
-            )
-            .join("\n")
-            .trim();
+    text = text
+        .split("\n")
+        .map(
+            line =>
+                line
+                    .replace(/[ \t]{2,}/g, " ")
+                    .trimEnd()
+        )
+        .join("\n")
+        .trim();
 
     return {
         text,
@@ -726,9 +442,7 @@ function sanitizeSubtitleText(
     };
 }
 
-function characterSanitizationTotal(
-    stats
-) {
+function characterSanitizationTotal(stats) {
     return (
         stats.controlChars +
         stats.invisibleChars +
@@ -739,54 +453,25 @@ function characterSanitizationTotal(
     );
 }
 
-function logCharacterSanitization(
-    stage,
-    stats
-) {
-    const total =
-        characterSanitizationTotal(
-            stats
-        );
+function logCharacterSanitization(stage, stats) {
+    const total = characterSanitizationTotal(stats);
 
     console.log(
         `[CLEAN CHAR] ${stage}: ${total} ajuste(s); controles=${stats.controlChars}, invisíveis=${stats.invisibleChars}, espaços=${stats.normalizedSpaces}, replacement=${stats.replacementChars}, ASS=${stats.assTags}, NFC=${stats.nfcChanges}.`
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| LIMPEZA SDH / CC
-|--------------------------------------------------------------------------
-*/
-
 const SDH_CUE_WORDS =
     /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
-
-/*
-|--------------------------------------------------------------------------
-| CONTEXTO OCULTO DE FALANTE
-|--------------------------------------------------------------------------
-*/
 
 const SPEAKER_HINT_MARKER_REGEX =
     /^@@SPK:([^@]+)@@\s*/u;
 
-function normalizeSpeakerHint(
-    value
-) {
-    const speaker =
-        String(
-            value || ""
-        )
-            .replace(
-                /<[^>]+>/g,
-                " "
-            )
-            .replace(
-                /\s+/g,
-                " "
-            )
-            .trim();
+function normalizeSpeakerHint(value) {
+    const speaker = String(value || "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
     if (
         !speaker ||
@@ -795,44 +480,28 @@ function normalizeSpeakerHint(
         return "";
     }
 
-    if (
-        SDH_CUE_WORDS.test(
-            speaker
-        )
-    ) {
+    if (SDH_CUE_WORDS.test(speaker)) {
         return "";
     }
 
-    if (
-        /[!?;]/u.test(
-            speaker
-        )
-    ) {
+    if (/[!?;]/u.test(speaker)) {
         return "";
     }
 
     return speaker;
 }
 
-function encodeSpeakerHint(
-    speaker
-) {
+function encodeSpeakerHint(speaker) {
     return encodeURIComponent(
-        String(
-            speaker || ""
-        )
+        String(speaker || "")
     );
 }
 
-function decodeSpeakerHint(
-    encoded
-) {
+function decodeSpeakerHint(encoded) {
     try {
         return normalizeSpeakerHint(
             decodeURIComponent(
-                String(
-                    encoded || ""
-                )
+                String(encoded || "")
             )
         );
     } catch {
@@ -840,33 +509,21 @@ function decodeSpeakerHint(
     }
 }
 
-function extractSpeakerHint(
-    line
-) {
-    const original =
-        String(
-            line || ""
-        );
+function extractSpeakerHint(line) {
+    const original = String(line || "");
 
     const hiddenMatch =
         original.match(
             SPEAKER_HINT_MARKER_REGEX
         );
 
-    if (
-        hiddenMatch
-    ) {
+    if (hiddenMatch) {
         return {
-            speaker:
-                decodeSpeakerHint(
-                    hiddenMatch[1]
-                ),
-
-            lineForCleaning:
-                original.replace(
-                    SPEAKER_HINT_MARKER_REGEX,
-                    ""
-                )
+            speaker: decodeSpeakerHint(hiddenMatch[1]),
+            lineForCleaning: original.replace(
+                SPEAKER_HINT_MARKER_REGEX,
+                ""
+            )
         };
     }
 
@@ -875,19 +532,14 @@ function extractSpeakerHint(
             /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*/u
         );
 
-    if (
-        bracketMatch
-    ) {
+    if (bracketMatch) {
         const speaker =
-            normalizeSpeakerHint(
-                bracketMatch[1]
-            );
+            normalizeSpeakerHint(bracketMatch[1]);
 
         if (speaker) {
             return {
                 speaker,
-                lineForCleaning:
-                    original
+                lineForCleaning: original
             };
         }
     }
@@ -897,170 +549,100 @@ function extractSpeakerHint(
             /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50}):\s+(?=\S)/u
         );
 
-    if (
-        colonMatch
-    ) {
+    if (colonMatch) {
         const speaker =
-            normalizeSpeakerHint(
-                colonMatch[1]
-            );
+            normalizeSpeakerHint(colonMatch[1]);
 
         if (speaker) {
             return {
                 speaker,
-                lineForCleaning:
-                    original
+                lineForCleaning: original
             };
         }
     }
 
     return {
         speaker: "",
-        lineForCleaning:
-            original
+        lineForCleaning: original
     };
 }
 
-/*
-|--------------------------------------------------------------------------
-| NORMALIZAÇÃO DE ALONGAMENTOS VOCAIS
-|--------------------------------------------------------------------------
-*/
-
-function normalizeHyphenatedVocalElongations(
-    text
-) {
-    return String(
-        text ?? ""
-    ).replace(
+function normalizeHyphenatedVocalElongations(text) {
+    return String(text ?? "").replace(
         /([A-Za-zÀ-ÖØ-öø-ÿ])(?:[-–—]\1){2,}[-–—]?/giu,
         "$1"
     );
 }
 
-function normalizeTranslatedVocalElongations(
-    text
-) {
+function normalizeTranslatedVocalElongations(text) {
     let result =
-        normalizeHyphenatedVocalElongations(
-            text
-        );
+        normalizeHyphenatedVocalElongations(text);
 
-    result =
-        result.replace(
-            /([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{3,}/gu,
-            "$1"
-        );
+    result = result.replace(
+        /([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{3,}/gu,
+        "$1"
+    );
 
     return result;
 }
 
-function cleanDialogueLine(
-    line
-) {
-    let text =
-        String(
-            line || ""
-        ).trim();
+function cleanDialogueLine(line) {
+    let text = String(line || "").trim();
 
     if (!text) {
         return "";
     }
 
-    text =
-        text.replace(
-            /\s*\[[^\]]+\]\s*/gu,
-            " "
-        );
+    text = text.replace(
+        /\s*\[[^\]]+\]\s*/gu,
+        " "
+    );
 
-    text =
-        text.replace(
-            /\s*\(([^)]*)\)\s*/gu,
-            (
-                match,
-                inside
-            ) =>
-                SDH_CUE_WORDS.test(
-                    String(
-                        inside || ""
-                    )
-                )
-                    ? " "
-                    : match
-        );
-
-    text =
-        text.replace(
-            /^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,
-            ""
-        );
-
-    text =
-        text
-            .replace(
-                /[ \t]{2,}/g,
-                " "
+    text = text.replace(
+        /\s*\(([^)]*)\)\s*/gu,
+        (match, inside) =>
+            SDH_CUE_WORDS.test(
+                String(inside || "")
             )
-            .trim();
+                ? " "
+                : match
+    );
 
-    if (
-        /^[-–—♪♫♬\s]*$/u.test(
-            text
-        )
-    ) {
+    text = text.replace(
+        /^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,
+        ""
+    );
+
+    text = text
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+
+    if (/^[-–—♪♫♬\s]*$/u.test(text)) {
         return "";
     }
 
     return text;
 }
 
-/*
-|--------------------------------------------------------------------------
-| AUDITORIA ABSOLUTA DE TIMESTAMPS
-|--------------------------------------------------------------------------
-*/
-
 const TIMING_LINE_REGEX =
     /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
 
-function extractTimingLines(
-    srt
-) {
-    return String(
-        srt || ""
-    )
-        .replace(
-            /\r\n/g,
-            "\n"
-        )
-        .replace(
-            /\r/g,
-            "\n"
-        )
+function extractTimingLines(srt) {
+    return String(srt || "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
         .split("\n")
-        .map(
-            line =>
-                line.trim()
-        )
+        .map(line => line.trim())
         .filter(
             line =>
-                TIMING_LINE_REGEX.test(
-                    line
-                )
+                TIMING_LINE_REGEX.test(line)
         );
 }
 
-function timingSignature(
-    timings
-) {
+function timingSignature(timings) {
     return sha256(
-        JSON.stringify(
-            timings
-        )
-    ).slice(
-        0,
-        16
-    );
+        JSON.stringify(timings)
+    ).slice(0, 16);
 }
 
 function auditCleaningTimestamps(
@@ -1068,15 +650,9 @@ function auditCleaningTimestamps(
     cleanedSrt,
     label = "SOURCE"
 ) {
-    const rawTimings =
-        extractTimingLines(
-            rawSrt
-        );
-
+    const rawTimings = extractTimingLines(rawSrt);
     const cleanedTimings =
-        extractTimingLines(
-            cleanedSrt
-        );
+        extractTimingLines(cleanedSrt);
 
     let cursor = 0;
 
@@ -1085,8 +661,7 @@ function auditCleaningTimestamps(
         i < cleanedTimings.length;
         i++
     ) {
-        const wanted =
-            cleanedTimings[i];
+        const wanted = cleanedTimings[i];
 
         while (
             cursor < rawTimings.length &&
@@ -1095,9 +670,7 @@ function auditCleaningTimestamps(
             cursor++;
         }
 
-        if (
-            cursor >= rawTimings.length
-        ) {
+        if (cursor >= rawTimings.length) {
             throw timestampIntegrityError(
                 `Auditoria de timestamps falhou na limpeza (${label}) no bloco preservado ${i + 1}.`
             );
@@ -1118,15 +691,8 @@ function auditFinalTimestamps(
     finalSrt,
     label = "FINAL"
 ) {
-    const sourceBlocks =
-        parseSrt(
-            sourceSrt
-        );
-
-    const finalBlocks =
-        parseSrt(
-            finalSrt
-        );
+    const sourceBlocks = parseSrt(sourceSrt);
+    const finalBlocks = parseSrt(finalSrt);
 
     if (
         sourceBlocks.length !==
@@ -1142,17 +708,12 @@ function auditFinalTimestamps(
         i < sourceBlocks.length;
         i++
     ) {
-        const source =
-            sourceBlocks[i];
-
-        const final =
-            finalBlocks[i];
+        const source = sourceBlocks[i];
+        const final = finalBlocks[i];
 
         if (
-            source.index !==
-                final.index ||
-            source.timing !==
-                final.timing
+            source.index !== final.index ||
+            source.timing !== final.timing
         ) {
             throw timestampIntegrityError(
                 `Auditoria de timestamps falhou (${label}) no bloco ${i + 1}: índice/timing divergente.`
@@ -1177,22 +738,15 @@ function auditFinalTimestamps(
     return true;
 }
 
-function cleanSrtForTranslation(
-    srt
-) {
-    const normalized =
-        normalizeSrt(
-            srt
-        );
+function cleanSrtForTranslation(srt) {
+    const normalized = normalizeSrt(srt);
 
     if (!normalized) {
         return "";
     }
 
     const rawBlocks =
-        normalized.split(
-            /\n{2,}/
-        );
+        normalized.split(/\n{2,}/);
 
     const cleanedBlocks = [];
 
@@ -1204,10 +758,7 @@ function cleanSrtForTranslation(
     const characterStats =
         createCharacterSanitizationStats();
 
-    for (
-        const rawBlock
-        of rawBlocks
-    ) {
+    for (const rawBlock of rawBlocks) {
         const lines =
             rawBlock
                 .trim()
@@ -1215,41 +766,27 @@ function cleanSrtForTranslation(
 
         const timingIndex =
             lines.findIndex(
-                line =>
-                    /-->/.test(
-                        line
-                    )
+                line => /-->/.test(line)
             );
 
-        if (
-            timingIndex === -1
-        ) {
+        if (timingIndex === -1) {
             continue;
         }
 
         const timing =
-            lines[
-                timingIndex
-            ].trim();
+            lines[timingIndex].trim();
 
         const cleanedDialogue = [];
-        const speakerHints =
-            new Set();
+        const speakerHints = new Set();
 
         for (
             const line
-            of lines.slice(
-                timingIndex + 1
-            )
+            of lines.slice(timingIndex + 1)
         ) {
             const speakerInfo =
-                extractSpeakerHint(
-                    line
-                );
+                extractSpeakerHint(line);
 
-            if (
-                speakerInfo.speaker
-            ) {
+            if (speakerInfo.speaker) {
                 speakerHints.add(
                     speakerInfo.speaker
                 );
@@ -1285,62 +822,44 @@ function cleanSrtForTranslation(
                 elongatedLines++;
             }
 
-            if (
-                cleaned !==
-                line.trim()
-            ) {
+            if (cleaned !== line.trim()) {
                 changedLines++;
             }
 
             if (cleaned) {
-                cleanedDialogue.push(
-                    cleaned
-                );
+                cleanedDialogue.push(cleaned);
             }
         }
 
-        if (
-            cleanedDialogue.length === 0
-        ) {
+        if (cleanedDialogue.length === 0) {
             removedBlocks++;
             continue;
         }
 
-        if (
-            speakerHints.size === 1
-        ) {
+        if (speakerHints.size === 1) {
             const speakerHint =
-                Array.from(
-                    speakerHints
-                )[0];
+                Array.from(speakerHints)[0];
 
             cleanedDialogue[0] =
-                `@@SPK:${encodeSpeakerHint(
-                    speakerHint
-                )}@@ ${cleanedDialogue[0]}`;
+                `@@SPK:${encodeSpeakerHint(speakerHint)}@@ ${cleanedDialogue[0]}`;
 
             speakerHintBlocks++;
         }
 
         cleanedBlocks.push({
             timing,
-            dialogue:
-                cleanedDialogue
+            dialogue: cleanedDialogue
         });
     }
 
     const result =
         cleanedBlocks
             .map(
-                (
-                    block,
-                    index
-                ) =>
-                    [
-                        index + 1,
-                        block.timing,
-                        ...block.dialogue
-                    ].join("\n")
+                (block, index) => [
+                    index + 1,
+                    block.timing,
+                    ...block.dialogue
+                ].join("\n")
             )
             .join("\n\n")
             .trim();
@@ -1363,9 +882,7 @@ function cleanSrtForTranslation(
     );
 
     const finalResult =
-        result
-            ? result + "\n"
-            : "";
+        result ? result + "\n" : "";
 
     if (finalResult) {
         auditCleaningTimestamps(
@@ -1378,15 +895,8 @@ function cleanSrtForTranslation(
     return finalResult;
 }
 
-/*
-|--------------------------------------------------------------------------
-| PARSER SRT
-|--------------------------------------------------------------------------
-*/
-
 function parseSrt(srt) {
-    const normalized =
-        normalizeSrt(srt);
+    const normalized = normalizeSrt(srt);
 
     if (!normalized) {
         return [];
@@ -1395,64 +905,39 @@ function parseSrt(srt) {
     const blocks =
         normalized
             .split(/\n{2,}/)
-            .map(
-                block =>
-                    block.trim()
-            )
+            .map(block => block.trim())
             .filter(Boolean);
 
     const result = [];
 
-    for (
-        const block of blocks
-    ) {
-        const lines =
-            block.split("\n");
+    for (const block of blocks) {
+        const lines = block.split("\n");
 
-        if (
-            lines.length < 3
-        ) {
+        if (lines.length < 3) {
             continue;
         }
 
-        const indexLine =
-            lines[0].trim();
+        const indexLine = lines[0].trim();
+        const timingLine = lines[1].trim();
 
-        const timingLine =
-            lines[1].trim();
-
-        if (
-            !/^\d+$/.test(
-                indexLine
-            )
-        ) {
+        if (!/^\d+$/.test(indexLine)) {
             continue;
         }
 
-        if (
-            !TIMING_LINE_REGEX.test(
-                timingLine
-            )
-        ) {
+        if (!TIMING_LINE_REGEX.test(timingLine)) {
             continue;
         }
 
-        const textLines =
-            lines.slice(2);
-
+        const textLines = lines.slice(2);
         let speakerHint = "";
 
-        if (
-            textLines.length > 0
-        ) {
+        if (textLines.length > 0) {
             const markerMatch =
                 textLines[0].match(
                     SPEAKER_HINT_MARKER_REGEX
                 );
 
-            if (
-                markerMatch
-            ) {
+            if (markerMatch) {
                 speakerHint =
                     decodeSpeakerHint(
                         markerMatch[1]
@@ -1467,28 +952,15 @@ function parseSrt(srt) {
         }
 
         result.push({
-            index:
-                Number(indexLine),
-
-            timing:
-                timingLine,
-
-            text:
-                textLines.join("\n"),
-
-            speakerHint:
-                speakerHint || null
+            index: Number(indexLine),
+            timing: timingLine,
+            text: textLines.join("\n"),
+            speakerHint: speakerHint || null
         });
     }
 
     return result;
 }
-
-/*
-|--------------------------------------------------------------------------
-| LIMPEZA DE CARACTERES APÓS TRADUÇÃO
-|--------------------------------------------------------------------------
-*/
 
 function cleanAllTranslatedCharacters(
     translatedTexts
@@ -1499,33 +971,24 @@ function cleanAllTranslatedCharacters(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(
-            text => {
-                const original =
-                    String(
-                        text ?? ""
-                    );
+        translatedTexts.map(text => {
+            const original =
+                String(text ?? "");
 
-                const sanitized =
-                    sanitizeSubtitleText(
-                        original
-                    );
+            const sanitized =
+                sanitizeSubtitleText(original);
 
-                addCharacterSanitizationStats(
-                    stats,
-                    sanitized.stats
-                );
+            addCharacterSanitizationStats(
+                stats,
+                sanitized.stats
+            );
 
-                if (
-                    sanitized.text !==
-                    original
-                ) {
-                    changedBlocks++;
-                }
-
-                return sanitized.text;
+            if (sanitized.text !== original) {
+                changedBlocks++;
             }
-        );
+
+            return sanitized.text;
+        });
 
     logCharacterSanitization(
         `TRADUÇÃO (${changedBlocks} bloco(s) alterado(s))`,
@@ -1535,30 +998,13 @@ function cleanAllTranslatedCharacters(
     return cleaned;
 }
 
-/*
-|--------------------------------------------------------------------------
-| LIMPEZA DE MARCADORES DE DIÁLOGO TRADUZIDOS
-|--------------------------------------------------------------------------
-*/
-
-function cleanTranslatedDialogueMarkers(
-    text
-) {
+function cleanTranslatedDialogueMarkers(text) {
     const normalized =
-        String(
-            text ?? ""
-        )
-            .replace(
-                /\r\n/g,
-                "\n"
-            )
-            .replace(
-                /\r/g,
-                "\n"
-            );
+        String(text ?? "")
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n");
 
-    const lines =
-        normalized.split("\n");
+    const lines = normalized.split("\n");
 
     const markerRegex =
         /^\s*[-–—/]+\s+(?=\S)/u;
@@ -1566,20 +1012,12 @@ function cleanTranslatedDialogueMarkers(
     let markedDialogueLines = 0;
     let nonEmptyLines = 0;
 
-    for (
-        const line of lines
-    ) {
-        if (
-            line.trim()
-        ) {
+    for (const line of lines) {
+        if (line.trim()) {
             nonEmptyLines++;
         }
 
-        if (
-            markerRegex.test(
-                line
-            )
-        ) {
+        if (markerRegex.test(line)) {
             markedDialogueLines++;
         }
     }
@@ -1588,9 +1026,7 @@ function cleanTranslatedDialogueMarkers(
         nonEmptyLines >= 2 &&
         markedDialogueLines >= 2;
 
-    if (
-        isRealMultiSpeakerBlock
-    ) {
+    if (isRealMultiSpeakerBlock) {
         return normalized;
     }
 
@@ -1611,27 +1047,20 @@ function cleanAllTranslatedDialogueMarkers(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(
-            text => {
-                const original =
-                    String(
-                        text ?? ""
-                    );
+        translatedTexts.map(text => {
+            const original = String(text ?? "");
 
-                const result =
-                    cleanTranslatedDialogueMarkers(
-                        original
-                    );
+            const result =
+                cleanTranslatedDialogueMarkers(
+                    original
+                );
 
-                if (
-                    result !== original
-                ) {
-                    changedBlocks++;
-                }
-
-                return result;
+            if (result !== original) {
+                changedBlocks++;
             }
-        );
+
+            return result;
+        });
 
     console.log(
         `[CLEAN] Marcadores de diálogo: ${changedBlocks} bloco(s) ajustado(s).`
@@ -1646,27 +1075,20 @@ function cleanAllTranslatedVocalElongations(
     let changedBlocks = 0;
 
     const cleaned =
-        translatedTexts.map(
-            text => {
-                const original =
-                    String(
-                        text ?? ""
-                    );
+        translatedTexts.map(text => {
+            const original = String(text ?? "");
 
-                const result =
-                    normalizeTranslatedVocalElongations(
-                        original
-                    );
+            const result =
+                normalizeTranslatedVocalElongations(
+                    original
+                );
 
-                if (
-                    result !== original
-                ) {
-                    changedBlocks++;
-                }
-
-                return result;
+            if (result !== original) {
+                changedBlocks++;
             }
-        );
+
+            return result;
+        });
 
     console.log(
         `[CLEAN] Alongamentos vocais traduzidos: ${changedBlocks} bloco(s) ajustado(s).`
@@ -1675,82 +1097,46 @@ function cleanAllTranslatedVocalElongations(
     return cleaned;
 }
 
-/*
-|--------------------------------------------------------------------------
-| CONSTRUTOR SRT
-|--------------------------------------------------------------------------
-*/
-
-function buildSrt(
-    blocks,
-    translatedTexts
-) {
+function buildSrt(blocks, translatedTexts) {
     return (
         blocks
-            .map(
-                (
-                    block,
-                    index
-                ) => {
-                    const translated =
-                        translatedTexts[
-                            index
-                        ] ??
-                        block.text;
+            .map((block, index) => {
+                const translated =
+                    translatedTexts[index] ??
+                    block.text;
 
-                    return [
-                        block.index,
-                        block.timing,
-                        translated
-                    ].join("\n");
-                }
-            )
+                return [
+                    block.index,
+                    block.timing,
+                    translated
+                ].join("\n");
+            })
             .join("\n\n")
             .trim() +
         "\n"
     );
 }
 
-/*
-|--------------------------------------------------------------------------
-| CACHE
-|--------------------------------------------------------------------------
-*/
-
-function setTranslationCache(
-    key,
-    srt
-) {
+function setTranslationCache(key, srt) {
     const now = Date.now();
 
     translationCache.set(
         key,
         {
             srt,
-
-            version:
-                TRANSLATION_CACHE_VERSION,
-
-            contentAuditPassed:
-                true,
-
+            version: TRANSLATION_CACHE_VERSION,
+            contentAuditPassed: true,
             createdAt: now,
-
-            expiresAt:
-                now + CACHE_TTL_MS
+            expiresAt: now + CACHE_TTL_MS
         }
     );
 
     cleanupMemory();
 }
 
-function getTranslationCache(
-    key
-) {
+function getTranslationCache(key) {
     const item =
-        translationCache.get(
-            key
-        );
+        translationCache.get(key);
 
     if (!item) {
         return null;
@@ -1759,155 +1145,99 @@ function getTranslationCache(
     if (
         item.version !==
             TRANSLATION_CACHE_VERSION ||
-        item.contentAuditPassed !==
-            true
+        item.contentAuditPassed !== true
     ) {
-        translationCache.delete(
-            key
-        );
-
+        translationCache.delete(key);
         return null;
     }
 
-    if (
-        item.expiresAt <=
-        Date.now()
-    ) {
-        translationCache.delete(
-            key
-        );
-
+    if (item.expiresAt <= Date.now()) {
+        translationCache.delete(key);
         return null;
     }
 
     return item.srt;
 }
 
-/*
-|--------------------------------------------------------------------------
-| DIVISÃO INTELIGENTE DE LOTES
-|--------------------------------------------------------------------------
-*/
-
-function splitIntoBatches(
-    blocks
-) {
+function splitIntoBatches(blocks) {
     const batches = [];
 
     let current = [];
     let currentChars = 0;
 
-    for (
-        const block of blocks
-    ) {
+    for (const block of blocks) {
         const text =
-            String(
-                block.text || ""
-            );
+            String(block.text || "");
 
         const blockChars =
-            text.length + 50;
+            text.length + 28;
 
         const wouldExceedChars =
             current.length > 0 &&
-            currentChars +
-                blockChars >
+            currentChars + blockChars >
                 MAX_BATCH_CHARS;
 
         const wouldExceedBlocks =
-            current.length >=
-            MAX_BATCH_BLOCKS;
+            current.length >= MAX_BATCH_BLOCKS;
 
         if (
             wouldExceedChars ||
             wouldExceedBlocks
         ) {
-            batches.push(
-                current
-            );
+            batches.push(current);
 
             current = [];
             currentChars = 0;
         }
 
-        current.push(
-            block
-        );
-
-        currentChars +=
-            blockChars;
+        current.push(block);
+        currentChars += blockChars;
     }
 
-    if (
-        current.length > 0
-    ) {
-        batches.push(
-            current
-        );
+    if (current.length > 0) {
+        batches.push(current);
     }
 
     return batches;
 }
 
-/*
-|--------------------------------------------------------------------------
-| COOLDOWN / RETRY-AFTER / RATE LIMIT
-|--------------------------------------------------------------------------
-*/
-
 function getCooldownRemaining() {
     return Math.max(
         0,
-        geminiCooldownUntil -
-            Date.now()
+        geminiCooldownUntil - Date.now()
     );
 }
 
-function setGeminiCooldown(
-    ms
-) {
+function setGeminiCooldown(ms) {
     const safeMs =
         Math.min(
             Math.max(
-                Number(ms) || 30_000,
+                Number(ms) || 30000,
                 1000
             ),
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
 
-    const until =
-        Date.now() + safeMs;
+    const until = Date.now() + safeMs;
 
-    if (
-        until > geminiCooldownUntil
-    ) {
+    if (until > geminiCooldownUntil) {
         geminiCooldownUntil = until;
     }
 
     console.log(
-        `[GEMINI] RATE LIMIT. Cooldown global de ${Math.ceil(
-            safeMs / 1000
-        )}s.`
+        `[GEMINI] RATE LIMIT. Cooldown global de ${Math.ceil(safeMs / 1000)}s.`
     );
 }
 
-function getRetryAfterMs(
-    response,
-    errorData
-) {
+function getRetryAfterMs(response, errorData) {
     const header =
-        response?.headers?.get(
-            "retry-after"
-        );
+        response?.headers?.get("retry-after");
 
     if (header) {
-        const seconds =
-            Number(header);
+        const seconds = Number(header);
 
         if (
-            Number.isFinite(
-                seconds
-            ) &&
+            Number.isFinite(seconds) &&
             seconds > 0
         ) {
             return Math.min(
@@ -1919,8 +1249,7 @@ function getRetryAfterMs(
 
     const message =
         String(
-            errorData?.error?.message ||
-            ""
+            errorData?.error?.message || ""
         );
 
     const secondsMatch =
@@ -1928,19 +1257,11 @@ function getRetryAfterMs(
             /retry in\s+([\d.]+)s/i
         );
 
-    if (
-        secondsMatch
-    ) {
+    if (secondsMatch) {
         const seconds =
-            Number(
-                secondsMatch[1]
-            );
+            Number(secondsMatch[1]);
 
-        if (
-            Number.isFinite(
-                seconds
-            )
-        ) {
+        if (Number.isFinite(seconds)) {
             return Math.min(
                 (seconds + 1) * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
@@ -1953,13 +1274,9 @@ function getRetryAfterMs(
             /retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i
         );
 
-    if (
-        minuteSecondMatch
-    ) {
+    if (minuteSecondMatch) {
         const minutes =
-            Number(
-                minuteSecondMatch[1]
-            );
+            Number(minuteSecondMatch[1]);
 
         const seconds =
             Number(
@@ -1981,257 +1298,239 @@ function getRetryAfterMs(
             /retry in\s+(\d+)m/i
         );
 
-    if (
-        minuteMatch
-    ) {
+    if (minuteMatch) {
         return Math.min(
             (
-                Number(
-                    minuteMatch[1]
-                ) * 60 +
+                Number(minuteMatch[1]) * 60 +
                 1
             ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
 
-    return 30_000;
+    return 30000;
 }
 
-function isRateLimitError(
-    status,
-    message
-) {
+function isRateLimitError(status, message) {
     return (
         status === 429 ||
         /quota|rate.?limit|resource.?exhausted|too many requests/i.test(
-            String(
-                message || ""
-            )
+            String(message || "")
         )
     );
 }
-
-/*
-|--------------------------------------------------------------------------
-| REQUEST GEMINI
-|--------------------------------------------------------------------------
-*/
 
 async function rawGeminiRequest(
     prompt,
     deadlineAt,
     requestKind = "translation"
 ) {
-    if (
-        !GEMINI_API_KEY
-    ) {
+    if (!GEMINI_API_KEY) {
         throw new Error(
             "GEMINI_API_KEY não configurada."
         );
     }
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     const endpoint =
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-            GEMINI_MODEL
-        )}:generateContent`;
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+
+    const isAudit =
+        requestKind === "semantic-audit";
 
     const body =
-        requestKind ===
-        "semantic-audit"
+        isAudit
             ? {
-                  systemInstruction: {
-                      parts: [
-                          {
-                              text:
-                                  "Você é um auditor bilíngue extremamente rigoroso de integridade de legendas EN→PT-BR. " +
-                                  "NÃO traduza nem reescreva. Verifique somente correspondência semântica por ID. " +
-                                  "Cada item auditado inclui source, translation, speaker opcional e os vizinhos source anterior/próximo apenas como contexto. " +
-                                  "Os itens do array podem ser esparsos e vir de momentos diferentes do episódio: NUNCA trate o item anterior/seguinte do array como vizinho temporal; use exclusivamente prev/next dentro do próprio item. " +
-                                  "A tradução do ID deve representar exclusivamente o source do próprio ID; conteúdo antecipado do próximo ID ou atrasado do anterior é falha. " +
-                                  "Aceite paráfrase natural, adaptação idiomática, gíria contemporânea, linguagem LGBTQIAPN+, drag/camp/shade e mudança gramatical quando o significado do próprio ID estiver preservado. " +
-                                  "Não penalize fragmentos: se a fonte é fragmentária, a tradução pode ser fragmentária. " +
-                                  "Se houver migração inequívoca para outro ID, faithful=false e matchedSourceId deve apontar o ID mais provável. " +
-                                  "Se corresponder ao próprio ID, faithful=true e matchedSourceId deve ser o próprio id. " +
-                                  "Preserve exatamente id e lock e retorne somente o JSON solicitado."
-                          }
-                      ]
-                  },
+                systemInstruction: {
+                    parts: [
+                        {
+                            text:
+                                "Você é um auditor bilíngue rigoroso de integridade de legendas EN→PT-BR. " +
+                                "NÃO traduza nem reescreva. Cada registro usa chaves compactas: i=id, l=lock, s=source, t=translation, h=speaker, p=source anterior, n=source seguinte. " +
+                                "Os registros do array podem ser esparsos e de momentos diferentes: NUNCA use a posição no array como vizinhança; use somente p/n do próprio registro. " +
+                                "A tradução t deve corresponder exclusivamente ao source s do mesmo i. Conteúdo antecipado de n ou atrasado de p é falha. " +
+                                "Aceite paráfrase natural, localização idiomática, gíria contemporânea e linguagem LGBTQIAPN+/drag/camp/shade quando preservarem o sentido. " +
+                                "Fragmentos podem continuar fragmentários. Se t corresponde ao próprio s, retorne m=i e f=true; se migrou para outro ID, m deve ser esse ID e f=false. " +
+                                "Preserve i e l exatamente. Retorne somente JSON compacto no formato solicitado."
+                        }
+                    ]
+                },
 
-                  contents: [
-                      {
-                          role: "user",
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                text: prompt
+                            }
+                        ]
+                    }
+                ],
 
-                          parts: [
-                              {
-                                  text:
-                                      prompt
-                              }
-                          ]
-                      }
-                  ],
+                generationConfig: {
+                    thinkingConfig: {
+                        thinkingLevel: "MINIMAL"
+                    },
 
-                  generationConfig: {
-                      temperature: 0,
+                    responseMimeType:
+                        "application/json",
 
-                      responseMimeType:
-                          "application/json",
+                    responseSchema: {
+                        type: "ARRAY",
 
-                      responseSchema: {
-                          type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
 
-                          items: {
-                              type: "OBJECT",
+                            properties: {
+                                i: {
+                                    type: "INTEGER"
+                                },
 
-                              properties: {
-                                  id: {
-                                      type: "INTEGER"
-                                  },
+                                l: {
+                                    type: "STRING"
+                                },
 
-                                  lock: {
-                                      type: "STRING"
-                                  },
+                                m: {
+                                    type: "INTEGER"
+                                },
 
-                                  matchedSourceId: {
-                                      type: "INTEGER"
-                                  },
+                                f: {
+                                    type: "BOOLEAN"
+                                }
+                            },
 
-                                  faithful: {
-                                      type: "BOOLEAN"
-                                  }
-                              },
+                            required: [
+                                "i",
+                                "l",
+                                "m",
+                                "f"
+                            ]
+                        },
 
-                              required: [
-                                  "id",
-                                  "lock",
-                                  "matchedSourceId",
-                                  "faithful"
-                              ]
-                          },
+                        minItems: 1
+                    },
 
-                          minItems: 1
-                      },
-
-                      maxOutputTokens:
-                          AUDIT_MAX_OUTPUT_TOKENS
-                  }
-              }
+                    maxOutputTokens:
+                        AUDIT_MAX_OUTPUT_TOKENS
+                }
+            }
             : {
-                  systemInstruction: {
-                      parts: [
-                          {
-                              text:
-                                  "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, com padrão premium de streaming. " +
-                                  "A prioridade é: INTEGRIDADE DO CONTEÚDO POR ID → sentido/intenção → voz do personagem → naturalidade contemporânea → humor/ritmo → literalidade. " +
-                                  "Cada ID é uma unidade atômica e imutável: traduza SOMENTE o campo text daquele ID. Nunca antecipe, atrase, complete ou transfira conteúdo entre IDs, mesmo quando uma frase continuar no bloco seguinte. Vizinhos existem só para contexto. " +
-                                  "O PT-BR deve soar vivo, oral, atual e brasileiro de verdade, sem cara de tradução de dicionário. Prefira vocabulário contemporâneo compatível com 2026 e, quando idade/cena/personagem pedirem, use com naturalidade repertório de geração Z e Alpha, cultura digital, memes e oralidade jovem — sem transformar todo mundo em adolescente nem enfiar gíria onde não cabe. " +
-                                  "Evite vocabulário artificialmente datado. Modernidade vem de ritmo, escolhas de palavras e registro, não de uma lista fixa de bordões. " +
-                                  "Em contextos LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, traduza com letramento cultural e carinho: preserve identidade, nome escolhido, pronome, gênero, ironia, afeto, provocação, termos ressignificados e intensidade. Não heteronormativize, não higienize linguagem queer e não transforme vocativos camp em insultos literais. " +
-                                  "girl, bitch, honey, sis, queen, baby e babe podem ser vocativos afetivos/camp; nunca traduza automaticamente girl como garota nem bitch como vadia. Escolha gata, amiga, mana, bicha, querida, amor, mona ou omissão somente quando o contexto realmente sustentar. 'vadia' apenas quando houver insulto real ou uso ressignificado inequivocamente equivalente. " +
-                                  "Adapte expressões idiomáticas, piadas, trocadilhos, shade e referências culturais quando houver solução brasileira natural que preserve intenção e graça. Se adaptar piorar, preserve o original. Preserve bordões consagrados como Condragulations. " +
-                                  "Não censure palavrões nem intensidade emocional. Preserve nomes próprios, marcas, títulos e termos técnicos. Traduza falas ou letras efetivamente transcritas em outros idiomas para PT-BR; não invente letra para marcações de música. " +
-                                  "speaker é contexto oculto: nunca copie o nome para text. Se speaker identificar claramente a pessoa, respeite gênero/pronomes; se não estiver claro, NÃO chute gênero — prefira construção brasileira natural que evite marcar gênero. " +
-                                  "Não acrescente SDH/CC, sons, nomes de falantes ou explicações. Não reproduza alongamentos gráficos desnecessários. Preserve formatação útil. " +
-                                  "Além de traduzir, faça uma AUTOAUDITORIA silenciosa de cada item antes de responder: selfFaithful=true somente se text traduzido representar integralmente e exclusivamente o source do próprio ID; boundarySafe=true somente se nenhum conteúdo dos IDs vizinhos tiver migrado para ele. Se houver dúvida real, marque false. " +
-                                  "Retorne somente JSON, exatamente na ordem recebida, preservando id e lock sem qualquer alteração."
-                          }
-                      ]
-                  },
+                systemInstruction: {
+                    parts: [
+                        {
+                            text:
+                                "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, com padrão premium de streaming. " +
+                                "A prioridade é: INTEGRIDADE DO CONTEÚDO POR ID → sentido/intenção → voz do personagem → naturalidade contemporânea → humor/ritmo → literalidade. " +
+                                "Cada ID é uma unidade atômica e imutável: traduza SOMENTE o texto daquele ID. Nunca antecipe, atrase, complete ou transfira conteúdo entre IDs, mesmo quando uma frase continuar no bloco seguinte. Vizinhos existem só para contexto. " +
+                                "O PT-BR deve soar vivo, oral, atual e brasileiro de verdade. Prefira vocabulário contemporâneo compatível com 2026 e, quando idade/cena/personagem pedirem, use naturalmente repertório de geração Z e Alpha, cultura digital, memes e oralidade jovem — sem transformar todo mundo em adolescente nem forçar gíria. " +
+                                "Evite vocabulário artificialmente datado. Modernidade vem de ritmo, escolhas de palavras e registro, não de uma lista fixa de bordões. " +
+                                "Em contextos LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, traduza com letramento cultural e carinho: preserve identidade, nome escolhido, pronome, gênero, ironia, afeto, provocação, termos ressignificados e intensidade. Não heteronormativize nem higienize linguagem queer. " +
+                                "girl, bitch, honey, sis, queen, baby e babe podem ser vocativos afetivos/camp; nunca traduza automaticamente girl como garota nem bitch como vadia. Escolha gata, amiga, mana, bicha, querida, amor, mona ou omissão somente quando o contexto sustentar. 'vadia' apenas quando houver insulto real ou uso ressignificado inequivocamente equivalente. " +
+                                "Adapte expressões idiomáticas, piadas, trocadilhos, shade e referências culturais quando houver solução brasileira natural que preserve intenção e graça. Se adaptar piorar, preserve o original. Preserve bordões consagrados como Condragulations. " +
+                                "Não censure palavrões nem intensidade emocional. Preserve nomes próprios, marcas, títulos e termos técnicos. Traduza falas ou letras efetivamente transcritas em outros idiomas para PT-BR; não invente letra para marcações de música. " +
+                                "speaker é contexto oculto: nunca copie o nome para a tradução. Se identificar claramente a pessoa, respeite gênero/pronomes; se não estiver claro, NÃO chute gênero — prefira construção brasileira natural que evite marcação. " +
+                                "Não acrescente SDH/CC, sons, nomes de falantes ou explicações. Não reproduza alongamentos gráficos desnecessários. Preserve formatação útil. " +
+                                "Antes de responder, confira silenciosamente cada ID para garantir que nenhum conteúdo do vizinho migrou para ele. " +
+                                "A entrada usa chaves compactas: i=id, l=lock, x=texto e s=speaker opcional; p/n são contexto externo. " +
+                                "Retorne somente JSON compacto, exatamente na ordem recebida, usando i=id, l=lock e t=tradução. Preserve i e l sem qualquer alteração."
+                        }
+                    ]
+                },
 
-                  contents: [
-                      {
-                          role: "user",
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                text: prompt
+                            }
+                        ]
+                    }
+                ],
 
-                          parts: [
-                              {
-                                  text:
-                                      prompt
-                              }
-                          ]
-                      }
-                  ],
+                generationConfig: {
+                    thinkingConfig: {
+                        thinkingLevel: "MINIMAL"
+                    },
 
-                  generationConfig: {
-                      temperature: 0.25,
+                    responseMimeType:
+                        "application/json",
 
-                      responseMimeType:
-                          "application/json",
+                    responseSchema: {
+                        type: "ARRAY",
 
-                      responseSchema: {
-                          type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
 
-                          items: {
-                              type: "OBJECT",
+                            properties: {
+                                i: {
+                                    type: "INTEGER"
+                                },
 
-                              properties: {
-                                  id: {
-                                      type: "INTEGER"
-                                  },
+                                l: {
+                                    type: "STRING"
+                                },
 
-                                  lock: {
-                                      type: "STRING"
-                                  },
+                                t: {
+                                    type: "STRING"
+                                }
+                            },
 
-                                  text: {
-                                      type: "STRING"
-                                  },
+                            required: [
+                                "i",
+                                "l",
+                                "t"
+                            ]
+                        },
 
-                                  selfFaithful: {
-                                      type: "BOOLEAN"
-                                  },
+                        minItems: 1
+                    },
 
-                                  boundarySafe: {
-                                      type: "BOOLEAN"
-                                  }
-                              },
-
-                              required: [
-                                  "id",
-                                  "lock",
-                                  "text",
-                                  "selfFaithful",
-                                  "boundarySafe"
-                              ]
-                          },
-
-                          minItems: 1
-                      },
-
-                      maxOutputTokens:
-                          MAX_OUTPUT_TOKENS
-                  }
-              };
+                    maxOutputTokens:
+                        MAX_OUTPUT_TOKENS
+                }
+            };
 
     const remaining =
-        remainingBeforeDeadline(
-            deadlineAt
-        );
+        remainingBeforeDeadline(deadlineAt);
 
-    if (
-        remaining <= 0
-    ) {
+    if (remaining <= 0) {
         throw translationTimeoutError();
     }
 
-    const kindTimeoutMs =
-        requestKind ===
-        "semantic-audit"
-            ? SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS
-            : TRANSLATION_REQUEST_TIMEOUT_MS;
+    let kindTimeoutMs =
+        TRANSLATION_REQUEST_TIMEOUT_MS;
+
+    if (requestKind === "semantic-audit") {
+        kindTimeoutMs =
+            SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS;
+
+    } else if (
+        requestKind === "translation-rescue"
+    ) {
+        kindTimeoutMs =
+            RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS;
+
+    } else if (
+        requestKind === "translation-single"
+    ) {
+        kindTimeoutMs =
+            SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS;
+
+    } else if (
+        requestKind === "translation-single-last"
+    ) {
+        kindTimeoutMs =
+            SINGLE_LAST_TRANSLATION_REQUEST_TIMEOUT_MS;
+    }
 
     const requestTimeoutMs =
         Math.max(
             1,
             Math.min(
                 kindTimeoutMs,
-
-                Number.isFinite(
-                    remaining
-                )
+                Number.isFinite(remaining)
                     ? remaining
                     : kindTimeoutMs
             )
@@ -2242,63 +1541,48 @@ async function rawGeminiRequest(
 
     let requestTimedOut = false;
 
-    const timer =
-        setTimeout(
-            () => {
-                requestTimedOut =
-                    true;
-
-                controller.abort();
-            },
-            requestTimeoutMs
-        );
+    const timer = setTimeout(
+        () => {
+            requestTimedOut = true;
+            controller.abort();
+        },
+        requestTimeoutMs
+    );
 
     let response;
     let rawText;
 
     try {
-        response =
-            await fetch(
-                endpoint,
-                {
-                    method: "POST",
+        response = await fetch(
+            endpoint,
+            {
+                method: "POST",
 
-                    headers: {
-                        "Content-Type":
-                            "application/json",
+                headers: {
+                    "Content-Type":
+                        "application/json",
 
-                        "x-goog-api-key":
-                            GEMINI_API_KEY
-                    },
+                    "x-goog-api-key":
+                        GEMINI_API_KEY
+                },
 
-                    body:
-                        JSON.stringify(
-                            body
-                        ),
-
-                    signal:
-                        controller.signal
-                }
-            );
+                body: JSON.stringify(body),
+                signal: controller.signal
+            }
+        );
 
         rawText =
             await response.text();
 
-    } catch (
-        error
-    ) {
+    } catch (error) {
         if (
-            Number.isFinite(
-                deadlineAt
-            ) &&
+            Number.isFinite(deadlineAt) &&
             Date.now() >= deadlineAt
         ) {
             throw translationTimeoutError();
         }
 
-        if (
-            requestTimedOut
-        ) {
+        if (requestTimedOut) {
             throw geminiRequestTimeoutError(
                 requestKind
             );
@@ -2310,44 +1594,30 @@ async function rawGeminiRequest(
         clearTimeout(timer);
     }
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     let data;
 
     try {
-        data =
-            JSON.parse(
-                rawText
-            );
+        data = JSON.parse(rawText);
 
     } catch {
-        const error =
-            new Error(
-                `Resposta não-JSON do Gemini. HTTP ${response.status}.`
-            );
+        const error = new Error(
+            `Resposta não-JSON do Gemini. HTTP ${response.status}.`
+        );
 
-        error.status =
-            response.status;
-
+        error.status = response.status;
         throw error;
     }
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         const message =
             data?.error?.message ||
             `HTTP ${response.status}`;
 
-        const error =
-            new Error(
-                message
-            );
+        const error = new Error(message);
 
-        error.status =
-            response.status;
+        error.status = response.status;
 
         error.rateLimit =
             isRateLimitError(
@@ -2358,9 +1628,9 @@ async function rawGeminiRequest(
         error.retryAfterMs =
             error.rateLimit
                 ? getRetryAfterMs(
-                      response,
-                      data
-                  )
+                    response,
+                    data
+                )
                 : 0;
 
         throw error;
@@ -2370,9 +1640,7 @@ async function rawGeminiRequest(
         data?.candidates?.[0]
             ?.content?.parts
             ?.map(
-                part =>
-                    part?.text ||
-                    ""
+                part => part?.text || ""
             )
             .join("")
             .trim();
@@ -2386,33 +1654,20 @@ async function rawGeminiRequest(
     return text;
 }
 
-/*
-|--------------------------------------------------------------------------
-| FILA GEMINI
-|--------------------------------------------------------------------------
-*/
-
 function enqueueGemini(
     prompt,
     deadlineAt,
     requestKind = "translation"
 ) {
     return new Promise(
-        (
-            resolve,
-            reject
-        ) => {
+        (resolve, reject) => {
             if (
-                Number.isFinite(
-                    deadlineAt
-                ) &&
-                Date.now() >=
-                    deadlineAt
+                Number.isFinite(deadlineAt) &&
+                Date.now() >= deadlineAt
             ) {
                 reject(
                     translationTimeoutError()
                 );
-
                 return;
             }
 
@@ -2430,36 +1685,27 @@ function enqueueGemini(
 }
 
 async function processGeminiQueue() {
-    if (
-        geminiWorkerRunning
-    ) {
+    if (geminiWorkerRunning) {
         return;
     }
 
     geminiWorkerRunning = true;
 
     try {
-        while (
-            geminiQueue.length > 0
-        ) {
-            const item =
-                geminiQueue.shift();
+        while (geminiQueue.length > 0) {
+            const item = geminiQueue.shift();
 
             if (!item) {
                 continue;
             }
 
             if (
-                Number.isFinite(
-                    item.deadlineAt
-                ) &&
-                Date.now() >=
-                    item.deadlineAt
+                Number.isFinite(item.deadlineAt) &&
+                Date.now() >= item.deadlineAt
             ) {
                 item.reject(
                     translationTimeoutError()
                 );
-
                 continue;
             }
 
@@ -2475,13 +1721,9 @@ async function processGeminiQueue() {
                     const cooldown =
                         getCooldownRemaining();
 
-                    if (
-                        cooldown > 0
-                    ) {
+                    if (cooldown > 0) {
                         console.log(
-                            `[GEMINI] Fila aguardando cooldown de ${Math.ceil(
-                                cooldown / 1000
-                            )}s.`
+                            `[GEMINI] Fila aguardando cooldown de ${Math.ceil(cooldown / 1000)}s.`
                         );
 
                         await sleepWithDeadline(
@@ -2528,15 +1770,10 @@ async function processGeminiQueue() {
                             "translation"
                         );
 
-                    item.resolve(
-                        result
-                    );
-
+                    item.resolve(result);
                     finished = true;
 
-                } catch (
-                    error
-                ) {
+                } catch (error) {
                     if (
                         error?.code ===
                             "TRANSLATION_TIMEOUT" ||
@@ -2561,33 +1798,26 @@ async function processGeminiQueue() {
                         "GEMINI_REQUEST_TIMEOUT"
                     ) {
                         console.warn(
-                            `[GEMINI] Timeout curto (${item.requestKind || "translation"}); lote será tratado pelo split inteligente.`
+                            `[GEMINI] Timeout curto (${item.requestKind || "translation"}); request será tratado pelo RESCUE 6.2.`
                         );
 
-                        item.reject(
-                            error
-                        );
-
+                        item.reject(error);
                         finished = true;
                         continue;
                     }
 
                     const message =
-                        getErrorMessage(
-                            error
-                        );
+                        getErrorMessage(error);
 
                     console.error(
                         `[GEMINI] Erro: ${message}`
                     );
 
-                    if (
-                        error?.rateLimit
-                    ) {
+                    if (error?.rateLimit) {
                         const cooldownMs =
                             Math.min(
                                 error.retryAfterMs ||
-                                30_000,
+                                30000,
                                 MAX_RATE_LIMIT_COOLDOWN_MS
                             );
 
@@ -2603,13 +1833,10 @@ async function processGeminiQueue() {
                         MAX_NORMAL_RETRIES
                     ) {
                         const wait =
-                            1500 *
-                            normalAttempt;
+                            1500 * normalAttempt;
 
                         console.log(
-                            `[GEMINI] Retry normal em ${Math.ceil(
-                                wait / 1000
-                            )}s.`
+                            `[GEMINI] Retry normal em ${Math.ceil(wait / 1000)}s.`
                         );
 
                         normalAttempt++;
@@ -2633,76 +1860,41 @@ async function processGeminiQueue() {
                         continue;
                     }
 
-                    item.reject(
-                        error
-                    );
-
+                    item.reject(error);
                     finished = true;
                 }
             }
         }
 
     } finally {
-        geminiWorkerRunning =
-            false;
+        geminiWorkerRunning = false;
 
-        if (
-            geminiQueue.length > 0
-        ) {
+        if (geminiQueue.length > 0) {
             processGeminiQueue();
         }
     }
 }
 
-/*
-|--------------------------------------------------------------------------
-| PROMPT DE TRADUÇÃO
-|--------------------------------------------------------------------------
-*/
-
-function blockTranslationLock(
-    block
-) {
+function blockTranslationLock(block) {
     return sha256(
         JSON.stringify([
             BLOCK_LOCK_VERSION,
-
-            Number(
-                block?.index
-            ),
-
-            String(
-                block?.timing ?? ""
-            ),
-
-            String(
-                block?.text ?? ""
-            ),
-
-            String(
-                block?.speakerHint ??
-                ""
-            )
+            Number(block?.index),
+            String(block?.timing ?? ""),
+            String(block?.text ?? ""),
+            String(block?.speakerHint ?? "")
         ])
-    ).slice(
-        0,
-        20
-    );
+    ).slice(0, 20);
 }
 
-function contextBlockPayload(
-    block
-) {
+function contextBlockPayload(block) {
     if (!block) {
         return null;
     }
 
     return {
-        id:
-            block.index,
-
-        text:
-            block.text
+        i: block.index,
+        x: block.text
     };
 }
 
@@ -2711,128 +1903,61 @@ function buildTranslationPrompt(
     context = {}
 ) {
     const payload =
-        blocks.map(
-            block => {
-                const item = {
-                    id:
-                        block.index,
+        blocks.map(block => {
+            const item = {
+                i: block.index,
+                l: blockTranslationLock(block),
+                x: block.text
+            };
 
-                    lock:
-                        blockTranslationLock(
-                            block
-                        ),
-
-                    timing:
-                        block.timing,
-
-                    text:
-                        block.text
-                };
-
-                if (
-                    block.speakerHint
-                ) {
-                    item.speaker =
-                        block.speakerHint;
-                }
-
-                return item;
+            if (block.speakerHint) {
+                item.s = block.speakerHint;
             }
-        );
 
-    const envelope = {
-        contextBefore:
-            contextBlockPayload(
-                context.before
-            ),
+            return item;
+        });
 
-        items:
-            payload,
-
-        contextAfter:
-            contextBlockPayload(
-                context.after
-            )
-    };
-
-    return `
-TRADUZA os items para PT-BR premium conforme integralmente as regras do sistema.
-contextBefore/contextAfter são SOMENTE contexto e nunca devem ser traduzidos nem absorvidos pelos items.
-Para cada item devolva id, lock, text, selfFaithful e boundarySafe.
-SAÍDA EXATA: [{"id":123,"lock":"abc","text":"...","selfFaithful":true,"boundarySafe":true}]
-ENTRADA:
-${JSON.stringify(envelope)}
-`;
+    return `TRADUZA b para PT-BR premium seguindo integralmente as regras do sistema.
+p e n são SOMENTE contexto externo: nunca absorva o conteúdo deles em b.
+SAÍDA EXATA: [{"i":123,"l":"abc","t":"tradução"}]
+ENTRADA: ${JSON.stringify({
+        p: contextBlockPayload(context.before),
+        b: payload,
+        n: contextBlockPayload(context.after)
+    })}`;
 }
 
-/*
-|--------------------------------------------------------------------------
-| TRADUZIR / AUDITAR LOTE - 6.1
-|--------------------------------------------------------------------------
-*/
-
-function badModelOutputError(
-    message
-) {
-    const error =
-        new Error(
-            message
-        );
-
-    error.code =
-        "BAD_MODEL_OUTPUT";
-
+function badModelOutputError(message) {
+    const error = new Error(message);
+    error.code = "BAD_MODEL_OUTPUT";
     return error;
 }
 
-function badAuditOutputError(
-    message
-) {
-    const error =
-        new Error(
-            message
-        );
-
-    error.code =
-        "BAD_AUDIT_OUTPUT";
-
+function badAuditOutputError(message) {
+    const error = new Error(message);
+    error.code = "BAD_AUDIT_OUTPUT";
     return error;
 }
 
-function normalizedRiskText(
-    value
-) {
-    return String(
-        value || ""
-    )
+function normalizedRiskText(value) {
+    return String(value || "")
         .replace(
             /<[^>]+>|\{[^}]+\}/g,
             " "
         )
-        .replace(
-            /\s+/g,
-            " "
-        )
+        .replace(/\s+/g, " ")
         .trim();
 }
 
-function strongSentenceEnd(
-    text
-) {
+function strongSentenceEnd(text) {
     return /[.!?…]["'”’\)\]]*$/u.test(
-        normalizedRiskText(
-            text
-        )
+        normalizedRiskText(text)
     );
 }
 
-function fragmentTail(
-    text
-) {
+function fragmentTail(text) {
     return /(?:[,;:–—-]|\b(?:and|but|or|because|so|to|of|for|with|that|which|who|when|if|than|as|like|a|an|the|my|your|our|their|his|her|its|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|can|could|should|may|might|must))\s*$/iu.test(
-        normalizedRiskText(
-            text
-        )
+        normalizedRiskText(text)
     );
 }
 
@@ -2841,14 +1966,10 @@ function translationLengthRisk(
     translated
 ) {
     const sourceLength =
-        normalizedRiskText(
-            source
-        ).length;
+        normalizedRiskText(source).length;
 
     const translatedLength =
-        normalizedRiskText(
-            translated
-        ).length;
+        normalizedRiskText(translated).length;
 
     if (
         sourceLength < 18 ||
@@ -2858,8 +1979,7 @@ function translationLengthRisk(
     }
 
     const ratio =
-        translatedLength /
-        sourceLength;
+        translatedLength / sourceLength;
 
     return (
         ratio < 0.28 ||
@@ -2877,17 +1997,13 @@ function suspiciousNeighborDuplicate(
             translatedItems[index]?.text
         ).toLowerCase();
 
-    if (
-        current.length < 14
-    ) {
+    if (current.length < 14) {
         return false;
     }
 
     for (
-        const neighborIndex of [
-            index - 1,
-            index + 1
-        ]
+        const neighborIndex
+        of [index - 1, index + 1]
     ) {
         if (
             neighborIndex < 0 ||
@@ -2927,16 +2043,75 @@ function suspiciousNeighborDuplicate(
     return false;
 }
 
+function startsLikeContinuation(text) {
+    const value =
+        normalizedRiskText(text);
+
+    return (
+        /^[a-z]/u.test(value) ||
+        /^(?:and|but|or|so|because|then|that|which|who|when|if|to|of|for|with)\b/iu.test(value)
+    );
+}
+
+function boundaryPairRisk(
+    leftBlock,
+    rightBlock
+) {
+    if (!leftBlock || !rightBlock) {
+        return false;
+    }
+
+    const left =
+        normalizedRiskText(
+            leftBlock.text
+        );
+
+    const right =
+        normalizedRiskText(
+            rightBlock.text
+        );
+
+    if (!left || !right) {
+        return false;
+    }
+
+    if (fragmentTail(left)) {
+        return true;
+    }
+
+    if (
+        !strongSentenceEnd(left) &&
+        startsLikeContinuation(right)
+    ) {
+        return true;
+    }
+
+    if (/[,;:–—-]\s*$/u.test(left)) {
+        return true;
+    }
+
+    const leftWords =
+        left
+            .split(/\s+/)
+            .filter(Boolean)
+            .length;
+
+    if (
+        !strongSentenceEnd(left) &&
+        leftWords <= 5
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
 function auditRiskScore(
     blocks,
     translatedItems,
     index
 ) {
-    const block =
-        blocks[index];
-
-    const item =
-        translatedItems[index];
+    const block = blocks[index];
 
     const source =
         normalizedRiskText(
@@ -2950,44 +2125,42 @@ function auditRiskScore(
 
     let score = 0;
 
-    if (
-        item?.selfFaithful !==
-            true ||
-        item?.boundarySafe !==
-            true
-    ) {
-        score += 10;
-    }
-
-    if (
-        index <
-            blocks.length - 1 &&
-        !strongSentenceEnd(
-            source
-        )
-    ) {
-        score += 2;
-    }
-
-    if (
-        fragmentTail(
-            source
-        )
-    ) {
-        score += 2;
-    }
-
-    if (
-        words.length <= 3
-    ) {
-        score += 1;
+    if (fragmentTail(source)) {
+        score += 3;
     }
 
     if (
         index > 0 &&
-        /^[a-z]/u.test(
-            source
+        fragmentTail(
+            blocks[index - 1]?.text
         )
+    ) {
+        score += 3;
+    }
+
+    if (
+        index < blocks.length - 1 &&
+        boundaryPairRisk(
+            block,
+            blocks[index + 1]
+        )
+    ) {
+        score += 3;
+    }
+
+    if (
+        index > 0 &&
+        boundaryPairRisk(
+            blocks[index - 1],
+            block
+        )
+    ) {
+        score += 3;
+    }
+
+    if (
+        words.length <= 3 &&
+        !strongSentenceEnd(source)
     ) {
         score += 1;
     }
@@ -2995,7 +2168,7 @@ function auditRiskScore(
     if (
         translationLengthRisk(
             block?.text,
-            item?.text
+            translatedItems[index]?.text
         )
     ) {
         score += 3;
@@ -3018,10 +2191,9 @@ function selectIndependentAuditIndices(
     blocks,
     translatedItems
 ) {
-    const selected =
-        new Set();
+    const selected = new Set();
+    const riskSelected = new Set();
 
-    let riskCount = 0;
     let canaryCount = 0;
 
     for (
@@ -3029,44 +2201,61 @@ function selectIndependentAuditIndices(
         i < blocks.length;
         i++
     ) {
-        const risk =
+        if (
             auditRiskScore(
                 blocks,
                 translatedItems,
                 i
-            );
-
-        if (
-            risk >=
-            HIGH_RISK_AUDIT_SCORE
+            ) >= HIGH_RISK_AUDIT_SCORE
         ) {
             selected.add(i);
-            riskCount++;
-            continue;
+            riskSelected.add(i);
         }
+    }
 
+    for (
+        let i = 0;
+        i < blocks.length - 1;
+        i++
+    ) {
+        if (
+            boundaryPairRisk(
+                blocks[i],
+                blocks[i + 1]
+            )
+        ) {
+            selected.add(i);
+            selected.add(i + 1);
+
+            riskSelected.add(i);
+            riskSelected.add(i + 1);
+        }
+    }
+
+    for (
+        let i = 0;
+        i < blocks.length;
+        i++
+    ) {
         if (
             i === 0 ||
-            i ===
-                blocks.length - 1 ||
-            i % AUDIT_CANARY_STRIDE ===
-                0
+            i === blocks.length - 1 ||
+            i % AUDIT_CANARY_STRIDE === 0
         ) {
+            if (!selected.has(i)) {
+                canaryCount++;
+            }
+
             selected.add(i);
-            canaryCount++;
         }
     }
 
     return {
         indices:
-            Array.from(
-                selected
-            ).sort(
-                (a, b) =>
-                    a - b
-            ),
+            Array.from(selected)
+                .sort((a, b) => a - b),
 
-        riskCount,
+        riskCount: riskSelected.size,
         canaryCount
     };
 }
@@ -3083,19 +2272,11 @@ function blockAtWithOuterContext(
         return blocks[index];
     }
 
-    if (
-        index < 0
-    ) {
-        return (
-            context?.before ||
-            null
-        );
+    if (index < 0) {
+        return context?.before || null;
     }
 
-    return (
-        context?.after ||
-        null
-    );
+    return context?.after || null;
 }
 
 function buildIndependentAuditRecords(
@@ -3104,139 +2285,107 @@ function buildIndependentAuditRecords(
     indices,
     context
 ) {
-    return indices.map(
-        index => {
-            const block =
-                blocks[index];
+    return indices.map(index => {
+        const block = blocks[index];
 
-            const previous =
-                blockAtWithOuterContext(
-                    blocks,
-                    index - 1,
-                    context
-                );
+        const previous =
+            blockAtWithOuterContext(
+                blocks,
+                index - 1,
+                context
+            );
 
-            const next =
-                blockAtWithOuterContext(
-                    blocks,
-                    index + 1,
-                    context
-                );
+        const next =
+            blockAtWithOuterContext(
+                blocks,
+                index + 1,
+                context
+            );
 
-            return {
-                id:
-                    block.index,
+        return {
+            id: block.index,
 
-                lock:
-                    blockTranslationLock(
-                        block
-                    ),
+            lock:
+                blockTranslationLock(block),
 
-                source:
-                    block.text,
+            source: block.text,
 
-                translation:
-                    translatedItems[
-                        index
-                    ].text,
+            translation:
+                translatedItems[index].text,
 
-                speaker:
-                    block.speakerHint ||
-                    null,
+            speaker:
+                block.speakerHint || null,
 
-                prev:
-                    previous
-                        ? {
-                              id:
-                                  previous.index,
+            prev:
+                previous
+                    ? {
+                        id: previous.index,
+                        source: previous.text
+                    }
+                    : null,
 
-                              source:
-                                  previous.text
-                          }
-                        : null,
-
-                next:
-                    next
-                        ? {
-                              id:
-                                  next.index,
-
-                              source:
-                                  next.text
-                          }
-                        : null
-            };
-        }
-    );
+            next:
+                next
+                    ? {
+                        id: next.index,
+                        source: next.text
+                    }
+                    : null
+        };
+    });
 }
 
-function auditRecordForModel(
-    record
-) {
-    return {
-        id:
-            record.id,
-
-        lock:
-            record.lock,
-
-        source:
-            record.source,
-
-        translation:
-            record.translation,
-
-        speaker:
-            record.speaker ||
-            null,
-
-        prev:
-            record.prev ||
-            null,
-
-        next:
-            record.next ||
-            null
+function auditRecordForModel(record) {
+    const item = {
+        i: record.id,
+        l: record.lock,
+        s: record.source,
+        t: record.translation
     };
+
+    if (record.speaker) {
+        item.h = record.speaker;
+    }
+
+    if (record.prev) {
+        item.p = [
+            record.prev.id,
+            record.prev.source
+        ];
+    }
+
+    if (record.next) {
+        item.n = [
+            record.next.id,
+            record.next.source
+        ];
+    }
+
+    return item;
 }
 
-function buildSemanticAuditPrompt(
-    records
-) {
-    return `
-AUDITORIA INDEPENDENTE. Verifique somente os itens abaixo.
-Os itens podem ser esparsos e de momentos diferentes. NÃO use a posição no array como vizinhança temporal.
-Use SOMENTE prev/next do próprio item como contexto para detectar conteúdo migrado; eles NÃO precisam ser traduzidos.
-faithful=true SOMENTE se translation corresponde exclusivamente ao source do próprio id.
-SAÍDA EXATA: [{"id":123,"lock":"abc","matchedSourceId":123,"faithful":true}]
-ITENS:
-${JSON.stringify(
-    records.map(
-        auditRecordForModel
-    )
-)}
-`;
+function buildSemanticAuditPrompt(records) {
+    return `AUDITE os registros abaixo. Eles podem ser esparsos; use SOMENTE p/n do próprio registro como vizinhos.
+Falha = t contém sentido pertencente a p/n ou não corresponde ao source s do próprio i.
+Aceite localização natural, gíria, humor e linguagem LGBTQIAPN+/drag/camp/shade quando o sentido do próprio i estiver preservado.
+SAÍDA EXATA: [{"i":123,"l":"abc","m":123,"f":true}]
+REGISTROS: ${JSON.stringify(
+        records.map(auditRecordForModel)
+    )}`;
 }
 
-function semanticAuditFailureError(
-    failures
-) {
-    const error =
-        new Error(
-            `Auditoria independente detectou ${failures.length} bloco(s) semanticamente suspeito(s).`
-        );
+function semanticAuditFailureError(failures) {
+    const error = new Error(
+        `Auditoria independente detectou ${failures.length} bloco(s) semanticamente suspeito(s).`
+    );
 
     error.code =
         "SEMANTIC_AUDIT_FAILURE";
 
-    error.failures =
-        failures;
+    error.failures = failures;
 
     error.failedIds =
-        failures.map(
-            item =>
-                item.id
-        );
+        failures.map(item => item.id);
 
     return error;
 }
@@ -3247,9 +2396,7 @@ async function auditIndependentRecordsOnce(
 ) {
     const raw =
         await enqueueGemini(
-            buildSemanticAuditPrompt(
-                records
-            ),
+            buildSemanticAuditPrompt(records),
             deadlineAt,
             "semantic-audit"
         );
@@ -3259,9 +2406,7 @@ async function auditIndependentRecordsOnce(
     try {
         parsed =
             JSON.parse(
-                stripCodeFences(
-                    raw
-                )
+                stripCodeFences(raw)
             );
 
     } catch {
@@ -3271,11 +2416,8 @@ async function auditIndependentRecordsOnce(
     }
 
     if (
-        !Array.isArray(
-            parsed
-        ) ||
-        parsed.length !==
-            records.length
+        !Array.isArray(parsed) ||
+        parsed.length !== records.length
     ) {
         throw badAuditOutputError(
             `Auditoria independente incompleta: esperado=${records.length}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`
@@ -3289,23 +2431,15 @@ async function auditIndependentRecordsOnce(
         i < records.length;
         i++
     ) {
-        const expected =
-            records[i];
-
-        const item =
-            parsed[i];
+        const expected = records[i];
+        const item = parsed[i];
 
         if (
             !item ||
-            item.id !==
-                expected.id ||
-            item.lock !==
-                expected.lock ||
-            !Number.isInteger(
-                item.matchedSourceId
-            ) ||
-            typeof item.faithful !==
-                "boolean"
+            item.i !== expected.id ||
+            item.l !== expected.lock ||
+            !Number.isInteger(item.m) ||
+            typeof item.f !== "boolean"
         ) {
             throw badAuditOutputError(
                 `Auditoria independente quebrou o contrato no ID ${expected.id}.`
@@ -3313,29 +2447,20 @@ async function auditIndependentRecordsOnce(
         }
 
         if (
-            item.faithful !== true ||
-            item.matchedSourceId !==
-                expected.id
+            item.f !== true ||
+            item.m !== expected.id
         ) {
             failures.push({
-                id:
-                    expected.id,
-
-                matchedSourceId:
-                    item.matchedSourceId
+                id: expected.id,
+                matchedSourceId: item.m
             });
         }
     }
 
-    if (
-        failures.length > 0
-    ) {
+    if (failures.length > 0) {
         const sample =
             failures
-                .slice(
-                    0,
-                    8
-                )
+                .slice(0, 8)
                 .map(
                     item =>
                         `${item.id}->${item.matchedSourceId}`
@@ -3343,7 +2468,7 @@ async function auditIndependentRecordsOnce(
                 .join(", ");
 
         console.warn(
-            `[AUDIT SMART] FALHA independente — ${failures.length}/${records.length} suspeito(s); ${sample}.`
+            `[AUDIT FAST] FALHA — ${failures.length}/${records.length} suspeito(s); ${sample}.`
         );
 
         throw semanticAuditFailureError(
@@ -3352,7 +2477,7 @@ async function auditIndependentRecordsOnce(
     }
 
     console.log(
-        `[AUDIT SMART] OK independente — ${records.length}/${records.length} bloco(s) verificados.`
+        `[AUDIT FAST] OK — ${records.length}/${records.length} bloco(s) verificados.`
     );
 
     return true;
@@ -3364,9 +2489,7 @@ async function auditIndependentRecords(
     splitDepth = 0,
     singleBlockRetry = 0
 ) {
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     try {
         return await auditIndependentRecordsOnce(
@@ -3374,9 +2497,7 @@ async function auditIndependentRecords(
             deadlineAt
         );
 
-    } catch (
-        error
-    ) {
+    } catch (error) {
         if (
             error?.code ===
             "SEMANTIC_AUDIT_FAILURE"
@@ -3390,25 +2511,19 @@ async function auditIndependentRecords(
             error?.code ===
                 "GEMINI_REQUEST_TIMEOUT";
 
-        if (
-            !recoverable
-        ) {
+        if (!recoverable) {
             throw error;
         }
 
-        assertBeforeDeadline(
-            deadlineAt
-        );
+        assertBeforeDeadline(deadlineAt);
 
-        if (
-            records.length === 1
-        ) {
+        if (records.length === 1) {
             if (
                 singleBlockRetry <
                 MAX_SINGLE_BLOCK_AUDIT_RETRIES
             ) {
                 console.warn(
-                    `[AUDIT SMART] Auditoria de 1 bloco lenta/inválida. Retry ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_AUDIT_RETRIES}.`
+                    "[AUDIT FAST] Retry único de auditoria atômica."
                 );
 
                 return auditIndependentRecords(
@@ -3431,23 +2546,17 @@ async function auditIndependentRecords(
 
         const middle =
             Math.ceil(
-                records.length /
-                2
+                records.length / 2
             );
 
         const left =
-            records.slice(
-                0,
-                middle
-            );
+            records.slice(0, middle);
 
         const right =
-            records.slice(
-                middle
-            );
+            records.slice(middle);
 
         console.warn(
-            `[AUDIT SMART] Auditoria independente lenta/inválida (${records.length}); split imediato ${left.length} + ${right.length}.`
+            `[AUDIT FAST] Request lenta/inválida (${records.length}); split curto ${left.length} + ${right.length}.`
         );
 
         await auditIndependentRecords(
@@ -3480,7 +2589,7 @@ function prepareAuditSelection(
         );
 
     console.log(
-        `[AUDIT SMART] Autoauditoria: ${blocks.length}/${blocks.length}; auditoria independente selecionada=${selection.indices.length}/${blocks.length} (risco=${selection.riskCount}, canários=${selection.canaryCount}).`
+        `[GUARD 6.2] Scan local ${blocks.length}/${blocks.length}; auditoria independente selecionada=${selection.indices.length}/${blocks.length} (risco=${selection.riskCount}, canários=${selection.canaryCount}).`
     );
 
     return {
@@ -3507,8 +2616,7 @@ async function auditSelectionImmediate(
     for (
         let offset = 0;
         offset < records.length;
-        offset +=
-            MAX_INDEPENDENT_AUDIT_BLOCKS
+        offset += MAX_INDEPENDENT_AUDIT_BLOCKS
     ) {
         const chunk =
             records.slice(
@@ -3523,17 +2631,13 @@ async function auditSelectionImmediate(
                 deadlineAt
             );
 
-        } catch (
-            error
-        ) {
+        } catch (error) {
             if (
                 error?.code ===
                 "SEMANTIC_AUDIT_FAILURE"
             ) {
                 throw badModelOutputError(
-                    getErrorMessage(
-                        error
-                    )
+                    getErrorMessage(error)
                 );
             }
 
@@ -3544,39 +2648,22 @@ async function auditSelectionImmediate(
     return true;
 }
 
-function contextForSplitLeft(
+function contextForSlice(
     blocks,
-    middle,
+    start,
+    endExclusive,
     context
 ) {
     return {
         before:
-            context?.before ||
-            null,
+            start > 0
+                ? blocks[start - 1]
+                : context?.before || null,
 
         after:
-            blocks[middle] ||
-            context?.after ||
-            null
-    };
-}
-
-function contextForSplitRight(
-    blocks,
-    middle,
-    context
-) {
-    return {
-        before:
-            blocks[
-                middle - 1
-            ] ||
-            context?.before ||
-            null,
-
-        after:
-            context?.after ||
-            null
+            endExclusive < blocks.length
+                ? blocks[endExclusive]
+                : context?.after || null
     };
 }
 
@@ -3584,11 +2671,10 @@ async function translateBatchOnce(
     blocks,
     deadlineAt,
     context = {},
-    auditMode = "deferred"
+    auditMode = "deferred",
+    requestKind = "translation"
 ) {
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     const raw =
         await enqueueGemini(
@@ -3597,7 +2683,7 @@ async function translateBatchOnce(
                 context
             ),
             deadlineAt,
-            "translation"
+            requestKind
         );
 
     let parsed;
@@ -3605,9 +2691,7 @@ async function translateBatchOnce(
     try {
         parsed =
             JSON.parse(
-                stripCodeFences(
-                    raw
-                )
+                stripCodeFences(raw)
             );
 
     } catch {
@@ -3616,19 +2700,14 @@ async function translateBatchOnce(
         );
     }
 
-    if (
-        !Array.isArray(
-            parsed
-        )
-    ) {
+    if (!Array.isArray(parsed)) {
         throw badModelOutputError(
             "Gemini não retornou uma lista."
         );
     }
 
     if (
-        parsed.length !==
-        blocks.length
+        parsed.length !== blocks.length
     ) {
         throw badModelOutputError(
             `Quantidade incorreta de blocos: esperado=${blocks.length}, recebido=${parsed.length}. Resposta inteira descartada.`
@@ -3643,59 +2722,31 @@ async function translateBatchOnce(
         i < blocks.length;
         i++
     ) {
-        const block =
-            blocks[i];
-
-        const item =
-            parsed[i];
+        const block = blocks[i];
+        const item = parsed[i];
 
         const expectedLock =
-            blockTranslationLock(
-                block
-            );
+            blockTranslationLock(block);
 
         if (
             !item ||
-            !Number.isInteger(
-                item.id
-            ) ||
-            item.id !==
-                block.index ||
-            seenIds.has(
-                item.id
-            ) ||
-            typeof item.lock !==
-                "string" ||
-            item.lock !==
-                expectedLock ||
-            typeof item.text !==
-                "string" ||
-            item.text
-                .trim()
-                .length === 0 ||
-            typeof item.selfFaithful !==
-                "boolean" ||
-            typeof item.boundarySafe !==
-                "boolean"
+            !Number.isInteger(item.i) ||
+            item.i !== block.index ||
+            seenIds.has(item.i) ||
+            typeof item.l !== "string" ||
+            item.l !== expectedLock ||
+            typeof item.t !== "string" ||
+            item.t.trim().length === 0
         ) {
             throw badModelOutputError(
-                `Contrato ID/lock/autoverificação inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}. Resposta inteira descartada.`
+                `Contrato compacto ID/lock inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}. Resposta inteira descartada.`
             );
         }
 
-        seenIds.add(
-            item.id
-        );
+        seenIds.add(item.i);
 
         translatedItems.push({
-            text:
-                item.text,
-
-            selfFaithful:
-                item.selfFaithful,
-
-            boundarySafe:
-                item.boundarySafe
+            text: item.t
         });
     }
 
@@ -3710,10 +2761,7 @@ async function translateBatchOnce(
             context
         );
 
-    if (
-        auditMode ===
-        "immediate"
-    ) {
+    if (auditMode === "immediate") {
         await auditSelectionImmediate(
             auditSelection.records,
             deadlineAt
@@ -3722,8 +2770,7 @@ async function translateBatchOnce(
         return {
             texts:
                 translatedItems.map(
-                    item =>
-                        item.text
+                    item => item.text
                 ),
 
             auditRecords: []
@@ -3733,12 +2780,288 @@ async function translateBatchOnce(
     return {
         texts:
             translatedItems.map(
-                item =>
-                    item.text
+                item => item.text
             ),
 
         auditRecords:
             auditSelection.records
+    };
+}
+
+function splitFixedRescueBatches(blocks) {
+    const result = [];
+
+    let current = [];
+    let chars = 0;
+
+    for (const block of blocks) {
+        const size =
+            String(block.text || "").length +
+            20;
+
+        if (
+            current.length > 0 &&
+            (
+                current.length >=
+                    RESCUE_BATCH_BLOCKS ||
+                chars + size >
+                    RESCUE_BATCH_CHARS
+            )
+        ) {
+            result.push(current);
+
+            current = [];
+            chars = 0;
+        }
+
+        current.push(block);
+        chars += size;
+    }
+
+    if (current.length) {
+        result.push(current);
+    }
+
+    return result;
+}
+
+async function translateSingleLastChance(
+    block,
+    deadlineAt,
+    context,
+    auditMode
+) {
+    try {
+        return await translateBatchOnce(
+            [block],
+            deadlineAt,
+            context,
+            auditMode,
+            "translation-single"
+        );
+
+    } catch (error) {
+        const recoverable =
+            error?.code ===
+                "BAD_MODEL_OUTPUT" ||
+            error?.code ===
+                "GEMINI_REQUEST_TIMEOUT";
+
+        if (!recoverable) {
+            throw error;
+        }
+
+        assertBeforeDeadline(deadlineAt);
+
+        console.warn(
+            `[RESCUE 6.2] ID ${block.index}: última tentativa atômica.`
+        );
+
+        return translateBatchOnce(
+            [block],
+            deadlineAt,
+            context,
+            auditMode,
+            "translation-single-last"
+        );
+    }
+}
+
+async function translateRescueChunk(
+    blocks,
+    deadlineAt,
+    context,
+    auditMode,
+    splitDepth = 0
+) {
+    try {
+        return await translateBatchOnce(
+            blocks,
+            deadlineAt,
+            context,
+            auditMode,
+            "translation-rescue"
+        );
+
+    } catch (error) {
+        const recoverable =
+            error?.code ===
+                "BAD_MODEL_OUTPUT" ||
+            error?.code ===
+                "GEMINI_REQUEST_TIMEOUT";
+
+        if (!recoverable) {
+            throw error;
+        }
+
+        assertBeforeDeadline(deadlineAt);
+
+        if (blocks.length === 1) {
+            return translateSingleLastChance(
+                blocks[0],
+                deadlineAt,
+                context,
+                auditMode
+            );
+        }
+
+        if (
+            splitDepth >=
+            MAX_RESCUE_SPLIT_DEPTH
+        ) {
+            console.warn(
+                `[RESCUE 6.2] Micro-lote de ${blocks.length} ainda falhou; indo direto para IDs atômicos, sem nova árvore de timeout.`
+            );
+
+            const texts = [];
+            const auditRecords = [];
+
+            for (
+                let i = 0;
+                i < blocks.length;
+                i++
+            ) {
+                const singleContext =
+                    contextForSlice(
+                        blocks,
+                        i,
+                        i + 1,
+                        context
+                    );
+
+                const result =
+                    await translateSingleLastChance(
+                        blocks[i],
+                        deadlineAt,
+                        singleContext,
+                        auditMode
+                    );
+
+                texts.push(
+                    ...result.texts
+                );
+
+                auditRecords.push(
+                    ...result.auditRecords
+                );
+            }
+
+            return {
+                texts,
+                auditRecords
+            };
+        }
+
+        const middle =
+            Math.ceil(
+                blocks.length / 2
+            );
+
+        const left =
+            blocks.slice(0, middle);
+
+        const right =
+            blocks.slice(middle);
+
+        console.warn(
+            `[RESCUE 6.2] Micro-lote ${blocks.length} falhou; split curto ${left.length} + ${right.length} (nível ${splitDepth + 1}/${MAX_RESCUE_SPLIT_DEPTH}).`
+        );
+
+        const leftResult =
+            await translateRescueChunk(
+                left,
+                deadlineAt,
+                contextForSlice(
+                    blocks,
+                    0,
+                    middle,
+                    context
+                ),
+                auditMode,
+                splitDepth + 1
+            );
+
+        const rightResult =
+            await translateRescueChunk(
+                right,
+                deadlineAt,
+                contextForSlice(
+                    blocks,
+                    middle,
+                    blocks.length,
+                    context
+                ),
+                auditMode,
+                splitDepth + 1
+            );
+
+        return {
+            texts: [
+                ...leftResult.texts,
+                ...rightResult.texts
+            ],
+
+            auditRecords: [
+                ...leftResult.auditRecords,
+                ...rightResult.auditRecords
+            ]
+        };
+    }
+}
+
+async function translateBatchRescue(
+    blocks,
+    deadlineAt,
+    context,
+    auditMode
+) {
+    const rescueBatches =
+        splitFixedRescueBatches(blocks);
+
+    console.warn(
+        `[RESCUE 6.2] Entrando em modo fixo: ${blocks.length} bloco(s) -> ${rescueBatches.length} micro-lote(s), máx ${RESCUE_BATCH_BLOCKS} blocos/${RESCUE_BATCH_CHARS} chars.`
+    );
+
+    const texts = [];
+    const auditRecords = [];
+    let cursor = 0;
+
+    for (const chunk of rescueBatches) {
+        const start = cursor;
+        const end =
+            start + chunk.length;
+
+        const chunkContext =
+            contextForSlice(
+                blocks,
+                start,
+                end,
+                context
+            );
+
+        const result =
+            await translateRescueChunk(
+                chunk,
+                deadlineAt,
+                chunkContext,
+                auditMode,
+                0
+            );
+
+        texts.push(
+            ...result.texts
+        );
+
+        auditRecords.push(
+            ...result.auditRecords
+        );
+
+        cursor = end;
+    }
+
+    return {
+        texts,
+        auditRecords
     };
 }
 
@@ -3747,136 +3070,57 @@ async function translateBatch(
     deadlineAt,
     context = {},
     auditMode = "deferred",
-    splitDepth = 0,
-    singleBlockRetry = 0
+    options = {}
 ) {
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
+
+    if (options.forceRescue === true) {
+        return translateBatchRescue(
+            blocks,
+            deadlineAt,
+            context,
+            auditMode
+        );
+    }
 
     try {
         return await translateBatchOnce(
             blocks,
             deadlineAt,
             context,
-            auditMode
+            auditMode,
+            "translation"
         );
 
-    } catch (
-        error
-    ) {
-        const splitRecoverable =
+    } catch (error) {
+        const recoverable =
             error?.code ===
                 "BAD_MODEL_OUTPUT" ||
             error?.code ===
                 "GEMINI_REQUEST_TIMEOUT";
 
-        if (
-            !splitRecoverable
-        ) {
+        if (!recoverable) {
             throw error;
         }
 
-        assertBeforeDeadline(
-            deadlineAt
-        );
+        assertBeforeDeadline(deadlineAt);
 
-        if (
-            blocks.length === 1 &&
-            singleBlockRetry <
-                MAX_SINGLE_BLOCK_OUTPUT_RETRIES
-        ) {
-            console.warn(
-                `[TRANSLATE] Bloco atômico rejeitado. Nova tentativa ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_OUTPUT_RETRIES}.`
-            );
-
-            return translateBatch(
-                blocks,
-                deadlineAt,
-                context,
-                auditMode,
-                splitDepth,
-                singleBlockRetry + 1
-            );
-        }
-
-        const canSplit =
-            blocks.length > 1 &&
-            splitDepth <
-                MAX_BAD_OUTPUT_SPLIT_DEPTH;
-
-        if (
-            !canSplit
-        ) {
-            throw error;
-        }
-
-        const middle =
-            Math.ceil(
-                blocks.length /
-                2
-            );
-
-        const left =
-            blocks.slice(
-                0,
-                middle
-            );
-
-        const right =
-            blocks.slice(
-                middle
-            );
-
-        const splitReason =
+        const reason =
             error?.code ===
-                "GEMINI_REQUEST_TIMEOUT"
-                ? "timeout curto"
-                : "contrato/auditoria";
+            "GEMINI_REQUEST_TIMEOUT"
+                ? "timeout"
+                : "contrato";
 
         console.warn(
-            `[TRANSLATE] Lote de ${blocks.length} bloco(s) rejeitado integralmente por ${splitReason}. Dividindo em ${left.length} + ${right.length}.`
+            `[TRANSLATE] Lote normal de ${blocks.length} falhou por ${reason}. Sem árvore binária longa: entrando diretamente no RESCUE 6.2.`
         );
 
-        const translatedLeft =
-            await translateBatch(
-                left,
-                deadlineAt,
-                contextForSplitLeft(
-                    blocks,
-                    middle,
-                    context
-                ),
-                auditMode,
-                splitDepth + 1,
-                0
-            );
-
-        const translatedRight =
-            await translateBatch(
-                right,
-                deadlineAt,
-                contextForSplitRight(
-                    blocks,
-                    middle,
-                    context
-                ),
-                auditMode,
-                splitDepth + 1,
-                0
-            );
-
-        return {
-            texts: [
-                ...translatedLeft.texts,
-                ...translatedRight.texts
-            ],
-
-            auditRecords: [
-                ...translatedLeft.auditRecords,
-                ...translatedRight.auditRecords
-            ]
-        };
+        return translateBatchRescue(
+            blocks,
+            deadlineAt,
+            context,
+            auditMode
+        );
     }
 }
 
@@ -3896,14 +3140,10 @@ function writeTranslatedBatch(
                 batch[i]
             );
 
-        if (
-            originalIndex !==
-            undefined
-        ) {
+        if (originalIndex !== undefined) {
             translatedTexts[
                 originalIndex
-            ] =
-                translated[i];
+            ] = translated[i];
         }
     }
 }
@@ -3915,7 +3155,7 @@ async function recoverBatchWithImmediateAudit(
     originalPositions
 ) {
     console.warn(
-        `[AUDIT GROUP] Retraduzindo lote ${batchState.batchIndex + 1} em modo fail-closed com auditoria independente imediata.`
+        `[AUDIT FAST] Retraduzindo lote ${batchState.batchIndex + 1} em RESCUE fail-closed + auditoria imediata.`
     );
 
     const recovered =
@@ -3923,7 +3163,10 @@ async function recoverBatchWithImmediateAudit(
             batchState.batch,
             deadlineAt,
             batchState.context,
-            "immediate"
+            "immediate",
+            {
+                forceRescue: true
+            }
         );
 
     writeTranslatedBatch(
@@ -3936,66 +3179,50 @@ async function recoverBatchWithImmediateAudit(
     batchState.translated =
         recovered.texts;
 
-    batchState.recovered =
-        true;
+    batchState.recovered = true;
 
     console.log(
-        `[AUDIT GROUP] Lote ${batchState.batchIndex + 1} recuperado e aprovado independentemente.`
+        `[AUDIT FAST] Lote ${batchState.batchIndex + 1} recuperado e aprovado.`
     );
 }
 
-async function auditDeferredSelections(
-    records,
+async function flushAuditBuffer(
+    buffer,
     batchStates,
     deadlineAt,
     translatedTexts,
     originalPositions,
-    job
+    job,
+    totals,
+    force = false
 ) {
-    if (
-        !SEMANTIC_AUDIT_ENABLED ||
-        records.length === 0
-    ) {
-        return true;
+    if (!SEMANTIC_AUDIT_ENABLED) {
+        buffer.length = 0;
+        return;
     }
 
-    let pending =
-        records.slice();
-
-    const recoveredBatches =
-        new Set();
-
-    let verifiedRecords = 0;
-    let groupedRequests = 0;
-
-    console.log(
-        `[AUDIT GROUP] Iniciando auditoria agrupada: ${records.length} bloco(s) selecionado(s) de ${batchStates.length} lote(s); até ${MAX_INDEPENDENT_AUDIT_BLOCKS} por request.`
-    );
-
     while (
-        pending.length > 0
+        buffer.length >=
+            MAX_INDEPENDENT_AUDIT_BLOCKS ||
+        (
+            force &&
+            buffer.length > 0
+        )
     ) {
-        pending =
-            pending.filter(
-                record =>
-                    !recoveredBatches.has(
-                        record._batchIndex
-                    )
+        const take =
+            Math.min(
+                MAX_INDEPENDENT_AUDIT_BLOCKS,
+                buffer.length
             );
-
-        if (
-            pending.length === 0
-        ) {
-            break;
-        }
 
         const chunk =
-            pending.splice(
-                0,
-                MAX_INDEPENDENT_AUDIT_BLOCKS
-            );
+            buffer.splice(0, take);
 
-        groupedRequests++;
+        totals.requests++;
+
+        console.log(
+            `[AUDIT BUFFER] Flush ${chunk.length} registro(s); restantes=${buffer.length}.`
+        );
 
         try {
             await auditIndependentRecords(
@@ -4003,12 +3230,10 @@ async function auditDeferredSelections(
                 deadlineAt
             );
 
-            verifiedRecords +=
+            totals.verified +=
                 chunk.length;
 
-        } catch (
-            error
-        ) {
+        } catch (error) {
             if (
                 error?.code !==
                 "SEMANTIC_AUDIT_FAILURE"
@@ -4018,20 +3243,15 @@ async function auditDeferredSelections(
 
             const failedIds =
                 new Set(
-                    error.failedIds ||
-                    []
+                    error.failedIds || []
                 );
 
             const affectedBatchIndices =
                 new Set();
 
-            for (
-                const record of chunk
-            ) {
+            for (const record of chunk) {
                 if (
-                    failedIds.has(
-                        record.id
-                    ) &&
+                    failedIds.has(record.id) &&
                     Number.isInteger(
                         record._batchIndex
                     )
@@ -4046,108 +3266,69 @@ async function auditDeferredSelections(
                 affectedBatchIndices.size === 0
             ) {
                 throw badModelOutputError(
-                    "Auditoria agrupada detectou falha sem conseguir associá-la ao lote original."
+                    "Auditoria agrupada detectou falha sem associação ao lote original."
                 );
             }
-
-            console.warn(
-                `[AUDIT GROUP] Falha semântica em ${failedIds.size} ID(s); recuperando ${affectedBatchIndices.size} lote(s) original(is).`
-            );
 
             for (
                 const batchIndex
                 of affectedBatchIndices
             ) {
-                const batchState =
-                    batchStates[
-                        batchIndex
-                    ];
+                const state =
+                    batchStates[batchIndex];
 
-                if (!batchState) {
+                if (!state) {
                     throw badModelOutputError(
                         `Lote ${batchIndex + 1} não encontrado para recuperação.`
                     );
                 }
 
                 await recoverBatchWithImmediateAudit(
-                    batchState,
+                    state,
                     deadlineAt,
                     translatedTexts,
                     originalPositions
                 );
 
-                recoveredBatches.add(
-                    batchIndex
-                );
+                totals.recoveredBatches++;
+
+                for (
+                    let i =
+                        buffer.length - 1;
+                    i >= 0;
+                    i--
+                ) {
+                    if (
+                        buffer[i]._batchIndex ===
+                        batchIndex
+                    ) {
+                        buffer.splice(i, 1);
+                    }
+                }
             }
 
-            const unaffectedVerified =
+            totals.verified +=
                 chunk.filter(
                     record =>
-                        !recoveredBatches.has(
+                        !affectedBatchIndices.has(
                             record._batchIndex
                         )
-                );
-
-            verifiedRecords +=
-                unaffectedVerified.length;
+                ).length;
         }
 
         if (job) {
-            const ratio =
-                records.length > 0
-                    ? Math.min(
-                          1,
-                          (
-                              verifiedRecords +
-                              recoveredBatches.size
-                          ) /
-                          records.length
-                      )
-                    : 1;
-
-            job.progress =
-                Math.max(
-                    job.progress || 0,
-                    Math.min(
-                        98,
-                        90 +
-                        Math.round(
-                            ratio * 8
-                        )
-                    )
-                );
-
-            job.updatedAt =
-                Date.now();
+            job.updatedAt = Date.now();
         }
     }
-
-    console.log(
-        `[AUDIT GROUP] Concluída — ${verifiedRecords} registro(s) verificado(s) em ${groupedRequests} request(s); lotes recuperados=${recoveredBatches.size}.`
-    );
-
-    return true;
 }
-
-/*
-|--------------------------------------------------------------------------
-| TRADUÇÃO COMPLETA
-|--------------------------------------------------------------------------
-*/
 
 async function translateSrt(
     originalSrt,
     job
 ) {
-    const blocks =
-        parseSrt(
-            originalSrt
-        );
+    const blocks = parseSrt(originalSrt);
 
-    if (
-        blocks.length === 0
-    ) {
+    if (blocks.length === 0) {
         throw new Error(
             "Nenhum bloco SRT válido."
         );
@@ -4158,101 +3339,73 @@ async function translateSrt(
     );
 
     const batches =
-        splitIntoBatches(
-            blocks
-        );
+        splitIntoBatches(blocks);
 
     console.log(
         `[TRANSLATE] ${batches.length} lote(s).`
     );
 
     console.log(
-        `[TRANSLATE] Limite: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} caracteres.`
+        `[TRANSLATE] FAST-SAFE: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} caracteres; meta=${Math.round(PERFORMANCE_TARGET_MS / 1000)}s.`
     );
 
     const translatedTexts =
-        new Array(
-            blocks.length
-        );
+        new Array(blocks.length);
 
     const originalPositions =
         new Map();
 
     blocks.forEach(
-        (
-            block,
-            index
-        ) => {
+        (block, index) =>
             originalPositions.set(
                 block,
                 index
-            );
-        }
+            )
     );
 
-    const startedAt =
-        Date.now();
-
-    /*
-     * O teto começa somente quando o job entra em translateSrt.
-     * Espera na fila não consome os 8 minutos.
-     */
+    const startedAt = Date.now();
 
     const deadlineAt =
         startedAt +
         MAX_TRANSLATION_TIME_MS;
 
-    job.startedAt =
-        startedAt;
-
-    job.deadlineAt =
-        deadlineAt;
-
-    job.updatedAt =
-        startedAt;
+    job.startedAt = startedAt;
+    job.deadlineAt = deadlineAt;
+    job.updatedAt = startedAt;
 
     console.log(
-        `[JOB ${job.id}] Cronômetro de tradução iniciado agora: ${MAX_TRANSLATION_TIME_MS}ms disponíveis; espera anterior na fila não contabilizada.`
+        `[JOB ${job.id}] Cronômetro iniciado: teto ${MAX_TRANSLATION_TIME_MS}ms; fila anterior não contabilizada.`
     );
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
-
-    const deferredAuditRecords = [];
+    const auditBuffer = [];
     const batchStates = [];
+
+    const auditTotals = {
+        selected: 0,
+        verified: 0,
+        requests: 0,
+        recoveredBatches: 0
+    };
 
     for (
         let batchIndex = 0;
         batchIndex < batches.length;
         batchIndex++
     ) {
-        assertBeforeDeadline(
-            deadlineAt
-        );
+        assertBeforeDeadline(deadlineAt);
 
         const batch =
-            batches[
-                batchIndex
-            ];
+            batches[batchIndex];
 
         const batchChars =
             batch.reduce(
-                (
-                    total,
-                    block
-                ) =>
+                (total, block) =>
                     total +
                     String(
-                        block.text ||
-                        ""
+                        block.text || ""
                     ).length,
                 0
             );
-
-        console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
-        );
 
         const batchStart =
             originalPositions.get(
@@ -4268,26 +3421,25 @@ async function translateSrt(
 
         const context = {
             before:
-                Number.isInteger(
-                    batchStart
-                ) &&
+                Number.isInteger(batchStart) &&
                 batchStart > 0
-                    ? blocks[
-                          batchStart - 1
-                      ]
+                    ? blocks[batchStart - 1]
                     : null,
 
             after:
-                Number.isInteger(
-                    batchEnd
-                ) &&
+                Number.isInteger(batchEnd) &&
                 batchEnd <
                     blocks.length - 1
-                    ? blocks[
-                          batchEnd + 1
-                      ]
+                    ? blocks[batchEnd + 1]
                     : null
         };
+
+        const batchStartedAt =
+            Date.now();
+
+        console.log(
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
+        );
 
         const result =
             await translateBatch(
@@ -4297,10 +3449,6 @@ async function translateSrt(
                 "deferred"
             );
 
-        assertBeforeDeadline(
-            deadlineAt
-        );
-
         writeTranslatedBatch(
             batch,
             result.texts,
@@ -4308,42 +3456,47 @@ async function translateSrt(
             originalPositions
         );
 
-        batchStates[
-            batchIndex
-        ] = {
+        batchStates[batchIndex] = {
             batchIndex,
             batch,
             context,
-
-            translated:
-                result.texts,
-
-            recovered:
-                false
+            translated: result.texts,
+            recovered: false
         };
 
         for (
             const record
             of result.auditRecords
         ) {
-            deferredAuditRecords.push({
+            auditBuffer.push({
                 ...record,
-
-                _batchIndex:
-                    batchIndex
+                _batchIndex: batchIndex
             });
         }
+
+        auditTotals.selected +=
+            result.auditRecords.length;
+
+        await flushAuditBuffer(
+            auditBuffer,
+            batchStates,
+            deadlineAt,
+            translatedTexts,
+            originalPositions,
+            job,
+            auditTotals,
+            false
+        );
 
         job.progress =
             Math.round(
                 (
                     (
-                        batchIndex +
-                        1
+                        batchIndex + 1
                     ) /
                     batches.length
                 ) *
-                90
+                92
             );
 
         job.completedBatches =
@@ -4356,32 +3509,27 @@ async function translateSrt(
             Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} traduzido; auditoria independente acumulada=${deferredAuditRecords.length}.`
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} OK em ${((Date.now() - batchStartedAt) / 1000).toFixed(1)}s; auditBuffer=${auditBuffer.length}.`
         );
     }
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
-
-    await auditDeferredSelections(
-        deferredAuditRecords,
+    await flushAuditBuffer(
+        auditBuffer,
         batchStates,
         deadlineAt,
         translatedTexts,
         originalPositions,
-        job
+        job,
+        auditTotals,
+        true
     );
 
-    assertBeforeDeadline(
-        deadlineAt
-    );
+    assertBeforeDeadline(deadlineAt);
 
     if (
         translatedTexts.some(
             text =>
-                typeof text !==
-                "string"
+                typeof text !== "string"
         )
     ) {
         throw new Error(
@@ -4390,12 +3538,29 @@ async function translateSrt(
     }
 
     const elapsedMs =
-        Date.now() -
-        startedAt;
+        Date.now() - startedAt;
 
     console.log(
         `[TRANSLATE] Finalizada em ${(elapsedMs / 1000).toFixed(1)}s.`
     );
+
+    console.log(
+        `[AUDIT FAST] selecionados=${auditTotals.selected}; verificados=${auditTotals.verified}; requests=${auditTotals.requests}; lotes recuperados=${auditTotals.recoveredBatches}.`
+    );
+
+    if (
+        elapsedMs <=
+        PERFORMANCE_TARGET_MS
+    ) {
+        console.log(
+            `[PERF] META 1–3 MIN: ATINGIDA ✅ (${(elapsedMs / 1000).toFixed(1)}s)`
+        );
+
+    } else {
+        console.log(
+            `[PERF] Acima da meta de 180s: ${(elapsedMs / 1000).toFixed(1)}s.`
+        );
+    }
 
     const sanitizedTranslatedTexts =
         cleanAllTranslatedCharacters(
@@ -4424,26 +3589,16 @@ async function translateSrt(
         "TRADUÇÃO FINAL"
     );
 
-    job.timestampAuditPassed =
-        true;
-
-    job.contentAuditPassed =
-        true;
-
+    job.timestampAuditPassed = true;
+    job.contentAuditPassed = true;
     job.progress = 100;
 
     console.log(
-        "[AUDIT CONTENT] TRADUÇÃO FINAL: OK — 100% autoauditado no mesmo passe; mesma seleção de risco/canários passou pela auditoria independente agrupada, com recuperação fail-closed por lote quando necessária."
+        "[AUDIT CONTENT] TRADUÇÃO FINAL: OK — ID/lock 100%, guard local 100% e fronteiras de risco + canários aprovados pela auditoria independente."
     );
 
     return finalSrt;
 }
-
-/*
-|--------------------------------------------------------------------------
-| JOBS
-|--------------------------------------------------------------------------
-*/
 
 function createJob({
     jobId,
@@ -4453,108 +3608,69 @@ function createJob({
     sourceHash,
     sourceSrt
 }) {
-    const now =
-        Date.now();
+    const now = Date.now();
 
     const job = {
-        id:
-            jobId,
-
+        id: jobId,
         cacheKey,
         type,
         videoId,
         sourceHash,
         sourceSrt,
 
-        status:
-            "processing",
-
-        result:
-            null,
-
-        error:
-            null,
-
+        status: "processing",
+        result: null,
+        error: null,
         progress: 0,
 
         completedBatches: 0,
         totalBatches: 0,
 
-        createdAt:
-            now,
+        createdAt: now,
+        updatedAt: now,
 
-        updatedAt:
-            now,
-
-        deadlineAt:
-            null,
-
-        queuedAt:
-            null,
+        deadlineAt: null,
+        queuedAt: null,
 
         priority: 50,
+        jobKind: "generic",
 
-        jobKind:
-            "generic",
-
-        lazyStartScheduled:
-            false,
+        lazyStartScheduled: false,
 
         expiresAt:
-            now +
-            JOB_TTL_MS,
+            now + JOB_TTL_MS,
 
-        timestampAuditPassed:
-            false,
+        timestampAuditPassed: false,
+        contentAuditPassed: false,
 
-        contentAuditPassed:
-            false,
-
-        promise:
-            null
+        promise: null
     };
 
-    jobs.set(
-        jobId,
-        job
-    );
-
+    jobs.set(jobId, job);
     cleanupMemory();
 
     return job;
 }
 
-function getJob(
-    jobId
-) {
-    const job =
-        jobs.get(
-            jobId
-        );
+function getJob(jobId) {
+    const job = jobs.get(jobId);
 
     if (!job) {
         return null;
     }
 
     if (
-        job.expiresAt <=
-            Date.now() &&
-        job.status !==
-            "processing"
+        job.expiresAt <= Date.now() &&
+        job.status !== "processing"
     ) {
-        jobs.delete(
-            jobId
-        );
-
+        jobs.delete(jobId);
         return null;
     }
 
     return job;
 }
 
-async function processJob(
-    job
-) {
+async function processJob(job) {
     console.log(
         `[JOB ${job.id}] Iniciando.`
     );
@@ -4572,23 +3688,12 @@ async function processJob(
                 "CACHE"
             );
 
-            job.timestampAuditPassed =
-                true;
-
-            job.contentAuditPassed =
-                true;
-
-            job.status =
-                "completed";
-
-            job.result =
-                cached;
-
-            job.progress =
-                100;
-
-            job.updatedAt =
-                Date.now();
+            job.timestampAuditPassed = true;
+            job.contentAuditPassed = true;
+            job.status = "completed";
+            job.result = cached;
+            job.progress = 100;
+            job.updatedAt = Date.now();
 
             console.log(
                 `[JOB ${job.id}] Cache utilizado.`
@@ -4612,35 +3717,20 @@ async function processJob(
             translated
         );
 
-        job.result =
-            translated;
-
-        job.status =
-            "completed";
-
-        job.progress =
-            100;
-
-        job.updatedAt =
-            Date.now();
+        job.result = translated;
+        job.status = "completed";
+        job.progress = 100;
+        job.updatedAt = Date.now();
 
         console.log(
             `[JOB ${job.id}] Concluído.`
         );
 
-    } catch (
-        error
-    ) {
-        job.status =
-            "failed";
-
+    } catch (error) {
+        job.status = "failed";
         job.error =
-            getErrorMessage(
-                error
-            );
-
-        job.updatedAt =
-            Date.now();
+            getErrorMessage(error);
+        job.updatedAt = Date.now();
 
         console.error(
             `[JOB ${job.id}] Falhou: ${job.error}`
@@ -4648,20 +3738,9 @@ async function processJob(
     }
 }
 
-/*
-|--------------------------------------------------------------------------
-| FILA DE JOBS COMPLETOS
-|--------------------------------------------------------------------------
-*/
-
-function enqueueTranslationJob(
-    job
-) {
+function enqueueTranslationJob(job) {
     return new Promise(
-        (
-            resolve,
-            reject
-        ) => {
+        (resolve, reject) => {
             if (
                 job.status !==
                 "processing"
@@ -4670,8 +3749,7 @@ function enqueueTranslationJob(
                 return;
             }
 
-            job.queuedAt =
-                Date.now();
+            job.queuedAt = Date.now();
 
             const queueItem = {
                 job,
@@ -4687,14 +3765,11 @@ function enqueueTranslationJob(
                             0
                         ) <
                         Number(
-                            job.priority ||
-                            0
+                            job.priority || 0
                         )
                 );
 
-            if (
-                insertAt === -1
-            ) {
+            if (insertAt === -1) {
                 translationJobQueue.push(
                     queueItem
                 );
@@ -4717,19 +3792,15 @@ function enqueueTranslationJob(
 }
 
 async function processTranslationJobQueue() {
-    if (
-        translationJobWorkerRunning
-    ) {
+    if (translationJobWorkerRunning) {
         return;
     }
 
-    translationJobWorkerRunning =
-        true;
+    translationJobWorkerRunning = true;
 
     try {
         while (
-            translationJobQueue.length >
-            0
+            translationJobQueue.length > 0
         ) {
             const item =
                 translationJobQueue.shift();
@@ -4758,38 +3829,29 @@ async function processTranslationJobQueue() {
                         job.queuedAt
                     )
                         ? Math.max(
-                              0,
-                              Date.now() -
-                              job.queuedAt
-                          )
+                            0,
+                            Date.now() -
+                                job.queuedAt
+                        )
                         : 0;
 
                 console.log(
                     `[JOB QUEUE] Iniciando job completo ${job.id}. Prioridade=${job.priority || 0}; restantes=${translationJobQueue.length}. Espera=${(queueWaitMs / 1000).toFixed(1)}s — fila não consumiu o teto.`
                 );
 
-                await processJob(
-                    job
-                );
-
+                await processJob(job);
                 resolve();
 
-            } catch (
-                error
-            ) {
-                reject(
-                    error
-                );
+            } catch (error) {
+                reject(error);
             }
         }
 
     } finally {
-        translationJobWorkerRunning =
-            false;
+        translationJobWorkerRunning = false;
 
         if (
-            translationJobQueue.length >
-            0
+            translationJobQueue.length > 0
         ) {
             processTranslationJobQueue();
         }
@@ -4805,72 +3867,46 @@ function startTranslationJob(
     }
 
     if (
-        job.status ===
-            "completed" ||
-        job.status ===
-            "failed"
+        job.status === "completed" ||
+        job.status === "failed"
     ) {
         return job.promise;
     }
 
-    if (
-        job.promise
-    ) {
+    if (job.promise) {
         return job.promise;
     }
 
-    if (
-        job.status ===
-        "pending"
-    ) {
-        job.status =
-            "processing";
-
-        job.updatedAt =
-            Date.now();
+    if (job.status === "pending") {
+        job.status = "processing";
+        job.updatedAt = Date.now();
     }
 
     job.promise =
-        enqueueTranslationJob(
-            job
-        ).catch(
+        enqueueTranslationJob(job).catch(
             error => {
                 console.error(
                     `[${label} ${job.id}] Erro inesperado:`,
                     error
                 );
 
-                job.status =
-                    "failed";
-
+                job.status = "failed";
                 job.error =
-                    getErrorMessage(
-                        error
-                    );
-
-                job.updatedAt =
-                    Date.now();
+                    getErrorMessage(error);
+                job.updatedAt = Date.now();
             }
         );
 
     return job.promise;
 }
 
-function findProcessingJob(
-    cacheKey
-) {
-    for (
-        const job
-        of jobs.values()
-    ) {
+function findProcessingJob(cacheKey) {
+    for (const job of jobs.values()) {
         if (
-            job.cacheKey ===
-                cacheKey &&
+            job.cacheKey === cacheKey &&
             (
-                job.status ===
-                    "processing" ||
-                job.status ===
-                    "pending"
+                job.status === "processing" ||
+                job.status === "pending"
             )
         ) {
             return job;
@@ -4880,13 +3916,9 @@ function findProcessingJob(
     return null;
 }
 
-function buildProcessingSrt(
-    job
-) {
+function buildProcessingSrt(job) {
     const progress =
-        Number.isFinite(
-            job?.progress
-        )
+        Number.isFinite(job?.progress)
             ? job.progress
             : 0;
 
@@ -4901,22 +3933,14 @@ function buildProcessingSrt(
     ].join("\n");
 }
 
-function buildErrorSrt(
-    message
-) {
+function buildErrorSrt(message) {
     const safe =
         String(
             message ||
             "Erro desconhecido."
         )
-            .replace(
-                /\s+/g,
-                " "
-            )
-            .slice(
-                0,
-                300
-            );
+            .replace(/\s+/g, " ")
+            .slice(0, 300);
 
     return [
         "1",
@@ -4947,62 +3971,38 @@ function sendSubtitleResponse(
             "*"
     });
 
-    return res.send(
-        srt
-    );
+    return res.send(srt);
 }
 
 async function waitForJob(
     job,
     timeoutMs
 ) {
-    if (
-        job.status ===
-        "completed"
-    ) {
+    if (job.status === "completed") {
         return true;
     }
 
-    if (
-        job.status ===
-        "failed"
-    ) {
+    if (job.status === "failed") {
         return false;
     }
 
-    const start =
-        Date.now();
+    const start = Date.now();
 
     while (
-        job.status ===
-            "processing" &&
-        Date.now() -
-            start <
-            timeoutMs
+        job.status === "processing" &&
+        Date.now() - start < timeoutMs
     ) {
-        await sleep(
-            500
-        );
+        await sleep(500);
     }
 
-    return (
-        job.status ===
-        "completed"
-    );
+    return job.status === "completed";
 }
-
-/*
-|--------------------------------------------------------------------------
-| MANIFEST STREMIO
-|--------------------------------------------------------------------------
-*/
 
 const manifest = {
     id:
         "org.tradutor.stateless.gemini.free",
 
-    version:
-        "6.1.0",
+    version: "6.2.0",
 
     name:
         "Tradutor Gemini PT-BR",
@@ -5035,209 +4035,165 @@ const manifest = {
 
 app.get(
     "/manifest.json",
-    (
-        req,
-        res
-    ) => {
-        res.json(
-            manifest
-        );
+    (req, res) => {
+        res.json(manifest);
     }
 );
 
-app.get(
-    "/",
-    (
-        req,
-        res
-    ) => {
-        res.json({
-            name:
-                manifest.name,
+app.get("/", (req, res) => {
+    res.json({
+        name: manifest.name,
+        version: manifest.version,
+        status: "online",
+        model: GEMINI_MODEL,
 
-            version:
-                manifest.version,
+        releaseAwareOpenSubtitles: true,
+        timestampAudit: true,
 
-            status:
-                "online",
+        conservativeCharacterSanitization: true,
 
-            model:
-                GEMINI_MODEL,
+        translationCacheVersion:
+            TRANSLATION_CACHE_VERSION,
 
-            releaseAwareOpenSubtitles:
-                true,
+        renderEngineVersion:
+            RENDER_ENGINE_VERSION,
 
-            timestampAudit:
-                true,
+        structuralIdLock: true,
 
-            conservativeCharacterSanitization:
-                true,
+        semanticContentAudit:
+            SEMANTIC_AUDIT_ENABLED,
 
-            translationCacheVersion:
-                TRANSLATION_CACHE_VERSION,
+        semanticAuditMode:
+            "id-lock-100%-plus-boundary-risk-canary",
 
-            structuralIdLock:
-                true,
+        groupedIndependentAudit: true,
 
-            semanticContentAudit:
-                SEMANTIC_AUDIT_ENABLED,
+        independentAuditMaxBlocks:
+            MAX_INDEPENDENT_AUDIT_BLOCKS,
 
-            semanticAuditMode:
-                "self-100%-plus-grouped-independent-risk-canary",
+        auditCanaryStride:
+            AUDIT_CANARY_STRIDE,
 
-            groupedIndependentAudit:
-                true,
+        highRiskAuditScore:
+            HIGH_RISK_AUDIT_SCORE,
 
-            independentAuditMaxBlocks:
-                MAX_INDEPENDENT_AUDIT_BLOCKS,
+        thinkingLevel: "MINIMAL",
 
-            auditCanaryStride:
-                AUDIT_CANARY_STRIDE,
+        performanceMode:
+            "6.2-fast-safe",
 
-            highRiskAuditScore:
-                HIGH_RISK_AUDIT_SCORE,
+        lazyOpenSubtitles: true,
 
-            performanceMode:
-                "6.1-grouped-audit-speed",
+        bridgeCompatibleCacheVersion:
+            "5.8",
 
-            lazyOpenSubtitles:
-                true,
+        translationJobQueue:
+            translationJobQueue.length,
 
-            bridgeCompatibleCacheVersion:
-                "5.8",
-
-            translationJobQueue:
-                translationJobQueue.length,
-
-            activeTranslationJob:
-                translationJobWorkerRunning,
-
-            queue:
-                geminiQueue.length,
-
-            cooldownSeconds:
-                Math.ceil(
-                    getCooldownRemaining() /
-                    1000
-                )
-        });
-    }
-);
-
-app.get(
-    "/health",
-    (
-        req,
-        res
-    ) => {
-        res.json({
-            status:
-                "ok",
-
-            uptime:
-                process.uptime(),
-
-            model:
-                GEMINI_MODEL,
-
-            jobs:
-                jobs.size,
-
-            cache:
-                translationCache.size,
-
-            releaseAwareOpenSubtitles:
-                true,
-
-            timestampAudit:
-                true,
-
-            conservativeCharacterSanitization:
-                true,
-
-            translationCacheVersion:
-                TRANSLATION_CACHE_VERSION,
-
-            structuralIdLock:
-                true,
-
-            semanticContentAudit:
-                SEMANTIC_AUDIT_ENABLED,
-
-            semanticAuditMode:
-                "self-100%-plus-grouped-independent-risk-canary",
-
-            groupedIndependentAudit:
-                true,
-
-            independentAuditMaxBlocks:
-                MAX_INDEPENDENT_AUDIT_BLOCKS,
-
-            auditCanaryStride:
-                AUDIT_CANARY_STRIDE,
-
-            highRiskAuditScore:
-                HIGH_RISK_AUDIT_SCORE,
-
-            performanceMode:
-                "6.1-grouped-audit-speed",
-
-            lazyOpenSubtitles:
-                true,
-
-            bridgeCompatibleCacheVersion:
-                "5.8",
-
-            translationJobQueue:
-                translationJobQueue.length,
-
+        activeTranslationJob:
             translationJobWorkerRunning,
 
-            geminiQueue:
-                geminiQueue.length,
+        queue: geminiQueue.length,
 
-            geminiCooldownSeconds:
-                Math.ceil(
-                    getCooldownRemaining() /
-                    1000
-                ),
+        cooldownSeconds:
+            Math.ceil(
+                getCooldownRemaining() /
+                1000
+            )
+    });
+});
 
-            batchMaxBlocks:
-                MAX_BATCH_BLOCKS,
+app.get("/health", (req, res) => {
+    res.json({
+        status: "ok",
+        uptime: process.uptime(),
 
-            batchMaxChars:
-                MAX_BATCH_CHARS,
+        model: GEMINI_MODEL,
 
-            requestIntervalMs:
-                MIN_REQUEST_INTERVAL_MS,
+        jobs: jobs.size,
+        cache: translationCache.size,
 
-            translationRequestTimeoutMs:
-                TRANSLATION_REQUEST_TIMEOUT_MS,
+        releaseAwareOpenSubtitles: true,
+        timestampAudit: true,
 
-            semanticAuditRequestTimeoutMs:
-                SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS,
+        conservativeCharacterSanitization: true,
 
-            maxOutputTokens:
-                MAX_OUTPUT_TOKENS,
+        translationCacheVersion:
+            TRANSLATION_CACHE_VERSION,
 
-            translationTimeoutMs:
-                MAX_TRANSLATION_TIME_MS,
+        renderEngineVersion:
+            RENDER_ENGINE_VERSION,
 
-            maxTranslationTimeMs:
-                MAX_TRANSLATION_TIME_MS
-        });
-    }
-);
+        structuralIdLock: true,
 
-/*
-|--------------------------------------------------------------------------
-| OPEN SUBTITLES - RELEASE AWARE
-|--------------------------------------------------------------------------
-*/
+        semanticContentAudit:
+            SEMANTIC_AUDIT_ENABLED,
 
-function scoreSubtitle(
-    subtitle
-) {
+        semanticAuditMode:
+            "id-lock-100%-plus-boundary-risk-canary",
+
+        groupedIndependentAudit: true,
+
+        independentAuditMaxBlocks:
+            MAX_INDEPENDENT_AUDIT_BLOCKS,
+
+        auditCanaryStride:
+            AUDIT_CANARY_STRIDE,
+
+        highRiskAuditScore:
+            HIGH_RISK_AUDIT_SCORE,
+
+        thinkingLevel: "MINIMAL",
+
+        performanceMode:
+            "6.2-fast-safe",
+
+        lazyOpenSubtitles: true,
+
+        bridgeCompatibleCacheVersion:
+            "5.8",
+
+        translationJobQueue:
+            translationJobQueue.length,
+
+        translationJobWorkerRunning,
+
+        geminiQueue:
+            geminiQueue.length,
+
+        geminiCooldownSeconds:
+            Math.ceil(
+                getCooldownRemaining() /
+                1000
+            ),
+
+        batchMaxBlocks:
+            MAX_BATCH_BLOCKS,
+
+        batchMaxChars:
+            MAX_BATCH_CHARS,
+
+        requestIntervalMs:
+            MIN_REQUEST_INTERVAL_MS,
+
+        translationRequestTimeoutMs:
+            TRANSLATION_REQUEST_TIMEOUT_MS,
+
+        semanticAuditRequestTimeoutMs:
+            SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS,
+
+        maxOutputTokens:
+            MAX_OUTPUT_TOKENS,
+
+        translationTimeoutMs:
+            MAX_TRANSLATION_TIME_MS,
+
+        maxTranslationTimeMs:
+            MAX_TRANSLATION_TIME_MS
+    });
+});
+
+function scoreSubtitle(subtitle) {
     let score = 0;
 
     const lang =
@@ -5245,20 +4201,15 @@ function scoreSubtitle(
             subtitle?.lang || ""
         ).toLowerCase();
 
-    if (
-        lang === "eng"
-    ) {
+    if (lang === "eng") {
         score += 100;
 
-    } else if (
-        lang === "en"
-    ) {
+    } else if (lang === "en") {
         score += 90;
     }
 
     if (
-        subtitle?.hearingImpaired ===
-        false
+        subtitle?.hearingImpaired === false
     ) {
         score += 20;
     }
@@ -5266,8 +4217,7 @@ function scoreSubtitle(
     if (
         String(
             subtitle?.format || ""
-        ).toLowerCase() ===
-        "srt"
+        ).toLowerCase() === "srt"
     ) {
         score += 20;
     }
@@ -5275,8 +4225,7 @@ function scoreSubtitle(
     if (
         /english/i.test(
             String(
-                subtitle?.name ||
-                ""
+                subtitle?.name || ""
             )
         )
     ) {
@@ -5286,9 +4235,7 @@ function scoreSubtitle(
     return score;
 }
 
-function isUsableEnglishSubtitle(
-    subtitle
-) {
+function isUsableEnglishSubtitle(subtitle) {
     const lang =
         String(
             subtitle?.lang || ""
@@ -5313,11 +4260,7 @@ function selectBestSubtitle(
         releaseAware = false
     } = {}
 ) {
-    if (
-        !Array.isArray(
-            subtitles
-        )
-    ) {
+    if (!Array.isArray(subtitles)) {
         return null;
     }
 
@@ -5326,33 +4269,26 @@ function selectBestSubtitle(
             isUsableEnglishSubtitle
         );
 
-    if (
-        usable.length === 0
-    ) {
+    if (usable.length === 0) {
         return null;
     }
 
-    if (
-        releaseAware
-    ) {
+    if (releaseAware) {
         return usable[0];
     }
 
-    return usable
-        .sort(
-            (
-                a,
-                b
-            ) =>
-                scoreSubtitle(b) -
-                scoreSubtitle(a)
-        )[0] ||
-        null;
+    return (
+        usable
+            .sort(
+                (a, b) =>
+                    scoreSubtitle(b) -
+                    scoreSubtitle(a)
+            )[0] ||
+        null
+    );
 }
 
-function rawSubtitleExtraSegment(
-    req
-) {
+function rawSubtitleExtraSegment(req) {
     const originalUrl =
         String(
             req.originalUrl ||
@@ -5361,34 +4297,25 @@ function rawSubtitleExtraSegment(
         );
 
     const pathname =
-        originalUrl.split(
-            "?"
-        )[0];
+        originalUrl.split("?")[0];
 
     const match =
         pathname.match(
             /^\/subtitles\/[^/]+\/[^/]+\/(.+)\.json$/
         );
 
-    if (
-        match?.[1]
-    ) {
+    if (match?.[1]) {
         return match[1];
     }
 
     return String(
-        req.params.extra ||
-        ""
+        req.params.extra || ""
     ).trim();
 }
 
-function parseStremioSubtitleExtra(
-    req
-) {
+function parseStremioSubtitleExtra(req) {
     const rawExtra =
-        rawSubtitleExtraSegment(
-            req
-        );
+        rawSubtitleExtraSegment(req);
 
     if (!rawExtra) {
         return {
@@ -5400,42 +4327,28 @@ function parseStremioSubtitleExtra(
     }
 
     const params =
-        new URLSearchParams(
-            rawExtra
-        );
+        new URLSearchParams(rawExtra);
 
     const rawVideoHash =
         String(
-            params.get(
-                "videoHash"
-            ) ||
-            ""
+            params.get("videoHash") || ""
         ).trim();
 
     const rawVideoSize =
         String(
-            params.get(
-                "videoSize"
-            ) ||
-            ""
+            params.get("videoSize") || ""
         ).trim();
 
     const filename =
         String(
-            params.get(
-                "filename"
-            ) ||
-            ""
+            params.get("filename") || ""
         )
             .replace(
                 /[\u0000-\u001F\u007F]/g,
                 ""
             )
             .trim()
-            .slice(
-                0,
-                1000
-            );
+            .slice(0, 1000);
 
     const videoHash =
         /^[a-f0-9]{16}$/i.test(
@@ -5445,18 +4358,14 @@ function parseStremioSubtitleExtra(
             : "";
 
     const videoSizeNumber =
-        Number(
-            rawVideoSize
-        );
+        Number(rawVideoSize);
 
     const videoSize =
         Number.isSafeInteger(
             videoSizeNumber
         ) &&
         videoSizeNumber > 0
-            ? String(
-                  videoSizeNumber
-              )
+            ? String(videoSizeNumber)
             : "";
 
     return {
@@ -5477,36 +4386,26 @@ function buildOpenSubtitlesSearchUrl(
     } = {}
 ) {
     const base =
-        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
-            type
-        )}/${encodeURIComponent(
-            id
-        )}`;
+        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
 
     const extra =
         new URLSearchParams();
 
-    if (
-        videoHash
-    ) {
+    if (videoHash) {
         extra.set(
             "videoHash",
             videoHash
         );
     }
 
-    if (
-        videoSize
-    ) {
+    if (videoSize) {
         extra.set(
             "videoSize",
             videoSize
         );
     }
 
-    if (
-        filename
-    ) {
+    if (filename) {
         extra.set(
             "filename",
             filename
@@ -5516,48 +4415,30 @@ function buildOpenSubtitlesSearchUrl(
     const encodedExtra =
         extra.toString();
 
-    if (
-        !encodedExtra
-    ) {
+    if (!encodedExtra) {
         return `${base}.json`;
     }
 
     return `${base}/${encodedExtra}.json`;
 }
 
-function releaseIdentityDescription(
-    extra
-) {
+function releaseIdentityDescription(extra) {
     const parts = [];
 
-    if (
-        extra.videoHash
-    ) {
-        parts.push(
-            "videoHash"
-        );
+    if (extra.videoHash) {
+        parts.push("videoHash");
     }
 
-    if (
-        extra.videoSize
-    ) {
-        parts.push(
-            "videoSize"
-        );
+    if (extra.videoSize) {
+        parts.push("videoSize");
     }
 
-    if (
-        extra.filename
-    ) {
-        parts.push(
-            "filename"
-        );
+    if (extra.filename) {
+        parts.push("filename");
     }
 
     return parts.length
-        ? parts.join(
-              " + "
-          )
+        ? parts.join(" + ")
         : "nenhuma";
 }
 
@@ -5597,15 +4478,13 @@ async function findEnglishSubtitle(
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/6.1"
+                        "Stremio-Gemini-Subtitle-Translator/6.2"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
         );
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         throw new Error(
             `OpenSubtitles HTTP ${response.status}.`
         );
@@ -5615,9 +4494,7 @@ async function findEnglishSubtitle(
         await response.json();
 
     const subtitles =
-        Array.isArray(
-            data?.subtitles
-        )
+        Array.isArray(data?.subtitles)
             ? data.subtitles
             : [];
 
@@ -5631,9 +4508,7 @@ async function findEnglishSubtitle(
 
     if (target) {
         const upstreamIndex =
-            subtitles.indexOf(
-                target
-            );
+            subtitles.indexOf(target);
 
         console.log(
             `[OPENSUBTITLES MATCH] Selecionada posição upstream ${upstreamIndex >= 0 ? upstreamIndex + 1 : "?"}/${subtitles.length}; id=${String(target.id || "(sem id)")}; nome=${String(target.name || "(sem nome)")}.`
@@ -5648,15 +4523,7 @@ async function findEnglishSubtitle(
     return target;
 }
 
-/*
-|--------------------------------------------------------------------------
-| DOWNLOAD SRT
-|--------------------------------------------------------------------------
-*/
-
-async function downloadSubtitle(
-    url
-) {
+async function downloadSubtitle(url) {
     console.log(
         `[SOURCE] Baixando legenda: ${url}`
     );
@@ -5667,15 +4534,13 @@ async function downloadSubtitle(
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/6.1"
+                        "Stremio-Gemini-Subtitle-Translator/6.2"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
         );
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         throw new Error(
             `Falha ao baixar legenda: HTTP ${response.status}.`
         );
@@ -5715,12 +4580,6 @@ async function downloadSubtitle(
     return text;
 }
 
-/*
-|--------------------------------------------------------------------------
-| JOB DE LEGENDA EMBUTIDA
-|--------------------------------------------------------------------------
-*/
-
 async function createEmbeddedTranslationJob({
     type,
     videoId,
@@ -5728,13 +4587,9 @@ async function createEmbeddedTranslationJob({
     sourceName = "embedded"
 }) {
     const rawNormalizedSrt =
-        normalizeSrt(
-            sourceSrt
-        );
+        normalizeSrt(sourceSrt);
 
-    if (
-        !rawNormalizedSrt
-    ) {
+    if (!rawNormalizedSrt) {
         throw new Error(
             "A legenda embutida está vazia."
         );
@@ -5754,31 +4609,23 @@ async function createEmbeddedTranslationJob({
             rawNormalizedSrt
         );
 
-    if (
-        !normalizedSrt
-    ) {
+    if (!normalizedSrt) {
         throw new Error(
             "A legenda embutida ficou vazia após a limpeza SDH/CC."
         );
     }
 
     const blocks =
-        parseSrt(
-            normalizedSrt
-        );
+        parseSrt(normalizedSrt);
 
-    if (
-        blocks.length === 0
-    ) {
+    if (blocks.length === 0) {
         throw new Error(
             "A legenda embutida não possui blocos SRT válidos."
         );
     }
 
     const sourceHash =
-        sha256(
-            normalizedSrt
-        );
+        sha256(normalizedSrt);
 
     const cacheKey =
         `${TRANSLATION_CACHE_VERSION}:embedded:${sourceHash}`;
@@ -5796,39 +4643,26 @@ async function createEmbeddedTranslationJob({
         );
 
         const cachedJobId =
-            `embedded-cached-${sourceHash.slice(
-                0,
-                24
-            )}`;
+            `embedded-cached-${sourceHash.slice(0, 24)}`;
 
         let cachedJob =
-            getJob(
-                cachedJobId
-            );
+            getJob(cachedJobId);
 
         if (!cachedJob) {
             cachedJob =
                 createJob({
-                    jobId:
-                        cachedJobId,
-
+                    jobId: cachedJobId,
                     cacheKey,
                     type,
                     videoId,
                     sourceHash,
-
                     sourceSrt:
                         normalizedSrt
                 });
 
-            cachedJob.status =
-                "completed";
-
-            cachedJob.result =
-                cached;
-
-            cachedJob.progress =
-                100;
+            cachedJob.status = "completed";
+            cachedJob.result = cached;
+            cachedJob.progress = 100;
 
             cachedJob.timestampAuditPassed =
                 true;
@@ -5848,9 +4682,7 @@ async function createEmbeddedTranslationJob({
     }
 
     const existingJob =
-        findProcessingJob(
-            cacheKey
-        );
+        findProcessingJob(cacheKey);
 
     if (existingJob) {
         console.log(
@@ -5861,10 +4693,7 @@ async function createEmbeddedTranslationJob({
     }
 
     const jobId =
-        `embedded-${sourceHash.slice(
-            0,
-            24
-        )}-${randomId(8)}`;
+        `embedded-${sourceHash.slice(0, 24)}-${randomId(8)}`;
 
     const job =
         createJob({
@@ -5873,24 +4702,16 @@ async function createEmbeddedTranslationJob({
             type,
             videoId,
             sourceHash,
-
             sourceSrt:
                 normalizedSrt
         });
 
-    job.source =
-        sourceName;
-
-    job.priority =
-        100;
-
-    job.jobKind =
-        "embedded";
+    job.source = sourceName;
+    job.priority = 100;
+    job.jobKind = "embedded";
 
     job.totalBatches =
-        splitIntoBatches(
-            blocks
-        ).length;
+        splitIntoBatches(blocks).length;
 
     startTranslationJob(
         job,
@@ -5904,26 +4725,15 @@ async function createEmbeddedTranslationJob({
     return job;
 }
 
-/*
-|--------------------------------------------------------------------------
-| ENDPOINT SUBTITLES
-|--------------------------------------------------------------------------
-*/
-
-async function subtitlesHandler(
-    req,
-    res
-) {
+async function subtitlesHandler(req, res) {
     const type =
         String(
-            req.params.type ||
-            ""
+            req.params.type || ""
         ).trim();
 
     const id =
         String(
-            req.params.id ||
-            ""
+            req.params.id || ""
         ).trim();
 
     console.log(
@@ -5931,9 +4741,7 @@ async function subtitlesHandler(
     );
 
     const extra =
-        parseStremioSubtitleExtra(
-            req
-        );
+        parseStremioSubtitleExtra(req);
 
     console.log(
         `[STREMIO EXTRA] filename: ${extra.filename || "(não enviado)"}`
@@ -5947,10 +4755,7 @@ async function subtitlesHandler(
         `[STREMIO EXTRA] videoHash: ${extra.videoHash || "(não enviado)"}`
     );
 
-    if (
-        !type ||
-        !id
-    ) {
+    if (!type || !id) {
         return safeJson(
             res,
             {
@@ -5986,14 +4791,9 @@ async function subtitlesHandler(
             );
 
         const blocks =
-            parseSrt(
-                sourceSrt
-            );
+            parseSrt(sourceSrt);
 
-        if (
-            blocks.length ===
-            0
-        ) {
+        if (blocks.length === 0) {
             return safeJson(
                 res,
                 {
@@ -6003,17 +4803,13 @@ async function subtitlesHandler(
         }
 
         const sourceHash =
-            sha256(
-                sourceSrt
-            );
+            sha256(sourceSrt);
 
         const cacheKey =
             `${TRANSLATION_CACHE_VERSION}:${type}:${id}:${sourceHash}`;
 
         const baseUrl =
-            cleanBaseUrl(
-                req
-            );
+            cleanBaseUrl(req);
 
         const cached =
             getTranslationCache(
@@ -6028,15 +4824,9 @@ async function subtitlesHandler(
             );
 
             const jobId =
-                `cached-${sourceHash.slice(
-                    0,
-                    24
-                )}`;
+                `cached-${sourceHash.slice(0, 24)}`;
 
-            let job =
-                getJob(
-                    jobId
-                );
+            let job = getJob(jobId);
 
             if (!job) {
                 job =
@@ -6044,22 +4834,14 @@ async function subtitlesHandler(
                         jobId,
                         cacheKey,
                         type,
-
-                        videoId:
-                            id,
-
+                        videoId: id,
                         sourceHash,
                         sourceSrt
                     });
 
-                job.status =
-                    "completed";
-
-                job.result =
-                    cached;
-
-                job.progress =
-                    100;
+                job.status = "completed";
+                job.result = cached;
+                job.progress = 100;
 
                 job.timestampAuditPassed =
                     true;
@@ -6078,18 +4860,12 @@ async function subtitlesHandler(
                     subtitles: [
                         {
                             id:
-                                `${id}-gemini-${sourceHash.slice(
-                                    0,
-                                    12
-                                )}`,
+                                `${id}-gemini-${sourceHash.slice(0, 12)}`,
 
                             url:
-                                `${baseUrl}/subtitle/${encodeURIComponent(
-                                    jobId
-                                )}.srt`,
+                                `${baseUrl}/subtitle/${encodeURIComponent(jobId)}.srt`,
 
-                            lang:
-                                "por"
+                            lang: "por"
                         }
                     ]
                 }
@@ -6097,26 +4873,18 @@ async function subtitlesHandler(
         }
 
         let job =
-            findProcessingJob(
-                cacheKey
-            );
+            findProcessingJob(cacheKey);
 
         if (!job) {
             const jobId =
-                `job-${sourceHash.slice(
-                    0,
-                    24
-                )}-${randomId(8)}`;
+                `job-${sourceHash.slice(0, 24)}-${randomId(8)}`;
 
             job =
                 createJob({
                     jobId,
                     cacheKey,
                     type,
-
-                    videoId:
-                        id,
-
+                    videoId: id,
                     sourceHash,
                     sourceSrt
                 });
@@ -6126,20 +4894,11 @@ async function subtitlesHandler(
                     blocks
                 ).length;
 
-            job.priority =
-                10;
-
-            job.jobKind =
-                "opensubtitles";
-
-            job.status =
-                "pending";
-
-            job.lazyStart =
-                true;
-
-            job.updatedAt =
-                Date.now();
+            job.priority = 10;
+            job.jobKind = "opensubtitles";
+            job.status = "pending";
+            job.lazyStart = true;
+            job.updatedAt = Date.now();
 
             console.log(
                 `[LAZY] Job OpenSubtitles ${job.id} criado sem consumir Gemini; aguardando acesso à URL da legenda.`
@@ -6147,9 +4906,7 @@ async function subtitlesHandler(
         }
 
         const subtitleUrl =
-            `${baseUrl}/subtitle/${encodeURIComponent(
-                job.id
-            )}.srt`;
+            `${baseUrl}/subtitle/${encodeURIComponent(job.id)}.srt`;
 
         console.log(
             `[STREMIO] Subtitle URL: ${subtitleUrl}`
@@ -6161,28 +4918,18 @@ async function subtitlesHandler(
                 subtitles: [
                     {
                         id:
-                            `${id}-gemini-${sourceHash.slice(
-                                0,
-                                12
-                            )}`,
+                            `${id}-gemini-${sourceHash.slice(0, 12)}`,
 
-                        url:
-                            subtitleUrl,
-
-                        lang:
-                            "por"
+                        url: subtitleUrl,
+                        lang: "por"
                     }
                 ]
             }
         );
 
-    } catch (
-        error
-    ) {
+    } catch (error) {
         console.error(
-            `[STREMIO] Erro: ${getErrorMessage(
-                error
-            )}`
+            `[STREMIO] Erro: ${getErrorMessage(error)}`
         );
 
         return safeJson(
@@ -6204,22 +4951,11 @@ app.get(
     subtitlesHandler
 );
 
-/*
-|--------------------------------------------------------------------------
-| API DA PONTE LOCAL - LEGENDA EMBUTIDA
-|--------------------------------------------------------------------------
-*/
-
 app.post(
     "/api/translate-embedded",
-    async (
-        req,
-        res
-    ) => {
+    async (req, res) => {
         if (
-            !isAuthorizedLocalBridge(
-                req
-            )
+            !isAuthorizedLocalBridge(req)
         ) {
             console.warn(
                 "[EMBEDDED API] Tentativa não autorizada."
@@ -6228,8 +4964,7 @@ app.post(
             return safeJson(
                 res,
                 {
-                    error:
-                        "Unauthorized"
+                    error: "Unauthorized"
                 },
                 401
             );
@@ -6241,32 +4976,26 @@ app.post(
                 id,
                 srt,
                 name
-            } =
-                req.body ||
-                {};
+            } = req.body || {};
 
             const mediaType =
                 String(
-                    type ||
-                    "unknown"
+                    type || "unknown"
                 ).trim();
 
             const videoId =
                 String(
-                    id ||
-                    "unknown"
+                    id || "unknown"
                 ).trim();
 
             const sourceName =
                 String(
-                    name ||
-                    "embedded"
+                    name || "embedded"
                 ).trim();
 
             if (
                 !srt ||
-                typeof srt !==
-                    "string"
+                typeof srt !== "string"
             ) {
                 return safeJson(
                     res,
@@ -6298,49 +5027,30 @@ app.post(
 
             const job =
                 await createEmbeddedTranslationJob({
-                    type:
-                        mediaType,
-
+                    type: mediaType,
                     videoId,
-
-                    sourceSrt:
-                        srt,
-
+                    sourceSrt: srt,
                     sourceName
                 });
 
             const baseUrl =
-                cleanBaseUrl(
-                    req
-                );
+                cleanBaseUrl(req);
 
             const subtitleUrl =
-                `${baseUrl}/subtitle/${encodeURIComponent(
-                    job.id
-                )}.srt`;
+                `${baseUrl}/subtitle/${encodeURIComponent(job.id)}.srt`;
 
             return safeJson(
                 res,
                 {
-                    ok:
-                        true,
-
-                    jobId:
-                        job.id,
-
-                    status:
-                        job.status,
-
-                    progress:
-                        job.progress,
-
+                    ok: true,
+                    jobId: job.id,
+                    status: job.status,
+                    progress: job.progress,
                     subtitleUrl
                 }
             );
 
-        } catch (
-            error
-        ) {
+        } catch (error) {
             console.error(
                 "[EMBEDDED API] Erro:",
                 error
@@ -6350,9 +5060,7 @@ app.post(
                 res,
                 {
                     error:
-                        getErrorMessage(
-                            error
-                        )
+                        getErrorMessage(error)
                 },
                 500
             );
@@ -6360,33 +5068,20 @@ app.post(
     }
 );
 
-/*
-|--------------------------------------------------------------------------
-| RESULTADO DA LEGENDA
-|--------------------------------------------------------------------------
-*/
-
-async function subtitleResultHandler(
-    req,
-    res
-) {
+async function subtitleResultHandler(req, res) {
     const raw =
         String(
-            req.params.jobId ||
-            ""
+            req.params.jobId || ""
         ).trim();
 
     let jobId;
 
     try {
         jobId =
-            decodeURIComponent(
-                raw
-            );
+            decodeURIComponent(raw);
 
     } catch {
-        jobId =
-            raw;
+        jobId = raw;
     }
 
     if (!jobId) {
@@ -6398,10 +5093,7 @@ async function subtitleResultHandler(
         );
     }
 
-    const job =
-        getJob(
-            jobId
-        );
+    const job = getJob(jobId);
 
     if (!job) {
         return sendSubtitleResponse(
@@ -6412,18 +5104,10 @@ async function subtitleResultHandler(
         );
     }
 
-    if (
-        job.status ===
-        "pending"
-    ) {
-        if (
-            !job.lazyStartScheduled
-        ) {
-            job.lazyStartScheduled =
-                true;
-
-            job.updatedAt =
-                Date.now();
+    if (job.status === "pending") {
+        if (!job.lazyStartScheduled) {
+            job.lazyStartScheduled = true;
+            job.updatedAt = Date.now();
 
             console.log(
                 `[LAZY] URL OpenSubtitles ${job.id} requisitada; grace de ${LAZY_OPENSUB_START_GRACE_MS}ms para priorizar Embedded, se ele chegar.`
@@ -6439,8 +5123,7 @@ async function subtitleResultHandler(
                             job.status ===
                             "pending"
                         ) {
-                            job.lazyStart =
-                                false;
+                            job.lazyStart = false;
 
                             startTranslationJob(
                                 job,
@@ -6461,13 +5144,10 @@ async function subtitleResultHandler(
     }
 
     if (
-        job.status ===
-            "completed" &&
+        job.status === "completed" &&
         job.result
     ) {
-        if (
-            !job.timestampAuditPassed
-        ) {
+        if (!job.timestampAuditPassed) {
             try {
                 auditFinalTimestamps(
                     job.sourceSrt,
@@ -6478,9 +5158,7 @@ async function subtitleResultHandler(
                 job.timestampAuditPassed =
                     true;
 
-            } catch (
-                error
-            ) {
+            } catch (error) {
                 console.error(
                     `[AUDIT TIMESTAMP] Bloqueando legenda ${job.id}: ${getErrorMessage(error)}`
                 );
@@ -6495,9 +5173,7 @@ async function subtitleResultHandler(
             }
         }
 
-        if (
-            !job.contentAuditPassed
-        ) {
+        if (!job.contentAuditPassed) {
             console.error(
                 `[AUDIT CONTENT] Bloqueando legenda ${job.id}: auditoria semântica não confirmada.`
             );
@@ -6518,15 +5194,10 @@ async function subtitleResultHandler(
         );
     }
 
-    if (
-        job.status ===
-        "failed"
-    ) {
+    if (job.status === "failed") {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(
-                job.error
-            ),
+            buildErrorSrt(job.error),
             "no-store"
         );
     }
@@ -6534,18 +5205,15 @@ async function subtitleResultHandler(
     const completed =
         await waitForJob(
             job,
-            15_000
+            15000
         );
 
     if (
         completed &&
-        job.status ===
-            "completed" &&
+        job.status === "completed" &&
         job.result
     ) {
-        if (
-            !job.timestampAuditPassed
-        ) {
+        if (!job.timestampAuditPassed) {
             try {
                 auditFinalTimestamps(
                     job.sourceSrt,
@@ -6556,9 +5224,7 @@ async function subtitleResultHandler(
                 job.timestampAuditPassed =
                     true;
 
-            } catch (
-                error
-            ) {
+            } catch (error) {
                 console.error(
                     `[AUDIT TIMESTAMP] Bloqueando legenda ${job.id}: ${getErrorMessage(error)}`
                 );
@@ -6573,9 +5239,7 @@ async function subtitleResultHandler(
             }
         }
 
-        if (
-            !job.contentAuditPassed
-        ) {
+        if (!job.contentAuditPassed) {
             console.error(
                 `[AUDIT CONTENT] Bloqueando legenda ${job.id}: auditoria semântica não confirmada.`
             );
@@ -6596,24 +5260,17 @@ async function subtitleResultHandler(
         );
     }
 
-    if (
-        job.status ===
-        "failed"
-    ) {
+    if (job.status === "failed") {
         return sendSubtitleResponse(
             res,
-            buildErrorSrt(
-                job.error
-            ),
+            buildErrorSrt(job.error),
             "no-store"
         );
     }
 
     return sendSubtitleResponse(
         res,
-        buildProcessingSrt(
-            job
-        ),
+        buildProcessingSrt(job),
         "no-store, no-cache, must-revalidate"
     );
 }
@@ -6623,12 +5280,6 @@ app.get(
     subtitleResultHandler
 );
 
-/*
-|--------------------------------------------------------------------------
-| START
-|--------------------------------------------------------------------------
-*/
-
 app.listen(
     PORT,
     () => {
@@ -6637,7 +5288,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 6.1"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 6.2 FAST-SAFE"
         );
 
         console.log(
@@ -6653,15 +5304,23 @@ app.listen(
         );
 
         console.log(
+            "Thinking Gemini: MINIMAL (latência) ✅"
+        );
+
+        console.log(
+            "Sampling temperature/top_p/top_k: REMOVIDOS ✅"
+        );
+
+        console.log(
             `PUBLIC_URL: ${PUBLIC_URL || "(automático)"}`
         );
 
         console.log(
-            `Batch premium máximo: ${MAX_BATCH_BLOCKS} blocos`
+            `Batch FAST máximo: ${MAX_BATCH_BLOCKS} blocos`
         );
 
         console.log(
-            `Batch premium máximo: ${MAX_BATCH_CHARS} caracteres`
+            `Batch FAST máximo: ${MAX_BATCH_CHARS} caracteres`
         );
 
         console.log(
@@ -6681,7 +5340,7 @@ app.listen(
         );
 
         console.log(
-            `Timeout request auditoria: ${SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS}ms`
+            `Timeout request RESCUE: ${RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS}ms | auditoria: ${SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS}ms`
         );
 
         console.log(
@@ -6737,23 +5396,23 @@ app.listen(
         );
 
         console.log(
-            "Autoauditoria semântica no passe de tradução: 100% DOS BLOCOS ✅"
+            "Protocolo compacto i/l/t + ID/lock: 100% DOS BLOCOS ✅"
         );
 
         console.log(
-            `Auditoria independente: RISCO + CANÁRIOS AGRUPADOS; máx ${MAX_INDEPENDENT_AUDIT_BLOCKS} blocos/request ✅`
+            `Auditoria independente: FRONTEIRAS DE RISCO + CANÁRIOS; máx ${MAX_INDEPENDENT_AUDIT_BLOCKS}/request ✅`
         );
 
         console.log(
-            "Auditoria entre lotes: ACUMULADA / MENOS REQUESTS ✅"
+            "Auditoria em buffer: FLUSH DURANTE A TRADUÇÃO / MENOS REQUESTS ✅"
         );
 
         console.log(
-            "Falha semântica agrupada: RETRADUZ SOMENTE O LOTE DE ORIGEM ✅"
+            "Falha semântica: RESCUE SOMENTE DO LOTE DE ORIGEM ✅"
         );
 
         console.log(
-            "Timeout curto: SPLIT IMEDIATO ✅"
+            "Timeout: RESCUE FIXO / SEM ÁRVORE BINÁRIA LONGA ✅"
         );
 
         console.log(
