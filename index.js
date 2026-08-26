@@ -20,33 +20,40 @@ const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 const SOURCE_FETCH_TIMEOUT_MS = 20000;
 /*
- * 5.9 PERFORMANCE:
- * chamadas individuais mais curtas. Se uma chamada de tradução estourar
- * o limite, o lote é dividido imediatamente; auditoria lenta é dividida
- * sem retraduzir blocos que já passaram pelo contrato estrutural.
+ * 6.0 QUALITY + SPEED:
+ * - tradução em lotes menores e estáveis;
+ * - timeout curto para matar chamadas travadas cedo;
+ * - autoauditoria estrutural/semântica no MESMO passe da tradução;
+ * - auditoria Gemini independente apenas nos blocos de maior risco + canários;
+ * - qualquer falha independente continua fail-closed e força retradução/split.
  */
-const TRANSLATION_REQUEST_TIMEOUT_MS = 45000;
-const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 35000;
+const TRANSLATION_REQUEST_TIMEOUT_MS = 26000;
+const SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS = 12000;
+const MAX_INDEPENDENT_AUDIT_BLOCKS = 48;
+const AUDIT_CANARY_STRIDE = 9;
+const HIGH_RISK_AUDIT_SCORE = 3;
+const LAZY_OPENSUB_START_GRACE_MS = 1500;
 const MAX_TRANSLATION_TIME_MS = Number(process.env.MAX_TRANSLATION_TIME_MS ||
     480000);
 const configuredMaxBatchChars = Number(process.env.MAX_BATCH_CHARS ||
-    7000);
+    5200);
 const MAX_BATCH_CHARS = Number.isFinite(configuredMaxBatchChars) &&
     configuredMaxBatchChars > 0
-    ? Math.min(configuredMaxBatchChars, 7000)
-    : 7000;
+    ? Math.min(configuredMaxBatchChars, 5200)
+    : 5200;
 const configuredMaxBatchBlocks = Number(process.env.MAX_BATCH_BLOCKS ||
-    96);
+    72);
 const MAX_BATCH_BLOCKS = Number.isFinite(configuredMaxBatchBlocks) &&
     configuredMaxBatchBlocks > 0
-    ? Math.min(Math.floor(configuredMaxBatchBlocks), 96)
-    : 96;
+    ? Math.min(Math.floor(configuredMaxBatchBlocks), 72)
+    : 72;
 const GEMINI_CONCURRENCY = 1;
 const MIN_REQUEST_INTERVAL_MS = Number(process.env.MIN_REQUEST_INTERVAL_MS ||
     3000);
 const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS ||
     16000);
-const MAX_NORMAL_RETRIES = 2;
+const AUDIT_MAX_OUTPUT_TOKENS = 4096;
+const MAX_NORMAL_RETRIES = 1;
 const MAX_BAD_OUTPUT_SPLIT_DEPTH = 8;
 const MAX_AUDIT_SPLIT_DEPTH = 8;
 const MAX_SINGLE_BLOCK_OUTPUT_RETRIES = 1;
@@ -58,9 +65,9 @@ const MAX_CACHE_ENTRIES = 200;
 const MAX_JOBS = 300;
 const MAX_SOURCE_CHARS = 800000;
 /*
- * 5.9 mantém o contrato/cache 5.8 para compatibilidade direta com
- * a Ponte Local 2.5.1. A otimização muda execução, não a identidade
- * semântica do cache local.
+ * 6.0 mantém o namespace 5.8 para compatibilidade direta com a Ponte
+ * Local 2.5.1 e com os IDs/cache persistentes que ela já calcula.
+ * O protocolo e o endpoint da ponte permanecem inalterados.
  */
 const TRANSLATION_CACHE_VERSION = "5.8";
 const BLOCK_LOCK_VERSION = "5.8";
@@ -925,13 +932,14 @@ async function rawGeminiRequest(prompt, deadlineAt, requestKind = "translation")
             systemInstruction: {
                 parts: [
                     {
-                        text: "Você é um auditor bilíngue de integridade de legendas EN→PT-BR. " +
-                            "NÃO traduza nem reescreva. Compare cada tradução com a fonte do MESMO ID. " +
-                            "Cada ID é uma unidade atômica: uma tradução pode ser um fragmento se a fonte daquele ID também for fragmentária. " +
-                            "Não penalize paráfrase natural, gíria, adaptação idiomática ou mudança de estrutura gramatical quando o significado daquele próprio ID for preservado. " +
-                            "Use vizinhos somente para desambiguar e detectar migração. Se a tradução de um ID contiver claramente conteúdo de outro ID, marque faithful=false e indique o outro ID em matchedSourceId. " +
-                            "Se a tradução corresponder ao próprio ID, inclusive em falas curtas ou repetidas, prefira matchedSourceId igual ao próprio id. " +
-                            "Se não houver correspondência confiável, use matchedSourceId=-1 e faithful=false. " +
+                        text: "Você é um auditor bilíngue extremamente rigoroso de integridade de legendas EN→PT-BR. " +
+                            "NÃO traduza nem reescreva. Verifique somente correspondência semântica por ID. " +
+                            "Cada item auditado inclui source, translation, speaker opcional e os vizinhos source anterior/próximo apenas como contexto. " +
+                            "A tradução do ID deve representar exclusivamente o source do próprio ID; conteúdo antecipado do próximo ID ou atrasado do anterior é falha. " +
+                            "Aceite paráfrase natural, adaptação idiomática, gíria contemporânea, linguagem LGBTQIAPN+, drag/camp/shade e mudança gramatical quando o significado do próprio ID estiver preservado. " +
+                            "Não penalize fragmentos: se a fonte é fragmentária, a tradução pode ser fragmentária. " +
+                            "Se houver migração inequívoca para outro ID, faithful=false e matchedSourceId deve apontar o ID mais provável. " +
+                            "Se corresponder ao próprio ID, faithful=true e matchedSourceId deve ser o próprio id. " +
                             "Preserve exatamente id e lock e retorne somente o JSON solicitado."
                     }
                 ]
@@ -947,6 +955,7 @@ async function rawGeminiRequest(prompt, deadlineAt, requestKind = "translation")
                 }
             ],
             generationConfig: {
+                temperature: 0,
                 responseMimeType: "application/json",
                 responseSchema: {
                     type: "ARRAY",
@@ -975,37 +984,26 @@ async function rawGeminiRequest(prompt, deadlineAt, requestKind = "translation")
                     },
                     minItems: 1
                 },
-                maxOutputTokens: MAX_OUTPUT_TOKENS
+                maxOutputTokens: AUDIT_MAX_OUTPUT_TOKENS
             }
         }
         : {
             systemInstruction: {
                 parts: [
                     {
-                        text: "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, especializado em diálogo audiovisual contemporâneo. " +
-                            "Seu objetivo não é produzir uma tradução de dicionário: é fazer a fala soar como uma pessoa brasileira realmente falaria naquela situação, preservando intenção, humor, personalidade, ironia, shade, camp, provocação, carinho e ritmo cômico. " +
-                            "A entrada será majoritariamente em inglês, mas pode conter trechos em italiano, espanhol, francês ou outros idiomas; traduza também esses trechos para PT-BR quando forem conteúdo falado ou cantado relevante. " +
-                            "Em reality shows, competição, conversa informal, cultura pop e cenas descontraídas, prefira PT-BR oral, espontâneo e natural. Use gírias brasileiras somente quando combinarem de verdade com o contexto; não force caricaturas nem gírias aleatórias. " +
-                            "O português deve soar contemporâneo e atual para o público brasileiro de hoje, com sensação de legenda profissional de streaming. Evite escolhas lexicais datadas, antiquadas ou com cara de dublagem/tradução antiga. " +
-                            "Evite especialmente, salvo se o próprio personagem ou contexto exigir de forma clara, expressões como balacobaco, qualé, mó, broto, supimpa, jóia como gíria, é o bicho, da hora usado artificialmente e outras fórmulas que hoje possam soar envelhecidas ou deslocadas. Entre uma gíria antiga e uma formulação simples, natural e atual, prefira a formulação atual. " +
-                            "Pode usar linguagem contemporânea associada à cultura LGBTQIA+, drag, camp, shade e cultura pop quando isso combinar de verdade com quem fala e com a cena. Termos como gata, bicha, amiga, mana, serviu, arrasou, entregou ou amassou podem funcionar em contextos específicos, mas nunca devem ser inseridos mecanicamente só para deixar a tradução mais jovem ou queer. " +
-                            "Não transforme todo personagem em alguém da geração Z ou Alpha. A modernidade deve aparecer principalmente no ritmo, nas escolhas de palavras e na naturalidade, e não numa enxurrada de gírias. Preserve idade, personalidade, região, formalidade e contexto social do falante sempre que essas informações estiverem disponíveis. " +
-                            "REGRA DE INTEGRIDADE PRIORITÁRIA: cada ID é uma unidade atômica e imutável. O texto devolvido em um ID deve traduzir SOMENTE o campo text daquele próprio ID. Se a fonte daquele ID terminar no meio de uma frase, a tradução desse ID também deve conter somente a parte semanticamente presente nele; jamais antecipe palavras, ideias ou a conclusão do ID seguinte. " +
-                            "Antes de traduzir literalmente uma expressão curta ou ambígua, interprete a intenção usando os blocos vizinhos. Pontuação, quebras de linha e segmentação podem ser imperfeitas; trate os vizinhos SOMENTE como contexto para interpretar o próprio ID, nunca como autorização para redistribuir, completar, antecipar ou atrasar conteúdo. " +
-                            "Reconheça vocativos coloquiais. Palavras como girl, bitch, honey, sis, queen, baby e babe nem sempre são substantivos literais. Dependendo do tom, podem equivaler a gata, amiga, mana, bicha, querida, amor ou até ser omitidas quando isso soar mais natural. " +
-                            "Nunca traduza automaticamente girl como garota nem bitch como vadia. Use vadia apenas quando houver intenção real de insulto. Em fala camp, afetiva, debochada ou entre queens, escolha a solução brasileira que preserve o humor e o tom. " +
-                            "Exemplo de interpretação: 'Kenya got you, girl' em tom de shade significa algo como 'Mas a Kenya te pegou, gata', e não 'Kenya pegou a sua garota'. " +
-                            "Exemplo de registro: 'Vita is quiet, but this bitch is a silent killer' em contexto camp pode soar como 'A Vita é calada, mas essa bicha é uma assassina silenciosa', em vez de traduzir bitch mecanicamente como vadia. " +
-                            "Adapte expressões idiomáticas, piadas e trocadilhos quando existir uma solução natural em PT-BR que preserve a intenção e a graça. Se a adaptação ficar forçada, confusa ou perder um bordão reconhecível, preserve o termo original. " +
-                            "Exemplo: preserve 'Condragulations' como 'Condragulations'; não invente neologismos como 'Parabravas'. " +
-                            "Quando houver letra de música realmente transcrita na legenda, traduza seu conteúdo para PT-BR, mesmo que esteja em um idioma diferente do inglês. Não invente letras quando houver apenas marcações como [music], símbolos musicais ou descrições de som. " +
-                            "Preserve nomes próprios, marcas, títulos, termos técnicos, palavrões, intensidade emocional e intenção. Não censure. Não resuma. Não explique. " +
-                            "Não acrescente nomes de falantes, descrições de sons, rubricas SDH/CC ou observações que não existam no texto recebido. Traduza somente o campo text e mantenha exatamente os IDs e locks recebidos, na mesma ordem. O lock é um selo opaco: copie-o sem alteração. " +
-                            "Algumas entradas podem trazer um campo opcional speaker. Esse campo é somente contexto oculto de quem fala: nunca o copie para o campo text e nunca acrescente o nome do falante à legenda final. Quando speaker identificar claramente uma pessoa, respeite o gênero gramatical dessa pessoa em adjetivos, particípios e construções em primeira pessoa. " +
-                            "Quando não houver speaker ou a identidade do falante não estiver clara, NÃO chute masculino ou feminino. Prefira uma formulação brasileira natural sem marca de gênero sempre que isso evitar uma escolha incerta. Por exemplo, em vez de adivinhar entre 'estou empolgado' e 'estou empolgada', uma solução como 'Mal posso esperar', 'Que empolgação' ou outra construção neutra pode ser melhor conforme o contexto. Nunca use formas artificiais como empolgado(a), empolgade ou barras de gênero. " +
-                            "Não reproduza graficamente notas ou sílabas sustentadas. Alongamentos como home-e-e-e, ce-e-e-e-rto, sooooo ou nããããão representam duração da voz e devem virar a palavra normal adequada ao sentido. O áudio já transmite a duração. Preserve apenas vocalizações que tenham valor real de fala, como 'ah', 'oh' ou 'hmm', sem multiplicar letras desnecessariamente. " +
-                            "Não acrescente traços, travessões, barras ou marcadores de diálogo que não sejam necessários. Preserve marcadores somente quando forem realmente necessários para distinguir dois ou mais falantes no mesmo bloco. " +
-                            "Preserve tags de formatação como <i>, </i>, <b>, </b>, {\\i1}, {\\i0} e similares."
+                        text: "Você é um tradutor, localizador e adaptador profissional de legendas para Português do Brasil, com padrão premium de streaming. " +
+                            "A prioridade é: INTEGRIDADE DO CONTEÚDO POR ID → sentido/intenção → voz do personagem → naturalidade contemporânea → humor/ritmo → literalidade. " +
+                            "Cada ID é uma unidade atômica e imutável: traduza SOMENTE o campo text daquele ID. Nunca antecipe, atrase, complete ou transfira conteúdo entre IDs, mesmo quando uma frase continuar no bloco seguinte. Vizinhos existem só para contexto. " +
+                            "O PT-BR deve soar vivo, oral, atual e brasileiro de verdade, sem cara de tradução de dicionário. Prefira vocabulário contemporâneo compatível com 2026 e, quando idade/cena/personagem pedirem, use com naturalidade repertório de geração Z e Alpha, cultura digital, memes e oralidade jovem — sem transformar todo mundo em adolescente nem enfiar gíria onde não cabe. " +
+                            "Evite vocabulário artificialmente datado. Modernidade vem de ritmo, escolhas de palavras e registro, não de uma lista fixa de bordões. " +
+                            "Em contextos LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, traduza com letramento cultural e carinho: preserve identidade, nome escolhido, pronome, gênero, ironia, afeto, provocação, termos ressignificados e intensidade. Não heteronormativize, não higienize linguagem queer e não transforme vocativos camp em insultos literais. " +
+                            "girl, bitch, honey, sis, queen, baby e babe podem ser vocativos afetivos/camp; nunca traduza automaticamente girl como garota nem bitch como vadia. Escolha gata, amiga, mana, bicha, querida, amor, mona ou omissão somente quando o contexto realmente sustentar. 'vadia' apenas quando houver insulto real ou uso ressignificado inequivocamente equivalente. " +
+                            "Adapte expressões idiomáticas, piadas, trocadilhos, shade e referências culturais quando houver solução brasileira natural que preserve intenção e graça. Se adaptar piorar, preserve o original. Preserve bordões consagrados como Condragulations. " +
+                            "Não censure palavrões nem intensidade emocional. Preserve nomes próprios, marcas, títulos e termos técnicos. Traduza falas ou letras efetivamente transcritas em outros idiomas para PT-BR; não invente letra para marcações de música. " +
+                            "speaker é contexto oculto: nunca copie o nome para text. Se speaker identificar claramente a pessoa, respeite gênero/pronomes; se não estiver claro, NÃO chute gênero — prefira construção brasileira natural que evite marcar gênero. " +
+                            "Não acrescente SDH/CC, sons, nomes de falantes ou explicações. Não reproduza alongamentos gráficos desnecessários. Preserve formatação útil. " +
+                            "Além de traduzir, faça uma AUTOAUDITORIA silenciosa de cada item antes de responder: selfFaithful=true somente se text traduzido representar integralmente e exclusivamente o source do próprio ID; boundarySafe=true somente se nenhum conteúdo dos IDs vizinhos tiver migrado para ele. Se houver dúvida real, marque false. " +
+                            "Retorne somente JSON, exatamente na ordem recebida, preservando id e lock sem qualquer alteração."
                     }
                 ]
             },
@@ -1020,6 +1018,7 @@ async function rawGeminiRequest(prompt, deadlineAt, requestKind = "translation")
                 }
             ],
             generationConfig: {
+                temperature: 0.25,
                 responseMimeType: "application/json",
                 responseSchema: {
                     type: "ARRAY",
@@ -1034,12 +1033,20 @@ async function rawGeminiRequest(prompt, deadlineAt, requestKind = "translation")
                             },
                             text: {
                                 type: "STRING"
+                            },
+                            selfFaithful: {
+                                type: "BOOLEAN"
+                            },
+                            boundarySafe: {
+                                type: "BOOLEAN"
                             }
                         },
                         required: [
                             "id",
                             "lock",
-                            "text"
+                            "text",
+                            "selfFaithful",
+                            "boundarySafe"
                         ]
                     },
                     minItems: 1
@@ -1268,7 +1275,16 @@ function blockTranslationLock(block) {
             "")
     ])).slice(0, 20);
 }
-function buildTranslationPrompt(blocks) {
+function contextBlockPayload(block) {
+    if (!block) {
+        return null;
+    }
+    return {
+        id: block.index,
+        text: block.text
+    };
+}
+function buildTranslationPrompt(blocks, context = {}) {
     const payload = blocks.map(block => {
         const item = {
             id: block.index,
@@ -1282,17 +1298,23 @@ function buildTranslationPrompt(blocks) {
         }
         return item;
     });
+    const envelope = {
+        contextBefore: contextBlockPayload(context.before),
+        items: payload,
+        contextAfter: contextBlockPayload(context.after)
+    };
     return `
-TAREFA: traduza/localize cada "text" para PT-BR seguindo integralmente as regras do sistema.
-Cada item é atômico: preserve id+lock+ordem e devolva somente conteúdo do próprio ID. timing e speaker são apenas contexto.
-SAÍDA EXATA: [{"id":123,"lock":"abc123","text":"tradução"}]
-ENTRADAS:
-${JSON.stringify(payload)}
+TRADUZA os items para PT-BR premium conforme integralmente as regras do sistema.
+contextBefore/contextAfter são SOMENTE contexto e nunca devem ser traduzidos nem absorvidos pelos items.
+Para cada item devolva id, lock, text, selfFaithful e boundarySafe.
+SAÍDA EXATA: [{"id":123,"lock":"abc","text":"...","selfFaithful":true,"boundarySafe":true}]
+ENTRADA:
+${JSON.stringify(envelope)}
 `;
 }
 /*
 |--------------------------------------------------------------------------
-| TRADUZIR LOTE
+| TRADUZIR / AUDITAR LOTE - 6.0 SMART QUALITY
 |--------------------------------------------------------------------------
 */
 function badModelOutputError(message) {
@@ -1307,65 +1329,201 @@ function badAuditOutputError(message) {
         "BAD_AUDIT_OUTPUT";
     return error;
 }
-function buildSemanticAuditPrompt(blocks, translatedTexts) {
-    const payload = blocks.map((block, index) => {
-        const item = {
+function normalizedRiskText(value) {
+    return String(value || "")
+        .replace(/<[^>]+>|\{[^}]+\}/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function strongSentenceEnd(text) {
+    return /[.!?…]["'”’\)\]]*$/u.test(normalizedRiskText(text));
+}
+function fragmentTail(text) {
+    return /(?:[,;:–—-]|\b(?:and|but|or|because|so|to|of|for|with|that|which|who|when|if|than|as|like|a|an|the|my|your|our|their|his|her|its|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|can|could|should|may|might|must))\s*$/iu.test(normalizedRiskText(text));
+}
+function translationLengthRisk(source, translated) {
+    const sourceLength = normalizedRiskText(source).length;
+    const translatedLength = normalizedRiskText(translated).length;
+    if (sourceLength < 18 ||
+        translatedLength === 0) {
+        return false;
+    }
+    const ratio = translatedLength /
+        sourceLength;
+    return (ratio < 0.28 ||
+        ratio > 3.8);
+}
+function suspiciousNeighborDuplicate(translatedItems, index, blocks) {
+    const current = normalizedRiskText(translatedItems[index]?.text).toLowerCase();
+    if (current.length < 14) {
+        return false;
+    }
+    for (const neighborIndex of [
+        index - 1,
+        index + 1
+    ]) {
+        if (neighborIndex < 0 ||
+            neighborIndex >=
+                translatedItems.length) {
+            continue;
+        }
+        const neighbor = normalizedRiskText(translatedItems[neighborIndex]?.text).toLowerCase();
+        const source = normalizedRiskText(blocks[index]?.text).toLowerCase();
+        const neighborSource = normalizedRiskText(blocks[neighborIndex]?.text).toLowerCase();
+        if (current === neighbor &&
+            source !== neighborSource) {
+            return true;
+        }
+    }
+    return false;
+}
+function auditRiskScore(blocks, translatedItems, index) {
+    const block = blocks[index];
+    const item = translatedItems[index];
+    const source = normalizedRiskText(block?.text);
+    const words = source
+        .split(/\s+/)
+        .filter(Boolean);
+    let score = 0;
+    if (item?.selfFaithful !==
+        true ||
+        item?.boundarySafe !==
+            true) {
+        score += 10;
+    }
+    if (index <
+        blocks.length - 1 &&
+        !strongSentenceEnd(source)) {
+        score += 2;
+    }
+    if (fragmentTail(source)) {
+        score += 2;
+    }
+    if (words.length <= 3) {
+        score += 1;
+    }
+    if (index > 0 &&
+        /^[a-z]/u.test(source)) {
+        score += 1;
+    }
+    if (translationLengthRisk(block?.text, item?.text)) {
+        score += 3;
+    }
+    if (suspiciousNeighborDuplicate(translatedItems, index, blocks)) {
+        score += 3;
+    }
+    return score;
+}
+function selectIndependentAuditIndices(blocks, translatedItems) {
+    const selected = new Set();
+    let riskCount = 0;
+    let canaryCount = 0;
+    for (let i = 0; i < blocks.length; i++) {
+        const risk = auditRiskScore(blocks, translatedItems, i);
+        if (risk >=
+            HIGH_RISK_AUDIT_SCORE) {
+            selected.add(i);
+            riskCount++;
+            continue;
+        }
+        if (i === 0 ||
+            i ===
+                blocks.length - 1 ||
+            i % AUDIT_CANARY_STRIDE ===
+                0) {
+            selected.add(i);
+            canaryCount++;
+        }
+    }
+    return {
+        indices: Array.from(selected).sort((a, b) => a - b),
+        riskCount,
+        canaryCount
+    };
+}
+function blockAtWithOuterContext(blocks, index, context) {
+    if (index >= 0 &&
+        index < blocks.length) {
+        return blocks[index];
+    }
+    if (index < 0) {
+        return context?.before ||
+            null;
+    }
+    return context?.after ||
+        null;
+}
+function buildIndependentAuditRecords(blocks, translatedItems, indices, context) {
+    return indices.map(index => {
+        const block = blocks[index];
+        const previous = blockAtWithOuterContext(blocks, index - 1, context);
+        const next = blockAtWithOuterContext(blocks, index + 1, context);
+        return {
             id: block.index,
             lock: blockTranslationLock(block),
-            timing: block.timing,
             source: block.text,
-            translation: translatedTexts[index]
+            translation: translatedItems[index].text,
+            speaker: block.speakerHint ||
+                null,
+            prev: previous
+                ? {
+                    id: previous.index,
+                    source: previous.text
+                }
+                : null,
+            next: next
+                ? {
+                    id: next.index,
+                    source: next.text
+                }
+                : null
         };
-        if (block.speakerHint) {
-            item.speaker =
-                block.speakerHint;
-        }
-        return item;
     });
+}
+function buildSemanticAuditPrompt(records) {
     return `
-AUDITE 100% dos itens conforme as regras do sistema. Não traduza nem reescreva.
-Para cada item, confirme se translation corresponde semanticamente ao source do MESMO id; vizinhos servem apenas para detectar migração.
-SAÍDA EXATA: [{"id":123,"lock":"abc123","matchedSourceId":123,"faithful":true}]
-BLOCOS:
-${JSON.stringify(payload)}
+AUDITORIA INDEPENDENTE. Verifique somente os itens abaixo.
+prev/next são contexto para detectar conteúdo migrado; NÃO precisam ser traduzidos.
+faithful=true SOMENTE se translation corresponde exclusivamente ao source do próprio id.
+SAÍDA EXATA: [{"id":123,"lock":"abc","matchedSourceId":123,"faithful":true}]
+ITENS:
+${JSON.stringify(records)}
 `;
 }
-async function auditBatchSemanticsOnce(blocks, translatedTexts, deadlineAt) {
-    const raw = await enqueueGemini(buildSemanticAuditPrompt(blocks, translatedTexts), deadlineAt, "semantic-audit");
+async function auditIndependentRecordsOnce(records, deadlineAt) {
+    const raw = await enqueueGemini(buildSemanticAuditPrompt(records), deadlineAt, "semantic-audit");
     let parsed;
     try {
         parsed =
             JSON.parse(stripCodeFences(raw));
     }
     catch {
-        throw badAuditOutputError("Auditoria semântica retornou JSON inválido.");
+        throw badAuditOutputError("Auditoria independente retornou JSON inválido.");
     }
     if (!Array.isArray(parsed) ||
         parsed.length !==
-            blocks.length) {
-        throw badAuditOutputError(`Auditoria semântica incompleta: esperado=${blocks.length}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`);
+            records.length) {
+        throw badAuditOutputError(`Auditoria independente incompleta: esperado=${records.length}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`);
     }
     const failures = [];
-    for (let i = 0; i < blocks.length; i++) {
-        const block = blocks[i];
+    for (let i = 0; i < records.length; i++) {
+        const expected = records[i];
         const item = parsed[i];
-        const expectedLock = blockTranslationLock(block);
         if (!item ||
             item.id !==
-                block.index ||
+                expected.id ||
             item.lock !==
-                expectedLock ||
+                expected.lock ||
             !Number.isInteger(item.matchedSourceId) ||
             typeof item.faithful !==
                 "boolean") {
-            throw badAuditOutputError(`Auditoria semântica quebrou o contrato no bloco ${block.index}.`);
+            throw badAuditOutputError(`Auditoria independente quebrou o contrato no ID ${expected.id}.`);
         }
-        if (item.faithful !==
-            true ||
+        if (item.faithful !== true ||
             item.matchedSourceId !==
-                block.index) {
+                expected.id) {
             failures.push({
-                id: block.index,
+                id: expected.id,
                 matchedSourceId: item.matchedSourceId
             });
         }
@@ -1375,50 +1533,35 @@ async function auditBatchSemanticsOnce(blocks, translatedTexts, deadlineAt) {
             .slice(0, 8)
             .map(item => `${item.id}->${item.matchedSourceId}`)
             .join(", ");
-        console.warn(`[AUDIT CONTENT] FALHA — ${failures.length}/${blocks.length} bloco(s) suspeito(s); ${sample}. Tradução desse lote será descartada.`);
-        throw badModelOutputError(`Auditoria semântica detectou ${failures.length} bloco(s) com conteúdo associado ao ID errado.`);
+        console.warn(`[AUDIT SMART] FALHA independente — ${failures.length}/${records.length} suspeito(s); ${sample}. Lote de tradução será rejeitado.`);
+        throw badModelOutputError(`Auditoria independente detectou ${failures.length} bloco(s) semanticamente suspeito(s).`);
     }
-    const signature = sha256(JSON.stringify(blocks.map(block => [
-        block.index,
-        blockTranslationLock(block)
-    ]))).slice(0, 16);
-    console.log(`[AUDIT CONTENT] OK — ${blocks.length}/${blocks.length} bloco(s); ID/lock/significado correspondentes; assinatura=${signature}.`);
+    console.log(`[AUDIT SMART] OK independente — ${records.length}/${records.length} bloco(s) verificados.`);
     return true;
 }
-async function auditBatchSemantics(blocks, translatedTexts, deadlineAt, splitDepth = 0, singleBlockRetry = 0) {
-    if (!SEMANTIC_AUDIT_ENABLED) {
-        return true;
-    }
+async function auditIndependentRecords(records, deadlineAt, splitDepth = 0, singleBlockRetry = 0) {
     assertBeforeDeadline(deadlineAt);
-    if (blocks.length !==
-        translatedTexts.length) {
-        throw badModelOutputError(`Auditoria semântica recebeu tamanhos divergentes: fonte=${blocks.length}, tradução=${translatedTexts.length}.`);
-    }
     try {
-        return await auditBatchSemanticsOnce(blocks, translatedTexts, deadlineAt);
+        return await auditIndependentRecordsOnce(records, deadlineAt);
     }
     catch (error) {
         if (error?.code ===
             "BAD_MODEL_OUTPUT") {
-            /*
-             * Falha semântica verdadeira: a tradução é suspeita.
-             * Propagamos para translateBatch, que descarta/retraduz.
-             */
             throw error;
         }
-        const auditRecoverable = error?.code ===
+        const recoverable = error?.code ===
             "BAD_AUDIT_OUTPUT" ||
             error?.code ===
                 "GEMINI_REQUEST_TIMEOUT";
-        if (!auditRecoverable) {
+        if (!recoverable) {
             throw error;
         }
         assertBeforeDeadline(deadlineAt);
-        if (blocks.length === 1) {
+        if (records.length === 1) {
             if (singleBlockRetry <
                 MAX_SINGLE_BLOCK_AUDIT_RETRIES) {
-                console.warn(`[AUDIT CONTENT] Auditoria de 1 bloco falhou/estourou timeout. Nova tentativa ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_AUDIT_RETRIES}.`);
-                return auditBatchSemantics(blocks, translatedTexts, deadlineAt, splitDepth, singleBlockRetry + 1);
+                console.warn(`[AUDIT SMART] Auditoria de 1 bloco lenta/inválida. Retry ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_AUDIT_RETRIES}.`);
+                return auditIndependentRecords(records, deadlineAt, splitDepth, singleBlockRetry + 1);
             }
             throw error;
         }
@@ -1426,21 +1569,52 @@ async function auditBatchSemantics(blocks, translatedTexts, deadlineAt, splitDep
             MAX_AUDIT_SPLIT_DEPTH) {
             throw error;
         }
-        const middle = Math.ceil(blocks.length /
+        const middle = Math.ceil(records.length /
             2);
-        const leftBlocks = blocks.slice(0, middle);
-        const rightBlocks = blocks.slice(middle);
-        const leftTranslations = translatedTexts.slice(0, middle);
-        const rightTranslations = translatedTexts.slice(middle);
-        console.warn(`[AUDIT CONTENT] Auditoria de ${blocks.length} bloco(s) lenta/inválida; dividindo SOMENTE a auditoria em ${leftBlocks.length} + ${rightBlocks.length}. Tradução já aprovada por ID/lock será preservada enquanto ambos os lados forem auditados.`);
-        await auditBatchSemantics(leftBlocks, leftTranslations, deadlineAt, splitDepth + 1, 0);
-        await auditBatchSemantics(rightBlocks, rightTranslations, deadlineAt, splitDepth + 1, 0);
+        const left = records.slice(0, middle);
+        const right = records.slice(middle);
+        console.warn(`[AUDIT SMART] Auditoria independente lenta/inválida (${records.length}); split imediato ${left.length} + ${right.length}.`);
+        await auditIndependentRecords(left, deadlineAt, splitDepth + 1, 0);
+        await auditIndependentRecords(right, deadlineAt, splitDepth + 1, 0);
         return true;
     }
 }
-async function translateBatchOnce(blocks, deadlineAt) {
+async function auditTranslationSmart(blocks, translatedItems, context, deadlineAt) {
+    if (!SEMANTIC_AUDIT_ENABLED) {
+        return true;
+    }
+    const selection = selectIndependentAuditIndices(blocks, translatedItems);
+    console.log(`[AUDIT SMART] Autoauditoria: ${blocks.length}/${blocks.length}; auditoria independente selecionada=${selection.indices.length}/${blocks.length} (risco=${selection.riskCount}, canários=${selection.canaryCount}).`);
+    const records = buildIndependentAuditRecords(blocks, translatedItems, selection.indices, context);
+    for (let offset = 0; offset < records.length; offset +=
+        MAX_INDEPENDENT_AUDIT_BLOCKS) {
+        const chunk = records.slice(offset, offset +
+            MAX_INDEPENDENT_AUDIT_BLOCKS);
+        await auditIndependentRecords(chunk, deadlineAt);
+    }
+    return true;
+}
+function contextForSplitLeft(blocks, middle, context) {
+    return {
+        before: context?.before ||
+            null,
+        after: blocks[middle] ||
+            context?.after ||
+            null
+    };
+}
+function contextForSplitRight(blocks, middle, context) {
+    return {
+        before: blocks[middle - 1] ||
+            context?.before ||
+            null,
+        after: context?.after ||
+            null
+    };
+}
+async function translateBatchOnce(blocks, deadlineAt, context = {}) {
     assertBeforeDeadline(deadlineAt);
-    const raw = await enqueueGemini(buildTranslationPrompt(blocks), deadlineAt, "translation");
+    const raw = await enqueueGemini(buildTranslationPrompt(blocks, context), deadlineAt, "translation");
     let parsed;
     try {
         parsed =
@@ -1456,7 +1630,7 @@ async function translateBatchOnce(blocks, deadlineAt) {
         blocks.length) {
         throw badModelOutputError(`Quantidade incorreta de blocos: esperado=${blocks.length}, recebido=${parsed.length}. Resposta inteira descartada.`);
     }
-    const translatedTexts = [];
+    const translatedItems = [];
     const seenIds = new Set();
     for (let i = 0; i < blocks.length; i++) {
         const block = blocks[i];
@@ -1474,20 +1648,28 @@ async function translateBatchOnce(blocks, deadlineAt) {
             typeof item.text !==
                 "string" ||
             item.text.trim()
-                .length === 0) {
-            throw badModelOutputError(`Contrato ID/lock inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}. Resposta inteira descartada.`);
+                .length === 0 ||
+            typeof item.selfFaithful !==
+                "boolean" ||
+            typeof item.boundarySafe !==
+                "boolean") {
+            throw badModelOutputError(`Contrato ID/lock/autoverificação inválido na posição ${i + 1}; esperado id=${block.index}, lock=${expectedLock}. Resposta inteira descartada.`);
         }
         seenIds.add(item.id);
-        translatedTexts.push(item.text);
+        translatedItems.push({
+            text: item.text,
+            selfFaithful: item.selfFaithful,
+            boundarySafe: item.boundarySafe
+        });
     }
     console.log(`[AUDIT ID] OK — ${blocks.length}/${blocks.length} bloco(s); ordem, IDs e locks preservados exatamente.`);
-    await auditBatchSemantics(blocks, translatedTexts, deadlineAt);
-    return translatedTexts;
+    await auditTranslationSmart(blocks, translatedItems, context, deadlineAt);
+    return translatedItems.map(item => item.text);
 }
-async function translateBatch(blocks, deadlineAt, splitDepth = 0, singleBlockRetry = 0) {
+async function translateBatch(blocks, deadlineAt, context = {}, splitDepth = 0, singleBlockRetry = 0) {
     assertBeforeDeadline(deadlineAt);
     try {
-        return await translateBatchOnce(blocks, deadlineAt);
+        return await translateBatchOnce(blocks, deadlineAt, context);
     }
     catch (error) {
         const splitRecoverable = error?.code ===
@@ -1501,9 +1683,8 @@ async function translateBatch(blocks, deadlineAt, splitDepth = 0, singleBlockRet
         if (blocks.length === 1 &&
             singleBlockRetry <
                 MAX_SINGLE_BLOCK_OUTPUT_RETRIES) {
-            console.warn(`[TRANSLATE] Bloco atômico rejeitado pelo contrato/auditoria. Nova tentativa ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_OUTPUT_RETRIES}.`);
-            return translateBatch(blocks, deadlineAt, splitDepth, singleBlockRetry +
-                1);
+            console.warn(`[TRANSLATE] Bloco atômico rejeitado. Nova tentativa ${singleBlockRetry + 1}/${MAX_SINGLE_BLOCK_OUTPUT_RETRIES}.`);
+            return translateBatch(blocks, deadlineAt, context, splitDepth, singleBlockRetry + 1);
         }
         const canSplit = blocks.length > 1 &&
             splitDepth <
@@ -1519,9 +1700,9 @@ async function translateBatch(blocks, deadlineAt, splitDepth = 0, singleBlockRet
             "GEMINI_REQUEST_TIMEOUT"
             ? "timeout curto"
             : "contrato/auditoria";
-        console.warn(`[TRANSLATE] Lote de ${blocks.length} bloco(s) rejeitado integralmente por ${splitReason}. Nenhum resultado parcial será preservado. Dividindo em ${left.length} + ${right.length}.`);
-        const translatedLeft = await translateBatch(left, deadlineAt, splitDepth + 1, 0);
-        const translatedRight = await translateBatch(right, deadlineAt, splitDepth + 1, 0);
+        console.warn(`[TRANSLATE] Lote de ${blocks.length} bloco(s) rejeitado integralmente por ${splitReason}. Dividindo em ${left.length} + ${right.length}.`);
+        const translatedLeft = await translateBatch(left, deadlineAt, contextForSplitLeft(blocks, middle, context), splitDepth + 1, 0);
+        const translatedRight = await translateBatch(right, deadlineAt, contextForSplitRight(blocks, middle, context), splitDepth + 1, 0);
         return [
             ...translatedLeft,
             ...translatedRight
@@ -1549,7 +1730,7 @@ async function translateSrt(originalSrt, job) {
     });
     const startedAt = Date.now();
     /*
-     * 5.9 mantém a correção da 5.8.1:
+     * 6.0 mantém a correção da 5.8.1:
      * O teto de tradução começa SOMENTE quando este job realmente
      * entra em translateSrt. Tempo aguardando translationJobQueue
      * não consome mais os 8 minutos de processamento.
@@ -1571,7 +1752,19 @@ async function translateSrt(originalSrt, job) {
             String(block.text ||
                 "").length, 0);
         console.log(`[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`);
-        const translated = await translateBatch(batch, deadlineAt);
+        const batchStart = originalPositions.get(batch[0]);
+        const batchEnd = originalPositions.get(batch[batch.length - 1]);
+        const translated = await translateBatch(batch, deadlineAt, {
+            before: Number.isInteger(batchStart) &&
+                batchStart > 0
+                ? blocks[batchStart - 1]
+                : null,
+            after: Number.isInteger(batchEnd) &&
+                batchEnd <
+                    blocks.length - 1
+                ? blocks[batchEnd + 1]
+                : null
+        });
         assertBeforeDeadline(deadlineAt);
         for (let i = 0; i < batch.length; i++) {
             const originalIndex = originalPositions.get(batch[i]);
@@ -1610,7 +1803,7 @@ async function translateSrt(originalSrt, job) {
         true;
     job.contentAuditPassed =
         true;
-    console.log("[AUDIT CONTENT] TRADUÇÃO FINAL: OK — todos os lotes passaram pela auditoria semântica EN↔PT-BR.");
+    console.log("[AUDIT CONTENT] TRADUÇÃO FINAL: OK — 100% autoauditado no mesmo passe; blocos de risco/canários passaram pela auditoria independente adaptativa.");
     return finalSrt;
 }
 /*
@@ -1637,6 +1830,9 @@ function createJob({ jobId, cacheKey, type, videoId, sourceHash, sourceSrt }) {
         updatedAt: now,
         deadlineAt: null,
         queuedAt: null,
+        priority: 50,
+        jobKind: "generic",
+        lazyStartScheduled: false,
         expiresAt: now +
             JOB_TTL_MS,
         timestampAuditPassed: false,
@@ -1719,12 +1915,20 @@ function enqueueTranslationJob(job) {
         }
         job.queuedAt =
             Date.now();
-        translationJobQueue.push({
+        const queueItem = {
             job,
             resolve,
             reject
-        });
-        console.log(`[JOB QUEUE] ${job.id} entrou na fila. Aguardando: ${translationJobQueue.length}.`);
+        };
+        const insertAt = translationJobQueue.findIndex(item => Number(item?.job?.priority || 0) <
+            Number(job.priority || 0));
+        if (insertAt === -1) {
+            translationJobQueue.push(queueItem);
+        }
+        else {
+            translationJobQueue.splice(insertAt, 0, queueItem);
+        }
+        console.log(`[JOB QUEUE] ${job.id} entrou na fila. Prioridade=${job.priority || 0}; aguardando=${translationJobQueue.length}.`);
         processTranslationJobQueue();
     });
 }
@@ -1752,7 +1956,7 @@ async function processTranslationJobQueue() {
                     ? Math.max(0, Date.now() -
                         job.queuedAt)
                     : 0;
-                console.log(`[JOB QUEUE] Iniciando job completo ${job.id}. Restantes na fila: ${translationJobQueue.length}. Espera na fila: ${(queueWaitMs / 1000).toFixed(1)}s — não consumiu o teto de tradução.`);
+                console.log(`[JOB QUEUE] Iniciando job completo ${job.id}. Prioridade=${job.priority || 0}; restantes=${translationJobQueue.length}. Espera=${(queueWaitMs / 1000).toFixed(1)}s — fila não consumiu o teto.`);
                 await processJob(job);
                 resolve();
             }
@@ -1880,7 +2084,7 @@ async function waitForJob(job, timeoutMs) {
 */
 const manifest = {
     id: "org.tradutor.stateless.gemini.free",
-    version: "5.9.0",
+    version: "6.0.0",
     name: "Tradutor Gemini PT-BR",
     description: "Traduz automaticamente legendas para Português do Brasil usando Gemini.",
     logo: "",
@@ -1915,7 +2119,11 @@ app.get("/", (req, res) => {
         translationCacheVersion: TRANSLATION_CACHE_VERSION,
         structuralIdLock: true,
         semanticContentAudit: SEMANTIC_AUDIT_ENABLED,
-        performanceMode: "5.9-quality-fast",
+        semanticAuditMode: "self-100%-plus-independent-risk-canary",
+        independentAuditMaxBlocks: MAX_INDEPENDENT_AUDIT_BLOCKS,
+        auditCanaryStride: AUDIT_CANARY_STRIDE,
+        highRiskAuditScore: HIGH_RISK_AUDIT_SCORE,
+        performanceMode: "6.0-smart-quality-speed",
         lazyOpenSubtitles: true,
         bridgeCompatibleCacheVersion: "5.8",
         translationJobQueue: translationJobQueue.length,
@@ -1938,7 +2146,11 @@ app.get("/health", (req, res) => {
         translationCacheVersion: TRANSLATION_CACHE_VERSION,
         structuralIdLock: true,
         semanticContentAudit: SEMANTIC_AUDIT_ENABLED,
-        performanceMode: "5.9-quality-fast",
+        semanticAuditMode: "self-100%-plus-independent-risk-canary",
+        independentAuditMaxBlocks: MAX_INDEPENDENT_AUDIT_BLOCKS,
+        auditCanaryStride: AUDIT_CANARY_STRIDE,
+        highRiskAuditScore: HIGH_RISK_AUDIT_SCORE,
+        performanceMode: "6.0-smart-quality-speed",
         lazyOpenSubtitles: true,
         bridgeCompatibleCacheVersion: "5.8",
         translationJobQueue: translationJobQueue.length,
@@ -2108,7 +2320,7 @@ async function findEnglishSubtitle(type, id, extra = {}) {
     const response = await fetchWithTimeout(searchUrl, {
         headers: {
             Accept: "application/json",
-            "User-Agent": "Stremio-Gemini-Subtitle-Translator/5.9"
+            "User-Agent": "Stremio-Gemini-Subtitle-Translator/6.0"
         }
     }, SOURCE_FETCH_TIMEOUT_MS);
     if (!response.ok) {
@@ -2139,7 +2351,7 @@ async function downloadSubtitle(url) {
     console.log(`[SOURCE] Baixando legenda: ${url}`);
     const response = await fetchWithTimeout(url, {
         headers: {
-            "User-Agent": "Stremio-Gemini-Subtitle-Translator/5.9"
+            "User-Agent": "Stremio-Gemini-Subtitle-Translator/6.0"
         }
     }, SOURCE_FETCH_TIMEOUT_MS);
     if (!response.ok) {
@@ -2230,6 +2442,10 @@ async function createEmbeddedTranslationJob({ type, videoId, sourceSrt, sourceNa
     });
     job.source =
         sourceName;
+    job.priority =
+        100;
+    job.jobKind =
+        "embedded";
     job.totalBatches =
         splitIntoBatches(blocks).length;
     startTranslationJob(job, "EMBEDDED JOB");
@@ -2327,8 +2543,12 @@ async function subtitlesHandler(req, res) {
                 });
             job.totalBatches =
                 splitIntoBatches(blocks).length;
+            job.priority =
+                10;
+            job.jobKind =
+                "opensubtitles";
             /*
-             * 5.9 LAZY OPENSUBTITLES:
+             * 6.0 LAZY OPENSUBTITLES:
              * listar a legenda não gasta Gemini. O job só entra na fila
              * quando /subtitle/:jobId.srt for realmente requisitado.
              * Se o cliente fizer prefetch da URL, o comportamento volta
@@ -2447,10 +2667,27 @@ async function subtitleResultHandler(req, res) {
     }
     if (job.status ===
         "pending") {
-        console.log(`[LAZY] URL da legenda ${job.id} requisitada; iniciando tradução agora.`);
-        job.lazyStart =
-            false;
-        startTranslationJob(job, "JOB");
+        if (!job.lazyStartScheduled) {
+            job.lazyStartScheduled =
+                true;
+            job.updatedAt =
+                Date.now();
+            console.log(`[LAZY] URL OpenSubtitles ${job.id} requisitada; grace de ${LAZY_OPENSUB_START_GRACE_MS}ms para priorizar Embedded, se ele chegar.`);
+            const lazyTimer = setTimeout(() => {
+                job.lazyStartScheduled =
+                    false;
+                if (job.status ===
+                    "pending") {
+                    job.lazyStart =
+                        false;
+                    startTranslationJob(job, "JOB");
+                }
+            }, LAZY_OPENSUB_START_GRACE_MS);
+            if (typeof lazyTimer.unref ===
+                "function") {
+                lazyTimer.unref();
+            }
+        }
     }
     if (job.status ===
         "completed" &&
@@ -2512,13 +2749,13 @@ app.get("/subtitle/:jobId.srt", subtitleResultHandler);
 */
 app.listen(PORT, () => {
     console.log("==============================================");
-    console.log(" STREMIO GEMINI SUBTITLE TRANSLATOR 5.9");
+    console.log(" STREMIO GEMINI SUBTITLE TRANSLATOR 6.0");
     console.log("==============================================");
     console.log(`Porta: ${PORT}`);
     console.log(`Modelo Gemini: ${GEMINI_MODEL}`);
     console.log(`PUBLIC_URL: ${PUBLIC_URL || "(automático)"}`);
-    console.log(`Batch rápido máximo: ${MAX_BATCH_BLOCKS} blocos`);
-    console.log(`Batch rápido máximo: ${MAX_BATCH_CHARS} caracteres`);
+    console.log(`Batch premium máximo: ${MAX_BATCH_BLOCKS} blocos`);
+    console.log(`Batch premium máximo: ${MAX_BATCH_CHARS} caracteres`);
     console.log(`Intervalo Gemini: ${MIN_REQUEST_INTERVAL_MS}ms`);
     console.log(`Saída máxima Gemini: ${MAX_OUTPUT_TOKENS} tokens`);
     console.log(`Concorrência Gemini: ${GEMINI_CONCURRENCY}`);
@@ -2529,18 +2766,19 @@ app.listen(PORT, () => {
     console.log(`Cache TTL: ${CACHE_TTL_MS / 3600000}h`);
     console.log("Limpeza SDH/CC: ATIVA");
     console.log("Adaptação audiovisual 5.6: ATIVA");
-    console.log("Localização coloquial/contextual: ATIVA");
+    console.log("Localização contemporânea Gen Z/Alpha contextual: ATIVA");
+    console.log("Letramento LGBTQIAPN+/drag/camp/shade: ATIVO");
     console.log("Contexto oculto de falante: ATIVO");
     console.log("Proteção contra chute de gênero: ATIVA");
     console.log("Normalização de alongamentos vocais: ATIVA");
     console.log("Limpeza de traços soltos: ATIVA");
     console.log("Recuperação parcial de IDs: DESATIVADA (fail-closed)");
     console.log("Trava estrutural ID + lock: ATIVA");
-    console.log("Auditoria semântica EN↔PT-BR por lote: ATIVA (100% dos blocos)");
-    console.log("Auditoria lenta: SPLIT SOMENTE DA AUDITORIA ✅");
-    console.log("Timeout de lote: SPLIT IMEDIATO ✅");
-    console.log("OpenSubtitles: LAZY / SOB DEMANDA POR URL ✅");
-    console.log("Compatibilidade Ponte Local 2.5.1: SIM ✅");
+    console.log("Autoauditoria semântica no passe de tradução: 100% DOS BLOCOS ✅");
+    console.log(`Auditoria independente: RISCO + CANÁRIOS; máx ${MAX_INDEPENDENT_AUDIT_BLOCKS} blocos/request ✅`);
+    console.log("Timeout curto: SPLIT IMEDIATO ✅");
+    console.log(`OpenSubtitles: LAZY + grace ${LAZY_OPENSUB_START_GRACE_MS}ms + prioridade baixa ✅`);
+    console.log("Ponte Local 2.5.1: COMPATÍVEL + PRIORIDADE ALTA ✅");
     console.log(`Namespace de cache da tradução: ${TRANSLATION_CACHE_VERSION}`);
     console.log("Matching OpenSubtitles por release: ATIVO");
     console.log("Auditoria absoluta de timestamps: ATIVA");
