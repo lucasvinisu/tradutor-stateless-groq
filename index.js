@@ -7,10 +7,6 @@ const app = express();
 app.use(cors());
 app.disable("x-powered-by");
 
-/*
- * Necessário para receber o SRT enviado
- * pelo componente local.
- */
 app.use(
     express.json({
         limit: "1mb"
@@ -32,15 +28,6 @@ const GEMINI_API_KEY =
         process.env.GEMINI_API_KEY || ""
     ).trim();
 
-/*
- * IMPORTANTE:
- *
- * O Render está configurado para:
- *
- * gemini-3.5-flash-lite
- *
- * Este também é o fallback.
- */
 const GEMINI_MODEL =
     String(
         process.env.GEMINI_MODEL ||
@@ -50,142 +37,52 @@ const GEMINI_MODEL =
 const PUBLIC_URL =
     String(
         process.env.PUBLIC_URL || ""
-    )
-        .replace(/\/+$/, "");
+    ).replace(/\/+$/, "");
 
-/*
- * Segredo compartilhado somente entre
- * o Render e o componente local.
- */
 const LOCAL_BRIDGE_SECRET =
     String(
         process.env.LOCAL_BRIDGE_SECRET || ""
     ).trim();
 
-/*
-|--------------------------------------------------------------------------
-| TEMPOS
-|--------------------------------------------------------------------------
-*/
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const GEMINI_TIMEOUT_MS = 90_000;
 
-const SOURCE_FETCH_TIMEOUT_MS =
-    20_000;
-
-const GEMINI_TIMEOUT_MS =
-    90_000;
-
-/*
- * O job não pode ficar eternamente tentando.
- *
- * 8 minutos é suficiente para uma legenda
- * normal dentro da arquitetura gratuita.
- */
 const MAX_TRANSLATION_TIME_MS =
     Number(
         process.env.MAX_TRANSLATION_TIME_MS ||
         480_000
     );
 
-/*
-|--------------------------------------------------------------------------
-| LOTES
-|--------------------------------------------------------------------------
-*/
-
-/*
- * Tamanho de lote otimizado para reduzir
- * chamadas sem exagerar no tamanho da resposta.
- */
 const MAX_BATCH_CHARS =
     Number(
         process.env.MAX_BATCH_CHARS ||
         28_000
     );
 
-/*
- * IMPORTANTE:
- *
- * Não usamos somente caracteres.
- *
- * Também limitamos a quantidade de blocos.
- *
- * Isso evita situações como:
- *
- * Lote 1/5 - 352 blocos
- *
- * que eram ruins para a estabilidade.
- */
 const MAX_BATCH_BLOCKS =
     Number(
         process.env.MAX_BATCH_BLOCKS ||
         250
     );
 
-/*
-|--------------------------------------------------------------------------
-| GEMINI
-|--------------------------------------------------------------------------
-*/
-
-/*
- * Uma única requisição por vez.
- */
 const GEMINI_CONCURRENCY = 1;
 
-/*
- * Configurado no Render:
- *
- * MIN_REQUEST_INTERVAL_MS=3000
- */
 const MIN_REQUEST_INTERVAL_MS =
     Number(
         process.env.MIN_REQUEST_INTERVAL_MS ||
         3000
     );
 
-/*
- * É apenas um teto de saída, não uma quantidade
- * de tokens consumida obrigatoriamente.
- * 16k deixa folga para lotes de até 28k caracteres.
- */
 const MAX_OUTPUT_TOKENS =
     Number(
         process.env.MAX_OUTPUT_TOKENS ||
         16_000
     );
 
-/*
- * Não fazemos dezenas de retries normais.
- */
 const MAX_NORMAL_RETRIES = 2;
-
-/*
- * Resposta estrutural inválida pode ser dividida
- * em grupos progressivamente menores.
- *
- * A recuperação parcial de IDs é preferida e
- * normalmente evita chegar a este fallback.
- */
 const MAX_BAD_OUTPUT_SPLIT_DEPTH = 5;
-
-/*
- * Se até um único bloco vier com saída estrutural
- * inválida, permitimos uma tentativa estrutural extra.
- */
 const MAX_SINGLE_BLOCK_OUTPUT_RETRIES = 1;
-
-/*
- * Se recebermos 429, não ficamos martelando
- * a API.
- */
-const MAX_RATE_LIMIT_COOLDOWN_MS =
-    120_000;
-
-/*
-|--------------------------------------------------------------------------
-| CACHE
-|--------------------------------------------------------------------------
-*/
+const MAX_RATE_LIMIT_COOLDOWN_MS = 120_000;
 
 const CACHE_TTL_MS =
     7 * 24 * 60 * 60 * 1000;
@@ -194,17 +91,8 @@ const JOB_TTL_MS =
     24 * 60 * 60 * 1000;
 
 const MAX_CACHE_ENTRIES = 200;
-
 const MAX_JOBS = 300;
-
-/*
-|--------------------------------------------------------------------------
-| SEGURANÇA
-|--------------------------------------------------------------------------
-*/
-
-const MAX_SOURCE_CHARS =
-    800_000;
+const MAX_SOURCE_CHARS = 800_000;
 
 /*
 |--------------------------------------------------------------------------
@@ -212,48 +100,16 @@ const MAX_SOURCE_CHARS =
 |--------------------------------------------------------------------------
 */
 
-const translationCache =
-    new Map();
-
-const jobs =
-    new Map();
-
-/*
-|--------------------------------------------------------------------------
-| FILA DE JOBS COMPLETOS
-|--------------------------------------------------------------------------
-|
-| Apenas uma legenda inteira é traduzida por vez.
-|
-| Isso impede que OpenSubtitles e legenda embutida
-| alternem seus lotes e disputem a mesma fila Gemini.
-|
-| A fila individual do Gemini continua existindo
-| logo abaixo como segunda camada de proteção.
-|
-*/
+const translationCache = new Map();
+const jobs = new Map();
 
 const translationJobQueue = [];
-
-let translationJobWorkerRunning =
-    false;
-
-/*
-|--------------------------------------------------------------------------
-| FILA GLOBAL GEMINI
-|--------------------------------------------------------------------------
-*/
+let translationJobWorkerRunning = false;
 
 const geminiQueue = [];
-
-let geminiWorkerRunning =
-    false;
-
-let lastGeminiRequestAt =
-    0;
-
-let geminiCooldownUntil =
-    0;
+let geminiWorkerRunning = false;
+let lastGeminiRequestAt = 0;
+let geminiCooldownUntil = 0;
 
 /*
 |--------------------------------------------------------------------------
@@ -283,6 +139,20 @@ function translationTimeoutError() {
     return error;
 }
 
+function timestampIntegrityError(
+    message
+) {
+    const error =
+        new Error(
+            message
+        );
+
+    error.code =
+        "TIMESTAMP_INTEGRITY_ERROR";
+
+    return error;
+}
+
 function assertBeforeDeadline(
     deadlineAt
 ) {
@@ -290,8 +160,7 @@ function assertBeforeDeadline(
         Number.isFinite(
             deadlineAt
         ) &&
-        Date.now() >=
-            deadlineAt
+        Date.now() >= deadlineAt
     ) {
         throw translationTimeoutError();
     }
@@ -310,8 +179,7 @@ function remainingBeforeDeadline(
 
     return Math.max(
         0,
-        deadlineAt -
-            Date.now()
+        deadlineAt - Date.now()
     );
 }
 
@@ -325,9 +193,7 @@ async function sleepWithDeadline(
             Number(ms) || 0
         );
 
-    if (
-        safeMs === 0
-    ) {
+    if (safeMs === 0) {
         assertBeforeDeadline(
             deadlineAt
         );
@@ -344,12 +210,9 @@ async function sleepWithDeadline(
         Number.isFinite(
             remaining
         ) &&
-        remaining <=
-            safeMs
+        remaining <= safeMs
     ) {
-        if (
-            remaining > 0
-        ) {
+        if (remaining > 0) {
             await sleep(
                 remaining
             );
@@ -472,10 +335,6 @@ function isAuthorizedLocalBridge(
     const expectedBuffer =
         Buffer.from(expected);
 
-    /*
-     * timingSafeEqual exige buffers
-     * exatamente do mesmo tamanho.
-     */
     if (
         authBuffer.length !==
         expectedBuffer.length
@@ -526,17 +385,13 @@ async function fetchWithTimeout(
 
 /*
 |--------------------------------------------------------------------------
-| LIMPEZA
+| LIMPEZA DE MEMÓRIA
 |--------------------------------------------------------------------------
 */
 
 function cleanupMemory() {
-    const now =
-        Date.now();
+    const now = Date.now();
 
-    /*
-     * Cache expirado.
-     */
     for (
         const [
             key,
@@ -544,8 +399,7 @@ function cleanupMemory() {
         ] of translationCache.entries()
     ) {
         if (
-            item.expiresAt <=
-            now
+            item.expiresAt <= now
         ) {
             translationCache.delete(
                 key
@@ -553,9 +407,6 @@ function cleanupMemory() {
         }
     }
 
-    /*
-     * Jobs expirados.
-     */
     for (
         const [
             key,
@@ -563,8 +414,7 @@ function cleanupMemory() {
         ] of jobs.entries()
     ) {
         if (
-            job.expiresAt <=
-                now &&
+            job.expiresAt <= now &&
             job.status !==
                 "processing"
         ) {
@@ -572,9 +422,6 @@ function cleanupMemory() {
         }
     }
 
-    /*
-     * Limite do cache.
-     */
     while (
         translationCache.size >
         MAX_CACHE_ENTRIES
@@ -585,8 +432,7 @@ function cleanupMemory() {
                 .value;
 
         if (
-            key ===
-            undefined
+            key === undefined
         ) {
             break;
         }
@@ -596,14 +442,8 @@ function cleanupMemory() {
         );
     }
 
-    /*
-     * Limite dos jobs.
-     *
-     * Nunca removemos job em processamento.
-     */
     while (
-        jobs.size >
-        MAX_JOBS
+        jobs.size > MAX_JOBS
     ) {
         const key =
             jobs.keys()
@@ -611,14 +451,12 @@ function cleanupMemory() {
                 .value;
 
         if (
-            key ===
-            undefined
+            key === undefined
         ) {
             break;
         }
 
-        const job =
-            jobs.get(key);
+        const job = jobs.get(key);
 
         if (
             job &&
@@ -681,6 +519,179 @@ function stripCodeFences(
 
 /*
 |--------------------------------------------------------------------------
+| HIGIENIZAÇÃO CONSERVADORA DE CARACTERES - 5.7
+|--------------------------------------------------------------------------
+|
+| Regras deliberadamente estreitas:
+|
+| - mantém acentos, pontuação, emojis e símbolos musicais;
+| - mantém tags SRT comuns como <i>, <b> e <u>;
+| - converte espaços não separáveis em espaço normal;
+| - remove controles C0/C1 que não deveriam aparecer em diálogo;
+| - remove invisíveis conhecidos que costumam vazar de fontes externas;
+| - remove controles bidirecionais invisíveis;
+| - remove U+FFFD (replacement character), que indica texto corrompido;
+| - remove overrides ASS do tipo {\an8}, {\i1}, etc., pois podem ser
+|   exibidos literalmente quando o destino final é SRT.
+|
+| Não tentamos “consertar” mojibake visível de forma agressiva.
+|
+*/
+
+function createCharacterSanitizationStats() {
+    return {
+        controlChars: 0,
+        invisibleChars: 0,
+        normalizedSpaces: 0,
+        replacementChars: 0,
+        assTags: 0,
+        nfcChanges: 0
+    };
+}
+
+function addCharacterSanitizationStats(
+    target,
+    source
+) {
+    for (
+        const key of Object.keys(
+            target
+        )
+    ) {
+        target[key] +=
+            Number(
+                source?.[key] || 0
+            );
+    }
+
+    return target;
+}
+
+function sanitizeSubtitleText(
+    value
+) {
+    const stats =
+        createCharacterSanitizationStats();
+
+    let text =
+        String(
+            value ?? ""
+        );
+
+    const normalizedNfc =
+        text.normalize("NFC");
+
+    if (
+        normalizedNfc !== text
+    ) {
+        stats.nfcChanges++;
+        text = normalizedNfc;
+    }
+
+    text =
+        text.replace(
+            /[\u00A0\u202F]/gu,
+            () => {
+                stats.normalizedSpaces++;
+                return " ";
+            }
+        );
+
+    text =
+        text.replace(
+            /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu,
+            () => {
+                stats.controlChars++;
+                return "";
+            }
+        );
+
+    text =
+        text.replace(
+            /[\u00AD\u200B\u2060\uFEFF]/gu,
+            () => {
+                stats.invisibleChars++;
+                return "";
+            }
+        );
+
+    text =
+        text.replace(
+            /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
+            () => {
+                stats.invisibleChars++;
+                return "";
+            }
+        );
+
+    text =
+        text.replace(
+            /\uFFFD/gu,
+            () => {
+                stats.replacementChars++;
+                return "";
+            }
+        );
+
+    text =
+        text.replace(
+            /\{\\[^}\r\n]*\}/gu,
+            () => {
+                stats.assTags++;
+                return "";
+            }
+        );
+
+    text =
+        text
+            .split("\n")
+            .map(
+                line =>
+                    line
+                        .replace(
+                            /[ \t]{2,}/g,
+                            " "
+                        )
+                        .trimEnd()
+            )
+            .join("\n")
+            .trim();
+
+    return {
+        text,
+        stats
+    };
+}
+
+function characterSanitizationTotal(
+    stats
+) {
+    return (
+        stats.controlChars +
+        stats.invisibleChars +
+        stats.normalizedSpaces +
+        stats.replacementChars +
+        stats.assTags +
+        stats.nfcChanges
+    );
+}
+
+function logCharacterSanitization(
+    stage,
+    stats
+) {
+    const total =
+        characterSanitizationTotal(
+            stats
+        );
+
+    console.log(
+        `[CLEAN CHAR] ${stage}: ${total} ajuste(s); controles=${stats.controlChars}, invisíveis=${stats.invisibleChars}, espaços=${stats.normalizedSpaces}, replacement=${stats.replacementChars}, ASS=${stats.assTags}, NFC=${stats.nfcChanges}.`
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
 | LIMPEZA SDH / CC
 |--------------------------------------------------------------------------
 */
@@ -692,22 +703,6 @@ const SDH_CUE_WORDS =
 |--------------------------------------------------------------------------
 | CONTEXTO OCULTO DE FALANTE - 5.6
 |--------------------------------------------------------------------------
-|
-| Algumas fontes trazem informações úteis como:
-|
-| [Adam] I'm excited.
-| KELLY: I loved it.
-|
-| Antes nós removíamos isso para deixar a legenda limpa e a informação
-| desaparecia completamente antes de chegar ao Gemini.
-|
-| Agora preservamos o nome apenas INTERNAMENTE em um marcador que nunca
-| aparece na legenda final. O parser remove o marcador e envia o nome ao
-| Gemini no campo opcional "speaker".
-|
-| Se um bloco tiver dois nomes diferentes, não atribuímos um único falante
-| ao bloco inteiro, evitando fornecer contexto incorreto.
-|
 */
 
 const SPEAKER_HINT_MARKER_REGEX =
@@ -737,9 +732,6 @@ function normalizeSpeakerHint(
         return "";
     }
 
-    /*
-     * Não confundimos rubricas SDH com nomes.
-     */
     if (
         SDH_CUE_WORDS.test(
             speaker
@@ -748,9 +740,6 @@ function normalizeSpeakerHint(
         return "";
     }
 
-    /*
-     * Evita guardar frases completas como se fossem nome.
-     */
     if (
         /[!?;]/u.test(
             speaker
@@ -796,10 +785,6 @@ function extractSpeakerHint(
             line || ""
         );
 
-    /*
-     * Marcador interno já existente.
-     * Isso torna a limpeza idempotente.
-     */
     const hiddenMatch =
         original.match(
             SPEAKER_HINT_MARKER_REGEX
@@ -822,10 +807,6 @@ function extractSpeakerHint(
         };
     }
 
-    /*
-     * [Adam] Hello
-     * - [Kelly Clarkson] Hello
-     */
     const bracketMatch =
         original.match(
             /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*/u
@@ -848,13 +829,6 @@ function extractSpeakerHint(
         }
     }
 
-    /*
-     * ADAM: Hello
-     * Kelly Clarkson: Hello
-     *
-     * Esta heurística é conservadora e usa apenas o prefixo curto
-     * que o próprio limpador já tratava como rótulo de falante.
-     */
     const colonMatch =
         original.match(
             /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50}):\s+(?=\S)/u
@@ -878,9 +852,7 @@ function extractSpeakerHint(
     }
 
     return {
-        speaker:
-            "",
-
+        speaker: "",
         lineForCleaning:
             original
     };
@@ -890,21 +862,6 @@ function extractSpeakerHint(
 |--------------------------------------------------------------------------
 | NORMALIZAÇÃO DE ALONGAMENTOS VOCAIS - 5.6
 |--------------------------------------------------------------------------
-|
-| A duração de uma nota ou de uma sílaba já é transmitida pelo áudio.
-| A legenda deve mostrar a palavra, não desenhar a duração da voz.
-|
-| Exemplos:
-|
-| casa-a-a-a-a-a  -> casa
-| ce-e-e-e-e-rto  -> certo
-| ye-e-e-e-es      -> yes
-| nãããããão         -> não   (pós-tradução)
-|
-| A regra com hífen é extremamente específica: só colapsa a MESMA letra
-| repetida várias vezes. Portanto não mexe em palavras normais como
-| "bem-vindo", "guarda-chuva" ou "segunda-feira".
-|
 */
 
 function normalizeHyphenatedVocalElongations(
@@ -926,13 +883,6 @@ function normalizeTranslatedVocalElongations(
             text
         );
 
-    /*
-     * Depois da tradução, quatro ou mais vogais idênticas consecutivas
-     * são quase sempre representação visual de voz prolongada.
-     *
-     * O limiar de 4 é deliberadamente conservador: não toca em palavras
-     * legítimas com vogal dupla, como "voo", "enjoo" ou "creem".
-     */
     result =
         result.replace(
             /([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{3,}/gu,
@@ -954,22 +904,12 @@ function cleanDialogueLine(
         return "";
     }
 
-    /*
-     * [Heidi] Hello
-     * [laughing]
-     * Hello [laughs]
-     */
     text =
         text.replace(
             /\s*\[[^\]]+\]\s*/gu,
             " "
         );
 
-    /*
-     * Remove rubricas entre parênteses apenas
-     * quando parecem descrição de som/ação.
-     * Não apaga qualquer texto entre parênteses.
-     */
     text =
         text.replace(
             /\s*\(([^)]*)\)\s*/gu,
@@ -986,11 +926,6 @@ function cleanDialogueLine(
                     : match
         );
 
-    /*
-     * PRODUCER: Hello
-     * HEIDI: Hello
-     * Lucas: Hello
-     */
     text =
         text.replace(
             /^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,
@@ -1005,10 +940,6 @@ function cleanDialogueLine(
             )
             .trim();
 
-    /*
-     * Linhas que ficaram somente com marcação
-     * de diálogo ou símbolos musicais.
-     */
     if (
         /^[-–—♪♫♬\s]*$/u.test(
             text
@@ -1018,6 +949,181 @@ function cleanDialogueLine(
     }
 
     return text;
+}
+
+/*
+|--------------------------------------------------------------------------
+| AUDITORIA ABSOLUTA DE TIMESTAMPS - 5.7
+|--------------------------------------------------------------------------
+|
+| Existem duas barreiras:
+|
+| 1. RAW -> CLEAN:
+|    cada timing que sobrevive à limpeza precisa existir EXATAMENTE,
+|    byte por byte depois do trim, na fonte original e na mesma ordem.
+|
+| 2. SOURCE -> FINAL:
+|    quantidade de blocos, índices e linhas de timing precisam ser
+|    exatamente iguais. Qualquer divergência faz o job falhar em vez de
+|    servir uma legenda com tempo alterado.
+|
+*/
+
+const TIMING_LINE_REGEX =
+    /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
+
+function extractTimingLines(
+    srt
+) {
+    return String(
+        srt || ""
+    )
+        .replace(
+            /\r\n/g,
+            "\n"
+        )
+        .replace(
+            /\r/g,
+            "\n"
+        )
+        .split("\n")
+        .map(
+            line =>
+                line.trim()
+        )
+        .filter(
+            line =>
+                TIMING_LINE_REGEX.test(
+                    line
+                )
+        );
+}
+
+function timingSignature(
+    timings
+) {
+    return sha256(
+        JSON.stringify(
+            timings
+        )
+    ).slice(
+        0,
+        16
+    );
+}
+
+function auditCleaningTimestamps(
+    rawSrt,
+    cleanedSrt,
+    label = "SOURCE"
+) {
+    const rawTimings =
+        extractTimingLines(
+            rawSrt
+        );
+
+    const cleanedTimings =
+        extractTimingLines(
+            cleanedSrt
+        );
+
+    let cursor = 0;
+
+    for (
+        let i = 0;
+        i < cleanedTimings.length;
+        i++
+    ) {
+        const wanted =
+            cleanedTimings[i];
+
+        while (
+            cursor < rawTimings.length &&
+            rawTimings[cursor] !== wanted
+        ) {
+            cursor++;
+        }
+
+        if (
+            cursor >= rawTimings.length
+        ) {
+            throw timestampIntegrityError(
+                `Auditoria de timestamps falhou na limpeza (${label}) no bloco preservado ${i + 1}.`
+            );
+        }
+
+        cursor++;
+    }
+
+    console.log(
+        `[AUDIT TIMESTAMP] ${label} RAW->CLEAN: OK — ${cleanedTimings.length}/${rawTimings.length} timing(s) preservado(s) exatamente; removidos=${rawTimings.length - cleanedTimings.length}; assinatura=${timingSignature(cleanedTimings)}.`
+    );
+
+    return true;
+}
+
+function auditFinalTimestamps(
+    sourceSrt,
+    finalSrt,
+    label = "FINAL"
+) {
+    const sourceBlocks =
+        parseSrt(
+            sourceSrt
+        );
+
+    const finalBlocks =
+        parseSrt(
+            finalSrt
+        );
+
+    if (
+        sourceBlocks.length !==
+        finalBlocks.length
+    ) {
+        throw timestampIntegrityError(
+            `Auditoria de timestamps falhou (${label}): fonte=${sourceBlocks.length} blocos, final=${finalBlocks.length} blocos.`
+        );
+    }
+
+    for (
+        let i = 0;
+        i < sourceBlocks.length;
+        i++
+    ) {
+        const source =
+            sourceBlocks[i];
+
+        const final =
+            finalBlocks[i];
+
+        if (
+            source.index !==
+                final.index ||
+            source.timing !==
+                final.timing
+        ) {
+            throw timestampIntegrityError(
+                `Auditoria de timestamps falhou (${label}) no bloco ${i + 1}: índice/timing divergente.`
+            );
+        }
+    }
+
+    const signature =
+        timingSignature(
+            sourceBlocks.map(
+                block => [
+                    block.index,
+                    block.timing
+                ]
+            )
+        );
+
+    console.log(
+        `[AUDIT TIMESTAMP] ${label}: OK — ${sourceBlocks.length}/${sourceBlocks.length} bloco(s), 0 alteração(ões), assinatura=${signature}.`
+    );
+
+    return true;
 }
 
 function cleanSrtForTranslation(
@@ -1043,6 +1149,9 @@ function cleanSrtForTranslation(
     let changedLines = 0;
     let speakerHintBlocks = 0;
     let elongatedLines = 0;
+
+    const characterStats =
+        createCharacterSanitizationStats();
 
     for (
         const rawBlock
@@ -1095,10 +1204,23 @@ function cleanSrtForTranslation(
                 );
             }
 
-            const cleanedBeforeElongation =
+            const cleanedBeforeCharacters =
                 cleanDialogueLine(
                     speakerInfo.lineForCleaning
                 );
+
+            const sanitized =
+                sanitizeSubtitleText(
+                    cleanedBeforeCharacters
+                );
+
+            addCharacterSanitizationStats(
+                characterStats,
+                sanitized.stats
+            );
+
+            const cleanedBeforeElongation =
+                sanitized.text;
 
             const cleaned =
                 normalizeHyphenatedVocalElongations(
@@ -1127,25 +1249,16 @@ function cleanSrtForTranslation(
         }
 
         if (
-            cleanedDialogue.length ===
-            0
+            cleanedDialogue.length === 0
         ) {
             removedBlocks++;
             continue;
         }
 
-        /*
-         * Só preservamos um speakerHint quando há exatamente
-         * um único nome confiável no bloco inteiro.
-         */
-        let speakerHint =
-            "";
-
         if (
-            speakerHints.size ===
-            1
+            speakerHints.size === 1
         ) {
-            speakerHint =
+            const speakerHint =
                 Array.from(
                     speakerHints
                 )[0];
@@ -1193,9 +1306,25 @@ function cleanSrtForTranslation(
         `[CLEAN] Alongamentos vocais na fonte: ${elongatedLines} linha(s) normalizada(s).`
     );
 
-    return result
-        ? result + "\n"
-        : "";
+    logCharacterSanitization(
+        "FONTE",
+        characterStats
+    );
+
+    const finalResult =
+        result
+            ? result + "\n"
+            : "";
+
+    if (finalResult) {
+        auditCleaningTimestamps(
+            normalized,
+            finalResult,
+            "FONTE"
+        );
+    }
+
+    return finalResult;
 }
 
 /*
@@ -1230,8 +1359,7 @@ function parseSrt(srt) {
             block.split("\n");
 
         if (
-            lines.length <
-            3
+            lines.length < 3
         ) {
             continue;
         }
@@ -1251,7 +1379,7 @@ function parseSrt(srt) {
         }
 
         if (
-            !/^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/.test(
+            !TIMING_LINE_REGEX.test(
                 timingLine
             )
         ) {
@@ -1261,12 +1389,10 @@ function parseSrt(srt) {
         const textLines =
             lines.slice(2);
 
-        let speakerHint =
-            "";
+        let speakerHint = "";
 
         if (
-            textLines.length >
-            0
+            textLines.length > 0
         ) {
             const markerMatch =
                 textLines[0].match(
@@ -1297,12 +1423,10 @@ function parseSrt(srt) {
                 timingLine,
 
             text:
-                textLines
-                    .join("\n"),
+                textLines.join("\n"),
 
             speakerHint:
-                speakerHint ||
-                null
+                speakerHint || null
         });
     }
 
@@ -1311,27 +1435,59 @@ function parseSrt(srt) {
 
 /*
 |--------------------------------------------------------------------------
+| LIMPEZA DE CARACTERES APÓS TRADUÇÃO - 5.7
+|--------------------------------------------------------------------------
+*/
+
+function cleanAllTranslatedCharacters(
+    translatedTexts
+) {
+    const stats =
+        createCharacterSanitizationStats();
+
+    let changedBlocks = 0;
+
+    const cleaned =
+        translatedTexts.map(
+            text => {
+                const original =
+                    String(
+                        text ?? ""
+                    );
+
+                const sanitized =
+                    sanitizeSubtitleText(
+                        original
+                    );
+
+                addCharacterSanitizationStats(
+                    stats,
+                    sanitized.stats
+                );
+
+                if (
+                    sanitized.text !==
+                    original
+                ) {
+                    changedBlocks++;
+                }
+
+                return sanitized.text;
+            }
+        );
+
+    logCharacterSanitization(
+        `TRADUÇÃO (${changedBlocks} bloco(s) alterado(s))`,
+        stats
+    );
+
+    return cleaned;
+}
+
+/*
+|--------------------------------------------------------------------------
 | LIMPEZA DE MARCADORES DE DIÁLOGO TRADUZIDOS
 |--------------------------------------------------------------------------
-|
-| Remove hífen, meia-risca, travessão ou barra quando aparecem apenas
-| como marcador solto no começo de uma fala.
-|
-| Exemplo:
-|
-| - Eu não acredito nisso.
-|
-| vira:
-|
-| Eu não acredito nisso.
-|
-| Mas um bloco com dois falantes continua preservado:
-|
-| - Você está pronta?
-| - Estou.
-|
-| Assim não destruímos a indicação real de troca de falante.
-|
 */
 
 function cleanTranslatedDialogueMarkers(
@@ -1351,22 +1507,16 @@ function cleanTranslatedDialogueMarkers(
             );
 
     const lines =
-        normalized.split(
-            "\n"
-        );
+        normalized.split("\n");
 
     const markerRegex =
         /^\s*[-–—/]+\s+(?=\S)/u;
 
-    let markedDialogueLines =
-        0;
-
-    let nonEmptyLines =
-        0;
+    let markedDialogueLines = 0;
+    let nonEmptyLines = 0;
 
     for (
-        const line
-        of lines
+        const line of lines
     ) {
         if (
             line.trim()
@@ -1383,10 +1533,6 @@ function cleanTranslatedDialogueMarkers(
         }
     }
 
-    /*
-     * Dois ou mais marcadores em linhas distintas
-     * normalmente significam troca real de falantes.
-     */
     const isRealMultiSpeakerBlock =
         nonEmptyLines >= 2 &&
         markedDialogueLines >= 2;
@@ -1411,8 +1557,7 @@ function cleanTranslatedDialogueMarkers(
 function cleanAllTranslatedDialogueMarkers(
     translatedTexts
 ) {
-    let changedBlocks =
-        0;
+    let changedBlocks = 0;
 
     const cleaned =
         translatedTexts.map(
@@ -1428,8 +1573,7 @@ function cleanAllTranslatedDialogueMarkers(
                     );
 
                 if (
-                    result !==
-                    original
+                    result !== original
                 ) {
                     changedBlocks++;
                 }
@@ -1445,17 +1589,10 @@ function cleanAllTranslatedDialogueMarkers(
     return cleaned;
 }
 
-/*
-|--------------------------------------------------------------------------
-| POLIMENTO DE ALONGAMENTOS NA TRADUÇÃO - 5.6
-|--------------------------------------------------------------------------
-*/
-
 function cleanAllTranslatedVocalElongations(
     translatedTexts
 ) {
-    let changedBlocks =
-        0;
+    let changedBlocks = 0;
 
     const cleaned =
         translatedTexts.map(
@@ -1471,8 +1608,7 @@ function cleanAllTranslatedVocalElongations(
                     );
 
                 if (
-                    result !==
-                    original
+                    result !== original
                 ) {
                     changedBlocks++;
                 }
@@ -1534,20 +1670,15 @@ function setTranslationCache(
     key,
     srt
 ) {
-    const now =
-        Date.now();
+    const now = Date.now();
 
     translationCache.set(
         key,
         {
             srt,
-
-            createdAt:
-                now,
-
+            createdAt: now,
             expiresAt:
-                now +
-                CACHE_TTL_MS
+                now + CACHE_TTL_MS
         }
     );
 
@@ -1584,23 +1715,13 @@ function getTranslationCache(
 |--------------------------------------------------------------------------
 | DIVISÃO INTELIGENTE DE LOTES
 |--------------------------------------------------------------------------
-|
-| Usa DOIS limites:
-|
-| 1. máximo de caracteres
-| 2. máximo de blocos
-|
-| O primeiro limite atingido encerra o lote.
-|--------------------------------------------------------------------------
 */
 
 function splitIntoBatches(
     blocks
 ) {
     const batches = [];
-
     let current = [];
-
     let currentChars = 0;
 
     for (
@@ -1608,21 +1729,14 @@ function splitIntoBatches(
     ) {
         const text =
             String(
-                block.text ||
-                ""
+                block.text || ""
             );
 
-        /*
-         * Estimativa de tamanho do objeto
-         * enviado ao Gemini.
-         */
         const blockChars =
-            text.length +
-            50;
+            text.length + 50;
 
         const wouldExceedChars =
-            current.length >
-                0 &&
+            current.length > 0 &&
             currentChars +
                 blockChars >
                 MAX_BATCH_CHARS;
@@ -1640,7 +1754,6 @@ function splitIntoBatches(
             );
 
             current = [];
-
             currentChars = 0;
         }
 
@@ -1653,8 +1766,7 @@ function splitIntoBatches(
     }
 
     if (
-        current.length >
-        0
+        current.length > 0
     ) {
         batches.push(
             current
@@ -1666,7 +1778,7 @@ function splitIntoBatches(
 
 /*
 |--------------------------------------------------------------------------
-| COOLDOWN
+| COOLDOWN / RETRY-AFTER / RATE LIMIT
 |--------------------------------------------------------------------------
 */
 
@@ -1684,23 +1796,19 @@ function setGeminiCooldown(
     const safeMs =
         Math.min(
             Math.max(
-                Number(ms) ||
-                    30_000,
+                Number(ms) || 30_000,
                 1000
             ),
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
 
     const until =
-        Date.now() +
-        safeMs;
+        Date.now() + safeMs;
 
     if (
-        until >
-        geminiCooldownUntil
+        until > geminiCooldownUntil
     ) {
-        geminiCooldownUntil =
-            until;
+        geminiCooldownUntil = until;
     }
 
     console.log(
@@ -1709,12 +1817,6 @@ function setGeminiCooldown(
         )}s.`
     );
 }
-
-/*
-|--------------------------------------------------------------------------
-| RETRY-AFTER
-|--------------------------------------------------------------------------
-*/
 
 function getRetryAfterMs(
     response,
@@ -1736,8 +1838,7 @@ function getRetryAfterMs(
             seconds > 0
         ) {
             return Math.min(
-                seconds *
-                    1000,
+                seconds * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
             );
         }
@@ -1745,16 +1846,10 @@ function getRetryAfterMs(
 
     const message =
         String(
-            errorData?.error
-                ?.message ||
-                ""
+            errorData?.error?.message ||
+            ""
         );
 
-    /*
-     * Exemplo:
-     *
-     * Please retry in 51.98s.
-     */
     const secondsMatch =
         message.match(
             /retry in\s+([\d.]+)s/i
@@ -1774,18 +1869,12 @@ function getRetryAfterMs(
             )
         ) {
             return Math.min(
-                (seconds + 1) *
-                    1000,
+                (seconds + 1) * 1000,
                 MAX_RATE_LIMIT_COOLDOWN_MS
             );
         }
     }
 
-    /*
-     * Exemplo:
-     *
-     * retry in 2m30s
-     */
     const minuteSecondMatch =
         message.match(
             /retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i
@@ -1801,27 +1890,19 @@ function getRetryAfterMs(
 
         const seconds =
             Number(
-                minuteSecondMatch[2] ||
-                    0
+                minuteSecondMatch[2] || 0
             );
 
         return Math.min(
             (
-                minutes *
-                    60 +
+                minutes * 60 +
                 seconds +
                 1
-            ) *
-                1000,
+            ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
 
-    /*
-     * Exemplo:
-     *
-     * retry in 2m
-     */
     const minuteMatch =
         message.match(
             /retry in\s+(\d+)m/i
@@ -1834,27 +1915,15 @@ function getRetryAfterMs(
             (
                 Number(
                     minuteMatch[1]
-                ) *
-                    60 +
+                ) * 60 +
                 1
-            ) *
-                1000,
+            ) * 1000,
             MAX_RATE_LIMIT_COOLDOWN_MS
         );
     }
 
-    /*
-     * Se a API não disser quanto tempo,
-     * esperamos 30 segundos.
-     */
     return 30_000;
 }
-
-/*
-|--------------------------------------------------------------------------
-| DETECÇÃO DE RATE LIMIT
-|--------------------------------------------------------------------------
-*/
 
 function isRateLimitError(
     status,
@@ -1931,13 +2000,10 @@ async function rawGeminiRequest(
 
         contents: [
             {
-                role:
-                    "user",
-
+                role: "user",
                 parts: [
                     {
-                        text:
-                            prompt
+                        text: prompt
                     }
                 ]
             }
@@ -1948,22 +2014,18 @@ async function rawGeminiRequest(
                 "application/json",
 
             responseSchema: {
-                type:
-                    "ARRAY",
+                type: "ARRAY",
 
                 items: {
-                    type:
-                        "OBJECT",
+                    type: "OBJECT",
 
                     properties: {
                         id: {
-                            type:
-                                "INTEGER"
+                            type: "INTEGER"
                         },
 
                         text: {
-                            type:
-                                "STRING"
+                            type: "STRING"
                         }
                     },
 
@@ -2023,8 +2085,7 @@ async function rawGeminiRequest(
             await fetch(
                 endpoint,
                 {
-                    method:
-                        "POST",
+                    method: "POST",
 
                     headers: {
                         "Content-Type":
@@ -2053,17 +2114,14 @@ async function rawGeminiRequest(
             Number.isFinite(
                 deadlineAt
             ) &&
-            Date.now() >=
-                deadlineAt
+            Date.now() >= deadlineAt
         ) {
             throw translationTimeoutError();
         }
 
         throw error;
     } finally {
-        clearTimeout(
-            timer
-        );
+        clearTimeout(timer);
     }
 
     assertBeforeDeadline(
@@ -2073,10 +2131,7 @@ async function rawGeminiRequest(
     let data;
 
     try {
-        data =
-            JSON.parse(
-                rawText
-            );
+        data = JSON.parse(rawText);
     } catch {
         const error =
             new Error(
@@ -2093,14 +2148,11 @@ async function rawGeminiRequest(
         !response.ok
     ) {
         const message =
-            data?.error
-                ?.message ||
+            data?.error?.message ||
             `HTTP ${response.status}`;
 
         const error =
-            new Error(
-                message
-            );
+            new Error(message);
 
         error.status =
             response.status;
@@ -2127,8 +2179,7 @@ async function rawGeminiRequest(
             ?.content?.parts
             ?.map(
                 part =>
-                    part?.text ||
-                    ""
+                    part?.text || ""
             )
             .join("")
             .trim();
@@ -2171,14 +2222,12 @@ function enqueueGemini(
                 return;
             }
 
-            geminiQueue.push(
-                {
-                    prompt,
-                    deadlineAt,
-                    resolve,
-                    reject
-                }
-            );
+            geminiQueue.push({
+                prompt,
+                deadlineAt,
+                resolve,
+                reject
+            });
 
             processGeminiQueue();
         }
@@ -2192,13 +2241,11 @@ async function processGeminiQueue() {
         return;
     }
 
-    geminiWorkerRunning =
-        true;
+    geminiWorkerRunning = true;
 
     try {
         while (
-            geminiQueue.length >
-            0
+            geminiQueue.length > 0
         ) {
             const item =
                 geminiQueue.shift();
@@ -2253,8 +2300,7 @@ async function processGeminiQueue() {
                         lastGeminiRequestAt;
 
                     if (
-                        lastGeminiRequestAt >
-                            0 &&
+                        lastGeminiRequestAt > 0 &&
                         sinceLast <
                             MIN_REQUEST_INTERVAL_MS
                     ) {
@@ -2273,9 +2319,7 @@ async function processGeminiQueue() {
                     );
 
                     console.log(
-                        `[GEMINI] Request ${normalAttempt}/${
-                            MAX_NORMAL_RETRIES + 1
-                        }`
+                        `[GEMINI] Request ${normalAttempt}/${MAX_NORMAL_RETRIES + 1}`
                     );
 
                     lastGeminiRequestAt =
@@ -2287,18 +2331,14 @@ async function processGeminiQueue() {
                             item.deadlineAt
                         );
 
-                    item.resolve(
-                        result
-                    );
-
-                    finished =
-                        true;
+                    item.resolve(result);
+                    finished = true;
                 } catch (
                     error
                 ) {
                     if (
                         error?.code ===
-                        "TRANSLATION_TIMEOUT" ||
+                            "TRANSLATION_TIMEOUT" ||
                         (
                             Number.isFinite(
                                 item.deadlineAt
@@ -2311,9 +2351,7 @@ async function processGeminiQueue() {
                             translationTimeoutError()
                         );
 
-                        finished =
-                            true;
-
+                        finished = true;
                         continue;
                     }
 
@@ -2340,11 +2378,6 @@ async function processGeminiQueue() {
                             cooldownMs
                         );
 
-                        /*
-                         * Rate limit não consome uma tentativa normal.
-                         * Esperamos o cooldown e tentamos de novo,
-                         * sempre respeitando o deadline do job.
-                         */
                         continue;
                     }
 
@@ -2376,29 +2409,22 @@ async function processGeminiQueue() {
                                 timeoutError
                             );
 
-                            finished =
-                                true;
+                            finished = true;
                         }
 
                         continue;
                     }
 
-                    item.reject(
-                        error
-                    );
-
-                    finished =
-                        true;
+                    item.reject(error);
+                    finished = true;
                 }
             }
         }
     } finally {
-        geminiWorkerRunning =
-            false;
+        geminiWorkerRunning = false;
 
         if (
-            geminiQueue.length >
-            0
+            geminiQueue.length > 0
         ) {
             processGeminiQueue();
         }
@@ -2407,7 +2433,7 @@ async function processGeminiQueue() {
 
 /*
 |--------------------------------------------------------------------------
-| PROMPT
+| PROMPT - MANTIDO DA 5.6
 |--------------------------------------------------------------------------
 */
 
@@ -2418,18 +2444,10 @@ function buildTranslationPrompt(
         blocks.map(
             block => {
                 const item = {
-                    id:
-                        block.index,
-
-                    text:
-                        block.text
+                    id: block.index,
+                    text: block.text
                 };
 
-                /*
-                 * speaker é CONTEXTO OCULTO.
-                 * Só aparece quando a fonte realmente ofereceu
-                 * uma identificação confiável de falante.
-                 */
                 if (
                     block.speakerHint
                 ) {
@@ -2543,9 +2561,7 @@ function badModelOutputError(
     message
 ) {
     const error =
-        new Error(
-            message
-        );
+        new Error(message);
 
     error.code =
         "BAD_MODEL_OUTPUT";
@@ -2597,12 +2613,6 @@ async function translateBatchOnce(
         );
     }
 
-    /*
-     * Só aceitamos IDs que realmente pertencem
-     * ao lote enviado.
-     *
-     * IDs inventados pelo modelo são ignorados.
-     */
     const requestedIds =
         new Set(
             blocks.map(
@@ -2627,8 +2637,7 @@ async function translateBatchOnce(
             ) &&
             typeof item.text ===
                 "string" &&
-            item.text.trim().length >
-                0
+            item.text.trim().length > 0
         ) {
             translatedById.set(
                 item.id,
@@ -2637,28 +2646,14 @@ async function translateBatchOnce(
         }
     }
 
-    /*
-     * Se nenhum ID solicitado voltou corretamente,
-     * tratamos como saída estrutural inválida.
-     *
-     * Nesse caso o fallback de divisão entra em ação.
-     */
     if (
-        translatedById.size ===
-        0
+        translatedById.size === 0
     ) {
         throw badModelOutputError(
             "Gemini não devolveu nenhum bloco válido solicitado."
         );
     }
 
-    /*
-     * IMPORTANTE - 5.4:
-     *
-     * Não jogamos fora uma resposta parcialmente boa.
-     * Se o Gemini devolveu 247 de 250 IDs, guardamos
-     * os 247 e pedimos novamente APENAS os 3 ausentes.
-     */
     const missingBlocks =
         blocks.filter(
             block =>
@@ -2705,14 +2700,8 @@ async function translateBatch(
             deadlineAt
         );
 
-        /*
-         * Se sobrou apenas um bloco e a estrutura
-         * ainda veio inválida, fazemos uma tentativa
-         * estrutural extra antes de desistir.
-         */
         if (
-            blocks.length ===
-                1 &&
+            blocks.length === 1 &&
             singleBlockRetry <
                 MAX_SINGLE_BLOCK_OUTPUT_RETRIES
         ) {
@@ -2728,17 +2717,8 @@ async function translateBatch(
             );
         }
 
-        /*
-         * Para JSON totalmente inválido ou resposta
-         * sem nenhum ID útil, dividimos o lote.
-         *
-         * Diferente da 5.3, não existe mais o corte
-         * fixo de 80 blocos que fez um lote de 63
-         * falhar imediatamente.
-         */
         const canSplit =
-            blocks.length >
-                1 &&
+            blocks.length > 1 &&
             splitDepth <
                 MAX_BAD_OUTPUT_SPLIT_DEPTH;
 
@@ -2788,12 +2768,8 @@ async function translateBatch(
         ];
     }
 
-    /*
-     * Resposta completa: caminho normal.
-     */
     if (
-        result.missingBlocks.length ===
-        0
+        result.missingBlocks.length === 0
     ) {
         return blocks.map(
             block =>
@@ -2803,10 +2779,6 @@ async function translateBatch(
         );
     }
 
-    /*
-     * Resposta parcial: recuperamos SOMENTE
-     * os IDs que faltaram.
-     */
     const receivedCount =
         blocks.length -
         result.missingBlocks.length;
@@ -2832,8 +2804,7 @@ async function translateBatch(
 
     for (
         let i = 0;
-        i <
-            result.missingBlocks.length;
+        i < result.missingBlocks.length;
         i++
     ) {
         recoveredById.set(
@@ -2897,8 +2868,7 @@ async function translateSrt(
         );
 
     if (
-        blocks.length ===
-        0
+        blocks.length === 0
     ) {
         throw new Error(
             "Nenhum bloco SRT válido."
@@ -2942,15 +2912,8 @@ async function translateSrt(
         }
     );
 
-    const startedAt =
-        Date.now();
+    const startedAt = Date.now();
 
-    /*
-     * O teto total nasce junto com o job.
-     *
-     * Portanto o tempo aguardando na fila de jobs
-     * também conta para o limite absoluto de 8 minutos.
-     */
     const deadlineAt =
         Number.isFinite(
             job?.deadlineAt
@@ -2959,8 +2922,7 @@ async function translateSrt(
             : startedAt +
               MAX_TRANSLATION_TIME_MS;
 
-    job.startedAt =
-        startedAt;
+    job.startedAt = startedAt;
 
     if (
         !Number.isFinite(
@@ -2977,8 +2939,7 @@ async function translateSrt(
 
     for (
         let batchIndex = 0;
-        batchIndex <
-            batches.length;
+        batchIndex < batches.length;
         batchIndex++
     ) {
         assertBeforeDeadline(
@@ -2986,9 +2947,7 @@ async function translateSrt(
         );
 
         const batch =
-            batches[
-                batchIndex
-            ];
+            batches[batchIndex];
 
         const batchChars =
             batch.reduce(
@@ -2998,20 +2957,13 @@ async function translateSrt(
                 ) =>
                     total +
                     String(
-                        block.text ||
-                            ""
+                        block.text || ""
                     ).length,
                 0
             );
 
         console.log(
-            `[TRANSLATE] Lote ${
-                batchIndex + 1
-            }/${batches.length} - ${
-                batch.length
-            } blocos / ${
-                batchChars
-            } caracteres.`
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} - ${batch.length} blocos / ${batchChars} caracteres.`
         );
 
         const translated =
@@ -3036,12 +2988,11 @@ async function translateSrt(
 
             if (
                 originalIndex !==
-                    undefined
+                undefined
             ) {
                 translatedTexts[
                     originalIndex
-                ] =
-                    translated[i];
+                ] = translated[i];
             }
         }
 
@@ -3049,12 +3000,10 @@ async function translateSrt(
             Math.round(
                 (
                     (
-                        batchIndex +
-                        1
+                        batchIndex + 1
                     ) /
                     batches.length
-                ) *
-                    100
+                ) * 100
             );
 
         job.completedBatches =
@@ -3063,13 +3012,10 @@ async function translateSrt(
         job.totalBatches =
             batches.length;
 
-        job.updatedAt =
-            Date.now();
+        job.updatedAt = Date.now();
 
         console.log(
-            `[TRANSLATE] Lote ${
-                batchIndex + 1
-            }/${batches.length} concluído.`
+            `[TRANSLATE] Lote ${batchIndex + 1}/${batches.length} concluído.`
         );
     }
 
@@ -3086,16 +3032,20 @@ async function translateSrt(
     }
 
     const elapsedMs =
-        Date.now() -
-        startedAt;
+        Date.now() - startedAt;
 
     console.log(
         `[TRANSLATE] Finalizada em ${(elapsedMs / 1000).toFixed(1)}s.`
     );
 
+    const sanitizedTranslatedTexts =
+        cleanAllTranslatedCharacters(
+            translatedTexts
+        );
+
     const withoutVocalElongations =
         cleanAllTranslatedVocalElongations(
-            translatedTexts
+            sanitizedTranslatedTexts
         );
 
     const cleanedTranslatedTexts =
@@ -3103,10 +3053,21 @@ async function translateSrt(
             withoutVocalElongations
         );
 
-    return buildSrt(
-        blocks,
-        cleanedTranslatedTexts
+    const finalSrt =
+        buildSrt(
+            blocks,
+            cleanedTranslatedTexts
+        );
+
+    auditFinalTimestamps(
+        originalSrt,
+        finalSrt,
+        "TRADUÇÃO FINAL"
     );
+
+    job.timestampAuditPassed = true;
+
+    return finalSrt;
 }
 
 /*
@@ -3123,63 +3084,31 @@ function createJob({
     sourceHash,
     sourceSrt
 }) {
-    const now =
-        Date.now();
+    const now = Date.now();
 
     const job = {
-        id:
-            jobId,
-
+        id: jobId,
         cacheKey,
-
         type,
-
         videoId,
-
         sourceHash,
-
         sourceSrt,
-
-        status:
-            "processing",
-
-        result:
-            null,
-
-        error:
-            null,
-
-        progress:
-            0,
-
-        completedBatches:
-            0,
-
-        totalBatches:
-            0,
-
-        createdAt:
-            now,
-
-        updatedAt:
-            now,
-
-        /*
-         * O teto absoluto começa no momento
-         * em que o job é criado.
-         *
-         * Tempo de espera na fila também conta.
-         */
+        status: "processing",
+        result: null,
+        error: null,
+        progress: 0,
+        completedBatches: 0,
+        totalBatches: 0,
+        createdAt: now,
+        updatedAt: now,
         deadlineAt:
             now +
             MAX_TRANSLATION_TIME_MS,
-
         expiresAt:
-            now +
-            JOB_TTL_MS,
-
-        promise:
-            null
+            now + JOB_TTL_MS,
+        timestampAuditPassed:
+            false,
+        promise: null
     };
 
     jobs.set(
@@ -3195,10 +3124,7 @@ function createJob({
 function getJob(
     jobId
 ) {
-    const job =
-        jobs.get(
-            jobId
-        );
+    const job = jobs.get(jobId);
 
     if (!job) {
         return null;
@@ -3210,21 +3136,12 @@ function getJob(
         job.status !==
             "processing"
     ) {
-        jobs.delete(
-            jobId
-        );
-
+        jobs.delete(jobId);
         return null;
     }
 
     return job;
 }
-
-/*
-|--------------------------------------------------------------------------
-| PROCESSAMENTO DO JOB
-|--------------------------------------------------------------------------
-*/
 
 async function processJob(
     job
@@ -3234,26 +3151,25 @@ async function processJob(
     );
 
     try {
-        /*
-         * Cache primeiro.
-         */
         const cached =
             getTranslationCache(
                 job.cacheKey
             );
 
         if (cached) {
-            job.status =
-                "completed";
+            auditFinalTimestamps(
+                job.sourceSrt,
+                cached,
+                "CACHE"
+            );
 
-            job.result =
-                cached;
+            job.timestampAuditPassed =
+                true;
 
-            job.progress =
-                100;
-
-            job.updatedAt =
-                Date.now();
+            job.status = "completed";
+            job.result = cached;
+            job.progress = 100;
+            job.updatedAt = Date.now();
 
             console.log(
                 `[JOB ${job.id}] Cache utilizado.`
@@ -3272,25 +3188,15 @@ async function processJob(
                 job
             );
 
-        /*
-         * Cacheia o resultado.
-         */
         setTranslationCache(
             job.cacheKey,
             translated
         );
 
-        job.result =
-            translated;
-
-        job.status =
-            "completed";
-
-        job.progress =
-            100;
-
-        job.updatedAt =
-            Date.now();
+        job.result = translated;
+        job.status = "completed";
+        job.progress = 100;
+        job.updatedAt = Date.now();
 
         console.log(
             `[JOB ${job.id}] Concluído.`
@@ -3298,16 +3204,12 @@ async function processJob(
     } catch (
         error
     ) {
-        job.status =
-            "failed";
-
+        job.status = "failed";
         job.error =
             getErrorMessage(
                 error
             );
-
-        job.updatedAt =
-            Date.now();
+        job.updatedAt = Date.now();
 
         console.error(
             `[JOB ${job.id}] Falhou: ${job.error}`
@@ -3319,12 +3221,6 @@ async function processJob(
 |--------------------------------------------------------------------------
 | FILA DE JOBS COMPLETOS
 |--------------------------------------------------------------------------
-|
-| 5.3+:
-|
-| Um job inteiro termina antes do próximo começar.
-| Assim OpenSubtitles e Embedded não alternam lotes.
-|
 */
 
 function enqueueTranslationJob(
@@ -3337,19 +3233,17 @@ function enqueueTranslationJob(
         ) => {
             if (
                 job.status !==
-                    "processing"
+                "processing"
             ) {
                 resolve();
                 return;
             }
 
-            translationJobQueue.push(
-                {
-                    job,
-                    resolve,
-                    reject
-                }
-            );
+            translationJobQueue.push({
+                job,
+                resolve,
+                reject
+            });
 
             console.log(
                 `[JOB QUEUE] ${job.id} entrou na fila. Aguardando: ${translationJobQueue.length}.`
@@ -3367,13 +3261,11 @@ async function processTranslationJobQueue() {
         return;
     }
 
-    translationJobWorkerRunning =
-        true;
+    translationJobWorkerRunning = true;
 
     try {
         while (
-            translationJobQueue.length >
-            0
+            translationJobQueue.length > 0
         ) {
             const item =
                 translationJobQueue.shift();
@@ -3386,22 +3278,17 @@ async function processTranslationJobQueue() {
                 job,
                 resolve,
                 reject
-            } =
-                item;
+            } = item;
 
             try {
                 if (
                     job.status !==
-                        "processing"
+                    "processing"
                 ) {
                     resolve();
                     continue;
                 }
 
-                /*
-                 * O tempo aguardando nesta fila conta
-                 * no teto absoluto do job.
-                 */
                 if (
                     Number.isFinite(
                         job.deadlineAt
@@ -3409,12 +3296,9 @@ async function processTranslationJobQueue() {
                     Date.now() >=
                         job.deadlineAt
                 ) {
-                    job.status =
-                        "failed";
-
+                    job.status = "failed";
                     job.error =
                         "Tempo máximo de tradução atingido.";
-
                     job.updatedAt =
                         Date.now();
 
@@ -3430,17 +3314,12 @@ async function processTranslationJobQueue() {
                     `[JOB QUEUE] Iniciando job completo ${job.id}. Restantes na fila: ${translationJobQueue.length}.`
                 );
 
-                await processJob(
-                    job
-                );
-
+                await processJob(job);
                 resolve();
             } catch (
                 error
             ) {
-                reject(
-                    error
-                );
+                reject(error);
             }
         }
     } finally {
@@ -3448,19 +3327,12 @@ async function processTranslationJobQueue() {
             false;
 
         if (
-            translationJobQueue.length >
-            0
+            translationJobQueue.length > 0
         ) {
             processTranslationJobQueue();
         }
     }
 }
-
-/*
-|--------------------------------------------------------------------------
-| JOB EM PROCESSAMENTO
-|--------------------------------------------------------------------------
-*/
 
 function findProcessingJob(
     cacheKey
@@ -3469,8 +3341,7 @@ function findProcessingJob(
         const job of jobs.values()
     ) {
         if (
-            job.cacheKey ===
-                cacheKey &&
+            job.cacheKey === cacheKey &&
             job.status ===
                 "processing"
         ) {
@@ -3480,12 +3351,6 @@ function findProcessingJob(
 
     return null;
 }
-
-/*
-|--------------------------------------------------------------------------
-| SRT DE PROCESSAMENTO
-|--------------------------------------------------------------------------
-*/
 
 function buildProcessingSrt(
     job
@@ -3507,12 +3372,6 @@ function buildProcessingSrt(
         `Progresso: ${progress}%. Aguarde alguns instantes.`
     ].join("\n");
 }
-
-/*
-|--------------------------------------------------------------------------
-| SRT DE ERRO
-|--------------------------------------------------------------------------
-*/
 
 function buildErrorSrt(
     message
@@ -3542,78 +3401,53 @@ function buildErrorSrt(
     ].join("\n");
 }
 
-/*
-|--------------------------------------------------------------------------
-| RESPOSTA SRT
-|--------------------------------------------------------------------------
-*/
-
 function sendSubtitleResponse(
     res,
     srt,
-    cacheControl =
-        "no-store"
+    cacheControl = "no-store"
 ) {
     res.status(200);
 
     res.set({
         "Content-Type":
             "text/plain; charset=utf-8",
-
         "Cache-Control":
             cacheControl,
-
         "Access-Control-Allow-Origin":
             "*"
     });
 
-    return res.send(
-        srt
-    );
+    return res.send(srt);
 }
-
-/*
-|--------------------------------------------------------------------------
-| ESPERAR JOB
-|--------------------------------------------------------------------------
-*/
 
 async function waitForJob(
     job,
     timeoutMs
 ) {
     if (
-        job.status ===
-        "completed"
+        job.status === "completed"
     ) {
         return true;
     }
 
     if (
-        job.status ===
-        "failed"
+        job.status === "failed"
     ) {
         return false;
     }
 
-    const start =
-        Date.now();
+    const start = Date.now();
 
     while (
-        job.status ===
-            "processing" &&
-        Date.now() -
-            start <
+        job.status === "processing" &&
+        Date.now() - start <
             timeoutMs
     ) {
-        await sleep(
-            500
-        );
+        await sleep(500);
     }
 
     return (
-        job.status ===
-        "completed"
+        job.status === "completed"
     );
 }
 
@@ -3626,48 +3460,29 @@ async function waitForJob(
 const manifest = {
     id:
         "org.tradutor.stateless.gemini.free",
-
     version:
-        "5.6.0",
-
+        "5.7.0",
     name:
         "Tradutor Gemini PT-BR",
-
     description:
         "Traduz automaticamente legendas para Português do Brasil usando Gemini.",
-
-    logo:
-        "",
-
+    logo: "",
     resources: [
         "subtitles"
     ],
-
     types: [
         "movie",
         "series"
     ],
-
     idPrefixes: [
         "tt"
     ],
-
     catalogs: [],
-
     behaviorHints: {
-        configurable:
-            false,
-
-        adult:
-            false
+        configurable: false,
+        adult: false
     }
 };
-
-/*
-|--------------------------------------------------------------------------
-| MANIFEST
-|--------------------------------------------------------------------------
-*/
 
 app.get(
     "/manifest.json",
@@ -3675,17 +3490,9 @@ app.get(
         req,
         res
     ) => {
-        res.json(
-            manifest
-        );
+        res.json(manifest);
     }
 );
-
-/*
-|--------------------------------------------------------------------------
-| HOME
-|--------------------------------------------------------------------------
-*/
 
 app.get(
     "/",
@@ -3696,25 +3503,22 @@ app.get(
         res.json({
             name:
                 manifest.name,
-
             version:
                 manifest.version,
-
-            status:
-                "online",
-
-            model:
-                GEMINI_MODEL,
-
+            status: "online",
+            model: GEMINI_MODEL,
+            releaseAwareOpenSubtitles:
+                true,
+            timestampAudit:
+                true,
+            conservativeCharacterSanitization:
+                true,
             translationJobQueue:
                 translationJobQueue.length,
-
             activeTranslationJob:
                 translationJobWorkerRunning,
-
             queue:
                 geminiQueue.length,
-
             cooldownSeconds:
                 Math.ceil(
                     getCooldownRemaining() /
@@ -3724,12 +3528,6 @@ app.get(
     }
 );
 
-/*
-|--------------------------------------------------------------------------
-| HEALTH
-|--------------------------------------------------------------------------
-*/
-
 app.get(
     "/health",
     (
@@ -3737,50 +3535,41 @@ app.get(
         res
     ) => {
         res.json({
-            status:
-                "ok",
-
+            status: "ok",
             uptime:
                 process.uptime(),
-
             model:
                 GEMINI_MODEL,
-
             jobs:
                 jobs.size,
-
             cache:
                 translationCache.size,
-
+            releaseAwareOpenSubtitles:
+                true,
+            timestampAudit:
+                true,
+            conservativeCharacterSanitization:
+                true,
             translationJobQueue:
                 translationJobQueue.length,
-
             translationJobWorkerRunning,
-
             geminiQueue:
                 geminiQueue.length,
-
             geminiCooldownSeconds:
                 Math.ceil(
                     getCooldownRemaining() /
                         1000
                 ),
-
             batchMaxBlocks:
                 MAX_BATCH_BLOCKS,
-
             batchMaxChars:
                 MAX_BATCH_CHARS,
-
             requestIntervalMs:
                 MIN_REQUEST_INTERVAL_MS,
-
             maxOutputTokens:
                 MAX_OUTPUT_TOKENS,
-
             translationTimeoutMs:
                 MAX_TRANSLATION_TIME_MS,
-
             maxTranslationTimeMs:
                 MAX_TRANSLATION_TIME_MS
         });
@@ -3789,7 +3578,7 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| PONTUAÇÃO DA LEGENDA
+| OPEN SUBTITLES - RELEASE AWARE 5.7
 |--------------------------------------------------------------------------
 */
 
@@ -3800,64 +3589,73 @@ function scoreSubtitle(
 
     const lang =
         String(
-            subtitle?.lang ||
-                ""
+            subtitle?.lang || ""
         ).toLowerCase();
 
     if (
         lang === "eng"
     ) {
-        score +=
-            100;
+        score += 100;
     } else if (
         lang === "en"
     ) {
-        score +=
-            90;
+        score += 90;
     }
 
     if (
         subtitle?.hearingImpaired ===
         false
     ) {
-        score +=
-            20;
+        score += 20;
     }
 
     if (
         String(
-            subtitle?.format ||
-                ""
-        ).toLowerCase() ===
-        "srt"
+            subtitle?.format || ""
+        ).toLowerCase() === "srt"
     ) {
-        score +=
-            20;
+        score += 20;
     }
 
     if (
         /english/i.test(
             String(
-                subtitle?.name ||
-                    ""
+                subtitle?.name || ""
             )
         )
     ) {
-        score +=
-            10;
+        score += 10;
     }
 
     return score;
 }
 
-/*
-|--------------------------------------------------------------------------
-| ESCOLHER LEGENDA INGLESA
-|--------------------------------------------------------------------------
-*/
+function isUsableEnglishSubtitle(
+    subtitle
+) {
+    const lang =
+        String(
+            subtitle?.lang || ""
+        ).toLowerCase();
+
+    return (
+        (
+            lang === "eng" ||
+            lang === "en"
+        ) &&
+        typeof subtitle?.url ===
+            "string" &&
+        /^https?:\/\//i.test(
+            subtitle.url
+        )
+    );
+}
 
 function selectBestSubtitle(
-    subtitles
+    subtitles,
+    {
+        releaseAware = false
+    } = {}
 ) {
     if (
         !Array.isArray(
@@ -3867,61 +3665,238 @@ function selectBestSubtitle(
         return null;
     }
 
-    return subtitles
-        .filter(
-            subtitle => {
-                const lang =
-                    String(
-                        subtitle?.lang ||
-                            ""
-                    ).toLowerCase();
+    const usable =
+        subtitles.filter(
+            isUsableEnglishSubtitle
+        );
 
-                return (
-                    (
-                        lang ===
-                            "eng" ||
-                        lang ===
-                            "en"
-                    ) &&
-                    typeof subtitle?.url ===
-                        "string" &&
-                    /^https?:\/\//i.test(
-                        subtitle.url
-                    )
-                );
-            }
-        )
+    if (
+        usable.length === 0
+    ) {
+        return null;
+    }
+
+    /*
+     * Quando o upstream recebeu hash/tamanho/filename,
+     * preservamos a ordem dele. Essa ordem carrega a relevância
+     * específica do release; não deixamos a preferência por SRT/SDH
+     * reordenar uma correspondência de arquivo mais precisa.
+     */
+    if (
+        releaseAware
+    ) {
+        return usable[0];
+    }
+
+    return usable
         .sort(
             (
                 a,
                 b
             ) =>
-                scoreSubtitle(
-                    b
-                ) -
-                scoreSubtitle(
-                    a
-                )
-        )[0] ||
-        null;
+                scoreSubtitle(b) -
+                scoreSubtitle(a)
+        )[0] || null;
 }
 
-/*
-|--------------------------------------------------------------------------
-| PROCURAR LEGENDA
-|--------------------------------------------------------------------------
-*/
-
-async function findEnglishSubtitle(
-    type,
-    id
+function rawSubtitleExtraSegment(
+    req
 ) {
-    const searchUrl =
+    const originalUrl =
+        String(
+            req.originalUrl ||
+            req.url ||
+            ""
+        );
+
+    const pathname =
+        originalUrl.split("?")[0];
+
+    const match =
+        pathname.match(
+            /^\/subtitles\/[^/]+\/[^/]+\/(.+)\.json$/
+        );
+
+    if (
+        match?.[1]
+    ) {
+        return match[1];
+    }
+
+    return String(
+        req.params.extra || ""
+    ).trim();
+}
+
+function parseStremioSubtitleExtra(
+    req
+) {
+    const rawExtra =
+        rawSubtitleExtraSegment(
+            req
+        );
+
+    if (!rawExtra) {
+        return {
+            rawExtra: "",
+            videoHash: "",
+            videoSize: "",
+            filename: ""
+        };
+    }
+
+    const params =
+        new URLSearchParams(
+            rawExtra
+        );
+
+    const rawVideoHash =
+        String(
+            params.get("videoHash") ||
+            ""
+        ).trim();
+
+    const rawVideoSize =
+        String(
+            params.get("videoSize") ||
+            ""
+        ).trim();
+
+    const filename =
+        String(
+            params.get("filename") ||
+            ""
+        )
+            .replace(
+                /[\u0000-\u001F\u007F]/g,
+                ""
+            )
+            .trim()
+            .slice(
+                0,
+                1000
+            );
+
+    const videoHash =
+        /^[a-f0-9]{16}$/i.test(
+            rawVideoHash
+        )
+            ? rawVideoHash.toLowerCase()
+            : "";
+
+    const videoSizeNumber =
+        Number(rawVideoSize);
+
+    const videoSize =
+        Number.isSafeInteger(
+            videoSizeNumber
+        ) &&
+        videoSizeNumber > 0
+            ? String(videoSizeNumber)
+            : "";
+
+    return {
+        rawExtra,
+        videoHash,
+        videoSize,
+        filename
+    };
+}
+
+function buildOpenSubtitlesSearchUrl(
+    type,
+    id,
+    {
+        videoHash = "",
+        videoSize = "",
+        filename = ""
+    } = {}
+) {
+    const base =
         `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
             type
         )}/${encodeURIComponent(
             id
-        )}.json`;
+        )}`;
+
+    const extra =
+        new URLSearchParams();
+
+    if (videoHash) {
+        extra.set(
+            "videoHash",
+            videoHash
+        );
+    }
+
+    if (videoSize) {
+        extra.set(
+            "videoSize",
+            videoSize
+        );
+    }
+
+    if (filename) {
+        extra.set(
+            "filename",
+            filename
+        );
+    }
+
+    const encodedExtra =
+        extra.toString();
+
+    if (!encodedExtra) {
+        return `${base}.json`;
+    }
+
+    return `${base}/${encodedExtra}.json`;
+}
+
+function releaseIdentityDescription(
+    extra
+) {
+    const parts = [];
+
+    if (extra.videoHash) {
+        parts.push("videoHash");
+    }
+
+    if (extra.videoSize) {
+        parts.push("videoSize");
+    }
+
+    if (extra.filename) {
+        parts.push("filename");
+    }
+
+    return parts.length
+        ? parts.join(" + ")
+        : "nenhuma";
+}
+
+async function findEnglishSubtitle(
+    type,
+    id,
+    extra = {}
+) {
+    const releaseAware =
+        Boolean(
+            extra.videoHash ||
+            extra.videoSize ||
+            extra.filename
+        );
+
+    const searchUrl =
+        buildOpenSubtitlesSearchUrl(
+            type,
+            id,
+            extra
+        );
+
+    console.log(
+        `[OPENSUBTITLES MATCH] Modo: ${releaseAware ? "RELEASE-AWARE" : "GENÉRICO"}; identidade: ${releaseIdentityDescription(extra)}.`
+    );
 
     console.log(
         `[STREMIO] Procurando legenda: ${searchUrl}`
@@ -3934,9 +3909,8 @@ async function findEnglishSubtitle(
                 headers: {
                     Accept:
                         "application/json",
-
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.6"
+                        "Stremio-Gemini-Subtitle-Translator/5.7"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -3953,10 +3927,37 @@ async function findEnglishSubtitle(
     const data =
         await response.json();
 
-    return selectBestSubtitle(
-        data?.subtitles ||
-            []
-    );
+    const subtitles =
+        Array.isArray(
+            data?.subtitles
+        )
+            ? data.subtitles
+            : [];
+
+    const target =
+        selectBestSubtitle(
+            subtitles,
+            {
+                releaseAware
+            }
+        );
+
+    if (target) {
+        const upstreamIndex =
+            subtitles.indexOf(
+                target
+            );
+
+        console.log(
+            `[OPENSUBTITLES MATCH] Selecionada posição upstream ${upstreamIndex >= 0 ? upstreamIndex + 1 : "?"}/${subtitles.length}; id=${String(target.id || "(sem id)")}; nome=${String(target.name || "(sem nome)")}.`
+        );
+    } else {
+        console.log(
+            `[OPENSUBTITLES MATCH] Nenhuma legenda inglesa utilizável retornada (${subtitles.length} resultado(s) upstream).`
+        );
+    }
+
+    return target;
 }
 
 /*
@@ -3978,7 +3979,7 @@ async function downloadSubtitle(
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-Gemini-Subtitle-Translator/5.6"
+                        "Stremio-Gemini-Subtitle-Translator/5.7"
                 }
             },
             SOURCE_FETCH_TIMEOUT_MS
@@ -4075,8 +4076,7 @@ async function createEmbeddedTranslationJob({
         );
 
     if (
-        blocks.length ===
-        0
+        blocks.length === 0
     ) {
         throw new Error(
             "A legenda embutida não possui blocos SRT válidos."
@@ -4088,25 +4088,21 @@ async function createEmbeddedTranslationJob({
             normalizedSrt
         );
 
-    /*
-     * O cache da fonte embutida depende
-     * somente do conteúdo real do SRT.
-     *
-     * Se o mesmo SRT aparecer novamente,
-     * não gastamos outra chamada Gemini.
-     */
     const cacheKey =
         `embedded:${sourceHash}`;
 
-    /*
-     * Cache já pronto.
-     */
     const cached =
         getTranslationCache(
             cacheKey
         );
 
     if (cached) {
+        auditFinalTimestamps(
+            normalizedSrt,
+            cached,
+            "EMBEDDED CACHE"
+        );
+
         const cachedJobId =
             `embedded-cached-${sourceHash.slice(
                 0,
@@ -4123,28 +4119,21 @@ async function createEmbeddedTranslationJob({
                 createJob({
                     jobId:
                         cachedJobId,
-
                     cacheKey,
-
                     type,
-
                     videoId,
-
                     sourceHash,
-
                     sourceSrt:
                         normalizedSrt
                 });
 
             cachedJob.status =
                 "completed";
-
             cachedJob.result =
                 cached;
-
-            cachedJob.progress =
-                100;
-
+            cachedJob.progress = 100;
+            cachedJob.timestampAuditPassed =
+                true;
             cachedJob.updatedAt =
                 Date.now();
         }
@@ -4156,10 +4145,6 @@ async function createEmbeddedTranslationJob({
         return cachedJob;
     }
 
-    /*
-     * Se a mesma legenda já está sendo
-     * traduzida, reutilizamos o job.
-     */
     const existingJob =
         findProcessingJob(
             cacheKey
@@ -4173,9 +4158,6 @@ async function createEmbeddedTranslationJob({
         return existingJob;
     }
 
-    /*
-     * Novo job.
-     */
     const jobId =
         `embedded-${sourceHash.slice(
             0,
@@ -4185,37 +4167,21 @@ async function createEmbeddedTranslationJob({
     const job =
         createJob({
             jobId,
-
             cacheKey,
-
             type,
-
             videoId,
-
             sourceHash,
-
             sourceSrt:
                 normalizedSrt
         });
 
-    job.source =
-        sourceName;
+    job.source = sourceName;
 
     job.totalBatches =
         splitIntoBatches(
             blocks
         ).length;
 
-    /*
-     * Importantíssimo:
-     *
-     * usamos a fila de jobs completos.
-     *
-     * O job Embedded só começa quando o job
-     * anterior terminar. Dentro dele continuamos
-     * usando a mesma fila Gemini, intervalo,
-     * cooldown, cache e limites.
-     */
     job.promise =
         enqueueTranslationJob(
             job
@@ -4226,14 +4192,11 @@ async function createEmbeddedTranslationJob({
                     error
                 );
 
-                job.status =
-                    "failed";
-
+                job.status = "failed";
                 job.error =
                     getErrorMessage(
                         error
                     );
-
                 job.updatedAt =
                     Date.now();
             }
@@ -4258,82 +4221,37 @@ async function subtitlesHandler(
 ) {
     const type =
         String(
-            req.params.type ||
-                ""
+            req.params.type || ""
         ).trim();
 
     const id =
         String(
-            req.params.id ||
-                ""
+            req.params.id || ""
         ).trim();
 
     console.log(
         `[STREMIO] Pedido: ${type}/${id}`
     );
 
-    /*
-     * DIAGNÓSTICO:
-     * mostra quais informações o Stremio
-     * enviou sobre o arquivo em reprodução.
-     *
-     * Isto NÃO chama Gemini.
-     */
-    const rawExtra =
-        String(
-            req.params.extra || ""
-        ).trim();
-
-    if (rawExtra) {
-        const extraParams =
-            new URLSearchParams(
-                rawExtra
-            );
-
-        const videoHash =
-            extraParams.get(
-                "videoHash"
-            ) || "";
-
-        const videoSize =
-            extraParams.get(
-                "videoSize"
-            ) || "";
-
-        const filename =
-            extraParams.get(
-                "filename"
-            ) || "";
-
-        console.log(
-            `[STREMIO EXTRA] filename: ${
-                filename ||
-                "(não enviado)"
-            }`
+    const extra =
+        parseStremioSubtitleExtra(
+            req
         );
 
-        console.log(
-            `[STREMIO EXTRA] videoSize: ${
-                videoSize ||
-                "(não enviado)"
-            }`
-        );
+    console.log(
+        `[STREMIO EXTRA] filename: ${extra.filename || "(não enviado)"}`
+    );
 
-        console.log(
-            `[STREMIO EXTRA] videoHash: ${
-                videoHash ||
-                "(não enviado)"
-            }`
-        );
-    } else {
-        console.log(
-            "[STREMIO EXTRA] Nenhuma informação extra recebida."
-        );
-    }
+    console.log(
+        `[STREMIO EXTRA] videoSize: ${extra.videoSize || "(não enviado)"}`
+    );
+
+    console.log(
+        `[STREMIO EXTRA] videoHash: ${extra.videoHash || "(não enviado)"}`
+    );
 
     if (
-        !type ||
-        !id
+        !type || !id
     ) {
         return safeJson(
             res,
@@ -4344,13 +4262,11 @@ async function subtitlesHandler(
     }
 
     try {
-        /*
-         * 1. Procurar legenda inglesa.
-         */
         const target =
             await findEnglishSubtitle(
                 type,
-                id
+                id,
+                extra
             );
 
         if (!target) {
@@ -4366,25 +4282,18 @@ async function subtitlesHandler(
             );
         }
 
-        /*
-         * 2. Baixar SRT.
-         */
         const sourceSrt =
             await downloadSubtitle(
                 target.url
             );
 
-        /*
-         * 3. Validar SRT.
-         */
         const blocks =
             parseSrt(
                 sourceSrt
             );
 
         if (
-            blocks.length ===
-            0
+            blocks.length === 0
         ) {
             return safeJson(
                 res,
@@ -4394,12 +4303,6 @@ async function subtitlesHandler(
             );
         }
 
-        /*
-         * 4. Hash da legenda real.
-         *
-         * Isso evita confundir episódios diferentes
-         * ou versões diferentes da mesma legenda.
-         */
         const sourceHash =
             sha256(
                 sourceSrt
@@ -4413,51 +4316,42 @@ async function subtitlesHandler(
                 req
             );
 
-        /*
-         * 5. Cache.
-         */
         const cached =
             getTranslationCache(
                 cacheKey
             );
 
         if (cached) {
+            auditFinalTimestamps(
+                sourceSrt,
+                cached,
+                "OPENSUBTITLES CACHE"
+            );
+
             const jobId =
                 `cached-${sourceHash.slice(
                     0,
                     24
                 )}`;
 
-            let job =
-                getJob(
-                    jobId
-                );
+            let job = getJob(jobId);
 
             if (!job) {
                 job =
                     createJob({
                         jobId,
-
                         cacheKey,
-
                         type,
-
-                        videoId:
-                            id,
-
+                        videoId: id,
                         sourceHash,
-
                         sourceSrt
                     });
 
-                job.status =
-                    "completed";
-
-                job.result =
-                    cached;
-
-                job.progress =
-                    100;
+                job.status = "completed";
+                job.result = cached;
+                job.progress = 100;
+                job.timestampAuditPassed =
+                    true;
             }
 
             console.log(
@@ -4474,32 +4368,22 @@ async function subtitlesHandler(
                                     0,
                                     12
                                 )}`,
-
                             url:
                                 `${baseUrl}/subtitle/${encodeURIComponent(
                                     jobId
                                 )}.srt`,
-
-                            lang:
-                                "por"
+                            lang: "por"
                         }
                     ]
                 }
             );
         }
 
-        /*
-         * 6. Verifica se outro pedido
-         * já está traduzindo a mesma legenda.
-         */
         let job =
             findProcessingJob(
                 cacheKey
             );
 
-        /*
-         * 7. Se não existe, cria.
-         */
         if (!job) {
             const jobId =
                 `job-${sourceHash.slice(
@@ -4510,31 +4394,18 @@ async function subtitlesHandler(
             job =
                 createJob({
                     jobId,
-
                     cacheKey,
-
                     type,
-
-                    videoId:
-                        id,
-
+                    videoId: id,
                     sourceHash,
-
                     sourceSrt
                 });
 
-            /*
-             * Calcula previamente
-             * quantos lotes serão necessários.
-             */
             job.totalBatches =
                 splitIntoBatches(
                     blocks
                 ).length;
 
-            /*
-             * Não bloqueia a resposta do Stremio.
-             */
             job.promise =
                 enqueueTranslationJob(
                     job
@@ -4545,14 +4416,11 @@ async function subtitlesHandler(
                             error
                         );
 
-                        job.status =
-                            "failed";
-
+                        job.status = "failed";
                         job.error =
                             getErrorMessage(
                                 error
                             );
-
                         job.updatedAt =
                             Date.now();
                     }
@@ -4578,12 +4446,9 @@ async function subtitlesHandler(
                                 0,
                                 12
                             )}`,
-
                         url:
                             subtitleUrl,
-
-                        lang:
-                            "por"
+                        lang: "por"
                     }
                 ]
             }
@@ -4605,12 +4470,6 @@ async function subtitlesHandler(
         );
     }
 }
-
-/*
-|--------------------------------------------------------------------------
-| ROTAS STREMIO
-|--------------------------------------------------------------------------
-*/
 
 app.get(
     "/subtitles/:type/:id.json",
@@ -4634,9 +4493,6 @@ app.post(
         req,
         res
     ) => {
-        /*
-         * Segurança.
-         */
         if (
             !isAuthorizedLocalBridge(
                 req
@@ -4662,25 +4518,21 @@ app.post(
                 id,
                 srt,
                 name
-            } =
-                req.body || {};
+            } = req.body || {};
 
             const mediaType =
                 String(
-                    type ||
-                        "unknown"
+                    type || "unknown"
                 ).trim();
 
             const videoId =
                 String(
-                    id ||
-                        "unknown"
+                    id || "unknown"
                 ).trim();
 
             const sourceName =
                 String(
-                    name ||
-                        "embedded"
+                    name || "embedded"
                 ).trim();
 
             if (
@@ -4698,10 +4550,6 @@ app.post(
                 );
             }
 
-            /*
-             * Tamanho antes de qualquer
-             * processamento.
-             */
             if (
                 srt.length >
                 MAX_SOURCE_CHARS
@@ -4722,14 +4570,9 @@ app.post(
 
             const job =
                 await createEmbeddedTranslationJob({
-                    type:
-                        mediaType,
-
+                    type: mediaType,
                     videoId,
-
-                    sourceSrt:
-                        srt,
-
+                    sourceSrt: srt,
                     sourceName
                 });
 
@@ -4746,18 +4589,10 @@ app.post(
             return safeJson(
                 res,
                 {
-                    ok:
-                        true,
-
-                    jobId:
-                        job.id,
-
-                    status:
-                        job.status,
-
-                    progress:
-                        job.progress,
-
+                    ok: true,
+                    jobId: job.id,
+                    status: job.status,
+                    progress: job.progress,
                     subtitleUrl
                 }
             );
@@ -4795,20 +4630,16 @@ async function subtitleResultHandler(
 ) {
     const raw =
         String(
-            req.params.jobId ||
-                ""
+            req.params.jobId || ""
         ).trim();
 
     let jobId;
 
     try {
         jobId =
-            decodeURIComponent(
-                raw
-            );
+            decodeURIComponent(raw);
     } catch {
-        jobId =
-            raw;
+        jobId = raw;
     }
 
     if (!jobId) {
@@ -4820,10 +4651,7 @@ async function subtitleResultHandler(
         );
     }
 
-    const job =
-        getJob(
-            jobId
-        );
+    const job = getJob(jobId);
 
     if (!job) {
         return sendSubtitleResponse(
@@ -4834,14 +4662,39 @@ async function subtitleResultHandler(
         );
     }
 
-    /*
-     * Já terminou.
-     */
     if (
-        job.status ===
-            "completed" &&
+        job.status === "completed" &&
         job.result
     ) {
+        if (
+            !job.timestampAuditPassed
+        ) {
+            try {
+                auditFinalTimestamps(
+                    job.sourceSrt,
+                    job.result,
+                    "SERVING"
+                );
+
+                job.timestampAuditPassed =
+                    true;
+            } catch (
+                error
+            ) {
+                console.error(
+                    `[AUDIT TIMESTAMP] Bloqueando legenda ${job.id}: ${getErrorMessage(error)}`
+                );
+
+                return sendSubtitleResponse(
+                    res,
+                    buildErrorSrt(
+                        "A auditoria de timestamps detectou uma divergência e bloqueou esta legenda."
+                    ),
+                    "no-store"
+                );
+            }
+        }
+
         return sendSubtitleResponse(
             res,
             job.result,
@@ -4849,12 +4702,8 @@ async function subtitleResultHandler(
         );
     }
 
-    /*
-     * Falhou.
-     */
     if (
-        job.status ===
-        "failed"
+        job.status === "failed"
     ) {
         return sendSubtitleResponse(
             res,
@@ -4865,12 +4714,6 @@ async function subtitleResultHandler(
         );
     }
 
-    /*
-     * Esperamos no máximo 15 segundos
-     * nesta conexão.
-     *
-     * O processamento continua no Render.
-     */
     const completed =
         await waitForJob(
             job,
@@ -4879,10 +4722,38 @@ async function subtitleResultHandler(
 
     if (
         completed &&
-        job.status ===
-            "completed" &&
+        job.status === "completed" &&
         job.result
     ) {
+        if (
+            !job.timestampAuditPassed
+        ) {
+            try {
+                auditFinalTimestamps(
+                    job.sourceSrt,
+                    job.result,
+                    "SERVING"
+                );
+
+                job.timestampAuditPassed =
+                    true;
+            } catch (
+                error
+            ) {
+                console.error(
+                    `[AUDIT TIMESTAMP] Bloqueando legenda ${job.id}: ${getErrorMessage(error)}`
+                );
+
+                return sendSubtitleResponse(
+                    res,
+                    buildErrorSrt(
+                        "A auditoria de timestamps detectou uma divergência e bloqueou esta legenda."
+                    ),
+                    "no-store"
+                );
+            }
+        }
+
         return sendSubtitleResponse(
             res,
             job.result,
@@ -4891,8 +4762,7 @@ async function subtitleResultHandler(
     }
 
     if (
-        job.status ===
-        "failed"
+        job.status === "failed"
     ) {
         return sendSubtitleResponse(
             res,
@@ -4903,9 +4773,6 @@ async function subtitleResultHandler(
         );
     }
 
-    /*
-     * Ainda processando.
-     */
     return sendSubtitleResponse(
         res,
         buildProcessingSrt(
@@ -4914,12 +4781,6 @@ async function subtitleResultHandler(
         "no-store, no-cache, must-revalidate"
     );
 }
-
-/*
-|--------------------------------------------------------------------------
-| ROTA DA LEGENDA
-|--------------------------------------------------------------------------
-*/
 
 app.get(
     "/subtitle/:jobId.srt",
@@ -4940,7 +4801,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.6"
+            " STREMIO GEMINI SUBTITLE TRANSLATOR 5.7"
         );
 
         console.log(
@@ -4956,10 +4817,7 @@ app.listen(
         );
 
         console.log(
-            `PUBLIC_URL: ${
-                PUBLIC_URL ||
-                "(automático)"
-            }`
+            `PUBLIC_URL: ${PUBLIC_URL || "(automático)"}`
         );
 
         console.log(
@@ -5027,6 +4885,18 @@ app.listen(
         );
 
         console.log(
+            "Matching OpenSubtitles por release: ATIVO"
+        );
+
+        console.log(
+            "Auditoria absoluta de timestamps: ATIVA"
+        );
+
+        console.log(
+            "Higienização conservadora de caracteres: ATIVA"
+        );
+
+        console.log(
             "Fila de jobs completos: SEQUENCIAL (1 por vez)"
         );
 
@@ -5039,12 +4909,6 @@ app.listen(
         );
     }
 );
-
-/*
-|--------------------------------------------------------------------------
-| PROCESSOS
-|--------------------------------------------------------------------------
-*/
 
 process.on(
     "unhandledRejection",
