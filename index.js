@@ -3,141 +3,261 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(cors());
 app.disable("x-powered-by");
-app.use(express.json({ limit: "2mb" }));
+app.use(
+    express.json({
+        limit: "2mb"
+    })
+);
 
 // ============================================================
-// STREMIO PT-BR BACKEND 6.5 — QUALITY + SPEED
+// STREMIO PT-BR BACKEND 6.5.1 — HOTFIX REAL
 // ============================================================
-// - Ponte Local é a única interface visível no Stremio.
-// - Embedded inglesa é a autoridade temporal quando existir.
-// - Mistral Medium 3.5 traduz UMA vez, em fila serial rápida.
-// - Gemini Flash-Lite audita em microblocos EM PARALELO.
-// - Só groups realmente suspeitos voltam ao Mistral.
-// - Sem árbitro global, sem pacer inventado, sem teto global.
+//
+// Ponte Local 4.1 = NÃO MUDA.
+//
+// Objetivos:
+//
+// - embedded continua sendo autoridade temporal;
+// - Mistral principal continua serial;
+// - sem pacer arbitrário;
+// - sem teto global de episódio;
+// - quota usa headers REAIS da Mistral;
+// - top_p=1 explícito corrige greedy sampling;
+// - lote truncado/JSON inválido é DIVIDIDO;
+// - nunca transformar 200 groups em dezenas de rescues;
+// - Gemini micro-audita EN × PT em paralelo;
+// - somente groups problemáticos voltam ao Mistral;
+// - Style Pack 2026 preservado;
+// - cue IDs e timestamps são imutáveis.
+//
 // ============================================================
 
-const PORT = Number(process.env.PORT || 10000);
-const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
-const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
+const PORT =
+    Number(
+        process.env.PORT ||
+        10000
+    );
 
-const MISTRAL_API_KEY = String(process.env.MISTRAL_API_KEY || "").trim();
-const MISTRAL_MODEL = String(
-    process.env.MISTRAL_MODEL ||
-    "mistral-medium-3-5"
-).trim();
+const PUBLIC_URL =
+    String(
+        process.env.PUBLIC_URL ||
+        ""
+    ).replace(
+        /\/+$/,
+        ""
+    );
 
-const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
-const GEMINI_MODEL = String(
-    process.env.GEMINI_MODEL ||
-    "gemini-3.5-flash-lite"
-).trim();
+const LOCAL_BRIDGE_SECRET =
+    String(
+        process.env.LOCAL_BRIDGE_SECRET ||
+        ""
+    ).trim();
 
-const CACHE_VERSION = "6.5.0-final";
+const MISTRAL_API_KEY =
+    String(
+        process.env.MISTRAL_API_KEY ||
+        ""
+    ).trim();
 
-const MAX_SOURCE_CHARS = 800000;
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const JOB_TTL_MS = 24 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 25000;
+const MISTRAL_MODEL =
+    String(
+        process.env.MISTRAL_MODEL ||
+        "mistral-medium-3-5"
+    ).trim();
 
-const MISTRAL_TIMEOUT_MS = Number(
-    process.env.MISTRAL_TIMEOUT_MS ||
-    150000
-);
+const GEMINI_API_KEY =
+    String(
+        process.env.GEMINI_API_KEY ||
+        ""
+    ).trim();
 
-const GEMINI_TIMEOUT_MS = Number(
-    process.env.GEMINI_TIMEOUT_MS ||
-    90000
-);
+const GEMINI_MODEL =
+    String(
+        process.env.GEMINI_MODEL ||
+        "gemini-3.5-flash-lite"
+    ).trim();
 
-const MISTRAL_MAX_RETRIES = Number(
-    process.env.MISTRAL_MAX_RETRIES ||
-    7
-);
+const CACHE_VERSION =
+    "6.5.1-final";
 
-const GEMINI_MAX_RETRIES = Number(
-    process.env.GEMINI_MAX_RETRIES ||
-    6
-);
+const MAX_SOURCE_CHARS =
+    800000;
 
-/*
- * Com a quota gratuita observada:
- *
- * DUAS requests Mistral ao mesmo tempo geravam
- * uma tempestade de 429.
- *
- * Uma request por vez tende a ser MAIS RÁPIDA no total,
- * porque a próxima sai imediatamente quando a anterior termina.
- *
- * Não existe sleep artificial entre requests.
- */
-const MISTRAL_BATCH_CHARS = Number(
-    process.env.MISTRAL_BATCH_CHARS ||
-    19000
-);
+const CACHE_TTL_MS =
+    7 *
+    24 *
+    60 *
+    60 *
+    1000;
 
-const MISTRAL_BATCH_GROUPS = Number(
-    process.env.MISTRAL_BATCH_GROUPS ||
-    240
-);
+const JOB_TTL_MS =
+    24 *
+    60 *
+    60 *
+    1000;
 
-const GEMINI_AUDIT_GROUPS = Number(
-    process.env.GEMINI_AUDIT_GROUPS ||
-    32
-);
+const FETCH_TIMEOUT_MS =
+    25000;
 
-const GEMINI_AUDIT_CHARS = Number(
-    process.env.GEMINI_AUDIT_CHARS ||
-    10500
-);
+const MISTRAL_TIMEOUT_MS =
+    Number(
+        process.env.MISTRAL_TIMEOUT_MS ||
+        150000
+    );
 
-const REPAIR_BATCH_GROUPS = Number(
-    process.env.REPAIR_BATCH_GROUPS ||
-    20
-);
+const GEMINI_TIMEOUT_MS =
+    Number(
+        process.env.GEMINI_TIMEOUT_MS ||
+        90000
+    );
 
-const REPAIR_BATCH_CHARS = Number(
-    process.env.REPAIR_BATCH_CHARS ||
-    9000
-);
+const MISTRAL_MAX_RETRIES =
+    Number(
+        process.env.MISTRAL_MAX_RETRIES ||
+        7
+    );
+
+const GEMINI_MAX_RETRIES =
+    Number(
+        process.env.GEMINI_MAX_RETRIES ||
+        6
+    );
+
+// ============================================================
+// LOTE PRINCIPAL
+//
+// Menor do que 6.5.
+// Mais espaço de saída por group.
+//
+// O objetivo é ficar abaixo do custo que monopoliza
+// a janela de 25K TPM, mas sem truncar o JSON.
+// ============================================================
+
+const MAIN_BATCH_CHARS =
+    Number(
+        process.env.MISTRAL_BATCH_CHARS ||
+        12500
+    );
+
+const MAIN_BATCH_GROUPS =
+    Number(
+        process.env.MISTRAL_BATCH_GROUPS ||
+        145
+    );
+
+const MAIN_MAX_TOKENS =
+    Number(
+        process.env.MISTRAL_MAIN_MAX_TOKENS ||
+        6000
+    );
+
+// ============================================================
+// RESCUE
+// ============================================================
+
+const RESCUE_BATCH_CHARS =
+    5200;
+
+const RESCUE_BATCH_GROUPS =
+    10;
+
+const RESCUE_MAX_TOKENS =
+    3600;
+
+// ============================================================
+// REPAIR
+// ============================================================
+
+const REPAIR_BATCH_CHARS =
+    7500;
+
+const REPAIR_BATCH_GROUPS =
+    24;
+
+const REPAIR_MAX_TOKENS =
+    4800;
+
+// ============================================================
+// GEMINI MICRO-AUDIT
+// ============================================================
+
+const GEMINI_AUDIT_GROUPS =
+    Number(
+        process.env.GEMINI_AUDIT_GROUPS ||
+        28
+    );
+
+const GEMINI_AUDIT_CHARS =
+    Number(
+        process.env.GEMINI_AUDIT_CHARS ||
+        9000
+    );
 
 // ============================================================
 // STATE
 // ============================================================
 
-const translationCache = new Map();
-const jobs = new Map();
-const queue = [];
+const translationCache =
+    new Map();
 
-let queueRunning = false;
+const jobs =
+    new Map();
 
-const sleep = ms =>
-    new Promise(
-        resolve =>
-            setTimeout(
-                resolve,
-                ms
-            )
-    );
+const queue =
+    [];
+
+let queueRunning =
+    false;
+
+let mistralLane =
+    Promise.resolve();
+
+const sleep =
+    ms =>
+        new Promise(
+            resolve =>
+                setTimeout(
+                    resolve,
+                    ms
+                )
+        );
+
+// ============================================================
+// BASIC HELPERS
+// ============================================================
 
 function sha256(value) {
     return crypto
-        .createHash("sha256")
+        .createHash(
+            "sha256"
+        )
         .update(
             String(value),
             "utf8"
         )
-        .digest("hex");
+        .digest(
+            "hex"
+        );
 }
 
-function randomId(bytes = 6) {
+function randomId(
+    bytes = 6
+) {
     return crypto
-        .randomBytes(bytes)
-        .toString("hex");
+        .randomBytes(
+            bytes
+        )
+        .toString(
+            "hex"
+        );
 }
 
-function errorMessage(error) {
+function errorMessage(
+    error
+) {
     return String(
         error?.message ||
         error ||
@@ -145,16 +265,35 @@ function errorMessage(error) {
     );
 }
 
-function normalizeSrt(value) {
-    return String(value || "")
-        .replace(/^\uFEFF/, "")
-        .replace(/\r\n/g, "\n")
-        .replace(/\r/g, "\n")
+function normalizeSrt(
+    value
+) {
+    return String(
+        value ||
+        ""
+    )
+        .replace(
+            /^\uFEFF/,
+            ""
+        )
+        .replace(
+            /\r\n/g,
+            "\n"
+        )
+        .replace(
+            /\r/g,
+            "\n"
+        )
         .trim();
 }
 
-function stripCodeFences(value) {
-    return String(value || "")
+function stripCodeFences(
+    value
+) {
+    return String(
+        value ||
+        ""
+    )
         .replace(
             /^\s*```(?:json|text|plaintext|srt)?\s*/i,
             ""
@@ -166,14 +305,20 @@ function stripCodeFences(value) {
         .trim();
 }
 
-function baseUrl(req) {
-    if (PUBLIC_URL) {
+function baseUrl(
+    req
+) {
+    if (
+        PUBLIC_URL
+    ) {
         return PUBLIC_URL;
     }
 
     const proto =
         String(
-            req.headers["x-forwarded-proto"] ||
+            req.headers[
+                "x-forwarded-proto"
+            ] ||
             req.protocol ||
             "https"
         )
@@ -182,15 +327,22 @@ function baseUrl(req) {
 
     const host =
         String(
-            req.headers["x-forwarded-host"] ||
+            req.headers[
+                "x-forwarded-host"
+            ] ||
             req.headers.host ||
             ""
         )
             .split(",")[0]
             .trim();
 
-    return `${proto}://${host}`
-        .replace(/\/+$/, "");
+    return (
+        `${proto}://${host}`
+            .replace(
+                /\/+$/,
+                ""
+            )
+    );
 }
 
 function safeJson(
@@ -204,16 +356,23 @@ function safeJson(
     );
 
     return res
-        .status(status)
-        .json(payload);
+        .status(
+            status
+        )
+        .json(
+            payload
+        );
 }
 
 function sendSrt(
     res,
     srt,
-    cacheControl = "no-store"
+    cacheControl =
+        "no-store"
 ) {
-    res.status(200);
+    res.status(
+        200
+    );
 
     res.set(
         "Content-Type",
@@ -226,12 +385,19 @@ function sendSrt(
     );
 
     res.send(
-        String(srt || "")
+        String(
+            srt ||
+            ""
+        )
     );
 }
 
-function authorized(req) {
-    if (!LOCAL_BRIDGE_SECRET) {
+function authorized(
+    req
+) {
+    if (
+        !LOCAL_BRIDGE_SECRET
+    ) {
         return false;
     }
 
@@ -259,10 +425,10 @@ function authorized(req) {
 }
 
 // ============================================================
-// CACHE / JOBS
+// CACHE / JOB
 // ============================================================
 
-function makeCacheKey(
+function cacheKey(
     type,
     videoId,
     sourceSrt
@@ -271,15 +437,23 @@ function makeCacheKey(
         `${CACHE_VERSION}:` +
         `${type}:` +
         `${videoId}:` +
-        `${sha256(sourceSrt)}`
+        `${sha256(
+            sourceSrt
+        )}`
     );
 }
 
-function getCache(key) {
+function getCache(
+    key
+) {
     const item =
-        translationCache.get(key);
+        translationCache.get(
+            key
+        );
 
-    if (!item) {
+    if (
+        !item
+    ) {
         return null;
     }
 
@@ -287,7 +461,10 @@ function getCache(key) {
         item.expiresAt <=
         Date.now()
     ) {
-        translationCache.delete(key);
+        translationCache.delete(
+            key
+        );
+
         return null;
     }
 
@@ -321,7 +498,9 @@ function createJob({
         Date.now();
 
     const sourceHash =
-        sha256(sourceSrt);
+        sha256(
+            sourceSrt
+        );
 
     const job = {
         id:
@@ -331,14 +510,19 @@ function createJob({
             )}-${randomId()}`,
 
         type,
+
         videoId,
+
         filename,
+
         sourceSrt,
+
         sourceKind,
+
         sourceHash,
 
         cacheKey:
-            makeCacheKey(
+            cacheKey(
                 type,
                 videoId,
                 sourceSrt
@@ -376,16 +560,25 @@ function createJob({
             mistral429:
                 0,
 
-            mistralRetryWaitMs:
+            quotaWaitMs:
                 0,
 
-            structuralSingleCueJoins:
+            mainSplits:
+                0,
+
+            jsonInvalidSplits:
+                0,
+
+            outputTruncations:
                 0,
 
             salvageGroups:
                 0,
 
             rescueCalls:
+                0,
+
+            singleCueJoins:
                 0,
 
             geminiCalls:
@@ -450,27 +643,39 @@ function findJobByCache(
     return null;
 }
 
-function getOrCreateJob(args) {
+function getOrCreateJob(
+    args
+) {
     const key =
-        makeCacheKey(
+        cacheKey(
             args.type,
             args.videoId,
             args.sourceSrt
         );
 
     const cached =
-        getCache(key);
+        getCache(
+            key
+        );
 
-    if (cached) {
+    if (
+        cached
+    ) {
         let job =
             findJobByCache(
                 key,
-                ["completed"]
+                [
+                    "completed"
+                ]
             );
 
-        if (!job) {
+        if (
+            !job
+        ) {
             job =
-                createJob(args);
+                createJob(
+                    args
+                );
 
             job.status =
                 "completed";
@@ -488,27 +693,39 @@ function getOrCreateJob(args) {
     const active =
         findJobByCache(
             key,
-            ["processing"]
+            [
+                "processing"
+            ]
         );
 
-    if (active) {
+    if (
+        active
+    ) {
         return active;
     }
 
     const done =
         findJobByCache(
             key,
-            ["completed"]
+            [
+                "completed"
+            ]
         );
 
-    if (done) {
+    if (
+        done
+    ) {
         return done;
     }
 
     const job =
-        createJob(args);
+        createJob(
+            args
+        );
 
-    enqueue(job);
+    enqueue(
+        job
+    );
 
     return job;
 }
@@ -548,12 +765,16 @@ setInterval(
                 job.status !==
                     "processing"
             ) {
-                jobs.delete(id);
+                jobs.delete(
+                    id
+                );
             }
         }
     },
 
-    10 * 60 * 1000
+    10 *
+    60 *
+    1000
 ).unref();
 
 // ============================================================
@@ -569,9 +790,14 @@ const SPEAKER_RE =
 const SDH_WORDS =
     /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
 
-function normalizeSpeaker(value) {
+function normalizeSpeaker(
+    value
+) {
     const speaker =
-        String(value || "")
+        String(
+            value ||
+            ""
+        )
             .replace(
                 /<[^>]+>/g,
                 " "
@@ -584,7 +810,8 @@ function normalizeSpeaker(value) {
 
     if (
         !speaker ||
-        speaker.length > 60 ||
+        speaker.length >
+            60 ||
         SDH_WORDS.test(
             speaker
         ) ||
@@ -598,16 +825,23 @@ function normalizeSpeaker(value) {
     return speaker;
 }
 
-function extractSpeaker(line) {
+function extractSpeaker(
+    line
+) {
     const original =
-        String(line || "");
+        String(
+            line ||
+            ""
+        );
 
     const hidden =
         original.match(
             SPEAKER_RE
         );
 
-    if (hidden) {
+    if (
+        hidden
+    ) {
         let speaker =
             "";
 
@@ -637,19 +871,24 @@ function extractSpeaker(line) {
             /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*:?[ \t]*/u
         );
 
-    if (bracket) {
+    if (
+        bracket
+    ) {
         const speaker =
             normalizeSpeaker(
                 bracket[1]
             );
 
-        if (speaker) {
+        if (
+            speaker
+        ) {
             return {
                 speaker,
 
                 text:
                     original.slice(
-                        bracket[0].length
+                        bracket[0]
+                            .length
                     )
             };
         }
@@ -660,19 +899,24 @@ function extractSpeaker(line) {
             /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50})\s*:\s+(?=\S)/u
         );
 
-    if (colon) {
+    if (
+        colon
+    ) {
         const speaker =
             normalizeSpeaker(
                 colon[1]
             );
 
-        if (speaker) {
+        if (
+            speaker
+        ) {
             return {
                 speaker,
 
                 text:
                     original.slice(
-                        colon[0].length
+                        colon[0]
+                            .length
                     )
             };
         }
@@ -687,8 +931,13 @@ function extractSpeaker(line) {
     };
 }
 
-function normalizeElongations(text) {
-    return String(text || "")
+function normalizeElongations(
+    text
+) {
+    return String(
+        text ||
+        ""
+    )
         .replace(
             /([A-Za-zÀ-ÖØ-öø-ÿ]+?)([-–—])([A-Za-zÀ-ÖØ-öø-ÿ])(?:\2\3){2,}/gu,
             "$1"
@@ -703,9 +952,14 @@ function normalizeElongations(text) {
         );
 }
 
-function isEmptyVocalization(text) {
+function isEmptyVocalization(
+    text
+) {
     const value =
-        String(text || "")
+        String(
+            text ||
+            ""
+        )
             .toLowerCase()
             .replace(
                 /[.,!?…]+/g,
@@ -722,12 +976,18 @@ function isEmptyVocalization(text) {
     );
 }
 
-function cleanSourceLine(line) {
+function cleanSourceLine(
+    line
+) {
     let text =
-        String(line || "")
-            .trim();
+        String(
+            line ||
+            ""
+        ).trim();
 
-    if (!text) {
+    if (
+        !text
+    ) {
         return "";
     }
 
@@ -755,14 +1015,11 @@ function cleanSourceLine(line) {
         );
 
     text =
-        text.replace(
-            /[♪♫♬]/gu,
-            " "
-        );
-
-    text =
         normalizeElongations(
-            text
+            text.replace(
+                /[♪♫♬]/gu,
+                " "
+            )
         )
             .replace(
                 /[ \t]{2,}/g,
@@ -785,18 +1042,28 @@ function cleanSourceLine(line) {
     return text;
 }
 
-function cleanSrtForTranslation(srt) {
+function cleanSrtForTranslation(
+    srt
+) {
     const normalized =
-        normalizeSrt(srt);
+        normalizeSrt(
+            srt
+        );
 
-    if (!normalized) {
+    if (
+        !normalized
+    ) {
         return "";
     }
 
     const rawBlocks =
         normalized
-            .split(/\n{2,}/)
-            .filter(Boolean);
+            .split(
+                /\n{2,}/
+            )
+            .filter(
+                Boolean
+            );
 
     const out =
         [];
@@ -817,7 +1084,9 @@ function cleanSrtForTranslation(srt) {
         const lines =
             raw
                 .trim()
-                .split("\n");
+                .split(
+                    "\n"
+                );
 
         const timingIndex =
             lines.findIndex(
@@ -856,7 +1125,8 @@ function cleanSrtForTranslation(srt) {
         for (
             const sourceLine
             of lines.slice(
-                timingIndex + 1
+                timingIndex +
+                1
             )
         ) {
             const info =
@@ -892,7 +1162,9 @@ function cleanSrtForTranslation(srt) {
                 vocalizations++;
             }
 
-            if (cleaned) {
+            if (
+                cleaned
+            ) {
                 dialogue.push(
                     cleaned
                 );
@@ -903,6 +1175,7 @@ function cleanSrtForTranslation(srt) {
             !dialogue.length
         ) {
             removed++;
+
             continue;
         }
 
@@ -911,7 +1184,9 @@ function cleanSrtForTranslation(srt) {
             1
         ) {
             const speaker =
-                [...speakers][0];
+                [
+                    ...speakers
+                ][0];
 
             dialogue[0] =
                 `@@SPK:${encodeURIComponent(
@@ -934,7 +1209,9 @@ function cleanSrtForTranslation(srt) {
         `vocalizações=${vocalizations}.`
     );
 
-    if (!out.length) {
+    if (
+        !out.length
+    ) {
         return "";
     }
 
@@ -946,22 +1223,35 @@ function cleanSrtForTranslation(srt) {
                     index
                 ) =>
                     [
-                        index + 1,
+                        index +
+                        1,
+
                         block.timing,
+
                         ...block.dialogue
-                    ].join("\n")
+                    ].join(
+                        "\n"
+                    )
             )
-            .join("\n\n")
+            .join(
+                "\n\n"
+            )
             .trim() +
         "\n"
     );
 }
 
-function parseSrt(srt) {
+function parseSrt(
+    srt
+) {
     const normalized =
-        normalizeSrt(srt);
+        normalizeSrt(
+            srt
+        );
 
-    if (!normalized) {
+    if (
+        !normalized
+    ) {
         return [];
     }
 
@@ -977,22 +1267,29 @@ function parseSrt(srt) {
         const lines =
             raw
                 .trim()
-                .split("\n");
+                .split(
+                    "\n"
+                );
 
         if (
-            lines.length < 3 ||
+            lines.length <
+                3 ||
             !/^\d+$/.test(
-                lines[0].trim()
+                lines[0]
+                    .trim()
             ) ||
             !TIMING_RE.test(
-                lines[1].trim()
+                lines[1]
+                    .trim()
             )
         ) {
             continue;
         }
 
         const textLines =
-            lines.slice(2);
+            lines.slice(
+                2
+            );
 
         let speakerHint =
             null;
@@ -1006,7 +1303,9 @@ function parseSrt(srt) {
                         SPEAKER_RE
                     );
 
-            if (match) {
+            if (
+                match
+            ) {
                 try {
                     speakerHint =
                         normalizeSpeaker(
@@ -1039,7 +1338,9 @@ function parseSrt(srt) {
 
             text:
                 textLines
-                    .join("\n")
+                    .join(
+                        "\n"
+                    )
                     .trim(),
 
             speakerHint
@@ -1062,12 +1363,18 @@ function buildSrt(
                 ) =>
                     [
                         block.index,
+
                         block.timing,
+
                         texts[index] ??
-                            block.text
-                    ].join("\n")
+                        block.text
+                    ].join(
+                        "\n"
+                    )
             )
-            .join("\n\n")
+            .join(
+                "\n\n"
+            )
             .trim() +
         "\n"
     );
@@ -1128,34 +1435,55 @@ function auditTimestamps(
 // SENTENCE GROUPS
 // ============================================================
 
-function parseTimeSeconds(value) {
+function parseTimeSeconds(
+    value
+) {
     const match =
-        String(value || "")
-            .match(
-                /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
-            );
+        String(
+            value ||
+            ""
+        ).match(
+            /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
+        );
 
-    if (!match) {
+    if (
+        !match
+    ) {
         return NaN;
     }
 
     return (
-        Number(match[1]) *
+        Number(
+            match[1]
+        ) *
             3600 +
-        Number(match[2]) *
+
+        Number(
+            match[2]
+        ) *
             60 +
-        Number(match[3]) +
-        Number(match[4]) /
+
+        Number(
+            match[3]
+        ) +
+
+        Number(
+            match[4]
+        ) /
             1000
     );
 }
 
-function timingParts(timing) {
+function timingParts(
+    timing
+) {
     const match =
-        String(timing || "")
-            .match(
-                /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
-            );
+        String(
+            timing ||
+            ""
+        ).match(
+            /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
+        );
 
     return match
         ? {
@@ -1178,8 +1506,13 @@ function timingParts(timing) {
         };
 }
 
-function groupingText(text) {
-    return String(text || "")
+function groupingText(
+    text
+) {
+    return String(
+        text ||
+        ""
+    )
         .replace(
             /<[^>]+>/g,
             " "
@@ -1195,17 +1528,25 @@ function groupingText(text) {
         .trim();
 }
 
-function isMultiSpeaker(text) {
+function isMultiSpeaker(
+    text
+) {
     const lines =
-        String(text || "")
-            .split("\n")
+        String(
+            text ||
+            ""
+        )
+            .split(
+                "\n"
+            )
             .filter(
                 line =>
                     line.trim()
             );
 
     return (
-        lines.length >= 2 &&
+        lines.length >=
+            2 &&
         lines.filter(
             line =>
                 /^\s*[-–—]\s*\S/u.test(
@@ -1222,14 +1563,16 @@ function shouldMerge(
 ) {
     if (
         !group.length ||
-        group.length >= 4
+        group.length >=
+            4
     ) {
         return false;
     }
 
     const previous =
         group[
-            group.length - 1
+            group.length -
+            1
         ];
 
     if (
@@ -1324,7 +1667,9 @@ function shouldMerge(
     );
 }
 
-function buildSentenceGroups(blocks) {
+function buildSentenceGroups(
+    blocks
+) {
     const groups =
         [];
 
@@ -1389,7 +1734,9 @@ function buildSentenceGroups(blocks) {
     return groups;
 }
 
-function compactGroup(group) {
+function compactGroup(
+    group
+) {
     return {
         g:
             group.groupId,
@@ -1437,7 +1784,9 @@ function splitByBudget(
     ) {
         const size =
             JSON.stringify(
-                builder(item)
+                builder(
+                    item
+                )
             ).length +
             8;
 
@@ -1486,58 +1835,63 @@ function splitByBudget(
 // ============================================================
 
 const TRANSLATOR_PROMPT = `
-Você é o tradutor principal EN→PT-BR de legendas de entretenimento em 2026.
+Você traduz legendas EN→PT-BR em 2026.
 
-OBJETIVO:
-português brasileiro natural, oral, atual, conciso, fiel e culturalmente inteligente.
+Entregue português brasileiro:
+natural,
+oral,
+atual,
+conciso,
+fiel,
+contextual
+e culturalmente inteligente.
 
-Qualidade e sincronização semântica por cue são obrigatórias.
-
-NUNCA soe:
+Nunca soe:
 literal,
 engessado,
 antiquado,
 lusitano,
 burocrático
-ou com "gíria de tiozão".
+ou com gíria de tiozão.
 
-Também NÃO enfie internetês ou gíria jovem sem contexto.
+Não force internetês ou Gen Z.
+Use linguagem jovem apenas quando personagem,
+tom e contexto realmente pedirem.
 
-Gen Z/Alpha, drag, LGBTQIA+, reality, moda, música,
-memes e cultura pop devem soar como brasileiros reais
-daquele universo.
+REALITY / DRAG / LGBTQIA+ / POP:
 
-REGRAS EDITORIAIS CONCRETAS:
-
-- "bitch" como VOCATIVO amigável entre queens/amigas
-  pode ser "bicha", "gata", "amiga", "menina"
-  ou pode ser omitido conforme tom.
+- "bitch" como VOCATIVO amigável:
+  bicha,
+  gata,
+  amiga,
+  menina
+  ou omitir.
   NÃO use "puta" automaticamente.
-
-- "bitch" como insulto pode pedir "vadia",
-  "desgraçada" etc.
-  Decida pelo contexto.
+  Como insulto real,
+  adapte conforme contexto.
 
 - "I'm gagged" / "gagged" em reação:
   "Tô passada",
   "Tô muito passada",
   "Tô em choque",
   "Tô sem reação".
-  NUNCA "amordaçada".
+  Nunca "amordaçada".
 
 - "she ate":
-  "ela arrasou",
+  "arrasou",
   "entregou tudo",
-  "serviu demais"
-  etc. quando for gíria.
+  "serviu demais",
+  quando for gíria.
 
 - "no crumbs":
-  "não deixou nada pra ninguém"
-  quando fizer sentido.
+  "não deixou nada pra ninguém",
+  quando couber.
 
-- "motherfucking/fucking" é intensificador.
-  Preserve a força de modo brasileiro.
-  NÃO produza:
+- fucking / motherfucking =
+  INTENSIFICADOR.
+  Preserve força em posição natural brasileira.
+
+  Nunca:
   "competição da porra",
   "competição do caralho",
   "lip sync da porra",
@@ -1545,65 +1899,63 @@ REGRAS EDITORIAIS CONCRETAS:
   "cheque da porra",
   "cheque do caralho".
 
-- "fucking lip sync":
-  pode ser
-  "um puta lip sync",
-  "um lip sync foda",
-  "um lip sync absurdo"
-  conforme contexto.
+- supportive:
+  prefira:
+  "sempre me apoiou",
+  "sempre esteve do meu lado".
 
-- "supportive":
-  prefira
-  "sempre me apoiou muito",
-  "sempre esteve do meu lado"
-  etc.
-  Evite "super apoiador".
+  Evite:
+  "super apoiador".
 
-- no Drag Race,
-  "judges" = "jurados",
+- judges em Drag Race =
+  "jurados",
   não "juízes".
 
 - "the judgers are now the judgees":
   "agora quem julgava vai ser julgado"
   ou
   "agora os jurados é que vão ser julgados".
-  NÃO:
+
+  Nunca:
   "os juízes viraram os julgados".
 
 - "plucking pussy hairs":
-  preserve significado e vulgaridade.
-  Exemplo:
+  preserve corpo + vulgaridade.
+
+  Pode ser:
   "catar pelo de xereca",
-  "arrancar pelo de xereca".
-  NUNCA transforme em
+  "arrancar pelo de xereca",
+  conforme contexto.
+
+  Nunca:
   "fio de bigode".
 
-- vitória compartilhada / double win
-  NÃO é "empate duplo".
-  Use:
+- double win / shared win:
   "vitória dupla",
   "as duas ganharam"
-  ou formulação equivalente ao sentido real.
+  ou equivalente.
 
-- "week one" =
-  "primeira semana".
+  Não use "empate duplo"
+  quando não há empate.
 
-- "off the top" sobre dinheiro =
-  comissão/corte/porcentagem.
+- "off the top" sobre dinheiro:
+  comissão,
+  corte,
+  porcentagem.
 
-- "closing ranks" =
-  grupo se protegendo/panelinha.
+- "closing ranks":
+  grupo se protegendo,
+  panelinha.
 
-- "Carry the two" em conta =
+- "Carry the two":
   "vai dois".
+
+- "week one":
+  "primeira semana".
 
 - evite "apoiante".
 
-- "The talent performers"
-  não é
-  "As artistas do talento".
-
-PRESERVE quando presentes:
+Preserve quando presentes:
 
 Werkroom
 Condragulations
@@ -1613,17 +1965,22 @@ You betta werk
 Racers, start your engines
 
 PALAVRÃO:
-não censure.
+
+Não censure.
+
 Preserve intensidade,
-mas posicione como brasileiro realmente fala.
+mas posicione como um brasileiro realmente fala.
 
 GÊNERO:
+
 speaker é contexto oculto.
-Use quando seguro.
+
+Use apenas quando for seguro.
+
 Se não for seguro,
 reformule naturalmente.
 
-Nunca escreva:
+Nunca use:
 
 empolgado(a)
 animado(a)
@@ -1632,32 +1989,33 @@ ela/ele
 
 FORMATAÇÃO:
 
-sem nomes/labels de falante
-sem [NOME]
-sem NOME:
-sem barra "/" como separador
-sem hífen/travessão decorativo
-sem SDH/CC
-sem alongamentos gráficos
+Sem speaker labels.
+Sem [NOME].
+Sem NOME:.
+Sem barra "/" decorativa.
+Sem hífen/travessão decorativo.
+Sem SDH/CC.
+Sem alongamento gráfico.
 
 CUE LOCK ABSOLUTO:
 
-Você recebe Sentence Groups para entender contexto,
-mas CADA cue tem um id "i".
+Cada cue possui um id "i".
 
-Devolva exatamente UM "pt" para CADA "i" recebido,
+Devolva exatamente UM "pt"
+para CADA "i" recebido,
 com o MESMO "i".
 
 Não resuma.
 
-Não omita final de frase/raciocínio.
+Não omita o fim do raciocínio.
 
-Não mova fala para outro cue.
+Não antecipe conteúdo do cue seguinte.
 
-Se a frase atravessa vários cues,
-use o contexto para naturalidade,
-mas mantenha cada parte semanticamente alinhada
-ao cue onde é falada.
+Não atrase conteúdo para outro cue.
+
+Use Sentence Group apenas para entender contexto.
+
+Timestamps nunca são alterados.
 
 Responda SOMENTE JSON válido:
 
@@ -1666,8 +2024,10 @@ Responda SOMENTE JSON válido:
     {
       "g": 1,
       "c": [
-        {"i": 10, "pt": "..."},
-        {"i": 11, "pt": "..."}
+        {
+          "i": 10,
+          "pt": "..."
+        }
       ]
     }
   ]
@@ -1675,39 +2035,44 @@ Responda SOMENTE JSON válido:
 `;
 
 const RESCUE_PROMPT = `
-Você está corrigindo estrutura de uma tradução EN→PT-BR.
+Corrija a estrutura de uma tradução EN→PT-BR.
 
-Mantenha a MESMA qualidade editorial:
+Mantenha qualidade editorial alta:
 
-natural
-atual
-não literal
-completa
+natural,
+contemporânea,
+completa,
 fiel
+e não literal.
 
-Cada cue "i" deve voltar exatamente uma vez,
-com seu próprio "pt".
+Para cada group,
+devolva exatamente um "pt"
+para cada cue "i" recebido.
+
+Preserve o mesmo "i".
 
 Não omita conteúdo.
 
 Não mova conteúdo entre cues.
 
-speaker é contexto oculto
-e nunca aparece.
+speaker é contexto oculto.
 
 Sem labels.
 Sem barras.
-Sem marcadores de diálogo.
+Sem marcadores.
 Sem alongamentos.
 
-Responda SOMENTE JSON:
+Responda SOMENTE JSON válido:
 
 {
   "groups": [
     {
       "g": 1,
       "c": [
-        {"i": 10, "pt": "..."}
+        {
+          "i": 10,
+          "pt": "..."
+        }
       ]
     }
   ]
@@ -1715,251 +2080,195 @@ Responda SOMENTE JSON:
 `;
 
 const GEMINI_AUDIT_PROMPT = `
-Você é um AUDITOR editorial independente
-de legendas EN→PT-BR em 2026.
+Você é auditor editorial independente
+EN→PT-BR em 2026.
 
-NÃO traduza o episódio inteiro.
-
-NÃO faça reescrita cosmética.
-
-Analise CADA group recebido,
-comparando EN x PT cue por cue.
+Compare EN x PT
+CUE POR CUE.
 
 Para CADA group,
-devolva obrigatoriamente um veredito:
+devolva obrigatoriamente:
 
-"ok"
-=
-tradução correta,
-completa,
-natural
-e bem alinhada aos cues.
+v="ok"
 
-"fix"
-=
-existe problema REAL
-que merece retradução.
+ou
 
-Marque fix por qualquer um destes motivos:
+v="fix".
+
+Não reescreva por gosto.
+
+Marque "fix" somente por problema real.
+
+Motivos possíveis:
 
 SEMANTIC
-=
-sentido errado ou referência errada.
-
 OMISSION
-=
-conteúdo ou fim do raciocínio sumiu.
-
 CUE_SYNC
-=
-conteúdo foi antecipado ou atrasado
-entre cues.
-
 LITERAL
-=
-inglês vestido de português.
-
 REGISTER
-=
-português antiquado,
-duro,
-tiozão
-ou gíria artificial.
-
 CULTURE
-=
-drag,
-reality,
-LGBTQIA+,
-Gen Z/Alpha,
-meme,
-moda,
-música
-ou cultura pop
-mal adaptados.
-
 PROFANITY
-=
-palavrão censurado
-ou colocado de maneira
-que um brasileiro não falaria.
-
 GENDER
-=
-concordância/gênero inadequado.
-
 FORMAT
-=
-label,
-barra,
-"--" cru,
-marcador
-ou ruído visual.
 
-CRITÉRIOS OBRIGATÓRIOS:
+Cheque especialmente:
 
-- "bitch" como vocativo amigável
-  pode ser
-  bicha/gata/amiga/menina.
-  Não "puta" automaticamente.
+- bitch como vocativo amigável
+  não vira "puta" automaticamente.
 
 - motherfucking/fucking
-  é intensificador.
+  não vira:
   "competição da porra",
   "lip sync da porra",
-  "cheque da porra"
-  são sinais de literalidade ruim.
+  "cheque da porra".
 
 - supportive
-  não deve virar
-  "super apoiador"
-  se
-  "sempre me apoiou"
-  ou
-  "esteve do meu lado"
-  for mais natural.
+  não vira
+  "super apoiador".
 
-- judges em Drag Race =
+- judges no Drag Race =
   jurados.
 
 - judgers/judgees
-  não deve virar
+  não vira:
   "juízes viraram os julgados".
 
 - plucking pussy hairs
-  deve preservar pussy hairs
-  e vulgaridade.
-  "fio de bigode"
-  é erro grave.
+  não vira:
+  "fio de bigode".
 
-- double win/shared win
-  não é
-  "empate duplo".
+- double/shared win
+  não vira:
+  "empate duplo"
+  quando não existe empate.
 
-- gagged em reação:
+- gagged em reação
+  deve soar naturalmente:
   "Tô passada",
-  "Tô muito passada",
-  "Tô em choque"
-  são soluções naturais.
+  "Tô em choque",
+  etc.
 
-Não invente defeitos.
+Cheque também:
 
-Se estiver bom,
-marque "ok".
+- fim de frase/raciocínio perdido;
+- conteúdo antecipado;
+- conteúdo atrasado;
+- conteúdo migrado para cue vizinho.
 
 Para "fix",
-inclua "reasons"
-e um "hint" curto
-explicando COMO corrigir,
-sem escrever uma tradução longa.
+inclua:
+
+reasons
+
+e
+
+hint CURTO.
 
 Responda SOMENTE JSON
 e inclua EXATAMENTE
-um item por group recebido:
+um item por group:
 
 {
   "items": [
-    {"g": 1, "v": "ok"},
+    {
+      "g": 1,
+      "v": "ok"
+    },
     {
       "g": 2,
       "v": "fix",
-      "reasons": ["LITERAL", "CULTURE"],
-      "hint": "bitch é vocativo amigável; use bicha/gata conforme tom"
+      "reasons": [
+        "LITERAL"
+      ],
+      "hint": "..."
     }
   ]
 }
 `;
 
 const REPAIR_PROMPT = `
-Você é o editor final EN→PT-BR.
+Você é editor final EN→PT-BR.
 
-Recebe apenas Sentence Groups
-que uma auditoria marcou
-como problemáticos.
+Recebe SOMENTE groups
+com problema concreto.
 
-Para cada group,
-considere:
+Use:
 
 EN original
 PT atual
 reasons
 hint
-speaker oculto
 
-RETRADUZA somente o necessário
-para eliminar o problema,
-mantendo:
+Retraduza apenas o necessário.
+
+Mantenha:
 
 naturalidade
 contemporaneidade
 fidelidade
+cultura
 vulgaridade
-contexto cultural
-sincronização semântica
+sincronização semântica por cue
 
-STYLE PACK OBRIGATÓRIO:
+REGRAS OBRIGATÓRIAS:
 
 - bitch vocativo amigável:
   bicha/gata/amiga/menina
-  ou omitir.
+  ou omitir conforme tom.
   Não "puta" automaticamente.
 
-- motherfucking/fucking:
-  intensificador natural.
+- fucking/motherfucking:
+  intensificador natural brasileiro.
+
   Nunca:
   competição da porra/do caralho,
   lip sync da porra/do caralho,
   cheque da porra/do caralho.
 
 - supportive:
-  "sempre me apoiou",
-  "esteve do meu lado"
+  sempre me apoiou,
+  esteve do meu lado,
   etc.
-  Não "super apoiador".
 
 - judges no Drag Race:
   jurados.
 
 - judgers/judgees:
-  "quem julgava vai ser julgado"
-  ou
-  "os jurados é que vão ser julgados".
+  quem julgava vai ser julgado
+  ou equivalente natural.
 
 - plucking pussy hairs:
   preserve pelo de xereca
   ou equivalente vulgar.
-  Nunca fio de bigode.
 
-- double win/shared win:
-  vitória dupla/as duas ganharam.
-  Nunca "empate duplo"
-  quando não existe empate.
+- double/shared win:
+  vitória dupla,
+  as duas ganharam,
+  ou equivalente.
+
+  Não "empate duplo"
+  quando não há empate.
 
 - gagged:
   Tô passada,
   Tô muito passada,
   Tô em choque,
-  conforme contexto.
+  etc.
 
-- preserve:
-  Werkroom
-  Condragulations
-  Shantay, you stay
-  Sashay away
-  You betta werk
+Preserve catchphrases de Drag Race.
 
 CUE LOCK:
 
-devolva exatamente
-um "pt" para cada cue "i".
+Exatamente um "pt"
+para cada cue "i".
 
 Mesmo "i".
 
 Sem omissão.
 
-Sem mover fala entre cues.
+Sem mover conteúdo entre cues.
 
-speaker é contexto oculto.
+speaker é oculto.
 
 Sem labels.
 Sem barras.
@@ -1973,7 +2282,10 @@ Responda SOMENTE JSON:
     {
       "g": 1,
       "c": [
-        {"i": 10, "pt": "..."}
+        {
+          "i": 10,
+          "pt": "..."
+        }
       ]
     }
   ]
@@ -1981,16 +2293,34 @@ Responda SOMENTE JSON:
 `;
 
 // ============================================================
-// MISTRAL — UMA FILA, SEM PACER ARTIFICIAL
+// MISTRAL RATE-AWARE LANE
+//
+// Usa:
+// x-ratelimit-limit-tokens-minute
+// x-ratelimit-remaining-tokens-minute
+// x-ratelimit-tokens-query-cost
+//
+// Não inventa 23.500.
+// Não possui teto global.
 // ============================================================
 
-let mistralLane =
-    Promise.resolve();
+const rateState = {
+    limitTokens:
+        25000,
 
-let mistralCooldownUntil =
-    0;
+    remainingTokens:
+        null,
 
-function withMistralLane(fn) {
+    events:
+        [],
+
+    lastCostByPurpose:
+        new Map()
+};
+
+function withMistralLane(
+    fn
+) {
     const run =
         mistralLane.then(
             fn,
@@ -2005,181 +2335,119 @@ function withMistralLane(fn) {
     return run;
 }
 
-function dynamicMaxTokens(
-    user,
-    purpose
+function numberHeader(
+    response,
+    name
 ) {
-    const chars =
-        String(user || "")
-            .length;
+    const raw =
+        response
+            ?.headers
+            ?.get(
+                name
+            );
 
     if (
-        purpose ===
-        "translation"
+        raw == null ||
+        raw ===
+            ""
     ) {
-        return Math.max(
-            3200,
-            Math.min(
-                7000,
-                Math.ceil(
-                    chars /
-                    3.2
-                )
-            )
-        );
-    }
-
-    if (
-        purpose ===
-        "repair"
-    ) {
-        return Math.max(
-            1800,
-            Math.min(
-                5000,
-                Math.ceil(
-                    chars /
-                    3.0
-                )
-            )
-        );
-    }
-
-    return Math.max(
-        1200,
-        Math.min(
-            3500,
-            Math.ceil(
-                chars /
-                3.0
-            )
-        )
-    );
-}
-
-function parseWaitHeaderValue(raw) {
-    if (!raw) {
         return null;
     }
 
-    const value =
-        String(raw)
-            .trim()
-            .toLowerCase();
-
-    if (
-        /^\d+(?:\.\d+)?$/.test(
-            value
-        )
-    ) {
-        return Math.max(
-            1000,
-            Number(value) *
-                1000
-        );
-    }
-
-    const ms =
-        value.match(
-            /^(\d+(?:\.\d+)?)ms$/
+    const number =
+        Number(
+            raw
         );
 
-    if (ms) {
-        return Math.max(
-            250,
-            Number(ms[1])
-        );
-    }
-
-    const sec =
-        value.match(
-            /^(\d+(?:\.\d+)?)s$/
-        );
-
-    if (sec) {
-        return Math.max(
-            1000,
-            Number(sec[1]) *
-                1000
-        );
-    }
-
-    const date =
-        Date.parse(raw);
-
-    if (
-        Number.isFinite(
-            date
-        )
-    ) {
-        return Math.max(
-            1000,
-            date -
-                Date.now()
-        );
-    }
-
-    return null;
+    return Number.isFinite(
+        number
+    )
+        ? number
+        : null;
 }
 
-function retryWaitMs(
+function pruneRateEvents() {
+    const cutoff =
+        Date.now() -
+        60000;
+
+    rateState.events =
+        rateState.events.filter(
+            event =>
+                event.ts >
+                cutoff
+        );
+}
+
+function updateRateState(
     response,
-    attempt
+    purpose,
+    payloadChars,
+    eventTs =
+        Date.now()
 ) {
-    for (
-        const name
-        of [
-            "retry-after",
-            "x-ratelimit-reset",
-            "x-ratelimit-reset-tokens",
-            "x-ratelimit-reset-requests"
-        ]
-    ) {
-        const parsed =
-            parseWaitHeaderValue(
-                response
-                    ?.headers
-                    ?.get(name)
-            );
+    const limit =
+        numberHeader(
+            response,
+            "x-ratelimit-limit-tokens-minute"
+        );
 
-        if (parsed) {
-            return Math.min(
-                parsed +
-                    250,
-                90000
-            );
-        }
+    const remaining =
+        numberHeader(
+            response,
+            "x-ratelimit-remaining-tokens-minute"
+        );
+
+    const cost =
+        numberHeader(
+            response,
+            "x-ratelimit-tokens-query-cost"
+        );
+
+    if (
+        limit &&
+        limit >
+            0
+    ) {
+        rateState.limitTokens =
+            limit;
     }
 
-    /*
-     * Só usado quando a própria API
-     * realmente devolveu 429
-     * e não informou Retry-After.
-     *
-     * Evita a sequência inútil
-     * 4, 8, 12, 16...
-     * que estava gerando dezenas de 429.
-     */
-    const schedule = [
-        12000,
-        20000,
-        30000,
-        40000,
-        50000,
-        60000,
-        70000
-    ];
+    if (
+        remaining !=
+        null
+    ) {
+        rateState.remainingTokens =
+            remaining;
+    }
 
-    return schedule[
-        Math.min(
-            attempt - 1,
-            schedule.length - 1
-        )
-    ];
-}
+    if (
+        cost &&
+        cost >
+            0
+    ) {
+        rateState.events.push({
+            ts:
+                eventTs,
 
-function rateHeaderSummary(response) {
-    const out =
+            cost
+        });
+
+        rateState
+            .lastCostByPurpose
+            .set(
+                purpose,
+                {
+                    cost,
+
+                    payloadChars
+                }
+            );
+    }
+
+    pruneRateEvents();
+
+    const info =
         [];
 
     try {
@@ -2190,17 +2458,17 @@ function rateHeaderSummary(response) {
             ]
             of response.headers.entries()
         ) {
-            const name =
+            const lower =
                 key.toLowerCase();
 
             if (
-                name.startsWith(
+                lower.startsWith(
                     "x-ratelimit"
                 ) ||
-                name ===
+                lower ===
                     "retry-after"
             ) {
-                out.push(
+                info.push(
                     `${key}=${value}`
                 );
             }
@@ -2208,12 +2476,299 @@ function rateHeaderSummary(response) {
     }
     catch {}
 
-    return out.join(
-        " | "
+    if (
+        info.length
+    ) {
+        console.log(
+            `[MISTRAL RATE] ${info.join(
+                " | "
+            )}`
+        );
+    }
+}
+
+function estimateQueryCost(
+    purpose,
+    payloadChars,
+    maxTokens,
+    systemChars
+) {
+    const last =
+        rateState
+            .lastCostByPurpose
+            .get(
+                purpose
+            );
+
+    if (
+        last &&
+        last.payloadChars >
+            0
+    ) {
+        const ratio =
+            Math.max(
+                0.45,
+
+                Math.min(
+                    1.6,
+
+                    payloadChars /
+                    last.payloadChars
+                )
+            );
+
+        return Math.ceil(
+            last.cost *
+            (
+                0.58 +
+                0.42 *
+                ratio
+            )
+        );
+    }
+
+    return Math.ceil(
+        maxTokens +
+        (
+            payloadChars +
+            systemChars
+        ) /
+        3.4 +
+        350
     );
 }
 
-function extractMistralText(content) {
+async function waitForRealQuota(
+    estimate,
+    job
+) {
+    while (
+        true
+    ) {
+        pruneRateEvents();
+
+        const used =
+            rateState
+                .events
+                .reduce(
+                    (
+                        sum,
+                        event
+                    ) =>
+                        sum +
+                        event.cost,
+
+                    0
+                );
+
+        const limit =
+            rateState.limitTokens ||
+            25000;
+
+        const syntheticRemaining =
+            Math.max(
+                0,
+                limit -
+                used
+            );
+
+        const serverRemaining =
+            rateState.remainingTokens ==
+            null
+                ? syntheticRemaining
+                : rateState.remainingTokens;
+
+        const effectiveRemaining =
+            rateState.remainingTokens ==
+            null
+                ? syntheticRemaining
+                : Math.min(
+                    serverRemaining,
+                    syntheticRemaining
+                );
+
+        if (
+            estimate <=
+            Math.max(
+                0,
+
+                effectiveRemaining -
+                250
+            )
+        ) {
+            return;
+        }
+
+        if (
+            !rateState.events.length
+        ) {
+            return;
+        }
+
+        let freed =
+            0;
+
+        let releaseAt =
+            Date.now() +
+            1000;
+
+        for (
+            const event
+            of [
+                ...rateState.events
+            ].sort(
+                (
+                    a,
+                    b
+                ) =>
+                    a.ts -
+                    b.ts
+            )
+        ) {
+            freed +=
+                event.cost;
+
+            releaseAt =
+                event.ts +
+                60000 +
+                350;
+
+            if (
+                effectiveRemaining +
+                freed >=
+                estimate +
+                250
+            ) {
+                break;
+            }
+        }
+
+        const wait =
+            Math.max(
+                250,
+
+                releaseAt -
+                Date.now()
+            );
+
+        job.stats.quotaWaitMs +=
+            wait;
+
+        console.log(
+            `[MISTRAL QUOTA] ` +
+            `custo estimado~${estimate}; ` +
+            `restante~${Math.round(
+                effectiveRemaining
+            )}; ` +
+            `aguardando ${(wait / 1000).toFixed(
+                1
+            )}s pela própria janela de ` +
+            `${limit} TPM.`
+        );
+
+        await sleep(
+            wait
+        );
+
+        // O header anterior agora ficou velho.
+        // Os eventos reais locais passam a determinar a janela.
+        rateState.remainingTokens =
+            null;
+    }
+}
+
+function parseRetryAfter(
+    response
+) {
+    const raw =
+        response
+            ?.headers
+            ?.get(
+                "retry-after"
+            );
+
+    if (
+        raw
+    ) {
+        const number =
+            Number(
+                raw
+            );
+
+        if (
+            Number.isFinite(
+                number
+            ) &&
+            number >
+                0
+        ) {
+            return Math.min(
+                90000,
+
+                Math.max(
+                    1000,
+
+                    number *
+                    1000
+                )
+            );
+        }
+
+        const date =
+            Date.parse(
+                raw
+            );
+
+        if (
+            Number.isFinite(
+                date
+            )
+        ) {
+            return Math.min(
+                90000,
+
+                Math.max(
+                    1000,
+
+                    date -
+                    Date.now()
+                )
+            );
+        }
+    }
+
+    pruneRateEvents();
+
+    if (
+        rateState.events.length
+    ) {
+        return Math.max(
+            1000,
+
+            Math.min(
+                90000,
+
+                Math.min(
+                    ...rateState
+                        .events
+                        .map(
+                            event =>
+                                event.ts +
+                                60000 -
+                                Date.now() +
+                                500
+                        )
+                )
+            )
+        );
+    }
+
+    return 12000;
+}
+
+function extractMistralText(
+    content
+) {
     if (
         typeof content ===
         "string"
@@ -2230,14 +2785,16 @@ function extractMistralText(content) {
             .filter(
                 item =>
                     item?.type ===
-                        "text"
+                    "text"
             )
             .map(
                 item =>
                     item.text ||
                     ""
             )
-            .join("");
+            .join(
+                ""
+            );
     }
 
     return "";
@@ -2247,9 +2804,13 @@ async function mistralChat({
     system,
     user,
     job,
-    purpose = "translation",
-    reasoning = "none",
-    temperature = 0.1
+    purpose =
+        "translation",
+    reasoning =
+        "none",
+    temperature =
+        0.1,
+    maxTokens
 }) {
     if (
         !MISTRAL_API_KEY
@@ -2272,18 +2833,21 @@ async function mistralChat({
             ) {
                 job.stats.mistralAttempts++;
 
-                const now =
-                    Date.now();
+                const estimate =
+                    estimateQueryCost(
+                        purpose,
 
-                if (
-                    now <
-                    mistralCooldownUntil
-                ) {
-                    await sleep(
-                        mistralCooldownUntil -
-                        now
+                        user.length,
+
+                        maxTokens,
+
+                        system.length
                     );
-                }
+
+                await waitForRealQuota(
+                    estimate,
+                    job
+                );
 
                 const controller =
                     new AbortController();
@@ -2292,25 +2856,25 @@ async function mistralChat({
                     setTimeout(
                         () =>
                             controller.abort(),
+
                         MISTRAL_TIMEOUT_MS
                     );
 
                 try {
-                    const max_tokens =
-                        dynamicMaxTokens(
-                            user,
-                            purpose
-                        );
-
                     console.log(
                         `[MISTRAL ${purpose.toUpperCase()}] ` +
                         `Request ${attempt}/${MISTRAL_MAX_RETRIES} | ` +
-                        `max_tokens=${max_tokens}.`
+                        `max_tokens=${maxTokens} | ` +
+                        `custo~${estimate}.`
                     );
+
+                    const requestStartedAt =
+                        Date.now();
 
                     const response =
                         await fetch(
                             "https://api.mistral.ai/v1/chat/completions",
+
                             {
                                 method:
                                     "POST",
@@ -2356,13 +2920,20 @@ async function mistralChat({
 
                                         temperature,
 
-                                        max_tokens,
+                                        // IMPORTANTE:
+                                        // temperature 0 entra em greedy.
+                                        // A API exigiu top_p=1.
+                                        top_p:
+                                            1,
+
+                                        max_tokens:
+                                            maxTokens,
 
                                         prompt_cache_key:
                                             purpose ===
                                             "translation"
-                                                ? "stremio-ptbr-6-5-main"
-                                                : "stremio-ptbr-6-5-editor"
+                                                ? "stremio-ptbr-651-main"
+                                                : "stremio-ptbr-651-editor"
                                     }),
 
                                 signal:
@@ -2386,16 +2957,15 @@ async function mistralChat({
                     }
                     catch {}
 
-                    const rateInfo =
-                        rateHeaderSummary(
-                            response
-                        );
+                    updateRateState(
+                        response,
 
-                    if (rateInfo) {
-                        console.log(
-                            `[MISTRAL RATE] ${rateInfo}`
-                        );
-                    }
+                        purpose,
+
+                        user.length,
+
+                        requestStartedAt
+                    );
 
                     if (
                         response.ok &&
@@ -2426,13 +2996,38 @@ async function mistralChat({
                                     ?.content
                             );
 
-                        if (!text) {
+                        const finishReason =
+                            String(
+                                data
+                                    ?.choices
+                                    ?.[0]
+                                    ?.finish_reason ||
+                                ""
+                            );
+
+                        if (
+                            !text
+                        ) {
                             throw new Error(
                                 "Mistral retornou resposta vazia."
                             );
                         }
 
-                        return text;
+                        console.log(
+                            `[MISTRAL ${purpose.toUpperCase()}] ` +
+                            `finish_reason=${finishReason || "UNKNOWN"} | ` +
+                            `chars=${text.length}.`
+                        );
+
+                        return {
+                            text,
+
+                            finishReason,
+
+                            usage:
+                                data?.usage ||
+                                {}
+                        };
                     }
 
                     const message =
@@ -2465,19 +3060,8 @@ async function mistralChat({
                         job.stats.mistral429++;
 
                         const wait =
-                            retryWaitMs(
-                                response,
-                                attempt
-                            );
-
-                        job.stats.mistralRetryWaitMs +=
-                            wait;
-
-                        mistralCooldownUntil =
-                            Math.max(
-                                mistralCooldownUntil,
-                                Date.now() +
-                                    wait
+                            parseRetryAfter(
+                                response
                             );
 
                         if (
@@ -2488,15 +3072,18 @@ async function mistralChat({
                         }
 
                         console.warn(
-                            `[MISTRAL] 429 real; aguardando ` +
-                            `${(wait / 1000).toFixed(
+                            `[MISTRAL] 429 residual; ` +
+                            `aguardando ${(wait / 1000).toFixed(
                                 1
-                            )}s antes de tentar novamente.`
+                            )}s.`
                         );
 
                         await sleep(
                             wait
                         );
+
+                        rateState.remainingTokens =
+                            null;
 
                         continue;
                     }
@@ -2520,23 +3107,24 @@ async function mistralChat({
                         throw error;
                     }
 
-                    const wait =
+                    await sleep(
                         Math.min(
                             2500 *
-                                attempt,
-                            15000
-                        );
+                            attempt,
 
-                    await sleep(
-                        wait
+                            15000
+                        )
                     );
                 }
-                catch (error) {
+                catch (
+                    error
+                ) {
                     lastError =
                         error?.name ===
-                            "AbortError"
+                        "AbortError"
                             ? new Error(
-                                "MISTRAL: timeout desta request."
+                                `MISTRAL ${purpose}: ` +
+                                `timeout desta request.`
                             )
                             : error;
 
@@ -2579,7 +3167,8 @@ async function mistralChat({
                     const wait =
                         Math.min(
                             2500 *
-                                attempt,
+                            attempt,
+
                             15000
                         );
 
@@ -2618,7 +3207,7 @@ async function mistralChat({
 }
 
 // ============================================================
-// PARSER DE TRADUÇÃO POR CUE-ID
+// PARSER POR CUE ID
 // ============================================================
 
 function parseGroupResponse(
@@ -2707,11 +3296,6 @@ function parseGroupResponse(
                 ? item.c
                 : null;
 
-        /*
-         * Compatibilidade/resiliência
-         * caso o modelo ainda devolva
-         * o formato antigo "s".
-         */
         if (
             !cueItems &&
             Array.isArray(
@@ -2736,12 +3320,6 @@ function parseGroupResponse(
                 );
         }
 
-        /*
-         * 1 cue + modelo dividiu em vários pedaços.
-         *
-         * Não chama outra IA.
-         * Mantém TODO o conteúdo no MESMO timestamp.
-         */
         if (
             group.cues.length ===
                 1 &&
@@ -2751,10 +3329,10 @@ function parseGroupResponse(
             cueItems.length >
                 1 &&
             cueItems.every(
-                item =>
+                value =>
                     typeof (
-                        item?.pt ??
-                        item?.text
+                        value?.pt ??
+                        value?.text
                     ) ===
                     "string"
             )
@@ -2762,16 +3340,22 @@ function parseGroupResponse(
             const joined =
                 cueItems
                     .map(
-                        item =>
+                        value =>
                             String(
-                                item.pt ??
-                                item.text
+                                value.pt ??
+                                value.text
                             ).trim()
                     )
-                    .filter(Boolean)
-                    .join("\n");
+                    .filter(
+                        Boolean
+                    )
+                    .join(
+                        "\n"
+                    );
 
-            if (joined) {
+            if (
+                joined
+            ) {
                 cueItems = [
                     {
                         i:
@@ -2784,14 +3368,13 @@ function parseGroupResponse(
                     }
                 ];
 
-                job
-                    .stats
-                    .structuralSingleCueJoins++;
+                job.stats.singleCueJoins++;
 
                 console.log(
                     `[STRUCTURAL FIX] ` +
-                    `g${groupId}: oversplit unido ` +
-                    `no mesmo cue ${group.cues[0].index}.`
+                    `g${groupId}: ` +
+                    `oversplit unido no mesmo cue ` +
+                    `${group.cues[0].index}.`
                 );
             }
         }
@@ -2819,26 +3402,28 @@ function parseGroupResponse(
             false;
 
         for (
-            const item
+            const cueItem
             of cueItems
         ) {
             const id =
                 Number(
-                    item?.i ??
-                    item?.id
+                    cueItem?.i ??
+                    cueItem?.id
                 );
 
             const pt =
                 String(
-                    item?.pt ??
-                    item?.text ??
+                    cueItem?.pt ??
+                    cueItem?.text ??
                     ""
                 ).trim();
 
             if (
                 !id ||
                 !pt ||
-                byId.has(id)
+                byId.has(
+                    id
+                )
             ) {
                 bad =
                     true;
@@ -2852,7 +3437,9 @@ function parseGroupResponse(
             );
         }
 
-        if (bad) {
+        if (
+            bad
+        ) {
             issues.push(
                 `g${groupId}:invalid-cue`
             );
@@ -2872,7 +3459,9 @@ function parseGroupResponse(
                     cue.index
                 );
 
-            if (!pt) {
+            if (
+                !pt
+            ) {
                 bad =
                     true;
 
@@ -2884,7 +3473,9 @@ function parseGroupResponse(
             );
         }
 
-        if (bad) {
+        if (
+            bad
+        ) {
             issues.push(
                 `g${groupId}:missing-id`
             );
@@ -2916,7 +3507,9 @@ function parseGroupResponse(
                     group =>
                         group.groupId
                 )
-                .join(",")}`
+                .join(
+                    ","
+                )}`
         );
     }
 
@@ -2927,49 +3520,94 @@ function parseGroupResponse(
     };
 }
 
+// ============================================================
+// TRANSLATE / RESCUE
+// ============================================================
+
 async function translateBatch(
     groups,
     job,
-    rescue = false
+    {
+        rescue =
+            false,
+        high =
+            false
+    } = {}
 ) {
-    const raw =
+    const system =
+        rescue
+            ? RESCUE_PROMPT
+            : TRANSLATOR_PROMPT;
+
+    const purpose =
+        rescue
+            ? "rescue"
+            : "translation";
+
+    const maxTokens =
+        rescue
+            ? RESCUE_MAX_TOKENS
+            : MAIN_MAX_TOKENS;
+
+    const user =
+        rescue
+            ?
+            `Corrija a estrutura destes groups:\n` +
+            `${JSON.stringify({
+                groups:
+                    groups.map(
+                        compactGroup
+                    )
+            })}`
+            :
+            `Traduza estes Sentence Groups:\n` +
+            `${JSON.stringify({
+                groups:
+                    groups.map(
+                        compactGroup
+                    )
+            })}`;
+
+    const response =
         await mistralChat({
-            system:
-                rescue
-                    ? RESCUE_PROMPT
-                    : TRANSLATOR_PROMPT,
-
-            user:
-                `${rescue
-                    ? "Corrija a estrutura"
-                    : "Traduza"
-                } destes Sentence Groups:\n` +
-                `${JSON.stringify({
-                    groups:
-                        groups.map(
-                            compactGroup
-                        )
-                })}`,
-
+            system,
+            user,
             job,
-
-            purpose:
-                rescue
-                    ? "rescue"
-                    : "translation",
+            purpose,
 
             reasoning:
-                "none",
+                high
+                    ? "high"
+                    : "none",
 
             temperature:
                 rescue
                     ? 0
-                    : 0.12
+                    : 0.12,
+
+            maxTokens
         });
+
+    if (
+        response.finishReason ===
+            "length" ||
+        response.finishReason ===
+            "max_tokens"
+    ) {
+        const error =
+            new Error(
+                `OUTPUT_TRUNCATED:${groups.length}`
+            );
+
+        error.code =
+            "OUTPUT_TRUNCATED";
+
+        throw error;
+    }
 
     return parseGroupResponse(
         groups,
-        raw,
+        response.text,
         job
     );
 }
@@ -2984,8 +3622,11 @@ async function rescueGroups(
     const batches =
         splitByBudget(
             groups,
-            6500,
-            12,
+
+            RESCUE_BATCH_CHARS,
+
+            RESCUE_BATCH_GROUPS,
+
             compactGroup
         );
 
@@ -2997,7 +3638,10 @@ async function rescueGroups(
             await translateBatch(
                 batch,
                 job,
-                true
+                {
+                    rescue:
+                        true
+                }
             );
 
         for (
@@ -3017,14 +3661,14 @@ async function rescueGroups(
             const group
             of parsed.invalidGroups
         ) {
-            const raw =
+            const response =
                 await mistralChat({
                     system:
                         RESCUE_PROMPT,
 
                     user:
-                        `Corrija SOMENTE este group. ` +
-                        `Preserve todos os cues por id:\n` +
+                        `Corrija SOMENTE este group ` +
+                        `e preserve cada cue i:\n` +
                         `${JSON.stringify(
                             compactGroup(
                                 group
@@ -3040,13 +3684,32 @@ async function rescueGroups(
                         "high",
 
                     temperature:
-                        0
+                        0,
+
+                    maxTokens:
+                        2600
                 });
+
+            if (
+                response.finishReason ===
+                    "length" ||
+                response.finishReason ===
+                    "max_tokens"
+            ) {
+                throw new Error(
+                    `Resgate truncado ` +
+                    `g=${group.groupId}.`
+                );
+            }
 
             const one =
                 parseGroupResponse(
-                    [group],
-                    raw,
+                    [
+                        group
+                    ],
+
+                    response.text,
+
                     job
                 );
 
@@ -3076,65 +3739,197 @@ async function rescueGroups(
 
 async function translateBatchResilient(
     groups,
-    job
+    job,
+    depth = 0
 ) {
-    const first =
-        await translateBatch(
-            groups,
-            job,
-            false
-        );
+    try {
+        const first =
+            await translateBatch(
+                groups,
+                job
+            );
 
-    const result =
-        new Map(
-            first.valid
-        );
+        if (
+            !first
+                .invalidGroups
+                .length
+        ) {
+            return first.valid;
+        }
 
-    if (
-        !first
-            .invalidGroups
-            .length
-    ) {
-        return result;
-    }
+        const jsonInvalid =
+            first
+                .issues
+                .includes(
+                    "JSON_INVALID"
+                );
 
-    job.stats.salvageGroups +=
-        first.valid.size;
+        const invalidRatio =
+            first
+                .invalidGroups
+                .length /
+            groups.length;
 
-    console.warn(
-        `[MISTRAL SALVAGE] ` +
-        `válidos=${first.valid.size}/${groups.length}; ` +
-        `resgatar=${first.invalidGroups.length}; ` +
-        `${first.issues
-            .slice(
-                0,
-                8
-            )
-            .join(
-                " | "
-            )}`
-    );
+        if (
+            (
+                jsonInvalid ||
+                invalidRatio >=
+                    0.45
+            ) &&
+            groups.length >
+                24 &&
+            depth <
+                5
+        ) {
+            if (
+                jsonInvalid
+            ) {
+                job
+                    .stats
+                    .jsonInvalidSplits++;
+            }
 
-    const rescued =
-        await rescueGroups(
-            first.invalidGroups,
             job
+                .stats
+                .mainSplits++;
+
+            const middle =
+                Math.ceil(
+                    groups.length /
+                    2
+                );
+
+            console.warn(
+                `[MISTRAL SPLIT] ` +
+                `lote ${groups.length} com falha ampla -> ` +
+                `${middle}+${groups.length - middle}; ` +
+                `sem explosão de rescues.`
+            );
+
+            const left =
+                await translateBatchResilient(
+                    groups.slice(
+                        0,
+                        middle
+                    ),
+
+                    job,
+
+                    depth +
+                    1
+                );
+
+            const right =
+                await translateBatchResilient(
+                    groups.slice(
+                        middle
+                    ),
+
+                    job,
+
+                    depth +
+                    1
+                );
+
+            return new Map([
+                ...left,
+                ...right
+            ]);
+        }
+
+        job.stats.salvageGroups +=
+            first.valid.size;
+
+        console.warn(
+            `[MISTRAL SALVAGE] ` +
+            `válidos=${first.valid.size}/${groups.length}; ` +
+            `resgatar=${first.invalidGroups.length}; ` +
+            `${first
+                .issues
+                .slice(
+                    0,
+                    6
+                )
+                .join(
+                    " | "
+                )}`
         );
 
-    for (
-        const [
-            groupId,
-            segments
-        ]
-        of rescued
-    ) {
-        result.set(
-            groupId,
-            segments
-        );
+        const rescued =
+            await rescueGroups(
+                first.invalidGroups,
+                job
+            );
+
+        return new Map([
+            ...first.valid,
+            ...rescued
+        ]);
     }
+    catch (
+        error
+    ) {
+        if (
+            error?.code ===
+                "OUTPUT_TRUNCATED" &&
+            groups.length >
+                24 &&
+            depth <
+                5
+        ) {
+            job
+                .stats
+                .outputTruncations++;
 
-    return result;
+            job
+                .stats
+                .mainSplits++;
+
+            const middle =
+                Math.ceil(
+                    groups.length /
+                    2
+                );
+
+            console.warn(
+                `[MISTRAL SPLIT] ` +
+                `saída truncada em ${groups.length} groups -> ` +
+                `${middle}+${groups.length - middle}.`
+            );
+
+            const left =
+                await translateBatchResilient(
+                    groups.slice(
+                        0,
+                        middle
+                    ),
+
+                    job,
+
+                    depth +
+                    1
+                );
+
+            const right =
+                await translateBatchResilient(
+                    groups.slice(
+                        middle
+                    ),
+
+                    job,
+
+                    depth +
+                    1
+                );
+
+            return new Map([
+                ...left,
+                ...right
+            ]);
+        }
+
+        throw error;
+    }
 }
 
 // ============================================================
@@ -3182,7 +3977,9 @@ function reviewPayload(
     };
 }
 
-function extractGeminiText(data) {
+function extractGeminiText(
+    data
+) {
     return (
         data
             ?.candidates
@@ -3198,7 +3995,9 @@ function extractGeminiText(data) {
                     ? part.text
                     : ""
         )
-        .join("")
+        .join(
+            ""
+        )
         .trim();
 }
 
@@ -3207,6 +4006,14 @@ async function geminiRaw(
     translations,
     job
 ) {
+    if (
+        !GEMINI_API_KEY
+    ) {
+        throw new Error(
+            "GEMINI_API_KEY não configurada."
+        );
+    }
+
     let lastError =
         null;
 
@@ -3225,6 +4032,7 @@ async function geminiRaw(
             setTimeout(
                 () =>
                     controller.abort(),
+
                 GEMINI_TIMEOUT_MS
             );
 
@@ -3235,6 +4043,7 @@ async function geminiRaw(
                     `v1beta/models/${encodeURIComponent(
                         GEMINI_MODEL
                     )}:generateContent`,
+
                     {
                         method:
                             "POST",
@@ -3360,7 +4169,9 @@ async function geminiRaw(
                         data
                     );
 
-                if (!text) {
+                if (
+                    !text
+                ) {
                     throw new Error(
                         "Gemini audit vazio."
                     );
@@ -3398,11 +4209,31 @@ async function geminiRaw(
             ) {
                 job.stats.gemini429++;
 
-                const wait =
-                    retryWaitMs(
-                        response,
-                        attempt
+                const rawRetry =
+                    response.headers.get(
+                        "retry-after"
                     );
+
+                const wait =
+                    rawRetry &&
+                    Number(
+                        rawRetry
+                    ) >
+                        0
+                        ? Math.min(
+                            60000,
+
+                            Number(
+                                rawRetry
+                            ) *
+                            1000
+                        )
+                        : Math.min(
+                            4000 *
+                            attempt,
+
+                            24000
+                        );
 
                 if (
                     attempt ===
@@ -3410,13 +4241,6 @@ async function geminiRaw(
                 ) {
                     throw error;
                 }
-
-                console.warn(
-                    `[GEMINI AUDIT] 429; ` +
-                    `aguardando ${(wait / 1000).toFixed(
-                        1
-                    )}s.`
-                );
 
                 await sleep(
                     wait
@@ -3447,12 +4271,15 @@ async function geminiRaw(
             await sleep(
                 Math.min(
                     2000 *
-                        attempt,
+                    attempt,
+
                     12000
                 )
             );
         }
-        catch (error) {
+        catch (
+            error
+        ) {
             lastError =
                 error?.name ===
                     "AbortError"
@@ -3471,7 +4298,8 @@ async function geminiRaw(
             await sleep(
                 Math.min(
                     2000 *
-                        attempt,
+                    attempt,
+
                     12000
                 )
             );
@@ -3522,12 +4350,10 @@ function parseAudit(
     }
 
     const expected =
-        new Map(
+        new Set(
             groups.map(
-                group => [
-                    group.groupId,
-                    group
-                ]
+                group =>
+                    group.groupId
             )
         );
 
@@ -3582,29 +4408,28 @@ function parseAudit(
             verdict ===
             "fix"
         ) {
-            const reasons =
-                Array.isArray(
-                    item?.reasons
-                )
-                    ? item.reasons
-                        .map(
-                            value =>
-                                String(
-                                    value
-                                ).toUpperCase()
-                        )
-                        .slice(
-                            0,
-                            8
-                        )
-                    : [
-                        "REVIEW"
-                    ];
-
             flags.set(
                 groupId,
+
                 {
-                    reasons,
+                    reasons:
+                        Array.isArray(
+                            item?.reasons
+                        )
+                            ? item.reasons
+                                .map(
+                                    value =>
+                                        String(
+                                            value
+                                        ).toUpperCase()
+                                )
+                                .slice(
+                                    0,
+                                    8
+                                )
+                            : [
+                                "REVIEW"
+                            ],
 
                     hint:
                         String(
@@ -3660,7 +4485,9 @@ async function auditMicroBatch(
 
         return flags;
     }
-    catch (error) {
+    catch (
+        error
+    ) {
         if (
             groups.length >
                 1 &&
@@ -3674,8 +4501,9 @@ async function auditMicroBatch(
                 );
 
             console.warn(
-                `[GEMINI AUDIT] split ${groups.length} ` +
-                `por ${errorMessage(
+                `[GEMINI AUDIT] ` +
+                `split ${groups.length} por ` +
+                `${errorMessage(
                     error
                 ).slice(
                     0,
@@ -3689,9 +4517,13 @@ async function auditMicroBatch(
                         0,
                         middle
                     ),
+
                     translations,
+
                     job,
-                    depth + 1
+
+                    depth +
+                    1
                 );
 
             const right =
@@ -3699,9 +4531,13 @@ async function auditMicroBatch(
                     groups.slice(
                         middle
                     ),
+
                     translations,
+
                     job,
-                    depth + 1
+
+                    depth +
+                    1
                 );
 
             return new Map([
@@ -3715,13 +4551,18 @@ async function auditMicroBatch(
 }
 
 // ============================================================
-// FINAL CLEAN + KNOWN-RISK DETECTION
+// FINAL CLEAN
 // ============================================================
 
-function cleanFinalText(text) {
+function cleanFinalText(
+    text
+) {
     let value =
         normalizeElongations(
-            String(text || "")
+            String(
+                text ||
+                ""
+            )
                 .replace(
                     /\r\n/g,
                     "\n"
@@ -3732,64 +4573,59 @@ function cleanFinalText(text) {
                 )
         );
 
-    /*
-     * Remove separador visual:
-     *
-     * "fala 1 / fala 2"
-     * ->
-     * duas linhas limpas.
-     */
     value =
         value.replace(
             /\s+\/\s+(?=\S)/g,
             "\n"
         );
 
-    value =
-        value
-            .split("\n")
-            .map(
-                line => {
-                    let clean =
-                        String(line || "")
-                            .replace(
-                                /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
-                                ""
-                            )
-                            .replace(
-                                /^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+(?=\S)/u,
-                                ""
-                            )
-                            .replace(
-                                /^\s*[-–—/]+\s*(?=\S)/u,
-                                ""
-                            )
-                            .replace(
-                                /\s*--+\s*$/u,
-                                "…"
-                            )
-                            .replace(
-                                /\s*--+\s*/gu,
-                                "… "
-                            )
-                            .replace(
-                                /[♪♫♬]+/gu,
-                                ""
-                            )
-                            .replace(
-                                /[ \t]{2,}/g,
-                                " "
-                            )
-                            .trim();
-
-                    return clean;
-                }
-            )
-            .filter(Boolean)
-            .join("\n")
-            .trim();
-
-    return value;
+    return value
+        .split(
+            "\n"
+        )
+        .map(
+            line =>
+                String(
+                    line ||
+                    ""
+                )
+                    .replace(
+                        /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
+                        ""
+                    )
+                    .replace(
+                        /^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+(?=\S)/u,
+                        ""
+                    )
+                    .replace(
+                        /^\s*[-–—/]+\s*(?=\S)/u,
+                        ""
+                    )
+                    .replace(
+                        /\s*--+\s*$/u,
+                        "…"
+                    )
+                    .replace(
+                        /\s*--+\s*/gu,
+                        "… "
+                    )
+                    .replace(
+                        /[♪♫♬]+/gu,
+                        ""
+                    )
+                    .replace(
+                        /[ \t]{2,}/g,
+                        " "
+                    )
+                    .trim()
+        )
+        .filter(
+            Boolean
+        )
+        .join(
+            "\n"
+        )
+        .trim();
 }
 
 function applySafeFixes(
@@ -3797,16 +4633,11 @@ function applySafeFixes(
     target
 ) {
     let text =
-        String(target || "");
+        String(
+            target ||
+            ""
+        );
 
-    const before =
-        text;
-
-    /*
-     * Apenas correções 100% seguras,
-     * sem tentar "reescrever estilo"
-     * por regex.
-     */
     text =
         text
             .replace(
@@ -3827,7 +4658,10 @@ function applySafeFixes(
             );
 
     const english =
-        String(source || "");
+        String(
+            source ||
+            ""
+        );
 
     if (
         /\bWerkroom\b/i.test(
@@ -3858,24 +4692,26 @@ function applySafeFixes(
             );
     }
 
-    return {
-        text,
-
-        changed:
-            text !==
-            before
-    };
+    return text;
 }
 
-function wordCount(text) {
+function wordCount(
+    text
+) {
     return (
-        String(text || "")
-            .match(
-                /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
-            ) ||
+        String(
+            text ||
+            ""
+        ).match(
+            /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
+        ) ||
         []
     ).length;
 }
+
+// ============================================================
+// KNOWN QUALITY RISKS
+// ============================================================
 
 function knownIssuesForGroup(
     group,
@@ -3887,10 +4723,14 @@ function knownIssuesForGroup(
                 cue =>
                     cue.text
             )
-            .join(" ");
+            .join(
+                " "
+            );
 
     const pt =
-        segments.join(" ");
+        segments.join(
+            " "
+        );
 
     const reasons =
         new Set();
@@ -3978,11 +4818,6 @@ function knownIssuesForGroup(
         );
     }
 
-    /*
-     * Só marca para revisão contextual.
-     * Não substitui automaticamente,
-     * porque "bitch" pode ser insulto de verdade.
-     */
     if (
         /^\s*puta[,!]/i.test(
             pt
@@ -4045,16 +4880,13 @@ function knownIssuesForGroup(
             pt
         );
 
-    /*
-     * Detector conservador de possível omissão.
-     * Não condena traduções naturalmente mais curtas.
-     */
     if (
         enWords >=
             12 &&
         ptWords <=
             Math.max(
                 2,
+
                 Math.floor(
                     enWords *
                     0.30
@@ -4089,7 +4921,8 @@ function addIssue(
     issueMap,
     groupId,
     reasons,
-    hint = ""
+    hint =
+        ""
 ) {
     if (
         !reasons?.length
@@ -4116,15 +4949,21 @@ function addIssue(
         current
             .reasons
             .add(
-                String(reason)
+                String(
+                    reason
+                )
             );
     }
 
-    if (hint) {
+    if (
+        hint
+    ) {
         current
             .hints
             .push(
-                String(hint)
+                String(
+                    hint
+                )
             );
     }
 
@@ -4139,7 +4978,7 @@ function deterministicIssueMap(
     translations,
     job
 ) {
-    const out =
+    const result =
         new Map();
 
     for (
@@ -4149,6 +4988,7 @@ function deterministicIssueMap(
         const reasons =
             knownIssuesForGroup(
                 group,
+
                 translations.get(
                     group.groupId
                 )
@@ -4169,15 +5009,18 @@ function deterministicIssueMap(
             }
 
             addIssue(
-                out,
+                result,
+
                 group.groupId,
+
                 reasons,
+
                 "Aplique o Style Pack e preserve todo o sentido do EN no mesmo cue."
             );
         }
     }
 
-    return out;
+    return result;
 }
 
 function mergeIssueMaps(
@@ -4193,7 +5036,9 @@ function mergeIssueMaps(
     ) {
         addIssue(
             target,
+
             groupId,
+
             item.reasons instanceof
                 Set
                 ? [
@@ -4231,7 +5076,9 @@ function repairPayload(
         hint:
             issue
                 .hints
-                .join(" | ")
+                .join(
+                    " | "
+                )
                 .slice(
                     0,
                     500
@@ -4253,7 +5100,9 @@ function repairPayload(
                         translations
                             .get(
                                 group.groupId
-                            )[index],
+                            )[
+                                index
+                            ],
 
                     ...(
                         cue.speakerHint
@@ -4268,12 +5117,17 @@ function repairPayload(
     };
 }
 
+// ============================================================
+// TARGETED REPAIR
+// ============================================================
+
 async function repairIssueMap(
     groups,
     translations,
     issueMap,
     job,
-    high = false
+    high =
+        false
 ) {
     const selected =
         groups.filter(
@@ -4292,12 +5146,17 @@ async function repairIssueMap(
     const batches =
         splitByBudget(
             selected,
+
             REPAIR_BATCH_CHARS,
+
             REPAIR_BATCH_GROUPS,
+
             group =>
                 repairPayload(
                     group,
+
                     translations,
+
                     issueMap.get(
                         group.groupId
                     )
@@ -4314,26 +5173,30 @@ async function repairIssueMap(
         const batch
         of batches
     ) {
-        const raw =
+        const user =
+            `Corrija estes groups sinalizados:\n` +
+            `${JSON.stringify({
+                groups:
+                    batch.map(
+                        group =>
+                            repairPayload(
+                                group,
+
+                                translations,
+
+                                issueMap.get(
+                                    group.groupId
+                                )
+                            )
+                    )
+            })}`;
+
+        const response =
             await mistralChat({
                 system:
                     REPAIR_PROMPT,
 
-                user:
-                    `Corrija estes groups marcados pela auditoria:\n` +
-                    `${JSON.stringify({
-                        groups:
-                            batch.map(
-                                group =>
-                                    repairPayload(
-                                        group,
-                                        translations,
-                                        issueMap.get(
-                                            group.groupId
-                                        )
-                                    )
-                            )
-                    })}`,
+                user,
 
                 job,
 
@@ -4346,13 +5209,109 @@ async function repairIssueMap(
                         : "none",
 
                 temperature:
-                    0
+                    0,
+
+                maxTokens:
+                    REPAIR_MAX_TOKENS
             });
+
+        if (
+            response.finishReason ===
+                "length" ||
+            response.finishReason ===
+                "max_tokens"
+        ) {
+            if (
+                batch.length >
+                1
+            ) {
+                const middle =
+                    Math.ceil(
+                        batch.length /
+                        2
+                    );
+
+                const leftMap =
+                    new Map();
+
+                const rightMap =
+                    new Map();
+
+                for (
+                    const group
+                    of batch.slice(
+                        0,
+                        middle
+                    )
+                ) {
+                    leftMap.set(
+                        group.groupId,
+
+                        issueMap.get(
+                            group.groupId
+                        )
+                    );
+                }
+
+                for (
+                    const group
+                    of batch.slice(
+                        middle
+                    )
+                ) {
+                    rightMap.set(
+                        group.groupId,
+
+                        issueMap.get(
+                            group.groupId
+                        )
+                    );
+                }
+
+                await repairIssueMap(
+                    batch.slice(
+                        0,
+                        middle
+                    ),
+
+                    translations,
+
+                    leftMap,
+
+                    job,
+
+                    high
+                );
+
+                await repairIssueMap(
+                    batch.slice(
+                        middle
+                    ),
+
+                    translations,
+
+                    rightMap,
+
+                    job,
+
+                    high
+                );
+
+                continue;
+            }
+
+            throw new Error(
+                `Reparo truncado ` +
+                `g=${batch[0].groupId}.`
+            );
+        }
 
         const parsed =
             parseGroupResponse(
                 batch,
-                raw,
+
+                response.text,
+
                 job
             );
 
@@ -4397,6 +5356,10 @@ async function repairIssueMap(
         }
     }
 }
+
+// ============================================================
+// FLATTEN
+// ============================================================
 
 function flattenTranslations(
     blocks,
@@ -4480,28 +5443,22 @@ function cleanAll(
         (
             text,
             index
-        ) => {
-            let output =
+        ) =>
+            applySafeFixes(
+                blocks[index].text,
+
                 cleanFinalText(
                     text
-                );
-
-            output =
-                applySafeFixes(
-                    blocks[index].text,
-                    output
-                ).text;
-
-            return output;
-        }
+                )
+            )
     );
 }
 
-function writeCleanBackToTranslations(
+function writeCleanBack(
     blocks,
     groups,
     translations,
-    cleanedTexts
+    cleaned
 ) {
     const positions =
         new Map(
@@ -4525,7 +5482,7 @@ function writeCleanBackToTranslations(
 
             group.cues.map(
                 cue =>
-                    cleanedTexts[
+                    cleaned[
                         positions.get(
                             cue.index
                         )
@@ -4567,20 +5524,17 @@ async function translateSrt(
     const batches =
         splitByBudget(
             groups,
-            MISTRAL_BATCH_CHARS,
-            MISTRAL_BATCH_GROUPS,
+
+            MAIN_BATCH_CHARS,
+
+            MAIN_BATCH_GROUPS,
+
             compactGroup
         );
 
     const translations =
         new Map();
 
-    /*
-     * Gemini é independente do lane Mistral.
-     *
-     * Assim ele revisa o lote já pronto
-     * enquanto o Mistral traduz o próximo.
-     */
     const auditIssues =
         new Map();
 
@@ -4588,21 +5542,25 @@ async function translateSrt(
         Promise.resolve();
 
     console.log(
-        `[PIPELINE 6.5] ` +
+        `[PIPELINE 6.5.1] ` +
         `fonte=${job.sourceKind} | ` +
         `${blocks.length} cues -> ` +
         `${groups.length} groups -> ` +
-        `${batches.length} lote(s) Mistral SERIAL.`
+        `${batches.length} lote(s) ` +
+        `Mistral serial rate-aware.`
     );
 
     function scheduleAudit(
-        translatedBatch
+        batch
     ) {
         const micros =
             splitByBudget(
-                translatedBatch,
+                batch,
+
                 GEMINI_AUDIT_CHARS,
+
                 GEMINI_AUDIT_GROUPS,
+
                 group =>
                     reviewPayload(
                         group,
@@ -4620,7 +5578,9 @@ async function translateSrt(
                         const flags =
                             await auditMicroBatch(
                                 micro,
+
                                 translations,
+
                                 job
                             );
 
@@ -4633,8 +5593,11 @@ async function translateSrt(
                         ) {
                             addIssue(
                                 auditIssues,
+
                                 groupId,
+
                                 info.reasons,
+
                                 info.hint
                             );
                         }
@@ -4650,14 +5613,6 @@ async function translateSrt(
         }
     }
 
-    /*
-     * MISTRAL PRINCIPAL:
-     *
-     * propositalmente uma request por vez.
-     *
-     * Não há intervalo artificial.
-     * Acabou uma -> começa a seguinte.
-     */
     for (
         let index = 0;
         index <
@@ -4728,7 +5683,7 @@ async function translateSrt(
         );
     }
 
-    let primaryTexts =
+    let texts =
         cleanAll(
             blocks,
 
@@ -4739,30 +5694,24 @@ async function translateSrt(
             )
         );
 
-    writeCleanBackToTranslations(
+    writeCleanBack(
         blocks,
         groups,
         translations,
-        primaryTexts
+        texts
     );
-
-    const checkpointSrt =
-        buildSrt(
-            blocks,
-            primaryTexts
-        );
 
     auditTimestamps(
         sourceSrt,
-        checkpointSrt,
+
+        buildSrt(
+            blocks,
+            texts
+        ),
+
         "CHECKPOINT MISTRAL"
     );
 
-    /*
-     * Normalmente o Gemini já terminou
-     * ou está muito perto porque revisou
-     * enquanto Mistral traduzia.
-     */
     await auditTail;
 
     if (
@@ -4775,27 +5724,18 @@ async function translateSrt(
         );
     }
 
-    /*
-     * Une:
-     *
-     * 1. defeitos que Gemini detectou;
-     * 2. erros conhecidos do Style Pack;
-     * 3. provável omissão extrema.
-     */
-    const deterministic =
+    mergeIssueMaps(
+        auditIssues,
+
         deterministicIssueMap(
             groups,
             translations,
             job
-        );
-
-    mergeIssueMaps(
-        auditIssues,
-        deterministic
+        )
     );
 
     console.log(
-        `[QUALITY MAP] Gemini+guard => ` +
+        `[QUALITY MAP] ` +
         `${auditIssues.size} group(s) ` +
         `para retradução dirigida.`
     );
@@ -4803,25 +5743,18 @@ async function translateSrt(
     if (
         auditIssues.size
     ) {
-        /*
-         * Não existe árbitro global.
-         *
-         * O Mistral recebe SOMENTE
-         * o que realmente foi marcado.
-         */
         await repairIssueMap(
             groups,
+
             translations,
+
             auditIssues,
+
             job,
+
             false
         );
 
-        /*
-         * Reaudita SOMENTE o reparado.
-         *
-         * Não revisa os 1150 outra vez.
-         */
         const repairedGroups =
             groups.filter(
                 group =>
@@ -4836,8 +5769,11 @@ async function translateSrt(
         const microBatches =
             splitByBudget(
                 repairedGroups,
+
                 GEMINI_AUDIT_CHARS,
+
                 GEMINI_AUDIT_GROUPS,
+
                 group =>
                     reviewPayload(
                         group,
@@ -4852,7 +5788,9 @@ async function translateSrt(
             const flags =
                 await auditMicroBatch(
                     micro,
+
                     translations,
+
                     job
                 );
 
@@ -4865,23 +5803,26 @@ async function translateSrt(
             ) {
                 addIssue(
                     secondIssues,
+
                     groupId,
+
                     info.reasons,
+
                     info.hint
                 );
             }
         }
 
-        const guard2 =
-            deterministicIssueMap(
-                repairedGroups,
-                translations,
-                job
-            );
-
         mergeIssueMaps(
             secondIssues,
-            guard2
+
+            deterministicIssueMap(
+                repairedGroups,
+
+                translations,
+
+                job
+            )
         );
 
         if (
@@ -4899,15 +5840,19 @@ async function translateSrt(
 
             await repairIssueMap(
                 groups,
+
                 translations,
+
                 secondIssues,
+
                 job,
+
                 true
             );
         }
     }
 
-    let finalTexts =
+    texts =
         cleanAll(
             blocks,
 
@@ -4918,20 +5863,13 @@ async function translateSrt(
             )
         );
 
-    writeCleanBackToTranslations(
+    writeCleanBack(
         blocks,
         groups,
         translations,
-        finalTexts
+        texts
     );
 
-    /*
-     * Não derruba um episódio inteiro
-     * por uma regra estilística residual.
-     *
-     * Estrutura/timestamp, sim, continuam
-     * sendo invariantes rígidas.
-     */
     const residual =
         deterministicIssueMap(
             groups,
@@ -4944,9 +5882,8 @@ async function translateSrt(
     ) {
         console.warn(
             `[QUALITY GUARD] AVISO: ` +
-            `${residual.size} group(s) ` +
-            `ainda sinalizado(s) após dois reparos; ` +
-            `episódio NÃO será bloqueado.`
+            `${residual.size} group(s) ainda sinalizado(s); ` +
+            `episódio não será bloqueado.`
         );
     }
     else {
@@ -4958,13 +5895,13 @@ async function translateSrt(
     const finalSrt =
         buildSrt(
             blocks,
-            finalTexts
+            texts
         );
 
     auditTimestamps(
         sourceSrt,
         finalSrt,
-        "FINAL 6.5"
+        "FINAL 6.5.1"
     );
 
     const elapsed =
@@ -4975,18 +5912,18 @@ async function translateSrt(
         1000;
 
     console.log(
-        `[PIPELINE 6.5] OK em ${elapsed.toFixed(
-            1
-        )}s | ` +
+        `[PIPELINE 6.5.1] OK em ${elapsed.toFixed(1)}s | ` +
         `fonte=${job.sourceKind} | ` +
         `MistralCalls=${job.stats.mistralCalls} | ` +
         `Attempts=${job.stats.mistralAttempts} | ` +
         `429=${job.stats.mistral429} | ` +
-        `RetryWait=${(
-            job.stats.mistralRetryWaitMs /
+        `QuotaWait=${(
+            job.stats.quotaWaitMs /
             1000
         ).toFixed(1)}s | ` +
-        `SingleCueJoin=${job.stats.structuralSingleCueJoins} | ` +
+        `MainSplits=${job.stats.mainSplits} | ` +
+        `JsonSplits=${job.stats.jsonInvalidSplits} | ` +
+        `Trunc=${job.stats.outputTruncations} | ` +
         `RescueCalls=${job.stats.rescueCalls} | ` +
         `GeminiChecks=${job.stats.geminiReviewed} | ` +
         `GeminiCalls=${job.stats.geminiCalls} | ` +
@@ -5005,7 +5942,9 @@ async function translateSrt(
 // JOB QUEUE
 // ============================================================
 
-async function processJob(job) {
+async function processJob(
+    job
+) {
     job.status =
         "processing";
 
@@ -5024,7 +5963,9 @@ async function processJob(job) {
                 job.cacheKey
             );
 
-        if (cached) {
+        if (
+            cached
+        ) {
             auditTimestamps(
                 job.sourceSrt,
                 cached,
@@ -5067,7 +6008,9 @@ async function processJob(job) {
             `[JOB ${job.id}] Concluído.`
         );
     }
-    catch (error) {
+    catch (
+        error
+    ) {
         job.status =
             "failed";
 
@@ -5086,7 +6029,9 @@ async function processJob(job) {
         Date.now();
 }
 
-function enqueue(job) {
+function enqueue(
+    job
+) {
     if (
         queue.some(
             item =>
@@ -5156,7 +6101,8 @@ async function runQueue() {
 async function fetchWithTimeout(
     url,
     options = {},
-    timeoutMs = FETCH_TIMEOUT_MS
+    timeoutMs =
+        FETCH_TIMEOUT_MS
 ) {
     const controller =
         new AbortController();
@@ -5165,12 +6111,14 @@ async function fetchWithTimeout(
         setTimeout(
             () =>
                 controller.abort(),
+
             timeoutMs
         );
 
     try {
         return await fetch(
             url,
+
             {
                 ...options,
 
@@ -5235,7 +6183,9 @@ function buildOpenSubtitlesUrl(
         : `${base}.json`;
 }
 
-function selectEnglishSubtitle(subtitles) {
+function selectEnglishSubtitle(
+    subtitles
+) {
     return (
         Array.isArray(
             subtitles
@@ -5294,8 +6244,12 @@ function selectEnglishSubtitle(subtitles) {
                         );
 
                 return (
-                    score(b) -
-                    score(a)
+                    score(
+                        b
+                    ) -
+                    score(
+                        a
+                    )
                 );
             }
         )[0] ||
@@ -5327,13 +6281,14 @@ async function fetchFallbackSrt({
     const response =
         await fetchWithTimeout(
             url,
+
             {
                 headers: {
                     Accept:
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-PTBR/6.5"
+                        "Stremio-PTBR/6.5.1"
                 }
             }
         );
@@ -5342,7 +6297,8 @@ async function fetchFallbackSrt({
         !response.ok
     ) {
         throw new Error(
-            `OpenSubtitles HTTP ${response.status}.`
+            `OpenSubtitles HTTP ` +
+            `${response.status}.`
         );
     }
 
@@ -5354,7 +6310,9 @@ async function fetchFallbackSrt({
             data?.subtitles
         );
 
-    if (!target) {
+    if (
+        !target
+    ) {
         throw new Error(
             "OpenSubtitles não encontrou inglês utilizável."
         );
@@ -5363,10 +6321,11 @@ async function fetchFallbackSrt({
     const subtitleResponse =
         await fetchWithTimeout(
             target.url,
+
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-PTBR/6.5"
+                        "Stremio-PTBR/6.5.1"
                 }
             }
         );
@@ -5400,7 +6359,9 @@ async function fetchFallbackSrt({
             raw
         );
 
-    if (!clean) {
+    if (
+        !clean
+    ) {
         throw new Error(
             "Legenda fallback vazia após limpeza."
         );
@@ -5450,13 +6411,13 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "6.5.0",
+        "6.5.1",
 
     name:
         "Tradutor PT-BR Backend",
 
     description:
-        "Backend-only: Mistral principal + Gemini micro-audit + reparo dirigido.",
+        "Backend-only: Mistral serial rate-aware + Gemini micro-audit + reparo dirigido.",
 
     resources: [
         "subtitles"
@@ -5481,6 +6442,7 @@ const manifest = {
 
 app.get(
     "/manifest.json",
+
     (
         req,
         res
@@ -5492,6 +6454,7 @@ app.get(
 
 app.get(
     "/",
+
     (
         req,
         res
@@ -5515,11 +6478,17 @@ app.get(
             reviewer:
                 GEMINI_MODEL,
 
-            mistralMode:
-                "SERIAL_NO_ARTIFICIAL_PACER",
+            mainBatchGroups:
+                MAIN_BATCH_GROUPS,
 
-            geminiAuditGroups:
-                GEMINI_AUDIT_GROUPS,
+            mainBatchChars:
+                MAIN_BATCH_CHARS,
+
+            mainMaxTokens:
+                MAIN_MAX_TOKENS,
+
+            rateLimitMode:
+                "REAL_HEADERS_PLUS_LOCAL_QUERY_COST_WINDOW",
 
             queue:
                 queue.length,
@@ -5534,11 +6503,13 @@ function backendOnlySubtitles(
     res
 ) {
     console.log(
-        "[STREMIO PUBLIC] Backend-only: 0 legendas; use Ponte Local."
+        "[STREMIO PUBLIC] " +
+        "Backend-only: 0 legendas; use Ponte Local."
     );
 
     return safeJson(
         res,
+
         {
             subtitles: []
         }
@@ -5555,8 +6526,13 @@ app.get(
     backendOnlySubtitles
 );
 
+// ============================================================
+// EMBEDDED API
+// ============================================================
+
 app.post(
     "/api/translate-embedded",
+
     async (
         req,
         res
@@ -5568,10 +6544,12 @@ app.post(
         ) {
             return safeJson(
                 res,
+
                 {
                     error:
                         "Unauthorized"
                 },
+
                 401
             );
         }
@@ -5606,10 +6584,12 @@ app.post(
             ) {
                 return safeJson(
                     res,
+
                     {
                         error:
                             "Campo srt obrigatório."
                     },
+
                     400
                 );
             }
@@ -5620,10 +6600,12 @@ app.post(
             ) {
                 return safeJson(
                     res,
+
                     {
                         error:
                             "SRT grande demais."
                     },
+
                     413
                 );
             }
@@ -5657,8 +6639,11 @@ app.post(
             const job =
                 getOrCreateJob({
                     type,
+
                     videoId,
+
                     filename,
+
                     sourceSrt,
 
                     sourceKind:
@@ -5667,13 +6652,16 @@ app.post(
 
             return safeJson(
                 res,
+
                 jobResponse(
                     req,
                     job
                 )
             );
         }
-        catch (error) {
+        catch (
+            error
+        ) {
             console.error(
                 `[EMBEDDED API] ` +
                 `${errorMessage(
@@ -5683,20 +6671,27 @@ app.post(
 
             return safeJson(
                 res,
+
                 {
                     error:
                         errorMessage(
                             error
                         )
                 },
+
                 500
             );
         }
     }
 );
 
+// ============================================================
+// FALLBACK API
+// ============================================================
+
 app.post(
     "/api/translate-fallback",
+
     async (
         req,
         res
@@ -5708,10 +6703,12 @@ app.post(
         ) {
             return safeJson(
                 res,
+
                 {
                     error:
                         "Unauthorized"
                 },
+
                 401
             );
         }
@@ -5755,7 +6752,9 @@ app.post(
                         videoId,
 
                     filename,
+
                     videoSize,
+
                     videoHash
                 });
 
@@ -5769,8 +6768,11 @@ app.post(
             const job =
                 getOrCreateJob({
                     type,
+
                     videoId,
+
                     filename,
+
                     sourceSrt,
 
                     sourceKind:
@@ -5779,13 +6781,16 @@ app.post(
 
             return safeJson(
                 res,
+
                 jobResponse(
                     req,
                     job
                 )
             );
         }
-        catch (error) {
+        catch (
+            error
+        ) {
             console.error(
                 `[FALLBACK API] ` +
                 `${errorMessage(
@@ -5795,20 +6800,27 @@ app.post(
 
             return safeJson(
                 res,
+
                 {
                     error:
                         errorMessage(
                             error
                         )
                 },
+
                 500
             );
         }
     }
 );
 
+// ============================================================
+// JOB STATUS
+// ============================================================
+
 app.get(
     "/job/:jobId",
+
     (
         req,
         res
@@ -5821,19 +6833,24 @@ app.get(
                 )
             );
 
-        if (!job) {
+        if (
+            !job
+        ) {
             return safeJson(
                 res,
+
                 {
                     error:
                         "Job não encontrado."
                 },
+
                 404
             );
         }
 
         return safeJson(
             res,
+
             {
                 id:
                     job.id,
@@ -5857,29 +6874,51 @@ app.get(
     }
 );
 
-function processingSrt(job) {
+// ============================================================
+// RESULT SRT
+// ============================================================
+
+function processingSrt(
+    job
+) {
     return [
         "1",
+
         "00:00:01,000 --> 00:00:08,000",
+
         "Traduzindo e revisando legenda...",
+
         "",
+
         "2",
+
         "00:00:08,500 --> 00:00:15,000",
+
         `Progresso: ${Number(
             job?.progress ||
             0
         )}%.`
-    ].join("\n");
+    ].join(
+        "\n"
+    );
 }
 
-function errorSrt(error) {
+function errorSrt(
+    error
+) {
     return [
         "1",
+
         "00:00:01,000 --> 00:00:08,000",
+
         "Não foi possível concluir a legenda PT-BR.",
+
         "",
+
         "2",
+
         "00:00:08,500 --> 00:00:18,000",
+
         String(
             error ||
             "Erro desconhecido."
@@ -5892,11 +6931,14 @@ function errorSrt(error) {
                 0,
                 300
             )
-    ].join("\n");
+    ].join(
+        "\n"
+    );
 }
 
 app.get(
     "/subtitle/:jobId.srt",
+
     (
         req,
         res
@@ -5925,9 +6967,12 @@ app.get(
                 jobId
             );
 
-        if (!job) {
+        if (
+            !job
+        ) {
             return sendSrt(
                 res,
+
                 errorSrt(
                     "Job expirado."
                 )
@@ -5942,13 +6987,18 @@ app.get(
             try {
                 auditTimestamps(
                     job.sourceSrt,
+
                     job.result,
+
                     "SERVING"
                 );
             }
-            catch (error) {
+            catch (
+                error
+            ) {
                 return sendSrt(
                     res,
+
                     errorSrt(
                         errorMessage(
                             error
@@ -5959,7 +7009,9 @@ app.get(
 
             return sendSrt(
                 res,
+
                 job.result,
+
                 "public, max-age=604800"
             );
         }
@@ -5970,6 +7022,7 @@ app.get(
         ) {
             return sendSrt(
                 res,
+
                 errorSrt(
                     job.error
                 )
@@ -5978,9 +7031,11 @@ app.get(
 
         return sendSrt(
             res,
+
             processingSrt(
                 job
             ),
+
             "no-store, no-cache, must-revalidate"
         );
     }
@@ -5992,13 +7047,14 @@ app.get(
 
 app.listen(
     PORT,
+
     () => {
         console.log(
             "============================================================"
         );
 
         console.log(
-            " STREMIO PT-BR BACKEND 6.5 FINAL"
+            " STREMIO PT-BR BACKEND 6.5.1 HOTFIX"
         );
 
         console.log(
@@ -6030,43 +7086,45 @@ app.listen(
         );
 
         console.log(
-            "Render no menu do Stremio: DESATIVADO — BACKEND ONLY ✅"
+            "Ponte 4.1: NÃO PRECISA MUDAR ✅"
         );
 
         console.log(
-            "Mistral principal: SERIAL, sem concorrência TPM autodestrutiva ✅"
+            `Mistral main batch: até ` +
+            `${MAIN_BATCH_GROUPS} groups / ` +
+            `${MAIN_BATCH_CHARS} chars ✅`
         );
 
         console.log(
-            "Pacer artificial de 23500 TPM: REMOVIDO ✅"
+            `Mistral main max_tokens: ` +
+            `${MAIN_MAX_TOKENS} ✅`
         );
 
         console.log(
-            "429: somente backoff quando a própria API realmente devolver 429 ✅"
+            "top_p=1 explícito com greedy sampling: ATIVO ✅"
         );
 
         console.log(
-            "max_tokens: DINÂMICO por request ✅"
+            "JSON inválido/truncado em lote grande: " +
+            "DIVIDE O LOTE, não explode em rescue ✅"
         );
 
         console.log(
-            `Gemini micro-audit: ATÉ ${GEMINI_AUDIT_GROUPS} groups por chamada ✅`
+            "Quota Mistral: usa x-ratelimit-tokens-query-cost " +
+            "+ limite real de TPM ✅"
         );
 
         console.log(
-            "Gemini: veredito obrigatório EN×PT para CADA group ✅"
+            "Pacer arbitrário: NÃO EXISTE ✅"
         );
 
         console.log(
-            "Mistral árbitro global: REMOVIDO ✅"
+            "429: somente fallback residual quando a API ainda negar ✅"
         );
 
         console.log(
-            "Retradução Mistral: SOMENTE groups sinalizados ✅"
-        );
-
-        console.log(
-            "Reauditoria: SOMENTE groups reparados ✅"
+            `Gemini micro-audit: até ` +
+            `${GEMINI_AUDIT_GROUPS} groups ✅`
         );
 
         console.log(
@@ -6074,35 +7132,7 @@ app.listen(
         );
 
         console.log(
-            "bitch vocativo → bicha/gata/amiga conforme contexto; puta automática PROIBIDA ✅"
-        );
-
-        console.log(
-            "competição/lip sync/cheque 'da porra': BLOQUEADOS PELO GUARD ✅"
-        );
-
-        console.log(
-            "supportive→super apoiador: BLOQUEADO ✅"
-        );
-
-        console.log(
-            "judgers→juízes viraram os julgados: BLOQUEADO ✅"
-        );
-
-        console.log(
-            "plucking pussy hairs→fio de bigode: BLOQUEADO ✅"
-        );
-
-        console.log(
-            "empate duplo: BLOQUEADO ✅"
-        );
-
-        console.log(
-            "Cue-ID lock + timestamps imutáveis: ATIVOS ✅"
-        );
-
-        console.log(
-            "SRT temporário: backend pode expor status, Ponte nunca serve ao player ✅"
+            "Cue-ID lock + timestamps embedded imutáveis: ATIVOS ✅"
         );
 
         console.log(
@@ -6110,7 +7140,8 @@ app.listen(
         );
 
         console.log(
-            `Namespace de cache: ${CACHE_VERSION}`
+            `Namespace de cache Render: ` +
+            `${CACHE_VERSION}`
         );
 
         console.log(
@@ -6123,20 +7154,28 @@ app.listen(
     }
 );
 
+// ============================================================
+// PROCESS SAFETY
+// ============================================================
+
 process.on(
     "unhandledRejection",
-    error =>
+
+    error => {
         console.error(
             "[PROCESS] Unhandled rejection:",
             error
-        )
+        );
+    }
 );
 
 process.on(
     "uncaughtException",
-    error =>
+
+    error => {
         console.error(
             "[PROCESS] Uncaught exception:",
             error
-        )
+        );
+    }
 );
