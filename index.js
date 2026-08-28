@@ -3,6 +3,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(cors());
 app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
@@ -11,41 +12,49 @@ app.use(express.json({ limit: "2mb" }));
 // CONFIG
 // ============================================================
 
-const PORT = Number(process.env.PORT || 10000);
-const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
-const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
+const PORT = Number(
+    process.env.PORT ||
+    10000
+);
 
-const MISTRAL_API_KEY = String(process.env.MISTRAL_API_KEY || "").trim();
+const PUBLIC_URL = String(
+    process.env.PUBLIC_URL ||
+    ""
+).replace(
+    /\/+$/,
+    ""
+);
+
+const LOCAL_BRIDGE_SECRET = String(
+    process.env.LOCAL_BRIDGE_SECRET ||
+    ""
+).trim();
+
+const MISTRAL_API_KEY = String(
+    process.env.MISTRAL_API_KEY ||
+    ""
+).trim();
+
 const MISTRAL_MODEL = String(
     process.env.MISTRAL_MODEL ||
     "mistral-medium-3-5"
 ).trim();
 
-const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
+const GEMINI_API_KEY = String(
+    process.env.GEMINI_API_KEY ||
+    ""
+).trim();
 
 const GEMINI_MODEL = String(
     process.env.GEMINI_MODEL ||
     "gemini-3.5-flash-lite"
 ).trim();
 
-// A chave Groq pode continuar no Render,
-// mas o Groq NÃO participa do pipeline 6.2.
-const GROQ_API_KEY_PRESENT =
-    Boolean(
-        String(
-            process.env.GROQ_API_KEY ||
-            ""
-        ).trim()
-    );
-
-const TRANSLATION_CACHE_VERSION =
-    "6.2.0-final";
+const CACHE_VERSION =
+    "6.3.0-final";
 
 const MAX_SOURCE_CHARS =
     800000;
-
-const SOURCE_FETCH_TIMEOUT_MS =
-    20000;
 
 const CACHE_TTL_MS =
     7 *
@@ -60,21 +69,12 @@ const JOB_TTL_MS =
     60 *
     1000;
 
-const MAX_CACHE_ENTRIES =
-    200;
-
-const MAX_JOBS =
-    300;
+const SOURCE_FETCH_TIMEOUT_MS =
+    20000;
 
 // ============================================================
-// TIMEOUTS
+// PROVIDERS
 // ============================================================
-//
-// NÃO existe teto global do episódio.
-//
-// Estes timeouts são somente
-// de cada request de rede/API.
-//
 
 const MISTRAL_TIMEOUT_MS =
     Number(
@@ -100,10 +100,6 @@ const GEMINI_MAX_RETRIES =
         8
     );
 
-// ============================================================
-// MISTRAL - TRADUÇÃO PRINCIPAL
-// ============================================================
-
 const MISTRAL_BATCH_CHARS =
     Number(
         process.env.MISTRAL_BATCH_CHARS ||
@@ -116,15 +112,19 @@ const MISTRAL_BATCH_GROUPS =
         320
     );
 
-const MISTRAL_MAX_OUTPUT_TOKENS =
+const MISTRAL_RESCUE_CHARS =
     Number(
-        process.env.MISTRAL_MAX_OUTPUT_TOKENS ||
-        16000
+        process.env.MISTRAL_RESCUE_CHARS ||
+        8000
     );
 
-// Concorrência adaptativa.
-// Nunca passa de 2.
-const MISTRAL_MAX_CONCURRENCY =
+const MISTRAL_RESCUE_GROUPS =
+    Number(
+        process.env.MISTRAL_RESCUE_GROUPS ||
+        24
+    );
+
+const MISTRAL_CONCURRENCY =
     Math.max(
         1,
         Math.min(
@@ -136,54 +136,44 @@ const MISTRAL_MAX_CONCURRENCY =
         )
     );
 
-// ============================================================
-// RESGATE ESTRUTURAL
-// ============================================================
-
-const MISTRAL_RESCUE_GROUPS =
-    Number(
-        process.env.MISTRAL_RESCUE_GROUPS ||
-        24
-    );
-
-const MISTRAL_RESCUE_CHARS =
-    Number(
-        process.env.MISTRAL_RESCUE_CHARS ||
-        8000
-    );
-
-// ============================================================
-// GEMINI REVIEW
-// ============================================================
-//
-// Gemini revisa TODOS os groups.
-//
-// A revisão começa assim que
-// cada lote Mistral termina.
-//
-// Portanto Gemini trabalha
-// enquanto o Mistral traduz
-// os lotes seguintes.
-//
-
-const GEMINI_REVIEW_MAX_OUTPUT_TOKENS =
+const GEMINI_MAX_OUTPUT_TOKENS =
     Number(
         process.env.GEMINI_REVIEW_MAX_OUTPUT_TOKENS ||
         10000
     );
 
 // ============================================================
-// ARBITRAGEM MISTRAL
+// SOURCE ARBITER
 // ============================================================
+//
+// Esse é o conserto principal da 6.3.
+//
+// Se OpenSubtitles aparecer primeiro,
+// ele NÃO começa imediatamente.
+//
+// Esperamos alguns segundos pela Ponte.
+// Se a embedded chegar, ela substitui o
+// fallback ANTES de qualquer gasto Mistral.
+//
+// No log do Drag Race a embedded chegou
+// ~30 segundos depois da primeira busca.
+// 45 segundos deixa margem suficiente.
+//
 
-const ARBITER_BATCH_GROUPS =
-    30;
-
-const ARBITER_BATCH_CHARS =
-    7000;
+const LOCAL_SOURCE_GRACE_MS =
+    Math.max(
+        10000,
+        Math.min(
+            Number(
+                process.env.LOCAL_SOURCE_GRACE_MS ||
+                45000
+            ),
+            90000
+        )
+    );
 
 // ============================================================
-// ESTADO
+// STATE
 // ============================================================
 
 const translationCache =
@@ -192,10 +182,13 @@ const translationCache =
 const jobs =
     new Map();
 
-const translationJobQueue =
+const waitingByRelease =
+    new Map();
+
+const queue =
     [];
 
-let translationJobWorkerRunning =
+let queueRunning =
     false;
 
 // ============================================================
@@ -231,7 +224,7 @@ function sha256(
 }
 
 function randomId(
-    bytes = 8
+    bytes = 6
 ) {
     return crypto
         .randomBytes(
@@ -250,6 +243,46 @@ function getErrorMessage(
         error ||
         "Erro desconhecido."
     );
+}
+
+function normalizeSrt(
+    value
+) {
+    return String(
+        value ||
+        ""
+    )
+        .replace(
+            /^\uFEFF/,
+            ""
+        )
+        .replace(
+            /\r\n/g,
+            "\n"
+        )
+        .replace(
+            /\r/g,
+            "\n"
+        )
+        .trim();
+}
+
+function stripCodeFences(
+    value
+) {
+    return String(
+        value ||
+        ""
+    )
+        .replace(
+            /^\s*```(?:json|text|plaintext|srt)?\s*/i,
+            ""
+        )
+        .replace(
+            /\s*```\s*$/i,
+            ""
+        )
+        .trim();
 }
 
 function safeJson(
@@ -313,468 +346,84 @@ function cleanBaseUrl(
         );
 }
 
-function normalizeSrt(
+function normalizeFilename(
     value
 ) {
-    return String(
-        value ||
-        ""
-    )
-        .replace(
-            /^\uFEFF/,
+    let text =
+        String(
+            value ||
             ""
-        )
-        .replace(
-            /\r\n/g,
-            "\n"
-        )
-        .replace(
-            /\r/g,
-            "\n"
-        )
-        .trim();
-}
-
-function stripCodeFences(
-    value
-) {
-    return String(
-        value ||
-        ""
-    )
-        .replace(
-            /^\s*```(?:json|text|plaintext)?\s*/i,
-            ""
-        )
-        .replace(
-            /\s*```\s*$/i,
-            ""
-        )
-        .trim();
-}
-
-function formatSeconds(
-    seconds
-) {
-    if (
-        !Number.isFinite(
-            seconds
-        ) ||
-        seconds <
-            0
-    ) {
-        return "?";
-    }
-
-    const total =
-        Math.round(
-            seconds
         );
 
-    const min =
-        Math.floor(
-            total /
-            60
-        );
+    try {
+        text =
+            decodeURIComponent(
+                text
+            );
+    }
+    catch {
+        // mantém original
+    }
 
-    const sec =
-        total %
-        60;
-
-    return min
-        ? `${min}m${String(
-            sec
-        ).padStart(
-            2,
-            "0"
-        )}s`
-        : `${sec}s`;
+    return text
+        .replace(
+            /\+/g,
+            " "
+        )
+        .replace(
+            /\s+/g,
+            " "
+        )
+        .trim()
+        .toLowerCase();
 }
 
-// ============================================================
-// GOVERNADOR ADAPTATIVO DO MISTRAL
-// ============================================================
-//
-// Objetivo:
-//
-// - começa permitindo 2 requests;
-// - se vier 429, entra em cooldown;
-// - reduz temporariamente para 1;
-// - depois volta automaticamente a 2.
-//
-// Isso tenta ganhar velocidade
-// sem transformar a API numa
-// tempestade de 429.
-//
-
-class AdaptiveGovernor {
-
-    constructor(
-        maxConcurrency
-    ) {
-        this.maxConcurrency =
-            maxConcurrency;
-
-        this.active =
-            0;
-
-        this.cooldownUntil =
-            0;
-
-        this.serialUntil =
-            0;
-
-        this.waiters =
-            [];
-    }
-
-    effectiveLimit() {
-        return Date.now() <
-            this.serialUntil
-            ? 1
-            : this.maxConcurrency;
-    }
-
-    async acquire() {
-
-        while (
-            true
-        ) {
-            const now =
-                Date.now();
-
-            if (
-                now <
-                this.cooldownUntil
-            ) {
-                await sleep(
-                    this.cooldownUntil -
-                    now
-                );
-
-                continue;
-            }
-
-            if (
-                this.active <
-                this.effectiveLimit()
-            ) {
-                this.active++;
-
-                return;
-            }
-
-            await new Promise(
-                resolve =>
-                    this.waiters.push(
-                        resolve
-                    )
-            );
-        }
-    }
-
-    release() {
-
-        this.active =
-            Math.max(
-                0,
-                this.active -
-                1
-            );
-
-        const waiters =
-            this.waiters.splice(
-                0
-            );
-
-        for (
-            const resolve
-            of waiters
-        ) {
-            resolve();
-        }
-    }
-
-    noteRateLimit(
-        waitMs
-    ) {
-        const now =
-            Date.now();
-
-        this.cooldownUntil =
-            Math.max(
-                this.cooldownUntil,
-                now +
-                    Math.max(
-                        1000,
-                        waitMs
-                    )
-            );
-
-        /*
-         * TPM costuma trabalhar
-         * em janela de ~1 minuto.
-         *
-         * Depois de 429,
-         * serializamos temporariamente.
-         */
-        this.serialUntil =
-            Math.max(
-                this.serialUntil,
-                now +
-                    60000
-            );
-
-        const waiters =
-            this.waiters.splice(
-                0
-            );
-
-        for (
-            const resolve
-            of waiters
-        ) {
-            resolve();
-        }
-    }
-
-    status() {
-        return {
-            configuredMax:
-                this.maxConcurrency,
-
-            effective:
-                this.effectiveLimit(),
-
-            active:
-                this.active,
-
-            cooldownMs:
-                Math.max(
-                    0,
-                    this.cooldownUntil -
-                    Date.now()
-                ),
-
-            serializedMs:
-                Math.max(
-                    0,
-                    this.serialUntil -
-                    Date.now()
-                )
-        };
-    }
-}
-
-const mistralGovernor =
-    new AdaptiveGovernor(
-        MISTRAL_MAX_CONCURRENCY
-    );
-
-// ============================================================
-// PROJEÇÃO DE EFICIÊNCIA
-// ============================================================
-//
-// É SOMENTE informativa.
-//
-// Nunca cancela o job.
-//
-
-function updateProjection(
-    job,
-    phase,
-    completed,
-    total,
-    phaseStartedAt
+function makeReleaseKey(
+    type,
+    videoId,
+    filename
 ) {
-    if (
-        !completed ||
-        !total ||
-        completed >
-            total
-    ) {
-        return;
-    }
+    return [
+        String(
+            type ||
+            ""
+        ).toLowerCase(),
 
-    const elapsed =
-        (
-            Date.now() -
-            phaseStartedAt
-        ) /
-        1000;
+        String(
+            videoId ||
+            ""
+        ).toLowerCase(),
 
-    const avg =
-        elapsed /
-        completed;
-
-    const remaining =
-        Math.max(
-            0,
-            avg *
-                (
-                    total -
-                    completed
-                )
-        );
-
-    const jobElapsed =
-        job.processingStartedAt
-            ? (
-                Date.now() -
-                job.processingStartedAt
-            ) /
-                1000
-            : elapsed;
-
-    job.projection = {
-        phase,
-
-        completed,
-
-        total,
-
-        averageSecondsPerBatch:
-            Number(
-                avg.toFixed(
-                    2
-                )
-            ),
-
-        estimatedRemainingSeconds:
-            Math.round(
-                remaining
-            ),
-
-        projectedElapsedAtPhaseEndSeconds:
-            Math.round(
-                jobElapsed +
-                remaining
-            ),
-
-        updatedAt:
-            Date.now()
-    };
-
-    console.log(
-        `[EFICIÊNCIA] ${phase} ${completed}/${total} | ` +
-        `média=${avg.toFixed(
-            1
-        )}s/lote | ` +
-        `restante~${formatSeconds(
-            remaining
-        )} | ` +
-        `projeção~${formatSeconds(
-            jobElapsed +
-            remaining
-        )}.`
+        normalizeFilename(
+            filename
+        )
+    ].join(
+        "|"
     );
 }
 
 // ============================================================
-// CACHE / JOBS
+// CACHE
 // ============================================================
 
-function cleanupMemory() {
-
-    const now =
-        Date.now();
-
-    for (
-        const [
-            key,
-            item
-        ]
-        of translationCache.entries()
-    ) {
-        if (
-            item.expiresAt <=
-            now
-        ) {
-            translationCache.delete(
-                key
-            );
-        }
-    }
-
-    for (
-        const [
-            key,
-            job
-        ]
-        of jobs.entries()
-    ) {
-        if (
-            job.expiresAt <=
-                now &&
-            job.status !==
-                "processing"
-        ) {
-            jobs.delete(
-                key
-            );
-        }
-    }
-
-    while (
-        translationCache.size >
-        MAX_CACHE_ENTRIES
-    ) {
-        const key =
-            translationCache
-                .keys()
-                .next()
-                .value;
-
-        if (
-            key ===
-            undefined
-        ) {
-            break;
-        }
-
-        translationCache.delete(
-            key
-        );
-    }
-
-    if (
-        jobs.size >
-        MAX_JOBS
-    ) {
-        for (
-            const [
-                key,
-                job
-            ]
-            of jobs.entries()
-        ) {
-            if (
-                jobs.size <=
-                MAX_JOBS
-            ) {
-                break;
-            }
-
-            if (
-                job.status !==
-                "processing"
-            ) {
-                jobs.delete(
-                    key
-                );
-            }
-        }
-    }
+function makeCacheKey(
+    type,
+    videoId,
+    sourceSrt
+) {
+    return [
+        CACHE_VERSION,
+        type,
+        videoId,
+        sha256(
+            sourceSrt
+        )
+    ].join(
+        ":"
+    );
 }
 
-setInterval(
-    cleanupMemory,
-    10 *
-    60 *
-    1000
-).unref();
-
-function getTranslationCache(
+function getCache(
     key
 ) {
     const item =
@@ -802,7 +451,7 @@ function getTranslationCache(
     return item.srt;
 }
 
-function setTranslationCache(
+function setCache(
     key,
     srt
 ) {
@@ -811,51 +460,70 @@ function setTranslationCache(
         {
             srt,
 
-            createdAt:
-                Date.now(),
-
             expiresAt:
                 Date.now() +
                 CACHE_TTL_MS
         }
     );
-
-    cleanupMemory();
 }
 
+// ============================================================
+// JOBS
+// ============================================================
+
 function createJob({
-    jobId,
-    cacheKey,
     type,
     videoId,
-    sourceHash,
+    filename,
     sourceSrt,
-    sourceName = ""
+    sourceName,
+    sourceKind,
+    status
 }) {
+    const sourceHash =
+        sha256(
+            sourceSrt
+        );
+
     const now =
         Date.now();
 
     const job = {
         id:
-            jobId,
-
-        cacheKey,
+            `job-${sourceHash.slice(
+                0,
+                24
+            )}-${randomId()}`,
 
         type,
 
         videoId,
 
-        sourceHash,
+        filename,
+
+        releaseKey:
+            makeReleaseKey(
+                type,
+                videoId,
+                filename
+            ),
 
         sourceSrt,
 
+        sourceHash,
+
         sourceName,
 
-        status:
-            "processing",
+        sourceKind,
 
-        progress:
-            0,
+        cacheKey:
+            makeCacheKey(
+                type,
+                videoId,
+                sourceSrt
+            ),
+
+        status,
 
         result:
             null,
@@ -863,8 +531,20 @@ function createJob({
         error:
             null,
 
+        progress:
+            status ===
+                "waiting_source"
+                ? 0
+                : 1,
+
         createdAt:
             now,
+
+        queuedAt:
+            now,
+
+        processingStartedAt:
+            null,
 
         updatedAt:
             now,
@@ -873,100 +553,64 @@ function createJob({
             now +
             JOB_TTL_MS,
 
-        queuedAt:
-            now,
-
-        processingStartedAt:
+        fallbackTimer:
             null,
 
-        queueWaitSeconds:
-            0,
-
-        projection:
-            null,
-
-        timestampAuditPassed:
+        enqueued:
             false,
 
-        contentAuditPassed:
-            false,
-
-        mistralCalls:
-            0,
-
-        mistralAttempts:
-            0,
-
-        mistral429s:
-            0,
-
-        geminiReviewCalls:
-            0,
-
-        geminiReviewAttempts:
-            0,
-
-        gemini429s:
-            0,
-
-        geminiReviewedGroups:
-            0,
-
-        geminiProposalCount:
-            0,
-
-        geminiFallbackGroups:
-            0,
-
-        arbiterCalls:
-            0,
-
-        arbiterAccepted:
-            0,
-
-        salvagedGroups:
-            0,
-
-        rescueBatchCalls:
-            0,
-
-        atomicRescues:
-            0,
-
-        highReasoningRescues:
-            0,
-
-        perCueRescues:
-            0,
-
-        qualityRepairCalls:
-            0,
-
-        qualityGuardRisks:
-            0,
-
-        resumes:
-            0,
-
-        /*
-         * Checkpoint da tradução
-         * Mistral por Sentence Group.
-         */
         translationCheckpoint:
             new Map(),
 
-        /*
-         * SRT completo do Mistral
-         * antes de propostas secundárias.
-         */
         primaryCheckpoint:
             null,
 
-        primaryCheckpointAt:
-            null,
+        stats: {
+            mistralCalls:
+                0,
 
-        providerUsage:
-            {}
+            mistralAttempts:
+                0,
+
+            mistral429:
+                0,
+
+            geminiCalls:
+                0,
+
+            geminiAttempts:
+                0,
+
+            gemini429:
+                0,
+
+            geminiReviewed:
+                0,
+
+            geminiProposals:
+                0,
+
+            arbiterCalls:
+                0,
+
+            arbiterAccepted:
+                0,
+
+            salvageGroups:
+                0,
+
+            rescueBatches:
+                0,
+
+            atomicRescues:
+                0,
+
+            qualityRepairs:
+                0,
+
+            hardFixes:
+                0
+        }
     };
 
     jobs.set(
@@ -974,53 +618,25 @@ function createJob({
         job
     );
 
-    cleanupMemory();
-
     return job;
 }
 
-function getJob(
-    id
-) {
-    const job =
-        jobs.get(
-            id
-        );
-
-    if (
-        !job
-    ) {
-        return null;
-    }
-
-    if (
-        job.expiresAt <=
-            Date.now() &&
-        job.status !==
-            "processing"
-    ) {
-        jobs.delete(
-            id
-        );
-
-        return null;
-    }
-
-    return job;
-}
-
-function findProcessingJob(
-    cacheKey
+function findActiveByRelease(
+    releaseKey
 ) {
     for (
         const job
         of jobs.values()
     ) {
         if (
-            job.cacheKey ===
-                cacheKey &&
-            job.status ===
-                "processing"
+            job.releaseKey ===
+                releaseKey &&
+            (
+                job.status ===
+                    "waiting_source" ||
+                job.status ===
+                    "processing"
+            )
         ) {
             return job;
         }
@@ -1029,40 +645,58 @@ function findProcessingJob(
     return null;
 }
 
-function findReusableFailedJob(
-    cacheKey
-) {
-    let best =
-        null;
+function cleanupMemory() {
+    const now =
+        Date.now();
 
     for (
-        const job
-        of jobs.values()
+        const [
+            key,
+            item
+        ]
+        of translationCache
     ) {
         if (
-            job.cacheKey !==
-                cacheKey ||
-            job.status !==
-                "failed"
+            item.expiresAt <=
+            now
         ) {
-            continue;
-        }
-
-        if (
-            !best ||
-            job.updatedAt >
-            best.updatedAt
-        ) {
-            best =
-                job;
+            translationCache.delete(
+                key
+            );
         }
     }
 
-    return best;
+    for (
+        const [
+            id,
+            job
+        ]
+        of jobs
+    ) {
+        if (
+            job.expiresAt <=
+                now &&
+            job.status !==
+                "processing" &&
+            job.status !==
+                "waiting_source"
+        ) {
+            jobs.delete(
+                id
+            );
+        }
+    }
 }
 
+setInterval(
+    cleanupMemory,
+    10 *
+    60 *
+    1000
+).unref();
+
 // ============================================================
-// PONTE LOCAL AUTH
+// LOCAL BRIDGE AUTH
 // ============================================================
 
 function isAuthorizedLocalBridge(
@@ -1074,30 +708,18 @@ function isAuthorizedLocalBridge(
         return false;
     }
 
-    const auth =
-        String(
-            req.headers
-                .authorization ||
-            ""
-        ).trim();
-
-    const expected =
-        `Bearer ${LOCAL_BRIDGE_SECRET}`;
-
-    if (
-        !auth
-    ) {
-        return false;
-    }
-
     const a =
         Buffer.from(
-            auth
+            String(
+                req.headers
+                    .authorization ||
+                ""
+            ).trim()
         );
 
     const b =
         Buffer.from(
-            expected
+            `Bearer ${LOCAL_BRIDGE_SECRET}`
         );
 
     return (
@@ -1111,13 +733,13 @@ function isAuthorizedLocalBridge(
 }
 
 // ============================================================
-// SRT / LIMPEZA DA FONTE
+// SRT
 // ============================================================
 
-const TIMING_LINE_REGEX =
+const TIMING_RE =
     /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
 
-const SPEAKER_HINT_MARKER_REGEX =
+const SPEAKER_RE =
     /^@@SPK:([^@]+)@@\s*/u;
 
 const SDH_WORDS =
@@ -1158,35 +780,6 @@ function normalizeSpeakerHint(
     return speaker;
 }
 
-function encodeSpeakerHint(
-    value
-) {
-    return encodeURIComponent(
-        String(
-            value ||
-            ""
-        )
-    );
-}
-
-function decodeSpeakerHint(
-    value
-) {
-    try {
-        return normalizeSpeakerHint(
-            decodeURIComponent(
-                String(
-                    value ||
-                    ""
-                )
-            )
-        );
-    }
-    catch {
-        return "";
-    }
-}
-
 function extractSpeakerHint(
     line
 ) {
@@ -1198,21 +791,33 @@ function extractSpeakerHint(
 
     const hidden =
         original.match(
-            SPEAKER_HINT_MARKER_REGEX
+            SPEAKER_RE
         );
 
     if (
         hidden
     ) {
+        let speaker =
+            "";
+
+        try {
+            speaker =
+                normalizeSpeakerHint(
+                    decodeURIComponent(
+                        hidden[1]
+                    )
+                );
+        }
+        catch {
+            // ignora
+        }
+
         return {
-            speaker:
-                decodeSpeakerHint(
-                    hidden[1]
-                ),
+            speaker,
 
             text:
                 original.replace(
-                    SPEAKER_HINT_MARKER_REGEX,
+                    SPEAKER_RE,
                     ""
                 )
         };
@@ -1283,53 +888,62 @@ function extractSpeakerHint(
     };
 }
 
-// ============================================================
-// ALONGAMENTOS VOCAIS
-// ============================================================
-
 function normalizeVocalElongations(
     text
 ) {
-    let value =
-        String(
-            text ||
-            ""
-        );
-
-    /*
-     * você-e-e-e-e
-     * home-e-e-e-e
-     */
-    value =
-        value.replace(
+    return String(
+        text ||
+        ""
+    )
+        .replace(
             /([A-Za-zÀ-ÖØ-öø-ÿ]+?)([-–—])([A-Za-zÀ-ÖØ-öø-ÿ])(?:\2\3){2,}/gu,
-            (
-                match,
-                word
-            ) =>
-                word
-        );
-
-    /*
-     * a-a-a-a
-     */
-    value =
-        value.replace(
+            "$1"
+        )
+        .replace(
             /([A-Za-zÀ-ÖØ-öø-ÿ])(?:[-–—]\1){2,}[-–—]?/giu,
             "$1"
-        );
-
-    /*
-     * sooooo
-     * nããããão
-     */
-    value =
-        value.replace(
+        )
+        .replace(
             /([aeiouáéíóúãõâêô])\1{3,}/giu,
             "$1"
         );
+}
 
-    return value;
+function isNonSemanticVocalization(
+    text
+) {
+    const normalized =
+        String(
+            text ||
+            ""
+        )
+            .toLowerCase()
+            .replace(
+                /[.,!?…]+/g,
+                " "
+            )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .trim();
+
+    /*
+     * Conservador:
+     *
+     * "ah ah"
+     * "ha ha"
+     * "heh heh"
+     *
+     * Mas NÃO remove:
+     * uh-huh
+     * uh-uh
+     * hmm
+     * Oh!
+     */
+    return /^(?:ah|ha|heh)(?:\s+(?:ah|ha|heh)){1,5}$/.test(
+        normalized
+    );
 }
 
 function cleanSourceLine(
@@ -1372,17 +986,14 @@ function cleanSourceLine(
 
     text =
         text.replace(
-            /♪|♫|♬/gu,
+            /[♪♫♬]/gu,
             " "
         );
 
     text =
         normalizeVocalElongations(
             text
-        );
-
-    text =
-        text
+        )
             .replace(
                 /[ \t]{2,}/g,
                 " "
@@ -1392,6 +1003,14 @@ function cleanSourceLine(
     if (
         !text ||
         /^[-–—/\s]*$/u.test(
+            text
+        )
+    ) {
+        return "";
+    }
+
+    if (
+        isNonSemanticVocalization(
             text
         )
     ) {
@@ -1430,18 +1049,18 @@ function cleanSrtForTranslation(
     let removed =
         0;
 
-    let speakerBlocks =
+    let speakerHints =
         0;
 
-    let elongationChanges =
+    let vocalizations =
         0;
 
     for (
-        const rawBlock
+        const raw
         of rawBlocks
     ) {
         const lines =
-            rawBlock
+            raw
                 .trim()
                 .split(
                     "\n"
@@ -1468,7 +1087,7 @@ function cleanSrtForTranslation(
             ].trim();
 
         if (
-            !TIMING_LINE_REGEX.test(
+            !TIMING_RE.test(
                 timing
             )
         ) {
@@ -1505,7 +1124,7 @@ function cleanSrtForTranslation(
                 String(
                     info.text ||
                     ""
-                );
+                ).trim();
 
             const cleaned =
                 cleanSourceLine(
@@ -1513,13 +1132,12 @@ function cleanSrtForTranslation(
                 );
 
             if (
-                cleaned !==
-                    before.trim() &&
-                /(?:[-–—][A-Za-zÀ-ÿ]){2,}|([aeiouáéíóúãõâêô])\1{3,}/iu.test(
+                !cleaned &&
+                isNonSemanticVocalization(
                     before
                 )
             ) {
-                elongationChanges++;
+                vocalizations++;
             }
 
             if (
@@ -1549,11 +1167,11 @@ function cleanSrtForTranslation(
                 ][0];
 
             dialogue[0] =
-                `@@SPK:${encodeSpeakerHint(
+                `@@SPK:${encodeURIComponent(
                     speaker
                 )}@@ ${dialogue[0]}`;
 
-            speakerBlocks++;
+            speakerHints++;
         }
 
         out.push({
@@ -1563,10 +1181,10 @@ function cleanSrtForTranslation(
     }
 
     console.log(
-        `[CLEAN] SDH/CC: ${rawBlocks.length} -> ${out.length}; ` +
+        `[CLEAN] ${rawBlocks.length} -> ${out.length}; ` +
         `removidos=${removed}; ` +
-        `speakerHints=${speakerBlocks}; ` +
-        `alongamentos=${elongationChanges}.`
+        `speakerHints=${speakerHints}; ` +
+        `vocalizações=${vocalizations}.`
     );
 
     if (
@@ -1609,14 +1227,14 @@ function parseSrt(
             srt
         );
 
+    const result =
+        [];
+
     if (
         !normalized
     ) {
-        return [];
+        return result;
     }
-
-    const result =
-        [];
 
     for (
         const raw
@@ -1638,7 +1256,7 @@ function parseSrt(
                 lines[0]
                     .trim()
             ) ||
-            !TIMING_LINE_REGEX.test(
+            !TIMING_RE.test(
                 lines[1]
                     .trim()
             )
@@ -1652,7 +1270,7 @@ function parseSrt(
             );
 
         let speakerHint =
-            "";
+            null;
 
         if (
             textLines.length
@@ -1660,21 +1278,29 @@ function parseSrt(
             const match =
                 textLines[0]
                     .match(
-                        SPEAKER_HINT_MARKER_REGEX
+                        SPEAKER_RE
                     );
 
             if (
                 match
             ) {
-                speakerHint =
-                    decodeSpeakerHint(
-                        match[1]
-                    );
+                try {
+                    speakerHint =
+                        normalizeSpeakerHint(
+                            decodeURIComponent(
+                                match[1]
+                            )
+                        );
+                }
+                catch {
+                    speakerHint =
+                        null;
+                }
 
                 textLines[0] =
                     textLines[0]
                         .replace(
-                            SPEAKER_HINT_MARKER_REGEX,
+                            SPEAKER_RE,
                             ""
                         );
             }
@@ -1698,9 +1324,7 @@ function parseSrt(
                     )
                     .trim(),
 
-            speakerHint:
-                speakerHint ||
-                null
+            speakerHint
         });
     }
 
@@ -1709,23 +1333,21 @@ function parseSrt(
 
 function buildSrt(
     blocks,
-    translatedTexts
+    texts
 ) {
     return (
         blocks
             .map(
                 (
                     block,
-                    i
+                    index
                 ) =>
                     [
                         block.index,
 
                         block.timing,
 
-                        translatedTexts[
-                            i
-                        ] ??
+                        texts[index] ??
                             block.text
                     ].join(
                         "\n"
@@ -1739,10 +1361,10 @@ function buildSrt(
     );
 }
 
-function auditFinalTimestamps(
+function auditTimestamps(
     sourceSrt,
     finalSrt,
-    label = "FINAL"
+    label
 ) {
     const source =
         parseSrt(
@@ -1759,7 +1381,7 @@ function auditFinalTimestamps(
         final.length
     ) {
         throw new Error(
-            `TIMING LOCK ${label}: quantidade diferente ${source.length}/${final.length}.`
+            `TIMING LOCK ${label}: ${source.length}/${final.length}.`
         );
     }
 
@@ -1780,7 +1402,7 @@ function auditFinalTimestamps(
                     .timing
         ) {
             throw new Error(
-                `TIMING LOCK ${label}: divergência no cue ${source[i].index}.`
+                `TIMING LOCK ${label}: cue ${source[i].index}.`
             );
         }
     }
@@ -1789,8 +1411,6 @@ function auditFinalTimestamps(
         `[AUDIT TIMESTAMP] ${label}: PASSOU — ` +
         `${source.length}/${source.length}; 0 alterações.`
     );
-
-    return true;
 }
 
 // ============================================================
@@ -1800,7 +1420,7 @@ function auditFinalTimestamps(
 function parseTimeSeconds(
     value
 ) {
-    const m =
+    const match =
         String(
             value ||
             ""
@@ -1809,25 +1429,25 @@ function parseTimeSeconds(
         );
 
     if (
-        !m
+        !match
     ) {
         return NaN;
     }
 
     return (
         Number(
-            m[1]
+            match[1]
         ) *
             3600 +
         Number(
-            m[2]
+            match[2]
         ) *
             60 +
         Number(
-            m[3]
+            match[3]
         ) +
         Number(
-            m[4]
+            match[4]
         ) /
             1000
     );
@@ -1836,7 +1456,7 @@ function parseTimeSeconds(
 function timingParts(
     timing
 ) {
-    const m =
+    const match =
         String(
             timing ||
             ""
@@ -1844,25 +1464,29 @@ function timingParts(
             /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
         );
 
-    return m
-        ? {
-            start:
-                parseTimeSeconds(
-                    m[1]
-                ),
-
-            end:
-                parseTimeSeconds(
-                    m[2]
-                )
-        }
-        : {
+    if (
+        !match
+    ) {
+        return {
             start:
                 NaN,
 
             end:
                 NaN
         };
+    }
+
+    return {
+        start:
+            parseTimeSeconds(
+                match[1]
+            ),
+
+        end:
+            parseTimeSeconds(
+                match[2]
+            )
+    };
 }
 
 function groupingText(
@@ -1919,39 +1543,7 @@ function isMultiSpeakerSource(
     );
 }
 
-function endsStrongSentence(
-    text
-) {
-    return /[.!?…]["'”’\)\]\}]*$/u.test(
-        groupingText(
-            text
-        )
-    );
-}
-
-function startsLowercaseContinuation(
-    text
-) {
-    const value =
-        groupingText(
-            text
-        )
-            .replace(
-                /^[-–—]\s*/u,
-                ""
-            )
-            .replace(
-                /^["'“‘\(\[]+/u,
-                ""
-            )
-            .trim();
-
-    return /^[a-zà-öø-ÿ]/u.test(
-        value
-    );
-}
-
-function shouldMergeSentenceCue(
+function shouldMerge(
     group,
     next
 ) {
@@ -1963,7 +1555,7 @@ function shouldMergeSentenceCue(
         return false;
     }
 
-    const prev =
+    const previous =
         group[
             group.length -
             1
@@ -1971,7 +1563,7 @@ function shouldMergeSentenceCue(
 
     if (
         isMultiSpeakerSource(
-            prev.text
+            previous.text
         ) ||
         isMultiSpeakerSource(
             next.text
@@ -1981,10 +1573,10 @@ function shouldMergeSentenceCue(
     }
 
     if (
-        prev.speakerHint &&
+        previous.speakerHint &&
         next.speakerHint &&
         normalizeSpeakerHint(
-            prev.speakerHint
+            previous.speakerHint
         ).toLowerCase() !==
             normalizeSpeakerHint(
                 next.speakerHint
@@ -1995,7 +1587,7 @@ function shouldMergeSentenceCue(
 
     const a =
         timingParts(
-            prev.timing
+            previous.timing
         );
 
     const b =
@@ -2003,47 +1595,60 @@ function shouldMergeSentenceCue(
             next.timing
         );
 
-    const gap =
-        b.start -
-        a.end;
-
     if (
         Number.isFinite(
-            gap
+            a.end
         ) &&
-        gap >
+        Number.isFinite(
+            b.start
+        ) &&
+        b.start -
+            a.end >
             0.9
     ) {
         return false;
     }
 
-    if (
-        startsLowercaseContinuation(
+    const nextText =
+        groupingText(
             next.text
+        )
+            .replace(
+                /^[-–—]\s*/u,
+                ""
+            )
+            .replace(
+                /^["'“‘(\[]+/u,
+                ""
+            );
+
+    if (
+        /^[a-zà-öø-ÿ]/u.test(
+            nextText
         )
     ) {
         return true;
     }
 
-    const previous =
+    const previousText =
         groupingText(
-            prev.text
+            previous.text
         );
 
     if (
         /[,;:]$/u.test(
-            previous
+            previousText
         )
     ) {
         return true;
     }
 
     if (
-        !endsStrongSentence(
-            prev.text
+        !/[.!?…]["'”’)\]}]*$/u.test(
+            previousText
         ) &&
         /\b(?:the|to|of|or|with|for|in|at|from|that|who|which|about|into|as|than|while)\s*$/iu.test(
-            previous
+            previousText
         )
     ) {
         return true;
@@ -2063,7 +1668,6 @@ function buildSentenceGroups(
 
     const flush =
         () => {
-
             if (
                 !current.length
             ) {
@@ -2096,14 +1700,8 @@ function buildSentenceGroups(
         of blocks
     ) {
         if (
-            !current.length
-        ) {
-            current.push(
-                block
-            );
-        }
-        else if (
-            shouldMergeSentenceCue(
+            !current.length ||
+            shouldMerge(
                 current,
                 block
             )
@@ -2126,7 +1724,7 @@ function buildSentenceGroups(
     return groups;
 }
 
-function compactTranslationGroup(
+function compactGroup(
     group
 ) {
     return {
@@ -2138,25 +1736,22 @@ function compactTranslationGroup(
 
         c:
             group.cues.map(
-                cue => {
+                cue => ({
+                    i:
+                        cue.index,
 
-                    const item = {
-                        i:
-                            cue.index,
+                    t:
+                        cue.text,
 
-                        t:
-                            cue.text
-                    };
-
-                    if (
+                    ...(
                         cue.speakerHint
-                    ) {
-                        item.speaker =
-                            cue.speakerHint;
-                    }
-
-                    return item;
-                }
+                            ? {
+                                speaker:
+                                    cue.speakerHint
+                            }
+                            : {}
+                    )
+                })
             ),
 
         m:
@@ -2170,7 +1765,7 @@ function splitByBudget(
     items,
     maxChars,
     maxItems,
-    itemBuilder
+    builder
 ) {
     const batches =
         [];
@@ -2185,14 +1780,11 @@ function splitByBudget(
         const item
         of items
     ) {
-        const built =
-            itemBuilder(
-                item
-            );
-
         const size =
             JSON.stringify(
-                built
+                builder(
+                    item
+                )
             ).length +
             8;
 
@@ -2237,48 +1829,39 @@ function splitByBudget(
 }
 
 // ============================================================
-// PROMPT - TRADUTOR
+// PROMPTS
 // ============================================================
 
-const TRANSLATOR_SYSTEM_PROMPT = `
-Você é o TRADUTOR PRINCIPAL de legendas EN→PT-BR de um pipeline de produção.
+const TRANSLATOR_PROMPT = `
+Você é o tradutor principal de legendas EN→PT-BR.
 
-Traduza como uma excelente legenda brasileira de streaming: natural, contemporânea, oral, fiel e contextual.
+OBJETIVO:
+Legenda brasileira excelente, natural, contemporânea, oral, fiel e contextual.
 
-Evite português literal, engessado, lusitano, datado ou com cara de tradução automática.
+Nunca soe:
+- literal;
+- engessado;
+- antiquado;
+- lusitano;
+- com gíria de tiozão;
+- nem com gíria jovem artificialmente enfiada.
 
-CONTRATO TEMPORAL ABSOLUTO:
+Reality, drag, LGBTQIA+, música, moda, memes e cultura pop:
+adapte culturalmente quando o contexto pedir.
 
-Cada Sentence Group contém um ou mais cues consecutivos.
+Use linguagem Gen Z/Alpha quando ela combinar DE VERDADE com a pessoa, o contexto, o humor e a referência.
+Não transforme todo mundo em caricatura de TikTok.
 
-Traduza o grupo holisticamente para entender a frase, MAS devolva exatamente um segmento PT para cada cue EN, na mesma ordem.
-
-O campo n informa quantos segmentos devem existir.
-
-Cada segmento PT deve conter somente o conteúdo semanticamente pronunciado naquele cue.
-
-Não antecipe conteúdo do próximo cue e não atrase conteúdo para outro cue.
-
-Preserve humor, ironia, shade, camp, personalidade, vulgaridade e intensidade.
-
+Preserve personalidade, humor, ironia, shade, camp, vulgaridade e intensidade.
 Não censure.
 
-Adapte idioms, gírias e memes de reality, drag, LGBTQIA+, música, moda e cultura pop quando houver equivalente brasileiro natural, sem forçar internetês.
-
 "I'm gagged" não é "estou amordaçada".
+"She ate" pode ser "ela arrasou", "entregou tudo", etc., conforme contexto.
+"off the top" monetário = comissão/corte/porcentagem.
+"closing ranks" = grupo se protegendo/panelinha.
+"Carry the two" = "vai dois".
 
-"She ate" não é comer literalmente quando for gíria.
-
-"off the top" monetário é comissão/corte/porcentagem.
-
-"closing ranks" pode significar grupo se protegendo/panelinha.
-
-"Carry the two" em conta matemática é "vai dois".
-
-Preserve nomes, marcas, títulos e catchphrases reconhecidas.
-
-Preserve exatamente quando aparecerem:
-
+Preserve quando presentes:
 Werkroom
 Condragulations
 Shantay, you stay
@@ -2286,256 +1869,271 @@ Sashay away
 You betta werk
 Racers, start your engines
 
-O campo opcional speaker é CONTEXTO OCULTO.
+CONTRATO TEMPORAL:
+Cada group possui n cues.
+Entenda o group holisticamente, mas devolva EXATAMENTE n strings em s.
+Cada string pertence ao cue correspondente.
+Nunca antecipe nem atrase conteúdo entre cues.
 
-NUNCA escreva [NOME], NOME:, rótulo de personagem ou nome do falante.
+speaker é contexto oculto.
+Nunca escreva nome/rótulo de falante.
 
-Quando speaker/contexto identificar claramente uma pessoa, use o gênero gramatical correto.
-
-Se o gênero não for seguro, NÃO chute masculino/feminino.
-
-Reescreva naturalmente de forma neutra.
-
+Se gênero não for seguro, reformule naturalmente.
 Nunca use:
-
 empolgado(a)
 animado(a)
 ele/ela
-ela/ele
-barras de gênero
+barras de gênero.
 
-Não desenhe notas sustentadas.
-
-Nada de:
-
-você-e-e-e
-amo-o-o-o
-sooooo
-nãããão
-
-O áudio já carrega a duração.
-
-Não acrescente hífen, travessão, meia-risca, barra ou marcador decorativo de diálogo.
-
-Em cue com mais de um falante, use linhas limpas sem prefixos.
-
-Não acrescente SDH/CC, sons, explicações ou markdown.
-
-Traduza letras de música somente quando a letra real estiver transcrita.
+Não use travessão, hífen ou barra decorativa.
+Não represente alongamentos vocais.
+Não acrescente SDH/CC.
 
 Responda SOMENTE JSON:
-
-{"items":[{"g":1,"s":["segmento cue 1","segmento cue 2"]}]}
-
-g deve repetir exatamente o group id.
-
-s deve ter EXATAMENTE n elementos.
-
-Não omita groups.
-
-Não invente groups.
+{"items":[{"g":1,"s":["...","..."]}]}
 `;
 
-// ============================================================
-// PROMPT - RESGATE
-// ============================================================
+const RESCUE_PROMPT = `
+Faça resgate estrutural EN→PT-BR.
 
-const TRANSLATOR_RESCUE_SYSTEM_PROMPT = `
-Você está fazendo RESGATE ESTRUTURAL de uma tradução EN→PT-BR.
+Use PT-BR natural e contemporâneo.
 
-A qualidade continua importante, mas o contrato estrutural é absoluto.
-
-Para cada group:
-
-g deve ser exatamente o mesmo.
-
-n é a quantidade EXATA de strings em s.
-
-c contém os cues na ordem temporal.
-
-Traduza holisticamente, mas mantenha o conteúdo semanticamente no cue correspondente.
-
-speaker é contexto oculto e nunca aparece.
-
-Não use nomes de falante.
-
-Não use hífens, travessões ou barras decorativas.
-
-Não use alongamentos vocais gráficos.
-
-Use PT-BR natural, atual, fiel e não literal.
-
-Responda SOMENTE:
-
-{"items":[{"g":123,"s":["...","..."]}]}
-`;
-
-// ============================================================
-// PROMPT - GEMINI REVIEWER
-// ============================================================
-
-const GEMINI_REVIEWER_SYSTEM_PROMPT = `
-Você é a SEGUNDA IA independente de revisão de legendas EN→PT-BR.
-
-Você NÃO é o tradutor principal.
-
-O PT foi produzido por Mistral Medium 3.5.
-
-Revise TODOS os groups recebidos, comparando EN e PT cue por cue.
-
-Proponha mudança SOMENTE quando houver erro real ou melhoria claramente necessária e de alta confiança.
-
-Não faça mudanças cosméticas.
-
-Não reescreva frases que já estão boas.
-
-Procure especialmente:
-
-1. sentido errado, omissão, antecipação ou atraso semântico;
-2. conteúdo colocado no cue temporal errado;
-3. português literal, engessado, lusitano ou datado;
-4. idioms, gírias, memes, reality, drag, LGBTQIA+, camp, shade, música, moda e cultura pop culturalmente deslocados;
-5. palavrão censurado ou reposicionado de modo artificial;
-6. concordância ou gênero errado;
-7. speaker vazado como [Kelly]:, Kelly: ou personagem:;
-8. alongamento gráfico como você-e-e-e ou sooooo;
-9. hífen, travessão ou barra decorativa de diálogo;
-10. catchphrase ou termo protegido alterado.
-
-Termos protegidos:
-
-Werkroom
-Condragulations
-Shantay, you stay
-Sashay away
-You betta werk
-Racers, start your engines
-
-speaker é pista OCULTA.
-
-Nunca apareça na proposta.
-
-Se speaker/contexto identifica claramente homem ou mulher, preserve o gênero correto.
-
-Se não houver segurança, prefira frase natural sem marca de gênero.
-
-Cada proposta deve manter EXATAMENTE a mesma quantidade de segmentos do group.
-
+g deve permanecer igual.
+s deve conter EXATAMENTE n strings.
+Uma string por cue, na ordem original.
 Nunca mova conteúdo entre cues.
 
-Você deve revisar 100% dos groups do lote, mas retornar SOMENTE propostas de correção.
+speaker é oculto.
+Sem nomes de falante.
+Sem marcadores decorativos.
+Sem alongamentos gráficos.
 
-Responda SOMENTE JSON:
+Responda SOMENTE:
+{"items":[{"g":1,"s":["..."]}]}
+`;
 
-{"reviewed":123,"proposals":[{"g":12,"s":["..."],"why":"motivo curto","confidence":0.98}]}
+const GEMINI_REVIEW_PROMPT = `
+Você é a segunda IA independente de revisão EN→PT-BR.
 
-reviewed deve ser EXATAMENTE a quantidade de groups recebidos.
+Revise TODOS os groups recebidos.
+
+O PT foi feito por Mistral Medium 3.5.
+
+Não reescreva o que já está bom.
+Não faça mudanças cosméticas.
+
+Proponha somente correções reais e de alta confiança.
+
+Cheque:
+- sentido;
+- omissões;
+- temporalidade;
+- gênero;
+- literalidade;
+- português antiquado;
+- gírias e referências contemporâneas;
+- reality/drag/LGBTQIA+/Gen Z/Alpha/cultura pop;
+- humor, shade e camp;
+- palavrões;
+- nomes de falante vazados;
+- marcadores de diálogo;
+- alongamentos;
+- termos protegidos.
+
+speaker é contexto oculto.
+
+Mantenha exatamente o número de segmentos.
+
+Responda SOMENTE:
+{"reviewed":123,"proposals":[{"g":12,"s":["..."],"why":"motivo","confidence":0.98}]}
 
 Se tudo estiver bom:
-
 {"reviewed":123,"proposals":[]}
 `;
 
-// ============================================================
-// PROMPT - ÁRBITRO
-// ============================================================
+const ARBITER_PROMPT = `
+Você é o árbitro final Mistral.
 
-const ARBITER_SYSTEM_PROMPT = `
-Você é o ÁRBITRO FINAL Mistral de propostas feitas por uma segunda IA.
+Compare:
+EN original,
+PT original Mistral,
+proposta Gemini.
 
-A tradução ORIGINAL foi feita pelo próprio Mistral Medium 3.5.
+Aceite apenas se a proposta for claramente mais correta, fiel, natural e contemporânea.
 
-O Gemini apenas sugeriu correções.
+Na dúvida, mantenha o original.
 
-Compare para cada item:
-
-- EN original;
-- PT original Mistral;
-- proposta Gemini;
-- speaker oculto, quando houver;
-- motivo e confiança da proposta.
-
-REGRA PRINCIPAL:
-
-Só aceite a proposta se ela for claramente mais correta, fiel, natural e apropriada em PT-BR.
-
-Se houver dúvida, mantenha o PT original.
-
-Não aceite mudança meramente cosmética.
-
-Não deixe a proposta alterar o conteúdo temporal de um cue para outro.
-
-Preserve exatamente a quantidade de segmentos.
-
+Nunca altere número de segmentos.
+Nunca mova conteúdo entre cues.
 Nunca exponha speaker.
-
-Nunca introduza rótulo de falante.
-
-Nunca introduza hífen, travessão ou barra decorativa.
-
-Nunca introduza alongamento vocal gráfico.
-
 Nunca chute gênero.
-
-Responda SOMENTE JSON:
-
-{"accepted":[{"g":123,"s":["..."],"why":"motivo curto"}]}
-
-Retorne apenas as propostas ACEITAS.
-
-Se nenhuma for melhor:
-
-{"accepted":[]}
-`;
-
-// ============================================================
-// PROMPT - QUALITY REPAIR
-// ============================================================
-
-const QUALITY_REPAIR_SYSTEM_PROMPT = `
-Você é o reparador final de uma legenda EN→PT-BR.
-
-Receberá somente groups onde o Quality Guard detectou risco concreto.
-
-Use:
-
-- EN original;
-- PT atual;
-- speaker oculto;
-- reasons;
-
-para corrigir SOMENTE o necessário.
-
-Preserve exatamente g.
-
-Preserve exatamente o número de segmentos s.
-
-Não mova conteúdo entre cues.
-
-PT-BR natural, atual, fiel e conciso.
-
-Nunca exponha speaker.
-
-Nunca use rótulo de falante.
-
-Nunca use hífen, travessão ou barra decorativa.
-
-Nunca use alongamento vocal gráfico.
-
-Nunca use gênero artificial.
+Nunca introduza marcadores decorativos ou alongamentos.
 
 Responda SOMENTE:
+{"accepted":[{"g":123,"s":["..."],"why":"motivo"}]}
+`;
 
+const REPAIR_PROMPT = `
+Você é o reparador final de legenda EN→PT-BR.
+
+Você recebe somente groups com risco concreto.
+
+Corrija SOMENTE o problema apontado.
+
+Use PT-BR natural, atual, oral e fiel.
+
+Evite:
+literalidade,
+português antiquado,
+gíria datada,
+gíria jovem forçada.
+
+Preserve:
+g,
+quantidade de segmentos,
+temporalidade,
+speaker apenas como contexto oculto.
+
+Responda SOMENTE:
 {"items":[{"g":123,"s":["..."]}]}
 `;
 
 // ============================================================
-// RETRY-AFTER
+// MISTRAL GOVERNOR
+// ============================================================
+
+class AdaptiveGovernor {
+
+    constructor(
+        maxConcurrency
+    ) {
+        this.maxConcurrency =
+            maxConcurrency;
+
+        this.active =
+            0;
+
+        this.cooldownUntil =
+            0;
+
+        this.serialUntil =
+            0;
+
+        this.waiters =
+            [];
+    }
+
+    limit() {
+        return Date.now() <
+            this.serialUntil
+            ? 1
+            : this.maxConcurrency;
+    }
+
+    async acquire() {
+        while (
+            true
+        ) {
+            const now =
+                Date.now();
+
+            if (
+                now <
+                this.cooldownUntil
+            ) {
+                await sleep(
+                    this.cooldownUntil -
+                    now
+                );
+
+                continue;
+            }
+
+            if (
+                this.active <
+                this.limit()
+            ) {
+                this.active++;
+
+                return;
+            }
+
+            await new Promise(
+                resolve =>
+                    this.waiters.push(
+                        resolve
+                    )
+            );
+        }
+    }
+
+    release() {
+        this.active =
+            Math.max(
+                0,
+                this.active -
+                1
+            );
+
+        const waiters =
+            this.waiters.splice(
+                0
+            );
+
+        for (
+            const resolve
+            of waiters
+        ) {
+            resolve();
+        }
+    }
+
+    note429(
+        waitMs
+    ) {
+        const now =
+            Date.now();
+
+        this.cooldownUntil =
+            Math.max(
+                this.cooldownUntil,
+                now +
+                    waitMs
+            );
+
+        this.serialUntil =
+            Math.max(
+                this.serialUntil,
+                now +
+                    60000
+            );
+
+        const waiters =
+            this.waiters.splice(
+                0
+            );
+
+        for (
+            const resolve
+            of waiters
+        ) {
+            resolve();
+        }
+    }
+}
+
+const mistralGovernor =
+    new AdaptiveGovernor(
+        MISTRAL_CONCURRENCY
+    );
+
+// ============================================================
+// PROVIDER HTTP
 // ============================================================
 
 function retryAfterMs(
     response,
-    fallbackMs
+    fallback
 ) {
     const header =
         response
@@ -2560,75 +2158,8 @@ function retryAfterMs(
                 0
         ) {
             return Math.min(
-                Math.ceil(
-                    seconds *
-                    1000
-                ),
-                120000
-            );
-        }
-
-        const date =
-            Date.parse(
-                header
-            );
-
-        if (
-            Number.isFinite(
-                date
-            )
-        ) {
-            return Math.min(
-                Math.max(
+                seconds *
                     1000,
-                    date -
-                        Date.now()
-                ),
-                120000
-            );
-        }
-    }
-
-    for (
-        const name
-        of [
-            "x-ratelimit-reset-tokens",
-            "x-ratelimit-reset-requests"
-        ]
-    ) {
-        const value =
-            response
-                ?.headers
-                ?.get(
-                    name
-                );
-
-        if (
-            !value
-        ) {
-            continue;
-        }
-
-        const parsed =
-            parseFloat(
-                String(
-                    value
-                )
-            );
-
-        if (
-            Number.isFinite(
-                parsed
-            ) &&
-            parsed >
-                0
-        ) {
-            return Math.min(
-                Math.max(
-                    1000,
-                    parsed *
-                        1000
-                ),
                 120000
             );
         }
@@ -2636,122 +2167,15 @@ function retryAfterMs(
 
     return Math.min(
         Math.max(
-            Number(
-                fallbackMs
-            ) ||
-            5000,
+            fallback ||
+            4000,
             1000
         ),
         120000
     );
 }
 
-// ============================================================
-// USAGE
-// ============================================================
-
-function recordUsage(
-    job,
-    provider,
-    usage
-) {
-    if (
-        !job ||
-        !usage
-    ) {
-        return;
-    }
-
-    const prev =
-        job.providerUsage[
-            provider
-        ] ||
-        {
-            promptTokens:
-                0,
-
-            completionTokens:
-                0,
-
-            totalTokens:
-                0,
-
-            cachedTokens:
-                0
-        };
-
-    if (
-        provider ===
-        "GEMINI_REVIEW"
-    ) {
-        prev.promptTokens +=
-            Number(
-                usage.promptTokenCount ||
-                0
-            );
-
-        prev.completionTokens +=
-            Number(
-                usage.candidatesTokenCount ||
-                0
-            );
-
-        prev.totalTokens +=
-            Number(
-                usage.totalTokenCount ||
-                0
-            );
-    }
-    else {
-        prev.promptTokens +=
-            Number(
-                usage.prompt_tokens ||
-                usage.input_tokens ||
-                0
-            );
-
-        prev.completionTokens +=
-            Number(
-                usage.completion_tokens ||
-                usage.output_tokens ||
-                0
-            );
-
-        prev.totalTokens +=
-            Number(
-                usage.total_tokens ||
-                (
-                    Number(
-                        usage.prompt_tokens ||
-                        0
-                    ) +
-                    Number(
-                        usage.completion_tokens ||
-                        0
-                    )
-                )
-            );
-
-        prev.cachedTokens +=
-            Number(
-                usage
-                    ?.prompt_tokens_details
-                    ?.cached_tokens ||
-                0
-            );
-    }
-
-    job.providerUsage[
-        provider
-    ] =
-        prev;
-}
-
-// ============================================================
-// POST JSON + RETRIES
-// ============================================================
-
-async function postJsonWithRetry({
+async function postJsonRetry({
     url,
     headers,
     body,
@@ -2777,26 +2201,25 @@ async function postJsonWithRetry({
             job &&
             attemptCounter
         ) {
-            job[
+            job.stats[
                 attemptCounter
-            ] =
-                Number(
-                    job[
-                        attemptCounter
-                    ] ||
-                    0
-                ) +
-                1;
+            ]++;
+        }
+
+        if (
+            governor
+        ) {
+            await governor.acquire();
         }
 
         let slotHeld =
-            false;
+            Boolean(
+                governor
+            );
 
-        const releaseSlot =
+        const release =
             () => {
-
                 if (
-                    governor &&
                     slotHeld
                 ) {
                     slotHeld =
@@ -2805,15 +2228,6 @@ async function postJsonWithRetry({
                     governor.release();
                 }
             };
-
-        if (
-            governor
-        ) {
-            await governor.acquire();
-
-            slotHeld =
-                true;
-        }
 
         const controller =
             new AbortController();
@@ -2876,16 +2290,9 @@ async function postJsonWithRetry({
                     job &&
                     successCounter
                 ) {
-                    job[
+                    job.stats[
                         successCounter
-                    ] =
-                        Number(
-                            job[
-                                successCounter
-                            ] ||
-                            0
-                        ) +
-                        1;
+                    ]++;
                 }
 
                 return data;
@@ -2906,24 +2313,12 @@ async function postJsonWithRetry({
                         message
                     ).slice(
                         0,
-                        1600
+                        1400
                     )}`
                 );
 
             error.status =
                 response.status;
-
-            const retryable =
-                response.status ===
-                    408 ||
-                response.status ===
-                    409 ||
-                response.status ===
-                    425 ||
-                response.status ===
-                    429 ||
-                response.status >=
-                    500;
 
             if (
                 response.status ===
@@ -2933,16 +2328,9 @@ async function postJsonWithRetry({
                     job &&
                     rateCounter
                 ) {
-                    job[
+                    job.stats[
                         rateCounter
-                    ] =
-                        Number(
-                            job[
-                                rateCounter
-                            ] ||
-                            0
-                        ) +
-                        1;
+                    ]++;
                 }
 
                 const wait =
@@ -2958,7 +2346,7 @@ async function postJsonWithRetry({
                 if (
                     governor
                 ) {
-                    governor.noteRateLimit(
+                    governor.note429(
                         wait
                     );
                 }
@@ -2977,7 +2365,7 @@ async function postJsonWithRetry({
                     )}s.`
                 );
 
-                releaseSlot();
+                release();
 
                 clearTimeout(
                     timer
@@ -2990,6 +2378,17 @@ async function postJsonWithRetry({
                 continue;
             }
 
+            const retryable =
+                [
+                    408,
+                    409,
+                    425
+                ].includes(
+                    response.status
+                ) ||
+                response.status >=
+                    500;
+
             if (
                 !retryable ||
                 attempt ===
@@ -2999,23 +2398,13 @@ async function postJsonWithRetry({
             }
 
             const wait =
-                retryAfterMs(
-                    response,
-                    Math.min(
-                        3000 *
-                            attempt,
-                        20000
-                    )
+                Math.min(
+                    2500 *
+                        attempt,
+                    20000
                 );
 
-            console.warn(
-                `[${provider}] HTTP ${response.status}; aguardando ${Math.ceil(
-                    wait /
-                    1000
-                )}s.`
-            );
-
-            releaseSlot();
+            release();
 
             clearTimeout(
                 timer
@@ -3024,8 +2413,6 @@ async function postJsonWithRetry({
             await sleep(
                 wait
             );
-
-            continue;
         }
         catch (
             error
@@ -3037,22 +2424,6 @@ async function postJsonWithRetry({
                         `${provider}: timeout por request.`
                     )
                     : error;
-
-            if (
-                lastError?.status &&
-                ![
-                    408,
-                    409,
-                    425,
-                    429
-                ].includes(
-                    lastError.status
-                ) &&
-                lastError.status <
-                    500
-            ) {
-                throw lastError;
-            }
 
             if (
                 attempt ===
@@ -3073,14 +2444,13 @@ async function postJsonWithRetry({
                     lastError
                 ).slice(
                     0,
-                    250
-                )}; ` +
-                `retry em ${(wait / 1000).toFixed(
+                    180
+                )}; retry em ${(wait / 1000).toFixed(
                     1
                 )}s.`
             );
 
-            releaseSlot();
+            release();
 
             clearTimeout(
                 timer
@@ -3089,22 +2459,20 @@ async function postJsonWithRetry({
             await sleep(
                 wait
             );
-
-            continue;
         }
         finally {
             clearTimeout(
                 timer
             );
 
-            releaseSlot();
+            release();
         }
     }
 
     throw (
         lastError ||
         new Error(
-            `${provider}: falha desconhecida.`
+            `${provider}: falha.`
         )
     );
 }
@@ -3132,13 +2500,12 @@ function extractMistralText(
             .filter(
                 item =>
                     item?.type ===
-                        "text" &&
-                    typeof item.text ===
-                        "string"
+                        "text"
             )
             .map(
                 item =>
-                    item.text
+                    item.text ||
+                    ""
             )
             .join(
                 ""
@@ -3149,37 +2516,29 @@ function extractMistralText(
 }
 
 async function mistralChat({
-    systemPrompt,
-    userPrompt,
+    system,
+    user,
     job,
-    reasoningEffort =
+    reasoning =
         "none",
     temperature =
         0.1,
     maxTokens =
-        MISTRAL_MAX_OUTPUT_TOKENS,
+        16000,
     purpose =
         "translation"
 }) {
-    if (
-        !MISTRAL_API_KEY
-    ) {
-        throw new Error(
-            "MISTRAL_API_KEY não configurada."
-        );
-    }
-
-    const providerName =
+    const provider =
         purpose ===
-        "arbiter"
+            "arbiter"
             ? "MISTRAL_ARBITER"
             : purpose ===
-            "repair"
+                "repair"
                 ? "MISTRAL_REPAIR"
                 : "MISTRAL";
 
     const data =
-        await postJsonWithRetry({
+        await postJsonRetry({
             url:
                 "https://api.mistral.ai/v1/chat/completions",
 
@@ -3201,7 +2560,7 @@ async function mistralChat({
                             "system",
 
                         content:
-                            systemPrompt
+                            system
                     },
 
                     {
@@ -3209,7 +2568,7 @@ async function mistralChat({
                             "user",
 
                         content:
-                            userPrompt
+                            user
                     }
                 ],
 
@@ -3219,7 +2578,7 @@ async function mistralChat({
                 },
 
                 reasoning_effort:
-                    reasoningEffort,
+                    reasoning,
 
                 temperature,
 
@@ -3228,16 +2587,15 @@ async function mistralChat({
 
                 prompt_cache_key:
                     purpose ===
-                    "translation"
-                        ? "stremio-ptbr-6-2-translator"
-                        : "stremio-ptbr-6-2-editor"
+                        "translation"
+                        ? "stremio-ptbr-6-3-translator"
+                        : "stremio-ptbr-6-3-editor"
             },
 
             timeoutMs:
                 MISTRAL_TIMEOUT_MS,
 
-            provider:
-                providerName,
+            provider,
 
             maxRetries:
                 MISTRAL_MAX_RETRIES,
@@ -3249,26 +2607,16 @@ async function mistralChat({
 
             successCounter:
                 purpose ===
-                "arbiter"
+                    "arbiter"
                     ? "arbiterCalls"
                     : "mistralCalls",
 
             rateCounter:
-                "mistral429s",
+                "mistral429",
 
             governor:
                 mistralGovernor
         });
-
-    recordUsage(
-        job,
-        purpose ===
-            "arbiter"
-            ? "MISTRAL_ARBITER"
-            : "MISTRAL",
-        data.usage ||
-        {}
-    );
 
     const text =
         extractMistralText(
@@ -3283,54 +2631,11 @@ async function mistralChat({
         !text
     ) {
         throw new Error(
-            "Mistral retornou resposta vazia."
+            `${provider} retornou resposta vazia.`
         );
     }
 
     return text;
-}
-
-async function mistralTranslateGroups(
-    groups,
-    job,
-    rescue = false
-) {
-    const payload =
-        groups.map(
-            compactTranslationGroup
-        );
-
-    return mistralChat({
-        systemPrompt:
-            rescue
-                ? TRANSLATOR_RESCUE_SYSTEM_PROMPT
-                : TRANSLATOR_SYSTEM_PROMPT,
-
-        userPrompt:
-            `${rescue
-                ? "Resgate somente estes groups."
-                : "Traduza este lote."
-            }\n` +
-            `JSON de entrada:\n${JSON.stringify(
-                {
-                    groups:
-                        payload
-                }
-            )}`,
-
-        job,
-
-        reasoningEffort:
-            "none",
-
-        temperature:
-            rescue
-                ? 0
-                : 0.1,
-
-        purpose:
-            "translation"
-    });
 }
 
 function parseTranslationResponse(
@@ -3376,48 +2681,16 @@ function parseTranslationResponse(
         };
     }
 
-    let items =
-        [];
-
-    if (
+    const items =
         Array.isArray(
             parsed
         )
-    ) {
-        items =
-            parsed;
-    }
-    else if (
-        Array.isArray(
-            parsed?.items
-        )
-    ) {
-        items =
-            parsed.items;
-    }
-    else if (
-        parsed &&
-        typeof parsed ===
-            "object" &&
-        parsed.g !=
-            null
-    ) {
-        items = [
-            parsed
-        ];
-    }
-    else {
-        return {
-            valid,
-
-            invalidGroups:
-                groups.slice(),
-
-            issues: [
-                "ITEMS_MISSING"
-            ]
-        };
-    }
+            ? parsed
+            : Array.isArray(
+                parsed?.items
+            )
+                ? parsed.items
+                : [];
 
     for (
         const item
@@ -3491,10 +2764,10 @@ function parseTranslationResponse(
 
         if (
             segments.some(
-                text =>
-                    typeof text !==
+                value =>
+                    typeof value !==
                         "string" ||
-                    !text.trim()
+                    !value.trim()
             )
         ) {
             issues.push(
@@ -3508,10 +2781,8 @@ function parseTranslationResponse(
             groupId,
 
             segments.map(
-                text =>
-                    String(
-                        text
-                    ).trim()
+                value =>
+                    value.trim()
             )
         );
     }
@@ -3524,363 +2795,266 @@ function parseTranslationResponse(
                 )
         );
 
-    if (
-        invalidGroups.length
-    ) {
-        issues.push(
-            `faltando=${invalidGroups
-                .map(
-                    group =>
-                        group.groupId
-                )
-                .join(
-                    ","
-                )}`
-        );
-    }
-
     return {
         valid,
+
         invalidGroups,
+
         issues
     };
 }
 
-async function mistralAtomicGroup(
-    group,
+async function translateBatch(
+    groups,
     job,
-    reasoningEffort =
-        "none"
+    rescue = false
 ) {
     const raw =
         await mistralChat({
-            systemPrompt:
-                TRANSLATOR_RESCUE_SYSTEM_PROMPT,
+            system:
+                rescue
+                    ? RESCUE_PROMPT
+                    : TRANSLATOR_PROMPT,
 
-            userPrompt:
-                `TRADUZA EXATAMENTE UM GROUP.\n` +
-                `group=${group.groupId}; ` +
-                `cueIds=${JSON.stringify(
-                    group.cues.map(
-                        cue =>
-                            cue.index
-                    )
-                )}; ` +
-                `n=${group.cues.length}.\n` +
-                `A saída deve conter exatamente ${group.cues.length} string(s) em s.\n` +
-                `Entrada:\n${JSON.stringify(
-                    compactTranslationGroup(
-                        group
-                    )
-                )}`,
+            user:
+                `${
+                    rescue
+                        ? "Resgate"
+                        : "Traduza"
+                } estes groups:\n` +
+                JSON.stringify({
+                    groups:
+                        groups.map(
+                            compactGroup
+                        )
+                }),
 
             job,
 
-            reasoningEffort,
-
             temperature:
-                0,
-
-            maxTokens:
-                4000,
+                rescue
+                    ? 0
+                    : 0.1,
 
             purpose:
                 "translation"
         });
 
     return parseTranslationResponse(
-        [
-            group
-        ],
+        groups,
         raw
     );
-}
-
-async function mistralSingleCueRescue(
-    group,
-    cuePosition,
-    job
-) {
-    const cue =
-        group.cues[
-            cuePosition
-        ];
-
-    const context =
-        group.cues.map(
-            (
-                item,
-                index
-            ) => ({
-                pos:
-                    index +
-                    1,
-
-                id:
-                    item.index,
-
-                text:
-                    item.text,
-
-                speaker:
-                    item.speakerHint ||
-                    undefined,
-
-                target:
-                    index ===
-                    cuePosition
-            })
-        );
-
-    const raw =
-        await mistralChat({
-            systemPrompt: `
-Você está fazendo o último RESGATE de um único cue de legenda EN→PT-BR.
-
-Use todo o grupo apenas como contexto, mas traduza SOMENTE o cue target=true.
-
-Não antecipe nem atrase conteúdo de outros cues.
-
-Use PT-BR natural, contemporâneo e fiel.
-
-speaker é contexto oculto e nunca aparece.
-
-Não use rótulo de falante.
-
-Não use hífen, travessão ou barra decorativa.
-
-Não use alongamento vocal gráfico.
-
-Responda SOMENTE JSON:
-
-{"text":"tradução do cue target"}
-`,
-
-            userPrompt:
-                `group=${group.groupId}; ` +
-                `targetCue=${cue.index}.\n` +
-                `Contexto:\n${JSON.stringify(
-                    context
-                )}`,
-
-            job,
-
-            reasoningEffort:
-                "high",
-
-            temperature:
-                0,
-
-            maxTokens:
-                1800,
-
-            purpose:
-                "translation"
-        });
-
-    let parsed;
-
-    try {
-        parsed =
-            JSON.parse(
-                stripCodeFences(
-                    raw
-                )
-            );
-    }
-    catch {
-        throw new Error(
-            `Resgate por cue retornou JSON inválido no group ${group.groupId}, cue ${cue.index}.`
-        );
-    }
-
-    const text =
-        parsed?.text ??
-        parsed?.translation ??
-        parsed?.s?.[0];
-
-    if (
-        typeof text !==
-            "string" ||
-        !text.trim()
-    ) {
-        throw new Error(
-            `Resgate por cue vazio no group ${group.groupId}, cue ${cue.index}.`
-        );
-    }
-
-    job.perCueRescues++;
-
-    return String(
-        text
-    ).trim();
 }
 
 async function rescueSingleGroup(
     group,
     job
 ) {
-    job.atomicRescues++;
+    job.stats.atomicRescues++;
 
     console.warn(
-        `[MISTRAL RESCUE] Group ${group.groupId} isolado; ` +
-        `cues=${group.cues
-            .map(
-                cue =>
-                    cue.index
-            )
-            .join(
-                ","
-            )}.`
+        `[MISTRAL RESCUE] Group ${group.groupId} isolado.`
     );
 
-    let parsed =
-        await mistralAtomicGroup(
-            group,
-            job,
-            "none"
-        );
-
-    if (
-        parsed.valid.has(
-            group.groupId
-        )
-    ) {
-        return parsed.valid.get(
-            group.groupId
-        );
-    }
-
-    console.warn(
-        `[MISTRAL RESCUE] Group ${group.groupId} ainda inválido; reasoning=high.`
-    );
-
-    job.highReasoningRescues++;
-
-    parsed =
-        await mistralAtomicGroup(
-            group,
-            job,
+    for (
+        const reasoning
+        of [
+            "none",
             "high"
-        );
-
-    if (
-        parsed.valid.has(
-            group.groupId
-        )
+        ]
     ) {
-        return parsed.valid.get(
-            group.groupId
-        );
+        const raw =
+            await mistralChat({
+                system:
+                    RESCUE_PROMPT,
+
+                user:
+                    `Traduza este group com EXATAMENTE ${group.cues.length} string(s):\n` +
+                    JSON.stringify(
+                        compactGroup(
+                            group
+                        )
+                    ),
+
+                job,
+
+                reasoning,
+
+                temperature:
+                    0,
+
+                maxTokens:
+                    4000,
+
+                purpose:
+                    "translation"
+            });
+
+        const parsed =
+            parseTranslationResponse(
+                [
+                    group
+                ],
+                raw
+            );
+
+        if (
+            parsed.valid.has(
+                group.groupId
+            )
+        ) {
+            return parsed.valid.get(
+                group.groupId
+            );
+        }
     }
 
-    console.warn(
-        `[MISTRAL RESCUE] Group ${group.groupId} persistente; resgate por cue.`
-    );
-
-    const segments =
+    const output =
         [];
 
     for (
-        let i = 0;
-        i <
+        let index = 0;
+        index <
         group.cues.length;
-        i++
+        index++
     ) {
-        segments.push(
-            await mistralSingleCueRescue(
-                group,
-                i,
-                job
-            )
+        const raw =
+            await mistralChat({
+                system:
+                    `Traduza SOMENTE o cue target=true para PT-BR natural. ` +
+                    `Use os demais apenas como contexto. ` +
+                    `speaker é oculto. Responda {"text":"..."}.`,
+
+                user:
+                    JSON.stringify({
+                        group:
+                            group.groupId,
+
+                        cues:
+                            group.cues.map(
+                                (
+                                    cue,
+                                    cueIndex
+                                ) => ({
+                                    id:
+                                        cue.index,
+
+                                    text:
+                                        cue.text,
+
+                                    speaker:
+                                        cue.speakerHint ||
+                                        undefined,
+
+                                    target:
+                                        cueIndex ===
+                                        index
+                                })
+                            )
+                    }),
+
+                job,
+
+                reasoning:
+                    "high",
+
+                temperature:
+                    0,
+
+                maxTokens:
+                    1600,
+
+                purpose:
+                    "translation"
+            });
+
+        let parsed;
+
+        try {
+            parsed =
+                JSON.parse(
+                    stripCodeFences(
+                        raw
+                    )
+                );
+        }
+        catch {
+            parsed =
+                null;
+        }
+
+        const text =
+            parsed?.text ??
+            parsed?.translation;
+
+        if (
+            typeof text !==
+                "string" ||
+            !text.trim()
+        ) {
+            throw new Error(
+                `Resgate por cue falhou no group ${group.groupId}.`
+            );
+        }
+
+        output.push(
+            text.trim()
         );
     }
 
-    return segments;
+    return output;
 }
 
-async function translateGroupBatchResilient(
+async function translateBatchResilient(
     groups,
     job
 ) {
-    const result =
-        new Map();
-
-    const raw =
-        await mistralTranslateGroups(
+    const first =
+        await translateBatch(
             groups,
             job,
             false
         );
 
-    const parsed =
-        parseTranslationResponse(
-            groups,
-            raw
+    const result =
+        new Map(
+            first.valid
         );
-
-    for (
-        const [
-            groupId,
-            segments
-        ]
-        of parsed.valid
-    ) {
-        result.set(
-            groupId,
-            segments
-        );
-    }
-
-    const pending =
-        parsed.invalidGroups;
 
     if (
-        !pending.length
+        !first.invalidGroups.length
     ) {
         return result;
     }
 
-    job.salvagedGroups +=
-        parsed.valid.size;
+    job.stats.salvageGroups +=
+        first.valid.size;
 
     console.warn(
-        `[MISTRAL SALVAGE] Lote parcial: ` +
-        `válidos=${parsed.valid.size}/${groups.length}; ` +
-        `resgatar=${pending.length}; ` +
-        `${parsed.issues
-            .slice(
-                0,
-                8
-            )
-            .join(
-                " | "
-            )}`
+        `[MISTRAL SALVAGE] válidos=${first.valid.size}/${groups.length}; ` +
+        `resgatar=${first.invalidGroups.length}.`
     );
 
     const rescueBatches =
         splitByBudget(
-            pending,
+            first.invalidGroups,
             MISTRAL_RESCUE_CHARS,
             MISTRAL_RESCUE_GROUPS,
-            compactTranslationGroup
+            compactGroup
         );
 
-    const stillInvalid =
-        [];
-
     for (
-        const rescueBatch
+        const batch
         of rescueBatches
     ) {
-        job.rescueBatchCalls++;
+        job.stats.rescueBatches++;
 
         if (
-            rescueBatch.length ===
+            batch.length ===
             1
         ) {
             const group =
-                rescueBatch[0];
+                batch[0];
 
             result.set(
                 group.groupId,
@@ -3895,20 +3069,14 @@ async function translateGroupBatchResilient(
         }
 
         console.warn(
-            `[MISTRAL RESCUE] Lote pequeno com ${rescueBatch.length} group(s).`
+            `[MISTRAL RESCUE] Lote pequeno com ${batch.length} group(s).`
         );
 
-        const rescueRaw =
-            await mistralTranslateGroups(
-                rescueBatch,
+        const parsed =
+            await translateBatch(
+                batch,
                 job,
                 true
-            );
-
-        const rescueParsed =
-            parseTranslationResponse(
-                rescueBatch,
-                rescueRaw
             );
 
         for (
@@ -3916,7 +3084,7 @@ async function translateGroupBatchResilient(
                 groupId,
                 segments
             ]
-            of rescueParsed.valid
+            of parsed.valid
         ) {
             result.set(
                 groupId,
@@ -3924,20 +3092,9 @@ async function translateGroupBatchResilient(
             );
         }
 
-        stillInvalid.push(
-            ...rescueParsed
-                .invalidGroups
-        );
-    }
-
-    for (
-        const group
-        of stillInvalid
-    ) {
-        if (
-            !result.has(
-                group.groupId
-            )
+        for (
+            const group
+            of parsed.invalidGroups
         ) {
             result.set(
                 group.groupId,
@@ -3950,34 +3107,11 @@ async function translateGroupBatchResilient(
         }
     }
 
-    const missing =
-        groups.filter(
-            group =>
-                !result.has(
-                    group.groupId
-                )
-        );
-
-    if (
-        missing.length
-    ) {
-        throw new Error(
-            `Resgate estrutural incompleto: groups ${missing
-                .map(
-                    group =>
-                        group.groupId
-                )
-                .join(
-                    ","
-                )}.`
-        );
-    }
-
     return result;
 }
 
 // ============================================================
-// COMPACT REVIEW GROUP
+// GEMINI REVIEW
 // ============================================================
 
 function compactReviewGroup(
@@ -4017,10 +3151,6 @@ function compactReviewGroup(
     return item;
 }
 
-// ============================================================
-// GEMINI
-// ============================================================
-
 function extractGeminiText(
     data
 ) {
@@ -4045,29 +3175,12 @@ function extractGeminiText(
         .trim();
 }
 
-async function geminiReviewRequest(
+async function geminiReview(
     entries,
     job
 ) {
-    if (
-        !GEMINI_API_KEY
-    ) {
-        throw new Error(
-            "GEMINI_API_KEY não configurada."
-        );
-    }
-
-    const payload =
-        entries.map(
-            entry =>
-                compactReviewGroup(
-                    entry.group,
-                    entry.segments
-                )
-        );
-
     const data =
-        await postJsonWithRetry({
+        await postJsonRetry({
             url:
                 `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
                     GEMINI_MODEL
@@ -4086,7 +3199,7 @@ async function geminiReviewRequest(
                     parts: [
                         {
                             text:
-                                GEMINI_REVIEWER_SYSTEM_PROMPT
+                                GEMINI_REVIEW_PROMPT
                         }
                     ]
                 },
@@ -4099,57 +3212,19 @@ async function geminiReviewRequest(
                         parts: [
                             {
                                 text:
-                                    `Revise os ${entries.length} groups abaixo.\n` +
-                                    `JSON de entrada:\n${JSON.stringify(
-                                        {
-                                            groups:
-                                                payload
-                                        }
-                                    )}`
+                                    `Revise ${entries.length} groups:\n` +
+                                    JSON.stringify({
+                                        groups:
+                                            entries.map(
+                                                entry =>
+                                                    compactReviewGroup(
+                                                        entry.group,
+                                                        entry.segments
+                                                    )
+                                            )
+                                    })
                             }
                         ]
-                    }
-                ],
-
-                /*
-                 * Legenda de reality
-                 * pode conter palavrão,
-                 * sexualidade, shade etc.
-                 *
-                 * Isso é tradução/revisão,
-                 * não geração nociva.
-                 */
-                safetySettings: [
-                    {
-                        category:
-                            "HARM_CATEGORY_HARASSMENT",
-
-                        threshold:
-                            "BLOCK_NONE"
-                    },
-
-                    {
-                        category:
-                            "HARM_CATEGORY_HATE_SPEECH",
-
-                        threshold:
-                            "BLOCK_NONE"
-                    },
-
-                    {
-                        category:
-                            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-
-                        threshold:
-                            "BLOCK_NONE"
-                    },
-
-                    {
-                        category:
-                            "HARM_CATEGORY_DANGEROUS_CONTENT",
-
-                        threshold:
-                            "BLOCK_NONE"
                     }
                 ],
 
@@ -4161,7 +3236,7 @@ async function geminiReviewRequest(
                         "application/json",
 
                     maxOutputTokens:
-                        GEMINI_REVIEW_MAX_OUTPUT_TOKENS
+                        GEMINI_MAX_OUTPUT_TOKENS
                 }
             },
 
@@ -4177,21 +3252,14 @@ async function geminiReviewRequest(
             job,
 
             attemptCounter:
-                "geminiReviewAttempts",
+                "geminiAttempts",
 
             successCounter:
-                "geminiReviewCalls",
+                "geminiCalls",
 
             rateCounter:
-                "gemini429s"
+                "gemini429"
         });
-
-    recordUsage(
-        job,
-        "GEMINI_REVIEW",
-        data.usageMetadata ||
-        {}
-    );
 
     const text =
         extractGeminiText(
@@ -4202,37 +3270,24 @@ async function geminiReviewRequest(
         !text
     ) {
         throw new Error(
-            "Gemini reviewer retornou resposta vazia."
+            "Gemini retornou resposta vazia."
         );
     }
 
-    return text;
-}
-
-function parseGeminiReview(
-    entries,
-    raw
-) {
     let parsed;
 
     try {
         parsed =
             JSON.parse(
                 stripCodeFences(
-                    raw
+                    text
                 )
             );
     }
     catch {
-        const error =
-            new Error(
-                "Gemini reviewer retornou JSON inválido."
-            );
-
-        error.code =
-            "BAD_GEMINI_OUTPUT";
-
-        throw error;
+        throw new Error(
+            "Gemini retornou JSON inválido."
+        );
     }
 
     if (
@@ -4244,19 +3299,15 @@ function parseGeminiReview(
             parsed?.proposals
         )
     ) {
-        const error =
-            new Error(
-                `Gemini reviewer não confirmou revisão completa: ` +
-                `reviewed=${parsed?.reviewed}, esperado=${entries.length}.`
-            );
-
-        error.code =
-            "BAD_GEMINI_OUTPUT";
-
-        throw error;
+        throw new Error(
+            "Gemini não confirmou revisão integral."
+        );
     }
 
-    const expected =
+    job.stats.geminiReviewed +=
+        entries.length;
+
+    const allowed =
         new Map(
             entries.map(
                 entry => [
@@ -4268,9 +3319,6 @@ function parseGeminiReview(
             )
         );
 
-    const seen =
-        new Set();
-
     const proposals =
         [];
 
@@ -4280,80 +3328,37 @@ function parseGeminiReview(
     ) {
         const groupId =
             Number(
-                proposal?.g ??
-                proposal?.groupId
+                proposal?.g
             );
 
         const entry =
-            expected.get(
+            allowed.get(
                 groupId
             );
 
         if (
-            !entry ||
-            seen.has(
-                groupId
-            )
+            !entry
         ) {
             continue;
         }
 
-        let segments =
-            proposal?.s ??
-            proposal?.segments;
-
-        if (
-            !Array.isArray(
-                segments
-            ) &&
-            entry.group.cues.length ===
-                1 &&
-            typeof (
-                proposal?.text ??
-                proposal?.translation
-            ) ===
-                "string"
-        ) {
-            segments = [
-                proposal.text ??
-                proposal.translation
-            ];
-        }
+        const segments =
+            proposal?.s;
 
         if (
             !Array.isArray(
                 segments
             ) ||
             segments.length !==
-                entry.group.cues.length ||
+                entry
+                    .group
+                    .cues
+                    .length ||
             segments.some(
-                text =>
-                    typeof text !==
+                value =>
+                    typeof value !==
                         "string" ||
-                    !text.trim()
-            )
-        ) {
-            continue;
-        }
-
-        seen.add(
-            groupId
-        );
-
-        const cleaned =
-            segments.map(
-                text =>
-                    String(
-                        text
-                    ).trim()
-            );
-
-        if (
-            JSON.stringify(
-                cleaned
-            ) ===
-            JSON.stringify(
-                entry.segments
+                    !value.trim()
             )
         ) {
             continue;
@@ -4364,27 +3369,21 @@ function parseGeminiReview(
                 groupId,
 
             s:
-                cleaned,
+                segments.map(
+                    value =>
+                        value.trim()
+                ),
 
             why:
                 String(
                     proposal?.why ||
-                    "correção sugerida"
-                ).slice(
-                    0,
-                    240
+                    "correção"
                 ),
 
             confidence:
-                Math.max(
-                    0,
-                    Math.min(
-                        1,
-                        Number(
-                            proposal?.confidence ??
-                            0.9
-                        )
-                    )
+                Number(
+                    proposal?.confidence ||
+                    0.9
                 ),
 
             group:
@@ -4395,177 +3394,31 @@ function parseGeminiReview(
         });
     }
 
+    job.stats.geminiProposals +=
+        proposals.length;
+
     return proposals;
 }
 
-// ============================================================
-// CONTINGÊNCIA DE REVIEW
-// ============================================================
-//
-// Caso Gemini realmente fique
-// indisponível depois de todos
-// os retries:
-//
-// nenhum group fica "sem review".
-//
-// Mistral faz contingência,
-// em lotes pequenos.
-//
-// Normalmente esperamos:
-//
-// GeminiFallbackGroups = 0
-//
-
-async function mistralFallbackReview(
-    entries,
-    job
-) {
-    job.geminiFallbackGroups +=
-        entries.length;
-
-    const batches =
-        splitByBudget(
-            entries,
-            7000,
-            30,
-            entry =>
-                compactReviewGroup(
-                    entry.group,
-                    entry.segments
-                )
-        );
-
-    const all =
-        [];
-
-    for (
-        const batch
-        of batches
-    ) {
-        const payload =
-            batch.map(
-                entry =>
-                    compactReviewGroup(
-                        entry.group,
-                        entry.segments
-                    )
-            );
-
-        const raw =
-            await mistralChat({
-                systemPrompt: `
-Você é um revisor de contingência de legendas EN→PT-BR.
-
-Revise TODOS os groups recebidos.
-
-A tradução já foi feita pelo Mistral.
-
-Não reescreva o que está bom.
-
-Proponha somente correções reais e de alta confiança:
-
-- sentido;
-- temporalidade;
-- naturalidade;
-- gênero;
-- gíria/cultura;
-- palavrão;
-- speaker vazado;
-- alongamento;
-- marcadores de diálogo.
-
-Preserve exatamente o número de segmentos de cada group.
-
-speaker é contexto oculto.
-
-Responda SOMENTE JSON:
-
-{"reviewed":123,"proposals":[{"g":12,"s":["..."],"why":"motivo","confidence":0.95}]}
-`,
-
-                userPrompt:
-                    `Revise os ${batch.length} groups:\n` +
-                    `${JSON.stringify(
-                        {
-                            groups:
-                                payload
-                        }
-                    )}`,
-
-                job,
-
-                reasoningEffort:
-                    "none",
-
-                temperature:
-                    0,
-
-                maxTokens:
-                    5000,
-
-                purpose:
-                    "repair"
-            });
-
-        all.push(
-            ...parseGeminiReview(
-                batch,
-                raw
-            )
-        );
-    }
-
-    return all;
-}
-
-async function geminiReviewBatchResilient(
+async function geminiReviewResilient(
     entries,
     job,
     depth = 0
 ) {
     try {
-        const raw =
-            await geminiReviewRequest(
-                entries,
-                job
-            );
-
-        const proposals =
-            parseGeminiReview(
-                entries,
-                raw
-            );
-
-        job.geminiReviewedGroups +=
-            entries.length;
-
-        return proposals;
+        return await geminiReview(
+            entries,
+            job
+        );
     }
     catch (
         error
     ) {
-        const message =
-            getErrorMessage(
-                error
-            );
-
-        const splittable =
-            error?.code ===
-                "BAD_GEMINI_OUTPUT" ||
-            error?.status ===
-                400 ||
-            error?.status ===
-                413 ||
-            /JSON inválido|revisão completa|response too large|too large/i.test(
-                message
-            );
-
         if (
             entries.length >
                 1 &&
             depth <
-                7 &&
-            splittable
+                7
         ) {
             const middle =
                 Math.ceil(
@@ -4574,12 +3427,12 @@ async function geminiReviewBatchResilient(
                 );
 
             console.warn(
-                `[GEMINI REVIEW] Split estrutural ${entries.length} -> ` +
+                `[GEMINI REVIEW] Split ${entries.length} -> ` +
                 `${middle}+${entries.length - middle}.`
             );
 
             const left =
-                await geminiReviewBatchResilient(
+                await geminiReviewResilient(
                     entries.slice(
                         0,
                         middle
@@ -4590,7 +3443,7 @@ async function geminiReviewBatchResilient(
                 );
 
             const right =
-                await geminiReviewBatchResilient(
+                await geminiReviewResilient(
                     entries.slice(
                         middle
                     ),
@@ -4605,351 +3458,15 @@ async function geminiReviewBatchResilient(
             ];
         }
 
-        console.warn(
-            `[GEMINI REVIEW] Falha persistente em ${entries.length} group(s); ` +
-            `revisão de contingência Mistral. ` +
-            `${message.slice(
-                0,
-                220
-            )}`
-        );
-
-        const proposals =
-            await mistralFallbackReview(
-                entries,
-                job
-            );
-
-        job.geminiReviewedGroups +=
-            entries.length;
-
-        return proposals;
+        throw error;
     }
 }
 
 // ============================================================
-// ARBITRAGEM MISTRAL
+// ARBITER
 // ============================================================
 
-function proposalPayload(
-    proposal
-) {
-    const speakers =
-        proposal
-            .group
-            .cues
-            .map(
-                cue =>
-                    cue.speakerHint ||
-                    null
-            );
-
-    const item = {
-        g:
-            proposal.g,
-
-        en:
-            proposal
-                .group
-                .cues
-                .map(
-                    cue =>
-                        cue.text
-                ),
-
-        original:
-            proposal.original,
-
-        proposed:
-            proposal.s,
-
-        why:
-            proposal.why,
-
-        confidence:
-            proposal.confidence
-    };
-
-    if (
-        speakers.some(
-            Boolean
-        )
-    ) {
-        item.speaker =
-            speakers;
-    }
-
-    return item;
-}
-
-function parseArbiterResponse(
-    batch,
-    raw
-) {
-    let parsed;
-
-    try {
-        parsed =
-            JSON.parse(
-                stripCodeFences(
-                    raw
-                )
-            );
-    }
-    catch {
-        const error =
-            new Error(
-                "Mistral árbitro retornou JSON inválido."
-            );
-
-        error.code =
-            "BAD_ARBITER_OUTPUT";
-
-        throw error;
-    }
-
-    if (
-        !Array.isArray(
-            parsed?.accepted
-        )
-    ) {
-        const error =
-            new Error(
-                "Mistral árbitro não retornou accepted[]."
-            );
-
-        error.code =
-            "BAD_ARBITER_OUTPUT";
-
-        throw error;
-    }
-
-    const expected =
-        new Map(
-            batch.map(
-                proposal => [
-                    proposal.g,
-                    proposal
-                ]
-            )
-        );
-
-    const accepted =
-        [];
-
-    const seen =
-        new Set();
-
-    for (
-        const item
-        of parsed.accepted
-    ) {
-        const groupId =
-            Number(
-                item?.g ??
-                item?.groupId
-            );
-
-        const proposal =
-            expected.get(
-                groupId
-            );
-
-        if (
-            !proposal ||
-            seen.has(
-                groupId
-            )
-        ) {
-            continue;
-        }
-
-        let segments =
-            item?.s ??
-            item?.segments;
-
-        if (
-            !Array.isArray(
-                segments
-            ) &&
-            proposal.group.cues.length ===
-                1 &&
-            typeof (
-                item?.text ??
-                item?.translation
-            ) ===
-                "string"
-        ) {
-            segments = [
-                item.text ??
-                item.translation
-            ];
-        }
-
-        if (
-            !Array.isArray(
-                segments
-            ) ||
-            segments.length !==
-                proposal.group.cues.length ||
-            segments.some(
-                text =>
-                    typeof text !==
-                        "string" ||
-                    !text.trim()
-            )
-        ) {
-            continue;
-        }
-
-        seen.add(
-            groupId
-        );
-
-        accepted.push({
-            g:
-                groupId,
-
-            s:
-                segments.map(
-                    text =>
-                        String(
-                            text
-                        ).trim()
-                ),
-
-            why:
-                String(
-                    item?.why ||
-                    "aceita pelo árbitro"
-                ).slice(
-                    0,
-                    240
-                )
-        });
-    }
-
-    return accepted;
-}
-
-async function arbitrateBatchResilient(
-    batch,
-    job,
-    depth = 0
-) {
-    try {
-        const raw =
-            await mistralChat({
-                systemPrompt:
-                    ARBITER_SYSTEM_PROMPT,
-
-                userPrompt:
-                    `Avalie estas ${batch.length} propostas:\n` +
-                    `${JSON.stringify(
-                        {
-                            proposals:
-                                batch.map(
-                                    proposalPayload
-                                )
-                        }
-                    )}`,
-
-                job,
-
-                reasoningEffort:
-                    "none",
-
-                temperature:
-                    0,
-
-                maxTokens:
-                    5000,
-
-                purpose:
-                    "arbiter"
-            });
-
-        return parseArbiterResponse(
-            batch,
-            raw
-        );
-    }
-    catch (
-        error
-    ) {
-        if (
-            batch.length >
-                1 &&
-            depth <
-                7
-        ) {
-            const middle =
-                Math.ceil(
-                    batch.length /
-                    2
-                );
-
-            console.warn(
-                `[MISTRAL ARBITER] Split ${batch.length} -> ` +
-                `${middle}+${batch.length - middle} por ` +
-                `${getErrorMessage(
-                    error
-                ).slice(
-                    0,
-                    120
-                )}.`
-            );
-
-            const left =
-                await arbitrateBatchResilient(
-                    batch.slice(
-                        0,
-                        middle
-                    ),
-                    job,
-                    depth +
-                        1
-                );
-
-            const right =
-                await arbitrateBatchResilient(
-                    batch.slice(
-                        middle
-                    ),
-                    job,
-                    depth +
-                        1
-                );
-
-            return [
-                ...left,
-                ...right
-            ];
-        }
-
-        /*
-         * Segurança editorial:
-         *
-         * se não conseguimos provar
-         * que a proposta é melhor,
-         * o Mistral ORIGINAL vence.
-         */
-        console.warn(
-            `[MISTRAL ARBITER] Proposta g=${batch[0]?.g || "?"} ` +
-            `mantida como ORIGINAL por falha de arbitragem: ` +
-            `${getErrorMessage(
-                error
-            ).slice(
-                0,
-                200
-            )}`
-        );
-
-        return [];
-    }
-}
-
-async function arbitrateAllProposals(
+async function arbitrateProposals(
     proposals,
     translations,
     job
@@ -4961,183 +3478,213 @@ async function arbitrateAllProposals(
             "[MISTRAL ARBITER] Gemini propôs 0 alterações."
         );
 
-        return [];
+        return;
     }
+
+    const builder =
+        proposal => ({
+            g:
+                proposal.g,
+
+            en:
+                proposal
+                    .group
+                    .cues
+                    .map(
+                        cue =>
+                            cue.text
+                    ),
+
+            original:
+                proposal.original,
+
+            proposed:
+                proposal.s,
+
+            why:
+                proposal.why,
+
+            confidence:
+                proposal.confidence
+        });
 
     const batches =
         splitByBudget(
             proposals,
-            ARBITER_BATCH_CHARS,
-            ARBITER_BATCH_GROUPS,
-            proposalPayload
+            7000,
+            30,
+            builder
         );
 
-    console.log(
-        `[MISTRAL ARBITER] ${proposals.length} proposta(s) Gemini -> ` +
-        `${batches.length} lote(s) de arbitragem.`
-    );
-
-    const accepted =
-        [];
-
     for (
-        let i = 0;
-        i <
+        let index = 0;
+        index <
         batches.length;
-        i++
+        index++
     ) {
-        const result =
-            await arbitrateBatchResilient(
-                batches[i],
-                job
+        const batch =
+            batches[
+                index
+            ];
+
+        const raw =
+            await mistralChat({
+                system:
+                    ARBITER_PROMPT,
+
+                user:
+                    JSON.stringify({
+                        proposals:
+                            batch.map(
+                                builder
+                            )
+                    }),
+
+                job,
+
+                temperature:
+                    0,
+
+                maxTokens:
+                    5000,
+
+                purpose:
+                    "arbiter"
+            });
+
+        let parsed;
+
+        try {
+            parsed =
+                JSON.parse(
+                    stripCodeFences(
+                        raw
+                    )
+                );
+        }
+        catch {
+            parsed = {
+                accepted: []
+            };
+        }
+
+        let accepted =
+            0;
+
+        const allowed =
+            new Map(
+                batch.map(
+                    proposal => [
+                        proposal.g,
+                        proposal
+                    ]
+                )
             );
 
         for (
             const item
-            of result
+            of Array.isArray(
+                parsed?.accepted
+            )
+                ? parsed.accepted
+                : []
         ) {
+            const groupId =
+                Number(
+                    item?.g
+                );
+
+            const original =
+                allowed.get(
+                    groupId
+                );
+
+            if (
+                !original ||
+                !Array.isArray(
+                    item?.s
+                ) ||
+                item.s.length !==
+                    original
+                        .group
+                        .cues
+                        .length
+            ) {
+                continue;
+            }
+
             translations.set(
-                item.g,
-                item.s
+                groupId,
+
+                item.s.map(
+                    value =>
+                        String(
+                            value
+                        ).trim()
+                )
             );
 
-            accepted.push(
-                item
-            );
+            accepted++;
         }
 
+        job.stats.arbiterAccepted +=
+            accepted;
+
         console.log(
-            `[MISTRAL ARBITER] ${i + 1}/${batches.length}: ` +
-            `${result.length} aceita(s).`
+            `[MISTRAL ARBITER] ${index + 1}/${batches.length}: ` +
+            `${accepted} aceita(s).`
         );
     }
-
-    job.arbiterAccepted =
-        accepted.length;
-
-    return accepted;
 }
 
 // ============================================================
-// FINAL TEXT CLEANING
+// FINAL CLEAN / HARD FIXES
 // ============================================================
-
-function escapeRegExp(
-    value
-) {
-    return String(
-        value ||
-        ""
-    ).replace(
-        /[.*+?^${}()|[\]\\]/g,
-        "\\$&"
-    );
-}
 
 function cleanFinalText(
-    text,
-    speakerHint
+    text
 ) {
-    let value =
-        normalizeVocalElongations(
-            String(
-                text ||
-                ""
-            )
-                .replace(
-                    /\r\n/g,
-                    "\n"
-                )
-                .replace(
-                    /\r/g,
-                    "\n"
-                )
-        );
-
-    const speaker =
-        normalizeSpeakerHint(
-            speakerHint ||
+    return normalizeVocalElongations(
+        String(
+            text ||
             ""
-        );
-
-    const speakerRegex =
-        speaker
-            ? new RegExp(
-                `^\\s*(?:\\[\\s*)?${escapeRegExp(
-                    speaker
-                )}(?:\\s*\\])?\\s*:\\s*`,
-                "iu"
-            )
-            : null;
-
-    value =
-        value
-            .split(
-                "\n"
-            )
-            .map(
-                line => {
-
-                    let clean =
-                        String(
-                            line ||
-                            ""
-                        );
-
-                    clean =
-                        clean.replace(
-                            /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
-                            ""
-                        );
-
-                    if (
-                        speakerRegex
-                    ) {
-                        clean =
-                            clean.replace(
-                                speakerRegex,
-                                ""
-                            );
-                    }
-
-                    clean =
-                        clean.replace(
-                            /^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+(?=\S)/u,
-                            ""
-                        );
-
-                    clean =
-                        clean.replace(
-                            /^\s*[-–—/]+\s*(?=\S)/u,
-                            ""
-                        );
-
-                    return clean
-                        .replace(
-                            /[♪♫♬]+/gu,
-                            ""
-                        )
-                        .replace(
-                            /[ \t]{2,}/g,
-                            " "
-                        )
-                        .trim();
-                }
-            )
-            .filter(
-                Boolean
-            )
-            .join(
-                "\n"
-            );
-
-    value =
-        value.replace(
-            /\s+\/\s+(?=\S)/g,
+        )
+    )
+        .split(
             "\n"
-        );
-
-    return value.trim();
+        )
+        .map(
+            line =>
+                line
+                    .replace(
+                        /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
+                        ""
+                    )
+                    .replace(
+                        /^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+(?=\S)/u,
+                        ""
+                    )
+                    .replace(
+                        /^\s*[-–—/]+\s*(?=\S)/u,
+                        ""
+                    )
+                    .replace(
+                        /[♪♫♬]+/gu,
+                        ""
+                    )
+                    .replace(
+                        /[ \t]{2,}/g,
+                        " "
+                    )
+                    .trim()
+        )
+        .filter(
+            Boolean
+        )
+        .join(
+            "\n"
+        )
+        .trim();
 }
 
 function applyProtectedRules(
@@ -5162,15 +3709,10 @@ function applyProtectedRules(
         )
     ) {
         text =
-            text
-                .replace(
-                    /\bworkroom\b/gi,
-                    "Werkroom"
-                )
-                .replace(
-                    /\bwerkroom\b/g,
-                    "Werkroom"
-                );
+            text.replace(
+                /\bworkroom\b/gi,
+                "Werkroom"
+            );
     }
 
     if (
@@ -5186,64 +3728,12 @@ function applyProtectedRules(
     }
 
     if (
-        /Shantay,? you stay/i.test(
-            en
-        )
-    ) {
-        text =
-            text.replace(
-                /shantay,?\s+you\s+stay/gi,
-                "Shantay, you stay"
-            );
-    }
-
-    if (
-        /Sashay away/i.test(
-            en
-        )
-    ) {
-        text =
-            text.replace(
-                /sashay\s+away/gi,
-                "Sashay away"
-            );
-    }
-
-    if (
-        /You betta werk/i.test(
-            en
-        )
-    ) {
-        text =
-            text.replace(
-                /you\s+betta\s+werk/gi,
-                "You betta werk"
-            );
-    }
-
-    if (
-        /Racers,? start your engines/i.test(
-            en
-        )
-    ) {
-        text =
-            text.replace(
-                /racers,?\s+start\s+your\s+engines/gi,
-                "Racers, start your engines"
-            );
-    }
-
-    if (
         /\blip[ -]?sync\b/i.test(
             en
         )
     ) {
         text =
             text
-                .replace(
-                    /\blipsync\b/gi,
-                    "lip sync"
-                )
                 .replace(
                     /\bdublagem\b/gi,
                     "lip sync"
@@ -5257,53 +3747,77 @@ function applyProtectedRules(
     return text;
 }
 
-function deterministicNeutralizeArtificialGender(
-    text
+function applyHardFixes(
+    source,
+    target
 ) {
-    return String(
-        text ||
-        ""
-    )
-        .replace(
-            /\b(?:estou|tô)\s+empolgado\(a\)\b/gi,
-            "Mal posso esperar"
-        )
-        .replace(
-            /\b(?:estou|tô)\s+animado\(a\)\b/gi,
-            "Mal posso esperar"
-        )
-        .replace(
-            /\bempolgado\(a\)\b/gi,
-            "com muita empolgação"
-        )
-        .replace(
-            /\banimado\(a\)\b/gi,
-            "com muita animação"
+    let text =
+        String(
+            target ||
+            ""
         );
-}
 
-function cleanAllFinal(
-    blocks,
-    texts
-) {
-    return texts.map(
-        (
-            text,
-            i
-        ) =>
-            deterministicNeutralizeArtificialGender(
-                applyProtectedRules(
-                    blocks[i]
-                        .text,
+    const before =
+        text;
 
-                    cleanFinalText(
-                        text,
-                        blocks[i]
-                            .speakerHint
-                    )
-                )
+    text =
+        text
+            .replace(
+                /\buma alçapão\b/gi,
+                "um alçapão"
             )
-    );
+            .replace(
+                /\bcabina de votação\b/gi,
+                "cabine de votação"
+            )
+            .replace(
+                /\bse eu manter\b/gi,
+                "se eu mantiver"
+            )
+            .replace(
+                /\bbanheiro das (?:moças|damas)\b/gi,
+                "banheiro feminino"
+            )
+            .replace(
+                /\bcheque da porra\b/gi,
+                "cheque, porra"
+            )
+            .replace(
+                /\bcheque do caralho\b/gi,
+                "cheque, caralho"
+            );
+
+    /*
+     * Caso que já apareceu no Drag Race:
+     * "goddamn check".
+     *
+     * Mantemos a intensidade,
+     * mas não grudamos o palavrão
+     * artificialmente no substantivo.
+     */
+    if (
+        /\bgoddamn check\b/i.test(
+            String(
+                source ||
+                ""
+            )
+        )
+    ) {
+        text =
+            text
+                .replace(
+                    /\bcheque,\s*caralho\b/gi,
+                    "cheque, porra"
+                );
+    }
+
+    return {
+        text,
+
+        changed:
+            text !==
+            before
+    };
 }
 
 function flattenTranslations(
@@ -5344,40 +3858,68 @@ function flattenTranslations(
                 group.cues.length
         ) {
             throw new Error(
-                `Flatten inválido no group ${group.groupId}.`
+                `Flatten inválido g=${group.groupId}.`
             );
         }
 
         group.cues.forEach(
             (
                 cue,
-                i
+                index
             ) => {
-
                 texts[
                     positions.get(
                         cue.index
                     )
                 ] =
-                    segments[i];
+                    segments[
+                        index
+                    ];
             }
         );
     }
 
-    if (
-        texts.some(
-            text =>
-                typeof text !==
-                    "string" ||
-                !text.trim()
-        )
-    ) {
-        throw new Error(
-            "Cue ausente/vazio na tradução."
-        );
-    }
-
     return texts;
+}
+
+function cleanAllFinal(
+    blocks,
+    texts,
+    job
+) {
+    return texts.map(
+        (
+            text,
+            index
+        ) => {
+            let output =
+                cleanFinalText(
+                    text
+                );
+
+            output =
+                applyProtectedRules(
+                    blocks[index]
+                        .text,
+                    output
+                );
+
+            const fixed =
+                applyHardFixes(
+                    blocks[index]
+                        .text,
+                    output
+                );
+
+            if (
+                fixed.changed
+            ) {
+                job.stats.hardFixes++;
+            }
+
+            return fixed.text;
+        }
+    );
 }
 
 // ============================================================
@@ -5392,21 +3934,24 @@ function finalRiskScan(
         [];
 
     for (
-        let i = 0;
-        i <
+        let index = 0;
+        index <
         texts.length;
-        i++
+        index++
     ) {
-        const text =
+        const pt =
             String(
-                texts[i] ||
+                texts[
+                    index
+                ] ||
                 ""
             );
 
-        const source =
+        const en =
             String(
-                blocks[i]
-                    ?.text ||
+                blocks[
+                    index
+                ]?.text ||
                 ""
             );
 
@@ -5414,8 +3959,8 @@ function finalRiskScan(
             [];
 
         if (
-            /^\s*\[[^\]]{1,60}\]\s*:|^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+/mu.test(
-                text
+            /^\s*\[[^\]]{1,60}\]\s*:/mu.test(
+                pt
             )
         ) {
             reasons.push(
@@ -5425,7 +3970,7 @@ function finalRiskScan(
 
         if (
             /^\s*[-–—/]\s*\S/mu.test(
-                text
+                pt
             )
         ) {
             reasons.push(
@@ -5434,38 +3979,8 @@ function finalRiskScan(
         }
 
         if (
-            /(?:[A-Za-zÀ-ÖØ-öø-ÿ][-–—]){3,}[A-Za-zÀ-ÖØ-öø-ÿ]|([aeiouáéíóúãõâêô])\1{3,}/iu.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "VOCAL_ELONGATION"
-            );
-        }
-
-        if (
-            /empolgado\(a\)|empolgada\(o\)|animado\(a\)|animada\(o\)|\bele\/ela\b|\bela\/ele\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "ARTIFICIAL_GENDER"
-            );
-        }
-
-        if (
-            /\buma alçapão\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "GRAMMAR_ALCAPAO"
-            );
-        }
-
-        if (
             /\bcabina de votação\b/i.test(
-                text
+                pt
             )
         ) {
             reasons.push(
@@ -5474,58 +3989,8 @@ function finalRiskScan(
         }
 
         if (
-            /\bse eu manter\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "SE_EU_MANTER"
-            );
-        }
-
-        if (
-            /\bv(?:ão|ao)\b[^.!?\n]{0,80}\be serem\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "VAO_E_SEREM"
-            );
-        }
-
-        if (
-            /\bforam pedidas para\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "FORAM_PEDIDAS"
-            );
-        }
-
-        if (
-            /\bapoiante\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "APOIANTE"
-            );
-        }
-
-        if (
-            /\bbanheiro das (?:moças|damas)\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "BANHEIRO_DATADO"
-            );
-        }
-
-        if (
             /\bcheque (?:da porra|do caralho)\b/i.test(
-                text
+                pt
             )
         ) {
             reasons.push(
@@ -5534,21 +3999,21 @@ function finalRiskScan(
         }
 
         if (
-            /\bcompetição (?:da porra|do caralho)\b/i.test(
-                text
+            /\bapoiante\b/i.test(
+                pt
             )
         ) {
             reasons.push(
-                "COMPETICAO_PROFANITY_PLACEMENT"
+                "APOIANTE"
             );
         }
 
         if (
             /\bgagged\b/i.test(
-                source
+                en
             ) &&
             /amordaçad/i.test(
-                text
+                pt
             )
         ) {
             reasons.push(
@@ -5557,88 +4022,21 @@ function finalRiskScan(
         }
 
         if (
-            /\bslay\w*\b/i.test(
-                source
-            ) &&
-            /\bmat(?:ar|a|ou|aram|ando)\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "SLAY_LITERAL"
-            );
-        }
-
-        if (
-            /\bate\b/i.test(
-                source
-            ) &&
-            /\b(?:comeu|comi|comemos|comeram)\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "ATE_LITERAL"
-            );
-        }
-
-        if (
-            /\blip[ -]?sync\b/i.test(
-                source
-            ) &&
-            /\bdubl(?:agem|ar|ou|ando)\b/i.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "LIPSYNC_LITERAL"
-            );
-        }
-
-        if (
-            /\bWerkroom\b/i.test(
-                source
-            ) &&
-            !/\bWerkroom\b/.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "WERKROOM"
-            );
-        }
-
-        if (
-            /\bCondragulations\b/i.test(
-                source
-            ) &&
-            !/\bCondragulations\b/.test(
-                text
-            )
-        ) {
-            reasons.push(
-                "CONDRAGULATIONS"
-            );
-        }
-
-        if (
             reasons.length
         ) {
             issues.push({
                 id:
-                    blocks[i]
-                        .index,
+                    blocks[
+                        index
+                    ].index,
 
-                reasons:
-                    [
-                        ...new Set(
-                            reasons
-                        )
-                    ],
+                reasons,
 
-                source,
+                source:
+                    en,
 
-                text
+                text:
+                    pt
             });
         }
     }
@@ -5668,7 +4066,7 @@ function mapIssuesToGroups(
         }
     }
 
-    const reasonsByGroup =
+    const map =
         new Map();
 
     for (
@@ -5686,8 +4084,8 @@ function mapIssuesToGroups(
             continue;
         }
 
-        const set =
-            reasonsByGroup.get(
+        const reasons =
+            map.get(
                 groupId
             ) ||
             new Set();
@@ -5696,25 +4094,21 @@ function mapIssuesToGroups(
             const reason
             of issue.reasons
         ) {
-            set.add(
+            reasons.add(
                 reason
             );
         }
 
-        reasonsByGroup.set(
+        map.set(
             groupId,
-            set
+            reasons
         );
     }
 
-    return reasonsByGroup;
+    return map;
 }
 
-// ============================================================
-// QUALITY REPAIR
-// ============================================================
-
-async function mistralRepairRiskGroups(
+async function repairRisks(
     groups,
     translations,
     issues,
@@ -5723,292 +4117,141 @@ async function mistralRepairRiskGroups(
     if (
         !issues.length
     ) {
-        return [];
+        return;
     }
 
-    const reasonsByGroup =
+    const reasonsMap =
         mapIssuesToGroups(
             groups,
             issues
         );
 
-    const riskyGroups =
+    const risky =
         groups.filter(
             group =>
-                reasonsByGroup.has(
+                reasonsMap.has(
                     group.groupId
                 )
         );
 
-    if (
-        !riskyGroups.length
-    ) {
-        return [];
-    }
-
     console.warn(
-        `[QUALITY REPAIR] ${issues.length} risco(s) em ` +
-        `${riskyGroups.length} group(s); reparo localizado.`
+        `[QUALITY REPAIR] ${issues.length} risco(s) em ${risky.length} group(s).`
     );
 
-    const entries =
-        riskyGroups.map(
+    const batches =
+        splitByBudget(
+            risky,
+            5000,
+            12,
             group => ({
-                group,
+                ...compactReviewGroup(
+                    group,
+                    translations.get(
+                        group.groupId
+                    )
+                ),
 
                 reasons:
                     [
-                        ...reasonsByGroup.get(
+                        ...reasonsMap.get(
                             group.groupId
                         )
                     ]
             })
         );
 
-    const batches =
-        splitByBudget(
-            entries,
-            5000,
-            12,
-            entry => ({
-                ...compactReviewGroup(
-                    entry.group,
-                    translations.get(
-                        entry
-                            .group
-                            .groupId
-                    )
-                ),
-
-                reasons:
-                    entry.reasons
-            })
-        );
-
-    const changed =
-        [];
-
     for (
         const batch
         of batches
     ) {
-        job.qualityRepairCalls++;
+        job.stats.qualityRepairs++;
 
-        const payload =
-            batch.map(
-                entry => ({
-                    ...compactReviewGroup(
-                        entry.group,
-                        translations.get(
-                            entry
-                                .group
-                                .groupId
-                        )
-                    ),
+        const raw =
+            await mistralChat({
+                system:
+                    REPAIR_PROMPT,
 
-                    reasons:
-                        entry.reasons
-                })
-            );
+                user:
+                    JSON.stringify({
+                        groups:
+                            batch.map(
+                                group => ({
+                                    ...compactReviewGroup(
+                                        group,
+                                        translations.get(
+                                            group.groupId
+                                        )
+                                    ),
 
-        try {
-            const raw =
-                await mistralChat({
-                    systemPrompt:
-                        QUALITY_REPAIR_SYSTEM_PROMPT,
+                                    reasons:
+                                        [
+                                            ...reasonsMap.get(
+                                                group.groupId
+                                            )
+                                        ]
+                                })
+                            )
+                    }),
 
-                    userPrompt:
-                        `Repare estes groups:\n` +
-                        `${JSON.stringify(
-                            {
-                                groups:
-                                    payload
-                            }
-                        )}`,
+                job,
 
-                    job,
-
-                    reasoningEffort:
-                        "none",
-
-                    temperature:
-                        0,
-
-                    maxTokens:
-                        5000,
-
-                    purpose:
-                        "repair"
-                });
-
-            const pseudoGroups =
-                batch.map(
-                    entry =>
-                        entry.group
-                );
-
-            const parsed =
-                parseTranslationResponse(
-                    pseudoGroups,
-                    raw
-                );
-
-            for (
-                const [
-                    groupId,
-                    segments
-                ]
-                of parsed.valid
-            ) {
-                const before =
-                    translations.get(
-                        groupId
-                    );
-
-                if (
-                    JSON.stringify(
-                        before
-                    ) !==
-                    JSON.stringify(
-                        segments
-                    )
-                ) {
-                    translations.set(
-                        groupId,
-                        segments
-                    );
-
-                    changed.push(
-                        groupId
-                    );
-                }
-            }
-
-            for (
-                const group
-                of parsed.invalidGroups
-            ) {
-                translations.set(
-                    group.groupId,
-
-                    await rescueSingleGroup(
-                        group,
-                        job
-                    )
-                );
-
-                changed.push(
-                    group.groupId
-                );
-            }
-        }
-        catch (
-            error
-        ) {
-            console.warn(
-                `[QUALITY REPAIR] Erro transitório: ` +
-                `${getErrorMessage(
-                    error
-                ).slice(
+                temperature:
                     0,
-                    220
-                )}.`
+
+                maxTokens:
+                    5000,
+
+                purpose:
+                    "repair"
+            });
+
+        const parsed =
+            parseTranslationResponse(
+                batch,
+                raw
             );
 
-            /*
-             * Qualidade vence velocidade.
-             *
-             * Não ignoramos o risco.
-             */
-            for (
-                const entry
-                of batch
-            ) {
-                translations.set(
-                    entry
-                        .group
-                        .groupId,
+        for (
+            const [
+                groupId,
+                segments
+            ]
+            of parsed.valid
+        ) {
+            translations.set(
+                groupId,
+                segments
+            );
+        }
 
-                    await rescueSingleGroup(
-                        entry.group,
-                        job
-                    )
-                );
+        for (
+            const group
+            of parsed.invalidGroups
+        ) {
+            translations.set(
+                group.groupId,
 
-                changed.push(
-                    entry
-                        .group
-                        .groupId
-                );
-            }
+                await rescueSingleGroup(
+                    group,
+                    job
+                )
+            );
         }
     }
-
-    return [
-        ...new Set(
-            changed
-        )
-    ];
 }
 
 // ============================================================
-// PIPELINE 6.2
+// PIPELINE
 // ============================================================
 
 async function translateSrt(
     sourceSrt,
     job
 ) {
-    /*
-     * Em uma retomada:
-     *
-     * reaproveitamos a tradução Mistral,
-     * mas refazemos a revisão secundária
-     * para não somar contadores antigos.
-     */
-    job.geminiReviewedGroups =
-        0;
-
-    job.geminiProposalCount =
-        0;
-
-    job.geminiFallbackGroups =
-        0;
-
-    job.arbiterAccepted =
-        0;
-
-    job.qualityGuardRisks =
-        0;
-
     const blocks =
         parseSrt(
             sourceSrt
         );
-
-    if (
-        !blocks.length
-    ) {
-        throw new Error(
-            "Nenhum cue SRT válido."
-        );
-    }
-
-    if (
-        !MISTRAL_API_KEY
-    ) {
-        throw new Error(
-            "MISTRAL_API_KEY não configurada no Render."
-        );
-    }
-
-    if (
-        !GEMINI_API_KEY
-    ) {
-        throw new Error(
-            "GEMINI_API_KEY não configurada no Render."
-        );
-    }
 
     const groups =
         buildSentenceGroups(
@@ -6020,56 +4263,37 @@ async function translateSrt(
             groups,
             MISTRAL_BATCH_CHARS,
             MISTRAL_BATCH_GROUPS,
-            compactTranslationGroup
+            compactGroup
         );
 
     const translations =
-        job.translationCheckpoint
-            instanceof Map
-            ? new Map(
-                job.translationCheckpoint
-            )
-            : new Map();
+        new Map();
 
-    job.sentenceGroups =
-        groups.length;
-
-    job.totalBatches =
-        batches.length;
-
-    job.progress =
-        Math.max(
-            job.progress ||
-                0,
-            1
-        );
-
-    const startedAt =
-        Date.now();
-
-    const mistralStartedAt =
-        Date.now();
-
-    let completedBatchCount =
-        0;
-
-    let nextBatchIndex =
-        0;
-
-    // ========================================================
-    // FILA GEMINI EM PARALELO TEMPORAL
-    // ========================================================
-
-    const geminiProposals =
+    const proposals =
         [];
 
     const reviewScheduled =
         new Set();
 
-    let geminiReviewChain =
+    let reviewChain =
         Promise.resolve();
 
-    function scheduleGeminiReview(
+    let nextBatch =
+        0;
+
+    let completed =
+        0;
+
+    const startedAt =
+        Date.now();
+
+    console.log(
+        `[PIPELINE 6.3] fonte=${job.sourceKind} | ` +
+        `${blocks.length} cues -> ${groups.length} groups -> ` +
+        `${batches.length} lote(s).`
+    );
+
+    function scheduleReview(
         batch
     ) {
         const key =
@@ -6106,81 +4330,31 @@ async function translateSrt(
                 })
             );
 
-        geminiReviewChain =
-            geminiReviewChain.then(
+        reviewChain =
+            reviewChain.then(
                 async () => {
-
                     console.log(
-                        `[GEMINI REVIEW] Revisando ${entries.length} group(s) ` +
-                        `enquanto Mistral continua.`
+                        `[GEMINI REVIEW] Revisando ${entries.length} group(s).`
                     );
 
-                    const proposals =
-                        await geminiReviewBatchResilient(
+                    const batchProposals =
+                        await geminiReviewResilient(
                             entries,
                             job
                         );
 
-                    geminiProposals.push(
-                        ...proposals
+                    proposals.push(
+                        ...batchProposals
                     );
 
-                    job.geminiProposalCount =
-                        geminiProposals.length;
-
                     console.log(
-                        `[GEMINI REVIEW] Lote confirmado: ` +
-                        `${entries.length}/${entries.length} revisados; ` +
-                        `${proposals.length} proposta(s). ` +
-                        `Total revisado=${job.geminiReviewedGroups}/${groups.length}.`
+                        `[GEMINI REVIEW] confirmado=${entries.length}; ` +
+                        `propostas=${batchProposals.length}; ` +
+                        `total=${job.stats.geminiReviewed}/${groups.length}.`
                     );
                 }
             );
     }
-
-    console.log(
-        `[PIPELINE 6.2] ${blocks.length} cues -> ` +
-        `${groups.length} Sentence Groups -> ` +
-        `${batches.length} lote(s) Mistral | ` +
-        `concorrência adaptativa até ${MISTRAL_MAX_CONCURRENCY}.`
-    );
-
-    if (
-        translations.size
-    ) {
-        console.log(
-            `[CHECKPOINT] Retomando ${translations.size}/${groups.length} group(s) já aprovados.`
-        );
-    }
-
-    /*
-     * Em retomada:
-     *
-     * se um batch já estava
-     * inteiramente traduzido,
-     * ele já pode ir ao Gemini.
-     */
-    for (
-        const batch
-        of batches
-    ) {
-        if (
-            batch.every(
-                group =>
-                    translations.has(
-                        group.groupId
-                    )
-            )
-        ) {
-            scheduleGeminiReview(
-                batch
-            );
-        }
-    }
-
-    // ========================================================
-    // WORKERS MISTRAL
-    // ========================================================
 
     async function worker(
         workerId
@@ -6188,57 +4362,30 @@ async function translateSrt(
         while (
             true
         ) {
-            const index =
-                nextBatchIndex++;
+            const batchIndex =
+                nextBatch++;
 
             if (
-                index >=
+                batchIndex >=
                 batches.length
             ) {
                 return;
             }
 
-            const originalBatch =
+            const batch =
                 batches[
-                    index
+                    batchIndex
                 ];
 
-            const pending =
-                originalBatch.filter(
-                    group =>
-                        !translations.has(
-                            group.groupId
-                        )
-                );
-
-            if (
-                !pending.length
-            ) {
-                completedBatchCount++;
-
-                console.log(
-                    `[MISTRAL W${workerId}] Lote ${index + 1}/${batches.length}: checkpoint.`
-                );
-
-                updateProjection(
-                    job,
-                    "Mistral adaptativo",
-                    completedBatchCount,
-                    batches.length,
-                    mistralStartedAt
-                );
-
-                continue;
-            }
-
             console.log(
-                `[MISTRAL W${workerId}] Lote ${index + 1}/${batches.length}: ` +
-                `${pending.length} group(s) pendente(s).`
+                `[MISTRAL W${workerId}] ` +
+                `Lote ${batchIndex + 1}/${batches.length}: ` +
+                `${batch.length} group(s).`
             );
 
             const result =
-                await translateGroupBatchResilient(
-                    pending,
+                await translateBatchResilient(
+                    batch,
                     job
                 );
 
@@ -6255,148 +4402,70 @@ async function translateSrt(
                 );
             }
 
-            /*
-             * Checkpoint após
-             * CADA lote concluído.
-             */
             job.translationCheckpoint =
                 new Map(
                     translations
                 );
 
-            job.updatedAt =
-                Date.now();
-
-            completedBatchCount++;
-
-            job.completedBatches =
-                completedBatchCount;
+            completed++;
 
             job.progress =
-                Math.max(
-                    job.progress,
-
-                    Math.round(
-                        (
-                            completedBatchCount /
-                            batches.length
-                        ) *
-                        72
-                    )
+                Math.round(
+                    (
+                        completed /
+                        batches.length
+                    ) *
+                    72
                 );
 
             console.log(
-                `[MISTRAL W${workerId}] Lote ${index + 1}/${batches.length} aprovado; ` +
+                `[MISTRAL W${workerId}] ` +
+                `Lote ${batchIndex + 1}/${batches.length} aprovado; ` +
                 `total=${translations.size}/${groups.length}.`
             );
 
-            updateProjection(
-                job,
-                "Mistral adaptativo",
-                completedBatchCount,
-                batches.length,
-                mistralStartedAt
+            scheduleReview(
+                batch
             );
-
-            /*
-             * Assim que o batch
-             * terminou, Gemini já
-             * pode revisar enquanto
-             * o próximo Mistral roda.
-             */
-            if (
-                originalBatch.every(
-                    group =>
-                        translations.has(
-                            group.groupId
-                        )
-                )
-            ) {
-                scheduleGeminiReview(
-                    originalBatch
-                );
-            }
         }
     }
 
-    const workers =
-        [];
-
-    for (
-        let i = 0;
-        i <
-        MISTRAL_MAX_CONCURRENCY;
-        i++
-    ) {
-        workers.push(
-            worker(
-                i +
-                1
-            )
-        );
-    }
-
     await Promise.all(
-        workers
-    );
+        Array.from(
+            {
+                length:
+                    MISTRAL_CONCURRENCY
+            },
 
-    // ========================================================
-    // TRADUÇÃO COMPLETA?
-    // ========================================================
+            (
+                _,
+                index
+            ) =>
+                worker(
+                    index +
+                    1
+                )
+        )
+    );
 
     if (
         translations.size !==
         groups.length
     ) {
-        const missing =
-            groups
-                .filter(
-                    group =>
-                        !translations.has(
-                            group.groupId
-                        )
-                )
-                .map(
-                    group =>
-                        group.groupId
-                );
-
         throw new Error(
-            `Tradução incompleta: ` +
-            `${translations.size}/${groups.length}; ` +
-            `faltando=${missing.join(
-                ","
-            )}.`
+            `Tradução incompleta: ${translations.size}/${groups.length}.`
         );
     }
-
-    /*
-     * Garante review de qualquer
-     * batch que por alguma retomada
-     * ainda não tenha sido agendado.
-     */
-    for (
-        const batch
-        of batches
-    ) {
-        scheduleGeminiReview(
-            batch
-        );
-    }
-
-    // ========================================================
-    // CHECKPOINT MISTRAL COMPLETO
-    // ========================================================
 
     let primaryTexts =
         cleanAllFinal(
             blocks,
-
             flattenTranslations(
                 blocks,
                 groups,
                 translations
-            )
+            ),
+            job
         );
 
     const primarySrt =
@@ -6405,7 +4474,7 @@ async function translateSrt(
             primaryTexts
         );
 
-    auditFinalTimestamps(
+    auditTimestamps(
         sourceSrt,
         primarySrt,
         "CHECKPOINT MISTRAL"
@@ -6414,90 +4483,38 @@ async function translateSrt(
     job.primaryCheckpoint =
         primarySrt;
 
-    job.primaryCheckpointAt =
-        Date.now();
-
-    job.translationCheckpoint =
-        new Map(
-            translations
-        );
-
-    job.progress =
-        Math.max(
-            job.progress,
-            74
-        );
-
-    job.updatedAt =
-        Date.now();
-
-    console.log(
-        `[CHECKPOINT] Mistral completo preservado: ` +
-        `${groups.length}/${groups.length} groups. ` +
-        `A revisão secundária nunca apaga esse resultado.`
-    );
-
-    // ========================================================
-    // ESPERA SOMENTE CAUDA DO GEMINI
-    // ========================================================
-
-    console.log(
-        "[GEMINI REVIEW] Aguardando apenas a cauda da revisão 100% independente..."
-    );
-
-    await geminiReviewChain;
+    await reviewChain;
 
     if (
-        job.geminiReviewedGroups !==
+        job.stats.geminiReviewed !==
         groups.length
     ) {
         throw new Error(
-            `Revisão secundária incompleta: ` +
-            `${job.geminiReviewedGroups}/${groups.length} groups.`
+            `Gemini revisou ${job.stats.geminiReviewed}/${groups.length}.`
         );
     }
 
     console.log(
         `[GEMINI REVIEW] COMPLETA: ` +
-        `${job.geminiReviewedGroups}/${groups.length} groups; ` +
-        `${geminiProposals.length} proposta(s).`
+        `${job.stats.geminiReviewed}/${groups.length}; ` +
+        `propostas=${proposals.length}.`
     );
 
-    job.progress =
-        Math.max(
-            job.progress,
-            84
-        );
-
-    // ========================================================
-    // MISTRAL ARBITRA GEMINI
-    // ========================================================
-
-    await arbitrateAllProposals(
-        geminiProposals,
+    await arbitrateProposals(
+        proposals,
         translations,
         job
     );
 
-    job.progress =
-        Math.max(
-            job.progress,
-            93
-        );
-
-    // ========================================================
-    // QUALITY GUARD
-    // ========================================================
-
     let texts =
         cleanAllFinal(
             blocks,
-
             flattenTranslations(
                 blocks,
                 groups,
                 translations
-            )
+            ),
+            job
         );
 
     let risks =
@@ -6509,7 +4526,7 @@ async function translateSrt(
     if (
         risks.length
     ) {
-        await mistralRepairRiskGroups(
+        await repairRisks(
             groups,
             translations,
             risks,
@@ -6519,12 +4536,12 @@ async function translateSrt(
         texts =
             cleanAllFinal(
                 blocks,
-
                 flattenTranslations(
                     blocks,
                     groups,
                     translations
-                )
+                ),
+                job
             );
 
         risks =
@@ -6535,13 +4552,20 @@ async function translateSrt(
     }
 
     /*
-     * Última limpeza
-     * determinística.
+     * Hard-fixes conhecidos são aplicados
+     * novamente depois da IA.
+     *
+     * Portanto:
+     * cabina de votação
+     * cheque da porra
+     *
+     * não derrubam mais um episódio inteiro.
      */
     texts =
         cleanAllFinal(
             blocks,
-            texts
+            texts,
+            job
         );
 
     risks =
@@ -6550,44 +4574,31 @@ async function translateSrt(
             texts
         );
 
-    job.qualityGuardRisks =
-        risks.length;
-
     if (
         risks.length
     ) {
-        const summary =
+        throw new Error(
+            `Quality Guard ainda encontrou ${risks.length} risco(s): ` +
             risks
                 .slice(
                     0,
-                    20
+                    12
                 )
                 .map(
-                    item =>
-                        `${item.id}:${item.reasons.join(
+                    issue =>
+                        `${issue.id}:${issue.reasons.join(
                             "+"
                         )}`
                 )
                 .join(
                     ", "
-                );
-
-        /*
-         * Aqui NÃO fingimos
-         * que qualidade passou.
-         */
-        throw new Error(
-            `Quality Guard ainda encontrou ${risks.length} risco(s): ${summary}`
+                )
         );
     }
 
     console.log(
-        "[QUALITY GUARD] PASSOU — 0 padrão(s) conhecido(s) restante(s)."
+        "[QUALITY GUARD] PASSOU."
     );
-
-    // ========================================================
-    // FINAL SRT
-    // ========================================================
 
     const finalSrt =
         buildSrt(
@@ -6595,23 +4606,11 @@ async function translateSrt(
             texts
         );
 
-    auditFinalTimestamps(
+    auditTimestamps(
         sourceSrt,
         finalSrt,
-        "FINAL 6.2"
+        "FINAL 6.3"
     );
-
-    job.timestampAuditPassed =
-        true;
-
-    job.contentAuditPassed =
-        true;
-
-    job.progress =
-        100;
-
-    job.updatedAt =
-        Date.now();
 
     const elapsed =
         (
@@ -6621,31 +4620,24 @@ async function translateSrt(
         1000;
 
     console.log(
-        `[PIPELINE 6.2] OK em ${elapsed.toFixed(
+        `[PIPELINE 6.3] OK em ${elapsed.toFixed(
             1
         )}s | ` +
-        `MistralCalls=${job.mistralCalls} | ` +
-        `MistralAttempts=${job.mistralAttempts} | ` +
-        `Mistral429=${job.mistral429s} | ` +
-        `salvaged=${job.salvagedGroups} | ` +
-        `rescueBatch=${job.rescueBatchCalls} | ` +
-        `atomic=${job.atomicRescues} | ` +
-        `GeminiReviewed=${job.geminiReviewedGroups}/${groups.length} | ` +
-        `GeminiCalls=${job.geminiReviewCalls} | ` +
-        `Gemini429=${job.gemini429s} | ` +
-        `GeminiPropostas=${job.geminiProposalCount} | ` +
-        `GeminiFallbackGroups=${job.geminiFallbackGroups} | ` +
-        `ArbiterCalls=${job.arbiterCalls} | ` +
-        `ArbiterAccepted=${job.arbiterAccepted} | ` +
-        `QualityRepairCalls=${job.qualityRepairCalls} | ` +
-        `riscos finais=0.`
+        `fonte=${job.sourceKind} | ` +
+        `MistralCalls=${job.stats.mistralCalls} | ` +
+        `Attempts=${job.stats.mistralAttempts} | ` +
+        `429=${job.stats.mistral429} | ` +
+        `Gemini=${job.stats.geminiReviewed}/${groups.length} | ` +
+        `Propostas=${job.stats.geminiProposals} | ` +
+        `ArbiterAccepted=${job.stats.arbiterAccepted} | ` +
+        `HardFixes=${job.stats.hardFixes}.`
     );
 
     return finalSrt;
 }
 
 // ============================================================
-// JOB PROCESSING
+// JOB QUEUE
 // ============================================================
 
 async function processJob(
@@ -6654,48 +4646,22 @@ async function processJob(
     job.processingStartedAt =
         Date.now();
 
-    job.queueWaitSeconds =
-        Math.max(
-            0,
-
-            (
-                job.processingStartedAt -
-                job.queuedAt
-            ) /
-            1000
-        );
-
     job.status =
         "processing";
 
-    job.error =
-        null;
-
-    job.updatedAt =
-        Date.now();
-
     console.log(
-        `[JOB ${job.id}] Iniciando após ` +
-        `${job.queueWaitSeconds.toFixed(
-            1
-        )}s na fila. SEM teto global.`
+        `[JOB ${job.id}] Iniciando fonte=${job.sourceKind}. SEM teto global.`
     );
 
     try {
         const cached =
-            getTranslationCache(
+            getCache(
                 job.cacheKey
             );
 
         if (
             cached
         ) {
-            auditFinalTimestamps(
-                job.sourceSrt,
-                cached,
-                "CACHE"
-            );
-
             job.result =
                 cached;
 
@@ -6704,15 +4670,6 @@ async function processJob(
 
             job.progress =
                 100;
-
-            job.timestampAuditPassed =
-                true;
-
-            job.contentAuditPassed =
-                true;
-
-            job.updatedAt =
-                Date.now();
 
             return;
         }
@@ -6723,7 +4680,7 @@ async function processJob(
                 job
             );
 
-        setTranslationCache(
+        setCache(
             job.cacheKey,
             finalSrt
         );
@@ -6736,9 +4693,6 @@ async function processJob(
 
         job.progress =
             100;
-
-        job.updatedAt =
-            Date.now();
 
         console.log(
             `[JOB ${job.id}] Concluído.`
@@ -6755,320 +4709,305 @@ async function processJob(
                 error
             );
 
-        job.updatedAt =
-            Date.now();
-
         console.error(
             `[JOB ${job.id}] Falhou: ${job.error}`
         );
-
-        if (
-            job.translationCheckpoint
-                instanceof Map &&
-            job.translationCheckpoint
-                .size
-        ) {
-            console.error(
-                `[CHECKPOINT] ` +
-                `${job.translationCheckpoint.size} group(s) Mistral ` +
-                `preservados em memória para retomada.`
-            );
-        }
     }
+
+    job.updatedAt =
+        Date.now();
 }
 
-// ============================================================
-// JOB QUEUE
-// ============================================================
-
-function enqueueTranslationJob(
+function enqueue(
     job
 ) {
-    return new Promise(
-        resolve => {
-
-            translationJobQueue.push({
-                job,
-                resolve
-            });
-
-            console.log(
-                `[JOB QUEUE] ${job.id} entrou na fila; ` +
-                `aguardando=${translationJobQueue.length}.`
-            );
-
-            processTranslationJobQueue();
-        }
-    );
-}
-
-async function processTranslationJobQueue() {
-
     if (
-        translationJobWorkerRunning
+        job.enqueued
     ) {
         return;
     }
 
-    translationJobWorkerRunning =
+    job.enqueued =
+        true;
+
+    queue.push(
+        job
+    );
+
+    console.log(
+        `[JOB QUEUE] ${job.id} entrou na fila; aguardando=${queue.length}.`
+    );
+
+    runQueue();
+}
+
+async function runQueue() {
+    if (
+        queueRunning
+    ) {
+        return;
+    }
+
+    queueRunning =
         true;
 
     try {
         while (
-            translationJobQueue.length
+            queue.length
         ) {
-            const item =
-                translationJobQueue.shift();
+            const job =
+                queue.shift();
 
             if (
-                !item
-            ) {
-                continue;
-            }
-
-            if (
-                item.job.status ===
-                "processing"
+                job &&
+                job.status ===
+                    "processing"
             ) {
                 await processJob(
-                    item.job
+                    job
                 );
             }
-
-            item.resolve();
         }
     }
     finally {
-        translationJobWorkerRunning =
+        queueRunning =
             false;
-
-        if (
-            translationJobQueue.length
-        ) {
-            processTranslationJobQueue();
-        }
     }
 }
 
-function getOrCreateTranslationJob({
+// ============================================================
+// SOURCE ARBITRATION
+// ============================================================
+
+function activateOpenSubtitlesFallback(
+    job
+) {
+    if (
+        !job ||
+        job.status !==
+            "waiting_source"
+    ) {
+        return;
+    }
+
+    waitingByRelease.delete(
+        job.releaseKey
+    );
+
+    job.status =
+        "processing";
+
+    job.sourceKind =
+        "opensubtitles-fallback";
+
+    job.queuedAt =
+        Date.now();
+
+    console.log(
+        `[SOURCE ARBITER] Embedded não chegou em ` +
+        `${LOCAL_SOURCE_GRACE_MS / 1000}s. ` +
+        `Usando OpenSubtitles fallback.`
+    );
+
+    enqueue(
+        job
+    );
+}
+
+function createWaitingFallbackJob({
     type,
     videoId,
-    cleanedSrt,
-    sourceName = ""
+    filename,
+    sourceSrt,
+    sourceName
 }) {
-    const sourceHash =
-        sha256(
-            cleanedSrt
+    const key =
+        makeReleaseKey(
+            type,
+            videoId,
+            filename
         );
 
-    const cacheKey =
-        `${TRANSLATION_CACHE_VERSION}:${type}:${videoId}:${sourceHash}`;
-
-    // ========================================================
-    // CACHE FINAL
-    // ========================================================
-
-    const cached =
-        getTranslationCache(
-            cacheKey
+    const existing =
+        waitingByRelease.get(
+            key
         );
 
     if (
-        cached
+        existing &&
+        existing.status ===
+            "waiting_source"
     ) {
-        const jobId =
-            `cached-${sourceHash.slice(
-                0,
-                24
-            )}`;
-
-        let job =
-            getJob(
-                jobId
-            );
-
-        if (
-            !job
-        ) {
-            job =
-                createJob({
-                    jobId,
-
-                    cacheKey,
-
-                    type,
-
-                    videoId,
-
-                    sourceHash,
-
-                    sourceSrt:
-                        cleanedSrt,
-
-                    sourceName
-                });
-
-            job.status =
-                "completed";
-
-            job.result =
-                cached;
-
-            job.progress =
-                100;
-
-            job.timestampAuditPassed =
-                true;
-
-            job.contentAuditPassed =
-                true;
-        }
-
-        return job;
+        return existing;
     }
-
-    // ========================================================
-    // JÁ PROCESSANDO
-    // ========================================================
-
-    const processing =
-        findProcessingJob(
-            cacheKey
-        );
-
-    if (
-        processing
-    ) {
-        return processing;
-    }
-
-    // ========================================================
-    // RETOMADA
-    // ========================================================
-
-    const reusable =
-        findReusableFailedJob(
-            cacheKey
-        );
-
-    if (
-        reusable
-    ) {
-        reusable.status =
-            "processing";
-
-        reusable.error =
-            null;
-
-        reusable.progress =
-            Math.max(
-                1,
-                reusable.progress ||
-                    0
-            );
-
-        reusable.updatedAt =
-            Date.now();
-
-        reusable.queuedAt =
-            Date.now();
-
-        reusable.resumes =
-            Number(
-                reusable.resumes ||
-                0
-            ) +
-            1;
-
-        console.log(
-            `[CHECKPOINT] Retomando job ${reusable.id}; ` +
-            `${reusable.translationCheckpoint?.size || 0} group(s) preservados.`
-        );
-
-        reusable.promise =
-            enqueueTranslationJob(
-                reusable
-            )
-                .catch(
-                    error => {
-
-                        reusable.status =
-                            "failed";
-
-                        reusable.error =
-                            getErrorMessage(
-                                error
-                            );
-
-                        reusable.updatedAt =
-                            Date.now();
-                    }
-                );
-
-        return reusable;
-    }
-
-    // ========================================================
-    // NOVO
-    // ========================================================
-
-    const jobId =
-        `job-${sourceHash.slice(
-            0,
-            24
-        )}-${randomId(
-            6
-        )}`;
 
     const job =
         createJob({
-            jobId,
-
-            cacheKey,
-
             type,
 
             videoId,
 
-            sourceHash,
+            filename,
 
-            sourceSrt:
-                cleanedSrt,
+            sourceSrt,
 
-            sourceName
+            sourceName,
+
+            sourceKind:
+                "opensubtitles-pending",
+
+            status:
+                "waiting_source"
         });
 
-    job.promise =
-        enqueueTranslationJob(
-            job
-        )
-            .catch(
-                error => {
+    waitingByRelease.set(
+        key,
+        job
+    );
 
-                    job.status =
-                        "failed";
+    job.fallbackTimer =
+        setTimeout(
+            () =>
+                activateOpenSubtitlesFallback(
+                    job
+                ),
+            LOCAL_SOURCE_GRACE_MS
+        );
 
-                    job.error =
-                        getErrorMessage(
-                            error
-                        );
+    job.fallbackTimer.unref?.();
 
-                    job.updatedAt =
-                        Date.now();
-                }
+    console.log(
+        `[SOURCE ARBITER] OpenSubtitles encontrado. ` +
+        `Aguardando embedded por até ` +
+        `${LOCAL_SOURCE_GRACE_MS / 1000}s ANTES do Mistral.`
+    );
+
+    return job;
+}
+
+function promoteEmbeddedOrCreate({
+    type,
+    videoId,
+    filename,
+    sourceSrt,
+    sourceName
+}) {
+    const key =
+        makeReleaseKey(
+            type,
+            videoId,
+            filename
+        );
+
+    const waiting =
+        waitingByRelease.get(
+            key
+        );
+
+    if (
+        waiting &&
+        waiting.status ===
+            "waiting_source"
+    ) {
+        if (
+            waiting.fallbackTimer
+        ) {
+            clearTimeout(
+                waiting.fallbackTimer
             );
+        }
+
+        waitingByRelease.delete(
+            key
+        );
+
+        waiting.sourceSrt =
+            sourceSrt;
+
+        waiting.sourceHash =
+            sha256(
+                sourceSrt
+            );
+
+        waiting.cacheKey =
+            makeCacheKey(
+                type,
+                videoId,
+                sourceSrt
+            );
+
+        waiting.sourceName =
+            sourceName;
+
+        waiting.sourceKind =
+            "embedded";
+
+        waiting.status =
+            "processing";
+
+        waiting.progress =
+            1;
+
+        waiting.queuedAt =
+            Date.now();
+
+        console.log(
+            `[SOURCE ARBITER] EMBEDDED venceu ✅ ` +
+            `OpenSubtitles cancelado ANTES de gastar Mistral.`
+        );
+
+        enqueue(
+            waiting
+        );
+
+        return waiting;
+    }
+
+    const active =
+        findActiveByRelease(
+            key
+        );
+
+    if (
+        active
+    ) {
+        return active;
+    }
+
+    const job =
+        createJob({
+            type,
+
+            videoId,
+
+            filename,
+
+            sourceSrt,
+
+            sourceName,
+
+            sourceKind:
+                "embedded",
+
+            status:
+                "processing"
+        });
+
+    enqueue(
+        job
+    );
 
     return job;
 }
 
 // ============================================================
-// NETWORK FETCH
+// OPENSUBTITLES
 // ============================================================
 
 async function fetchWithTimeout(
     url,
     options = {},
-    timeoutMs =
+    timeout =
         SOURCE_FETCH_TIMEOUT_MS
 ) {
     const controller =
@@ -7078,7 +5017,7 @@ async function fetchWithTimeout(
         setTimeout(
             () =>
                 controller.abort(),
-            timeoutMs
+            timeout
         );
 
     try {
@@ -7099,310 +5038,16 @@ async function fetchWithTimeout(
     }
 }
 
-// ============================================================
-// OPENSUBTITLES
-// ============================================================
-
-function buildOpenSubtitlesSearchUrl(
-    type,
-    id,
-    extra = {}
-) {
-    const base =
-        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
-            type
-        )}/${encodeURIComponent(
-            id
-        )}`;
-
-    const params =
-        new URLSearchParams();
-
-    if (
-        extra.videoHash
-    ) {
-        params.set(
-            "videoHash",
-            extra.videoHash
-        );
-    }
-
-    if (
-        extra.videoSize
-    ) {
-        params.set(
-            "videoSize",
-            extra.videoSize
-        );
-    }
-
-    if (
-        extra.filename
-    ) {
-        params.set(
-            "filename",
-            extra.filename
-        );
-    }
-
-    const suffix =
-        params.toString();
-
-    return suffix
-        ? `${base}/${suffix}.json`
-        : `${base}.json`;
-}
-
-function scoreSubtitle(
-    subtitle
-) {
-    let score =
-        0;
-
-    const lang =
-        String(
-            subtitle?.lang ||
-            ""
-        ).toLowerCase();
-
-    if (
-        lang ===
-        "eng"
-    ) {
-        score +=
-            100;
-    }
-    else if (
-        lang ===
-        "en"
-    ) {
-        score +=
-            90;
-    }
-
-    if (
-        subtitle
-            ?.hearingImpaired ===
-        false
-    ) {
-        score +=
-            20;
-    }
-
-    if (
-        String(
-            subtitle?.format ||
-            ""
-        ).toLowerCase() ===
-        "srt"
-    ) {
-        score +=
-            20;
-    }
-
-    if (
-        /english/i.test(
-            String(
-                subtitle?.name ||
-                ""
-            )
-        )
-    ) {
-        score +=
-            10;
-    }
-
-    return score;
-}
-
-function selectBestSubtitle(
-    subtitles
-) {
-    if (
-        !Array.isArray(
-            subtitles
-        )
-    ) {
-        return null;
-    }
-
-    return (
-        subtitles
-            .filter(
-                subtitle => {
-
-                    const lang =
-                        String(
-                            subtitle?.lang ||
-                            ""
-                        ).toLowerCase();
-
-                    return (
-                        (
-                            lang ===
-                                "eng" ||
-                            lang ===
-                                "en"
-                        ) &&
-                        typeof subtitle?.url ===
-                            "string" &&
-                        /^https?:\/\//i.test(
-                            subtitle.url
-                        )
-                    );
-                }
-            )
-            .sort(
-                (
-                    a,
-                    b
-                ) =>
-                    scoreSubtitle(
-                        b
-                    ) -
-                    scoreSubtitle(
-                        a
-                    )
-            )[0] ||
-        null
-    );
-}
-
-async function findEnglishSubtitle(
-    type,
-    id,
-    extra
-) {
-    const url =
-        buildOpenSubtitlesSearchUrl(
-            type,
-            id,
-            extra
-        );
-
-    console.log(
-        `[OPENSUBTITLES] ${url}`
-    );
-
-    const response =
-        await fetchWithTimeout(
-            url,
-            {
-                headers: {
-                    Accept:
-                        "application/json",
-
-                    "User-Agent":
-                        "Stremio-PTBR-DualAI/6.2"
-                }
-            }
-        );
-
-    if (
-        !response.ok
-    ) {
-        throw new Error(
-            `OpenSubtitles HTTP ${response.status}.`
-        );
-    }
-
-    const data =
-        await response.json();
-
-    const subtitles =
-        Array.isArray(
-            data?.subtitles
-        )
-            ? data.subtitles
-            : [];
-
-    const target =
-        selectBestSubtitle(
-            subtitles
-        );
-
-    console.log(
-        target
-            ? `[OPENSUBTITLES] Inglês selecionado; resultados=${subtitles.length}.`
-            : `[OPENSUBTITLES] Nenhuma legenda inglesa utilizável; resultados=${subtitles.length}.`
-    );
-
-    return target;
-}
-
-async function downloadAndCleanSubtitle(
-    url
-) {
-    const response =
-        await fetchWithTimeout(
-            url,
-            {
-                headers: {
-                    "User-Agent":
-                        "Stremio-PTBR-DualAI/6.2"
-                }
-            }
-        );
-
-    if (
-        !response.ok
-    ) {
-        throw new Error(
-            `Falha ao baixar legenda: HTTP ${response.status}.`
-        );
-    }
-
-    const raw =
-        normalizeSrt(
-            await response.text()
-        );
-
-    if (
-        !raw
-    ) {
-        throw new Error(
-            "Legenda vazia."
-        );
-    }
-
-    if (
-        raw.length >
-        MAX_SOURCE_CHARS
-    ) {
-        throw new Error(
-            `Legenda muito grande: ${raw.length} caracteres.`
-        );
-    }
-
-    const clean =
-        cleanSrtForTranslation(
-            raw
-        );
-
-    if (
-        !clean
-    ) {
-        throw new Error(
-            "Legenda vazia após limpeza."
-        );
-    }
-
-    return clean;
-}
-
 function parseExtra(
     req
 ) {
-    const raw =
-        String(
-            req.params
-                .extra ||
-            ""
-        ).trim();
-
     const params =
         new URLSearchParams(
-            raw
+            String(
+                req.params
+                    .extra ||
+                ""
+            )
         );
 
     return {
@@ -7438,11 +5083,182 @@ function parseExtra(
     };
 }
 
+function buildOpenSubtitlesUrl(
+    type,
+    id,
+    extra
+) {
+    const base =
+        `https://opensubtitles-v3.strem.io/subtitles/` +
+        `${encodeURIComponent(
+            type
+        )}/` +
+        `${encodeURIComponent(
+            id
+        )}`;
+
+    const params =
+        new URLSearchParams();
+
+    if (
+        extra.videoHash
+    ) {
+        params.set(
+            "videoHash",
+            extra.videoHash
+        );
+    }
+
+    if (
+        extra.videoSize
+    ) {
+        params.set(
+            "videoSize",
+            extra.videoSize
+        );
+    }
+
+    if (
+        extra.filename
+    ) {
+        params.set(
+            "filename",
+            extra.filename
+        );
+    }
+
+    return params.toString()
+        ? `${base}/${params.toString()}.json`
+        : `${base}.json`;
+}
+
+function selectEnglishSubtitle(
+    subtitles
+) {
+    return (
+        Array.isArray(
+            subtitles
+        )
+            ? subtitles
+            : []
+    )
+        .filter(
+            subtitle =>
+                [
+                    "eng",
+                    "en"
+                ].includes(
+                    String(
+                        subtitle?.lang ||
+                        ""
+                    ).toLowerCase()
+                ) &&
+                /^https?:\/\//i.test(
+                    String(
+                        subtitle?.url ||
+                        ""
+                    )
+                )
+        )[0] ||
+        null;
+}
+
+async function findEnglishSubtitle(
+    type,
+    id,
+    extra
+) {
+    const url =
+        buildOpenSubtitlesUrl(
+            type,
+            id,
+            extra
+        );
+
+    console.log(
+        `[OPENSUBTITLES] ${url}`
+    );
+
+    const response =
+        await fetchWithTimeout(
+            url,
+            {
+                headers: {
+                    Accept:
+                        "application/json",
+
+                    "User-Agent":
+                        "Stremio-PTBR/6.3"
+                }
+            }
+        );
+
+    if (
+        !response.ok
+    ) {
+        throw new Error(
+            `OpenSubtitles HTTP ${response.status}.`
+        );
+    }
+
+    const data =
+        await response.json();
+
+    const target =
+        selectEnglishSubtitle(
+            data?.subtitles
+        );
+
+    console.log(
+        target
+            ? "[OPENSUBTITLES] Inglês encontrado."
+            : "[OPENSUBTITLES] Nenhum inglês utilizável."
+    );
+
+    return target;
+}
+
+async function downloadAndClean(
+    url
+) {
+    const response =
+        await fetchWithTimeout(
+            url
+        );
+
+    if (
+        !response.ok
+    ) {
+        throw new Error(
+            `Download legenda HTTP ${response.status}.`
+        );
+    }
+
+    const raw =
+        normalizeSrt(
+            await response.text()
+        );
+
+    if (
+        !raw ||
+        raw.length >
+            MAX_SOURCE_CHARS
+    ) {
+        throw new Error(
+            "Legenda vazia ou grande demais."
+        );
+    }
+
+    return cleanSrtForTranslation(
+        raw
+    );
+}
+
 // ============================================================
-// STATUS SRT
+// SRT STATUS
 // ============================================================
 
-function sendSubtitleResponse(
+function sendSrt(
     res,
     srt,
     cacheControl =
@@ -7470,63 +5286,36 @@ function sendSubtitleResponse(
     );
 }
 
-function buildProcessingSrt(
+function processingSrt(
     job
 ) {
-    const projection =
-        job
-            ?.projection
-            ?.estimatedRemainingSeconds;
-
-    const extra =
-        Number.isFinite(
-            projection
-        )
-            ? ` Estimativa atual: ~${formatSeconds(
-                projection
-            )} restantes.`
-            : "";
+    const message =
+        job.status ===
+            "waiting_source"
+            ? "Aguardando a faixa embedded exata antes do fallback..."
+            : `Traduzindo e revisando... Progresso ${job.progress || 0}%.`;
 
     return [
         "1",
-
-        "00:00:01,000 --> 00:00:06,000",
-
-        "Traduzindo e revisando legenda...",
-
-        "",
-
-        "2",
-
-        "00:00:06,500 --> 00:00:14,000",
-
-        `Progresso: ${Number(
-            job?.progress ||
-            0
-        )}%.${extra}`
+        "00:00:01,000 --> 00:00:09,000",
+        message
     ].join(
         "\n"
     );
 }
 
-function buildErrorSrt(
-    message
+function errorSrt(
+    error
 ) {
     return [
         "1",
-
-        "00:00:01,000 --> 00:00:08,000",
-
+        "00:00:01,000 --> 00:00:09,000",
         "Não foi possível concluir a legenda PT-BR.",
-
         "",
-
         "2",
-
-        "00:00:08,500 --> 00:00:18,000",
-
+        "00:00:09,500 --> 00:00:20,000",
         String(
-            message ||
+            error ||
             "Erro desconhecido."
         )
             .replace(
@@ -7535,7 +5324,7 @@ function buildErrorSrt(
             )
             .slice(
                 0,
-                300
+                280
             )
     ].join(
         "\n"
@@ -7551,13 +5340,13 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "6.2.0",
+        "6.3.0",
 
     name:
         "Tradutor PT-BR Premium",
 
     description:
-        "Mistral Medium 3.5 + revisão integral Gemini 3.5 Flash-Lite + arbitragem Mistral + timestamps imutáveis.",
+        "Embedded-first + Mistral Medium 3.5 + Gemini review + Mistral arbiter.",
 
     resources: [
         "subtitles"
@@ -7572,19 +5361,11 @@ const manifest = {
         "tt"
     ],
 
-    catalogs: [],
-
-    behaviorHints: {
-        configurable:
-            false,
-
-        adult:
-            false
-    }
+    catalogs: []
 };
 
 // ============================================================
-// ROOT / HEALTH
+// ROUTES
 // ============================================================
 
 app.get(
@@ -7603,126 +5384,20 @@ app.get(
     (
         req,
         res
-    ) => {
-
+    ) =>
         res.json({
             status:
                 "online",
 
-            name:
-                manifest.name,
-
             version:
                 manifest.version,
 
-            translator:
-                MISTRAL_MODEL,
+            sourcePolicy:
+                "embedded-first",
 
-            independentReviewer:
-                GEMINI_MODEL,
-
-            arbiter:
-                MISTRAL_MODEL,
-
-            groqInPipeline:
-                false,
-
-            groqKeyCanRemain:
-                GROQ_API_KEY_PRESENT,
-
-            translationCacheVersion:
-                TRANSLATION_CACHE_VERSION,
-
-            embeddedBridge:
-                Boolean(
-                    LOCAL_BRIDGE_SECRET
-                ),
-
-            mistralConfigured:
-                Boolean(
-                    MISTRAL_API_KEY
-                ),
-
-            geminiConfigured:
-                Boolean(
-                    GEMINI_API_KEY
-                ),
-
-            queue:
-                translationJobQueue.length,
-
-            processing:
-                translationJobWorkerRunning,
-
-            cache:
-                translationCache.size,
-
-            jobs:
-                jobs.size,
-
-            mistralGovernor:
-                mistralGovernor.status(),
-
-            rules: {
-                globalTimeCeiling:
-                    false,
-
-                mistralAdaptiveConcurrencyUpTo2:
-                    true,
-
-                checkpointPerMistralBatch:
-                    true,
-
-                geminiReviews100Percent:
-                    true,
-
-                geminiRunsWhileMistralTranslates:
-                    true,
-
-                secondaryAiCannotEditDirectly:
-                    true,
-
-                mistralArbitratesAllGeminiProposals:
-                    true,
-
-                groqRemovedFromCriticalPath:
-                    true,
-
-                timestampsImmutable:
-                    true,
-
-                hiddenSpeakerContext:
-                    true,
-
-                speakerLabelsForbidden:
-                    true,
-
-                genderGuessForbidden:
-                    true,
-
-                vocalElongationNormalization:
-                    true,
-
-                decorativeDialogueMarkersForbidden:
-                    true
-            }
-        });
-    }
-);
-
-app.get(
-    "/health",
-    (
-        req,
-        res
-    ) => {
-
-        res.json({
-            status:
-                "ok",
-
-            uptime:
-                process.uptime(),
+            localSourceGraceSeconds:
+                LOCAL_SOURCE_GRACE_MS /
+                1000,
 
             translator:
                 MISTRAL_MODEL,
@@ -7731,23 +5406,9 @@ app.get(
                 GEMINI_MODEL,
 
             cacheVersion:
-                TRANSLATION_CACHE_VERSION,
-
-            queue:
-                translationJobQueue.length,
-
-            processing:
-                translationJobWorkerRunning,
-
-            mistralGovernor:
-                mistralGovernor.status()
-        });
-    }
+                CACHE_VERSION
+        })
 );
-
-// ============================================================
-// STREMIO SUBTITLES
-// ============================================================
 
 async function subtitlesHandler(
     req,
@@ -7773,15 +5434,45 @@ async function subtitlesHandler(
                 req
             );
 
-        console.log(
-            `[STREMIO] Pedido: ${type}/${id}`
-        );
+        const releaseKey =
+            makeReleaseKey(
+                type,
+                id,
+                extra.filename
+            );
 
-        console.log(
-            `[STREMIO] filename=${extra.filename || "(não enviado)"}; ` +
-            `videoSize=${extra.videoSize || "(não enviado)"}; ` +
-            `videoHash=${extra.videoHash || "(não enviado)"}`
-        );
+        const active =
+            findActiveByRelease(
+                releaseKey
+            );
+
+        if (
+            active
+        ) {
+            return safeJson(
+                res,
+                {
+                    subtitles: [
+                        {
+                            id:
+                                `${id}-ptbr-${active.id.slice(
+                                    -8
+                                )}`,
+
+                            url:
+                                `${cleanBaseUrl(
+                                    req
+                                )}/subtitle/${encodeURIComponent(
+                                    active.id
+                                )}.srt`,
+
+                            lang:
+                                "por"
+                        }
+                    ]
+                }
+            );
+        }
 
         const target =
             await findEnglishSubtitle(
@@ -7802,29 +5493,61 @@ async function subtitlesHandler(
         }
 
         const sourceSrt =
-            await downloadAndCleanSubtitle(
+            await downloadAndClean(
                 target.url
             );
 
-        const job =
-            getOrCreateTranslationJob({
-                type,
+        let job;
 
-                videoId:
-                    id,
+        if (
+            LOCAL_BRIDGE_SECRET &&
+            extra.filename
+        ) {
+            job =
+                createWaitingFallbackJob({
+                    type,
 
-                cleanedSrt:
+                    videoId:
+                        id,
+
+                    filename:
+                        extra.filename,
+
                     sourceSrt,
 
-                sourceName:
-                    target.name ||
-                    "OpenSubtitles"
-            });
+                    sourceName:
+                        target.name ||
+                        "OpenSubtitles"
+                });
+        }
+        else {
+            job =
+                createJob({
+                    type,
 
-        const baseUrl =
-            cleanBaseUrl(
-                req
+                    videoId:
+                        id,
+
+                    filename:
+                        extra.filename,
+
+                    sourceSrt,
+
+                    sourceName:
+                        target.name ||
+                        "OpenSubtitles",
+
+                    sourceKind:
+                        "opensubtitles",
+
+                    status:
+                        "processing"
+                });
+
+            enqueue(
+                job
             );
+        }
 
         return safeJson(
             res,
@@ -7832,13 +5555,14 @@ async function subtitlesHandler(
                 subtitles: [
                     {
                         id:
-                            `${id}-ptbr-${job.sourceHash.slice(
-                                0,
-                                12
+                            `${id}-ptbr-${job.id.slice(
+                                -8
                             )}`,
 
                         url:
-                            `${baseUrl}/subtitle/${encodeURIComponent(
+                            `${cleanBaseUrl(
+                                req
+                            )}/subtitle/${encodeURIComponent(
                                 job.id
                             )}.srt`,
 
@@ -7877,17 +5601,12 @@ app.get(
     subtitlesHandler
 );
 
-// ============================================================
-// API PONTE LOCAL
-// ============================================================
-
 app.post(
     "/api/translate-embedded",
     async (
         req,
         res
     ) => {
-
         if (
             !isAuthorizedLocalBridge(
                 req
@@ -7925,6 +5644,19 @@ app.post(
                     "embedded"
                 ).trim();
 
+            /*
+             * Ponte Local 3.0 envia o
+             * filename no campo name.
+             */
+            const filename =
+                String(
+                    req.body
+                        ?.filename ||
+                    req.body
+                        ?.name ||
+                    ""
+                ).trim();
+
             const rawSrt =
                 req.body
                     ?.srt;
@@ -7938,23 +5670,9 @@ app.post(
                     res,
                     {
                         error:
-                            "Campo 'srt' é obrigatório."
+                            "Campo srt obrigatório."
                     },
                     400
-                );
-            }
-
-            if (
-                rawSrt.length >
-                MAX_SOURCE_CHARS
-            ) {
-                return safeJson(
-                    res,
-                    {
-                        error:
-                            `SRT muito grande. Limite: ${MAX_SOURCE_CHARS}.`
-                    },
-                    413
                 );
             }
 
@@ -7963,40 +5681,27 @@ app.post(
                     rawSrt
                 );
 
-            const cueCount =
-                parseSrt(
-                    cleanedSrt
-                ).length;
-
-            if (
-                !cleanedSrt ||
-                !cueCount
-            ) {
-                throw new Error(
-                    "Legenda embutida vazia/inválida após limpeza."
-                );
-            }
-
             console.log(
                 `[EMBEDDED API] ${type}/${videoId} | ` +
-                `${sourceName} | ${cueCount} cues.`
+                `${filename} | ` +
+                `${parseSrt(
+                    cleanedSrt
+                ).length} cues.`
             );
 
             const job =
-                getOrCreateTranslationJob({
+                promoteEmbeddedOrCreate({
                     type,
 
                     videoId,
 
-                    cleanedSrt,
+                    filename,
+
+                    sourceSrt:
+                        cleanedSrt,
 
                     sourceName
                 });
-
-            const baseUrl =
-                cleanBaseUrl(
-                    req
-                );
 
             return safeJson(
                 res,
@@ -8010,11 +5715,10 @@ app.post(
                     status:
                         job.status,
 
-                    progress:
-                        job.progress,
-
                     subtitleUrl:
-                        `${baseUrl}/subtitle/${encodeURIComponent(
+                        `${cleanBaseUrl(
+                            req
+                        )}/subtitle/${encodeURIComponent(
                             job.id
                         )}.srt`
                 }
@@ -8043,19 +5747,14 @@ app.post(
     }
 );
 
-// ============================================================
-// JOB STATUS
-// ============================================================
-
 app.get(
     "/job/:jobId",
     (
         req,
         res
     ) => {
-
         const job =
-            getJob(
+            jobs.get(
                 String(
                     req.params
                         .jobId ||
@@ -8070,7 +5769,7 @@ app.get(
                 res,
                 {
                     error:
-                        "Job não encontrado/expirado."
+                        "Job não encontrado."
                 },
                 404
             );
@@ -8085,122 +5784,21 @@ app.get(
                 status:
                     job.status,
 
+                sourceKind:
+                    job.sourceKind,
+
                 progress:
                     job.progress,
 
                 error:
                     job.error,
 
-                queueWaitSeconds:
-                    job.queueWaitSeconds,
-
-                projection:
-                    job.projection,
-
-                sentenceGroups:
-                    job.sentenceGroups ||
-                    0,
-
-                checkpointGroups:
-                    job.translationCheckpoint
-                        ?.size ||
-                    0,
-
-                primaryCheckpointReady:
-                    Boolean(
-                        job.primaryCheckpoint
-                    ),
-
-                resumes:
-                    job.resumes ||
-                    0,
-
-                mistralCalls:
-                    job.mistralCalls ||
-                    0,
-
-                mistralAttempts:
-                    job.mistralAttempts ||
-                    0,
-
-                mistral429s:
-                    job.mistral429s ||
-                    0,
-
-                geminiReviewCalls:
-                    job.geminiReviewCalls ||
-                    0,
-
-                geminiReviewAttempts:
-                    job.geminiReviewAttempts ||
-                    0,
-
-                gemini429s:
-                    job.gemini429s ||
-                    0,
-
-                geminiReviewedGroups:
-                    job.geminiReviewedGroups ||
-                    0,
-
-                geminiProposalCount:
-                    job.geminiProposalCount ||
-                    0,
-
-                geminiFallbackGroups:
-                    job.geminiFallbackGroups ||
-                    0,
-
-                arbiterCalls:
-                    job.arbiterCalls ||
-                    0,
-
-                arbiterAccepted:
-                    job.arbiterAccepted ||
-                    0,
-
-                salvagedGroups:
-                    job.salvagedGroups ||
-                    0,
-
-                rescueBatchCalls:
-                    job.rescueBatchCalls ||
-                    0,
-
-                atomicRescues:
-                    job.atomicRescues ||
-                    0,
-
-                highReasoningRescues:
-                    job.highReasoningRescues ||
-                    0,
-
-                perCueRescues:
-                    job.perCueRescues ||
-                    0,
-
-                qualityRepairCalls:
-                    job.qualityRepairCalls ||
-                    0,
-
-                qualityGuardRisks:
-                    job.qualityGuardRisks ||
-                    0,
-
-                mistralGovernor:
-                    mistralGovernor.status(),
-
-                providerUsage:
-                    job.providerUsage ||
-                    {}
+                stats:
+                    job.stats
             }
         );
     }
 );
-
-// ============================================================
-// RESULTADO SRT
-// ============================================================
 
 app.get(
     "/subtitle/:jobId.srt",
@@ -8208,41 +5806,27 @@ app.get(
         req,
         res
     ) => {
-
-        let jobId;
-
-        try {
-            jobId =
-                decodeURIComponent(
-                    String(
-                        req.params
-                            .jobId ||
-                        ""
-                    )
-                );
-        }
-        catch {
-            jobId =
+        const jobId =
+            decodeURIComponent(
                 String(
                     req.params
                         .jobId ||
                     ""
-                );
-        }
+                )
+            );
 
         const job =
-            getJob(
+            jobs.get(
                 jobId
             );
 
         if (
             !job
         ) {
-            return sendSubtitleResponse(
+            return sendSrt(
                 res,
-
-                buildErrorSrt(
-                    "Esta tradução expirou. Recarregue as legendas."
+                errorSrt(
+                    "Job expirado."
                 )
             );
         }
@@ -8253,35 +5837,26 @@ app.get(
             job.result
         ) {
             try {
-                auditFinalTimestamps(
+                auditTimestamps(
                     job.sourceSrt,
                     job.result,
                     "SERVING"
                 );
             }
-            catch {
-                return sendSubtitleResponse(
-                    res,
-
-                    buildErrorSrt(
-                        "A auditoria de timestamps bloqueou esta legenda."
-                    )
-                );
-            }
-
-            if (
-                !job.contentAuditPassed
+            catch (
+                error
             ) {
-                return sendSubtitleResponse(
+                return sendSrt(
                     res,
-
-                    buildErrorSrt(
-                        "A revisão de conteúdo não foi concluída."
+                    errorSrt(
+                        getErrorMessage(
+                            error
+                        )
                     )
                 );
             }
 
-            return sendSubtitleResponse(
+            return sendSrt(
                 res,
                 job.result,
                 "public, max-age=604800"
@@ -8292,23 +5867,20 @@ app.get(
             job.status ===
             "failed"
         ) {
-            return sendSubtitleResponse(
+            return sendSrt(
                 res,
-
-                buildErrorSrt(
+                errorSrt(
                     job.error
                 )
             );
         }
 
-        return sendSubtitleResponse(
+        return sendSrt(
             res,
-
-            buildProcessingSrt(
+            processingSrt(
                 job
             ),
-
-            "no-store, no-cache, must-revalidate"
+            "no-store"
         );
     }
 );
@@ -8320,33 +5892,16 @@ app.get(
 app.listen(
     PORT,
     () => {
-
         console.log(
             "============================================================"
         );
 
         console.log(
-            " STREMIO PT-BR DUAL AI TRANSLATOR 6.2 FINAL"
+            " STREMIO PT-BR DUAL AI TRANSLATOR 6.3 FINAL"
         );
 
         console.log(
             "============================================================"
-        );
-
-        console.log(
-            `Porta: ${PORT}`
-        );
-
-        console.log(
-            `Tradutor principal: ${MISTRAL_MODEL}`
-        );
-
-        console.log(
-            `Revisor independente 100%: ${GEMINI_MODEL}`
-        );
-
-        console.log(
-            `Árbitro final das propostas: ${MISTRAL_MODEL}`
         );
 
         console.log(
@@ -8354,7 +5909,7 @@ app.listen(
                 MISTRAL_API_KEY
                     ? "CONFIGURADO ✅"
                     : "FALTANDO ❌"
-            }`
+            } (${MISTRAL_MODEL})`
         );
 
         console.log(
@@ -8362,83 +5917,52 @@ app.listen(
                 GEMINI_API_KEY
                     ? "CONFIGURADO ✅"
                     : "FALTANDO ❌"
-            }`
-        );
-
-        console.log(
-            `Groq: FORA DO PIPELINE 6.2 ${
-                GROQ_API_KEY_PRESENT
-                    ? "(chave pode permanecer) ✅"
-                    : "✅"
-            }`
+            } (${GEMINI_MODEL})`
         );
 
         console.log(
             `Ponte Local: ${
                 LOCAL_BRIDGE_SECRET
-                    ? "COMPATÍVEL ✅"
-                    : "SECRET FALTANDO ❌"
+                    ? "CONFIGURADA ✅"
+                    : "FALTANDO ❌"
             }`
         );
 
         console.log(
-            `Mistral batch: ${MISTRAL_BATCH_GROUPS} groups / ${MISTRAL_BATCH_CHARS} chars`
+            `Fonte: EMBEDDED TEM PRIORIDADE por ` +
+            `${LOCAL_SOURCE_GRACE_MS / 1000}s ✅`
         );
 
         console.log(
-            `Mistral concorrência adaptativa: ATÉ ${MISTRAL_MAX_CONCURRENCY} ✅`
+            "OpenSubtitles: FALLBACK; não começa Mistral enquanto aguarda embedded ✅"
         );
 
         console.log(
-            "429 Mistral reduz temporariamente concorrência para 1: ATIVO ✅"
+            "Jobs duplicados OpenSubtitles + embedded: BLOQUEADOS ✅"
         );
 
         console.log(
-            "Gemini revisa 100% enquanto Mistral continua traduzindo: ATIVO ✅"
+            `Mistral concorrência adaptativa: ATÉ ${MISTRAL_CONCURRENCY} ✅`
         );
 
         console.log(
-            "Gemini NÃO altera legenda diretamente: GARANTIDO ✅"
+            "Gemini revisa 100%: ATIVO ✅"
         );
 
         console.log(
-            "Mistral arbitra TODAS as propostas Gemini: ATIVO ✅"
+            "Mistral arbitra propostas Gemini: ATIVO ✅"
         );
 
         console.log(
-            "Checkpoint após cada lote Mistral: ATIVO ✅"
+            'Vocalização repetida isolada "ah ah": FILTRADA ✅'
         );
 
         console.log(
-            "Checkpoint Mistral antes da revisão final: ATIVO ✅"
+            "Hard-fixes conhecidos antes do Quality Guard final: ATIVOS ✅"
         );
 
         console.log(
-            "Teto global de tradução: NÃO EXISTE ✅"
-        );
-
-        console.log(
-            "Timeout somente por request + retry: ATIVO ✅"
-        );
-
-        console.log(
-            "Quality Guard: BLOQUEIA risco conhecido restante ✅"
-        );
-
-        console.log(
-            "Speaker labels/nomes na saída: PROIBIDOS ✅"
-        );
-
-        console.log(
-            "Gênero chutado: PROIBIDO ✅"
-        );
-
-        console.log(
-            "Alongamentos gráficos: PROIBIDOS ✅"
-        );
-
-        console.log(
-            "Hífens/travessões decorativos: PROIBIDOS ✅"
+            "Teto global: NÃO EXISTE ✅"
         );
 
         console.log(
@@ -8446,11 +5970,7 @@ app.listen(
         );
 
         console.log(
-            `Namespace de cache: ${TRANSLATION_CACHE_VERSION}`
-        );
-
-        console.log(
-            "Fila de episódios: SEQUENCIAL (1 por vez)"
+            `Namespace de cache: ${CACHE_VERSION}`
         );
 
         console.log(
@@ -8463,14 +5983,9 @@ app.listen(
     }
 );
 
-// ============================================================
-// PROCESS SAFETY
-// ============================================================
-
 process.on(
     "unhandledRejection",
     error => {
-
         console.error(
             "[PROCESS] Unhandled rejection:",
             error
@@ -8481,7 +5996,6 @@ process.on(
 process.on(
     "uncaughtException",
     error => {
-
         console.error(
             "[PROCESS] Uncaught exception:",
             error
