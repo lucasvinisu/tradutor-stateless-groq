@@ -1,293 +1,5196 @@
-const express=require('express');
-const cors=require('cors');
-const crypto=require('crypto');
-const app=express();
-app.use(cors());app.disable('x-powered-by');app.use(express.json({limit:'4mb'}));
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
 
-/* 6.7 FAST-QUALITY / QUOTA-AWARE */
-const PORT=Number(process.env.PORT||10000);
-const GEMINI_API_KEY=String(process.env.GEMINI_API_KEY||'').trim();
-const GEMINI_MODEL=String(process.env.GEMINI_MODEL||'gemini-3.5-flash-lite').trim();
-const PUBLIC_URL=String(process.env.PUBLIC_URL||'').replace(/\/+$/,'');
-const LOCAL_BRIDGE_SECRET=String(process.env.LOCAL_BRIDGE_SECRET||'').trim();
-const SOURCE_FETCH_TIMEOUT_MS=30000,PERFORMANCE_TARGET_MS=90000;
-const MAX_BATCH_BLOCKS=Math.min(Math.max(1,Number(process.env.MAX_BATCH_BLOCKS||160)||160),160);
-const MAX_BATCH_CHARS=Math.min(Math.max(1000,Number(process.env.MAX_BATCH_CHARS||10000)||10000),10000);
-const GEMINI_CONCURRENCY=3,SAFE_RPM=14,RPM_WINDOW_MS=60000;
-const MIN_REQUEST_INTERVAL_MS=Math.max(Number(process.env.MIN_REQUEST_INTERVAL_MS||3000),4300);
-const TRANSLATION_REQUEST_TIMEOUT_MS=60000,STRUCTURE_RETRY_TIMEOUT_MS=55000,RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS=45000,REPAIR_TRANSLATION_REQUEST_TIMEOUT_MS=40000,SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS=40000,SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS=35000;
-const MAX_TRANSIENT_RETRIES=4,TRANSIENT_BACKOFF_BASE_MS=1000,TRANSIENT_BACKOFF_MAX_MS=15000;
-const RESCUE_BATCH_BLOCKS=80,RESCUE_BATCH_CHARS=4500,MAX_RESCUE_SPLIT_DEPTH=2;
-const AUDIT_CHUNK_SIZE=24,RECHECK_GROUP_SIZE=6,MAX_REPAIR_WINDOW_BLOCKS=4,MAX_SINGLE_AUDIT_RECOVERY_CYCLES=3;
-const SAFE_AUDIT_RATIO=.035,SAFE_AUDIT_MIN_RECORDS=72,EMBEDDED_CANARY_MIN=24,OPENSUB_CANARY_MIN=18,EMBEDDED_CANARY_EVERY=80,OPENSUB_CANARY_EVERY=100,NORMAL_GENDER_RESERVE_RATIO=.18;
-const MAX_OUTPUT_TOKENS=Number(process.env.MAX_OUTPUT_TOKENS||16000),AUDIT_MAX_OUTPUT_TOKENS=4096,MAX_RATE_LIMIT_COOLDOWN_MS=300000,LAZY_OPENSUB_START_GRACE_MS=1500;
-const CACHE_TTL_MS=7*24*60*60*1000,JOB_TTL_MS=24*60*60*1000,PARTIAL_CHECKPOINT_TTL_MS=6*60*60*1000;
-const MAX_CACHE_ENTRIES=200,MAX_PARTIAL_CHECKPOINTS=40,MAX_JOBS=300,MAX_SOURCE_CHARS=2500000;
-const TRANSLATION_CACHE_VERSION='5.8',BLOCK_LOCK_VERSION='5.8',FAST_CHECKPOINT_VERSION='6.7',RENDER_ENGINE_VERSION='6.7-fast-quality-quota-aware';
+const app = express();
+app.use(cors());
+app.disable("x-powered-by");
+app.use(express.json({ limit: "1mb" }));
 
-const translationCache=new Map(),partialTranslationCache=new Map(),jobs=new Map(),activeTranslationJobs=new Set();
-const geminiQueue=[],geminiRequestStarts=[],geminiTokenStarts=[];
-let geminiQueueSequence=0,activeGeminiWorkers=0,rateSlotChain=Promise.resolve(),geminiCooldownUntil=0,lastGeminiRequestAt=0,lifetimeGeminiRequests=0;
-let observedRpmLimit=null,observedInputTpmLimit=null,lastQuotaKind='none',lastQuotaId='',lastQuotaMetric='',lastQuotaMessage='';
+// ============================================================
+// CONFIG
+// ============================================================
 
-const PROTECTED_GLOSSARIES=[{id:'rupauls-drag-race',media:/rupaul|drag[ ._-]?race/i,terms:[
- {id:'condragulations',re:/\bcondragulations\b/giu,canonical:'Condragulations'},
- {id:'condragulation',re:/\bcondragulation\b/giu,canonical:'Condragulation'},
- {id:'shantay-you-stay',re:/\bshantay\s*,?\s*you\s+stay\b/giu,canonical:'Shantay, you stay'},
- {id:'sashay-away',re:/\bsashay\s+away\b/giu,canonical:'Sashay away'},
- {id:'snatch-game',re:/\bsnatch\s+game\b/giu,canonical:'Snatch Game'},
- {id:'lip-sync-for-your-life',re:/\blip[ -]?sync\s+for\s+your\s+life\b/giu,canonical:'Lip Sync for Your Life'},
- {id:'lip-sync-for-the-win',re:/\blip[ -]?sync\s+for\s+the\s+win\b/giu,canonical:'Lip Sync for the Win'},
- {id:'pit-crew',re:/\bpit\s+crew\b/giu,canonical:'Pit Crew'},
- {id:'rupaul',re:/\bru\s*paul\b/giu,canonical:'RuPaul'}
-]}];
+const PORT = Number(process.env.PORT || 10000);
+const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 
-const sleep=ms=>new Promise(r=>setTimeout(r,Math.max(0,Number(ms)||0)));
-const sha256=t=>crypto.createHash('sha256').update(String(t),'utf8').digest('hex');
-const randomId=(n=8)=>crypto.randomBytes(n).toString('hex');
-const getErrorMessage=e=>!e?'Erro desconhecido.':typeof e==='string'?e:(e.message||e.statusText||'Erro desconhecido.');
-function makeError(code,message,extra={}){const e=new Error(message);e.code=code;Object.assign(e,extra);return e;}
-const badModelOutputError=m=>makeError('BAD_MODEL_OUTPUT',m),badAuditOutputError=m=>makeError('BAD_AUDIT_OUTPUT',m),timestampIntegrityError=m=>makeError('TIMESTAMP_INTEGRITY_ERROR',m),protectedTermError=m=>makeError('PROTECTED_TERM_ERROR',m);
-const geminiRequestTimeoutError=k=>makeError('GEMINI_REQUEST_TIMEOUT',`Timeout da chamada Gemini (${k||'request'}).`,{requestKind:k||'request'});
-const jobCancelledError=(r='Job cancelado.')=>makeError('JOB_CANCELLED',String(r||'Job cancelado.'));
-function assertJobActive(j){if(j&&(j.cancelled||j.abortController?.signal?.aborted))throw jobCancelledError(j.cancelReason||'Job cancelado.');}
-function cleanBaseUrl(req){if(PUBLIC_URL)return PUBLIC_URL;return `${req.headers['x-forwarded-proto']||req.protocol||'https'}://${req.headers['x-forwarded-host']||req.get('host')}`;}
-function safeJson(res,data,status=200){res.status(status);res.set('Cache-Control','no-store, no-cache, must-revalidate');return res.json(data);}
-const jitterMs=b=>Math.floor(Math.max(1,b)*(.8+Math.random()*.4));
-const transientBackoffMs=a=>Math.min(TRANSIENT_BACKOFF_MAX_MS,jitterMs(TRANSIENT_BACKOFF_BASE_MS*Math.pow(2,Math.max(0,a-1))));
-const compactMediaContext=j=>String(j?.mediaContext||j?.videoId||'').replace(/[\u0000-\u001F\u007F]/g,' ').replace(/\s+/g,' ').trim().slice(0,300);
-const estimateTokensFromText=t=>Math.max(1,Math.ceil(String(t||'').length/3.5));
+const MISTRAL_API_KEY = String(process.env.MISTRAL_API_KEY || "").trim();
+const MISTRAL_MODEL = String(process.env.MISTRAL_MODEL || "mistral-medium-3-5").trim();
 
-function isAuthorizedLocalBridge(req){if(!LOCAL_BRIDGE_SECRET)return false;const auth=String(req.headers.authorization||'').trim(),exp=`Bearer ${LOCAL_BRIDGE_SECRET}`;if(!auth)return false;const a=Buffer.from(auth),b=Buffer.from(exp);return a.length===b.length&&crypto.timingSafeEqual(a,b);}
-async function fetchWithTimeout(url,options={},timeoutMs=SOURCE_FETCH_TIMEOUT_MS){const c=new AbortController(),timer=setTimeout(()=>c.abort(),timeoutMs);try{return await fetch(url,{...options,signal:c.signal});}finally{clearTimeout(timer);}}
+const GROQ_API_KEY = String(process.env.GROQ_API_KEY || "").trim();
+const GROQ_REVIEW_MODEL = String(
+    process.env.GROQ_REVIEW_MODEL ||
+    "groq/compound-mini"
+).trim();
 
-function cleanupMemory(){const now=Date.now();for(const[k,v]of translationCache)if(v.expiresAt<=now)translationCache.delete(k);for(const[k,v]of partialTranslationCache)if(v.expiresAt<=now)partialTranslationCache.delete(k);for(const[k,j]of jobs)if(j.expiresAt<=now&&!['processing','pending'].includes(j.status))jobs.delete(k);while(translationCache.size>MAX_CACHE_ENTRIES)translationCache.delete(translationCache.keys().next().value);while(partialTranslationCache.size>MAX_PARTIAL_CHECKPOINTS)partialTranslationCache.delete(partialTranslationCache.keys().next().value);while(jobs.size>MAX_JOBS){const k=jobs.keys().next().value,j=jobs.get(k);if(j&&['processing','pending'].includes(j.status))break;jobs.delete(k);}}
-setInterval(cleanupMemory,300000).unref();
-function setTranslationCache(key,srt){const now=Date.now();translationCache.set(key,{srt,version:TRANSLATION_CACHE_VERSION,contentAuditPassed:true,createdAt:now,expiresAt:now+CACHE_TTL_MS});partialTranslationCache.delete(`${FAST_CHECKPOINT_VERSION}:${key}`);cleanupMemory();}
-function getTranslationCache(key){const x=translationCache.get(key);if(!x)return null;if(x.version!==TRANSLATION_CACHE_VERSION||x.contentAuditPassed!==true||x.expiresAt<=Date.now()){translationCache.delete(key);return null;}return x.srt;}
-const partialCheckpointKey=k=>`${FAST_CHECKPOINT_VERSION}:${k}`;
-function getOrCreatePartialCheckpoint(cacheKey,blockCount,sourceSignature){const k=partialCheckpointKey(cacheKey);let x=partialTranslationCache.get(k);if(!x||x.blockCount!==blockCount||x.sourceSignature!==sourceSignature||x.expiresAt<=Date.now()){x={version:FAST_CHECKPOINT_VERSION,blockCount,sourceSignature,texts:new Array(blockCount),done:new Array(blockCount).fill(false),createdAt:Date.now(),updatedAt:Date.now(),expiresAt:Date.now()+PARTIAL_CHECKPOINT_TTL_MS};partialTranslationCache.set(k,x);}return x;}
-function writeCheckpointRange(cp,start,texts){for(let i=0;i<texts.length;i++){cp.texts[start+i]=texts[i];cp.done[start+i]=true;}cp.updatedAt=Date.now();cp.expiresAt=Date.now()+PARTIAL_CHECKPOINT_TTL_MS;}
-function checkpointRangeComplete(cp,start,len){for(let i=0;i<len;i++)if(!cp.done[start+i]||typeof cp.texts[start+i]!=='string')return false;return true;}
+// Mantido somente como rollback de emergência/manual.
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 
-function normalizeSrt(t){return String(t||'').replace(/^\uFEFF/,'').replace(/\r\n/g,'\n').replace(/\r/g,'\n').trim();}
-function stripCodeFences(t){return String(t||'').replace(/^```(?:json|srt|text|plaintext)?\s*/i,'').replace(/\s*```$/i,'').trim();}
-const newCharStats=()=>({controlChars:0,invisibleChars:0,normalizedSpaces:0,replacementChars:0,assTags:0,nfcChanges:0});
-function addCharStats(a,b){for(const k of Object.keys(a))a[k]+=Number(b?.[k]||0);return a;}
-function sanitizeSubtitleText(v){const s=newCharStats();let t=String(v??''),n=t.normalize('NFC');if(n!==t){s.nfcChanges++;t=n;}t=t.replace(/[\u00A0\u202F]/gu,()=>{s.normalizedSpaces++;return' ';}).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu,()=>{s.controlChars++;return'';}).replace(/[\u00AD\u200B\u2060\uFEFF\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,()=>{s.invisibleChars++;return'';}).replace(/\uFFFD/gu,()=>{s.replacementChars++;return'';}).replace(/\{\\[^}\r\n]*\}/gu,()=>{s.assTags++;return'';});t=t.split('\n').map(l=>l.replace(/[ \t]{2,}/g,' ').trimEnd()).join('\n').trim();return{text:t,stats:s};}
-const charStatsTotal=s=>Object.values(s).reduce((a,b)=>a+b,0);
-function logCharStats(stage,s){console.log(`[CLEAN CHAR] ${stage}: ${charStatsTotal(s)} ajuste(s); controles=${s.controlChars}, invisíveis=${s.invisibleChars}, espaços=${s.normalizedSpaces}, replacement=${s.replacementChars}, ASS=${s.assTags}, NFC=${s.nfcChanges}.`);}
-const SDH_CUE_WORDS=/laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough|laughs|sighs|gasps|applauds|cheering|singing/i;
-const PT_SDH_CUE_WORDS=/risad|ri[sd]o|suspir|ofeg|música|musica|aplaus|palmas|grit|sussurr|inaudível|inaudivel|indistint|tosse|engasga|cantando|canta|telefone|campainha|porta|barulho|som de/i;
-const SPEAKER_HINT_MARKER_REGEX=/^@@SPK:([^@]+)@@\s*/u;
-function normalizeSpeakerHint(v){const s=String(v||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();return !s||s.length>60||SDH_CUE_WORDS.test(s)||/[!?;]/u.test(s)?'':s;}
-const encodeSpeakerHint=s=>encodeURIComponent(String(s||''));
-function decodeSpeakerHint(s){try{return normalizeSpeakerHint(decodeURIComponent(String(s||'')));}catch{return'';}}
-function extractSpeakerHint(line){const o=String(line||''),h=o.match(SPEAKER_HINT_MARKER_REGEX);if(h)return{speaker:decodeSpeakerHint(h[1]),lineForCleaning:o.replace(SPEAKER_HINT_MARKER_REGEX,'')};const b=o.match(/^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*:?[ \t]*/u);if(b){const s=normalizeSpeakerHint(b[1]);if(s&&!SDH_CUE_WORDS.test(b[1]))return{speaker:s,lineForCleaning:o.replace(b[0],'')};}const c=o.match(/^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50}):\s+(?=\S)/u);if(c){const s=normalizeSpeakerHint(c[1]);if(s)return{speaker:s,lineForCleaning:o.replace(c[0],'')};}return{speaker:'',lineForCleaning:o};}
-function normalizeVocalElongationsHard(t){let r=String(t??'');r=r.replace(/([A-Za-zÀ-ÖØ-öø-ÿ])(?:\s*[-–—~]\s*\1){1,}/giu,'$1');r=r.replace(/([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{2,}/gu,'$1');r=r.replace(/([A-Za-zÀ-ÖØ-öø-ÿ])(?:\s+\1){2,}/giu,'$1');return r;}
-function cleanDialogueLine(line){let t=String(line||'').trim();if(!t)return'';t=t.replace(/\s*\[[^\]]+\]\s*/gu,' ').replace(/\s*\(([^)]*)\)\s*/gu,(m,x)=>SDH_CUE_WORDS.test(String(x||''))?' ':m).replace(/^\s*[-–—]?\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{0,30}:\s+(?=\S)/u,'').replace(/[♪♫♬]/gu,' ');t=normalizeVocalElongationsHard(t).replace(/[ \t]{2,}/g,' ').trim();return /^[-–—♪♫♬\s]*$/u.test(t)?'':t;}
-const TIMING_LINE_REGEX=/^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
-const extractTimingLines=s=>String(s||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').map(x=>x.trim()).filter(x=>TIMING_LINE_REGEX.test(x));
-const timingSignature=x=>sha256(JSON.stringify(x)).slice(0,16);
-function auditCleaningTimestamps(rawSrt,cleanedSrt,label='SOURCE'){const raw=extractTimingLines(rawSrt),clean=extractTimingLines(cleanedSrt);let c=0;for(let i=0;i<clean.length;i++){while(c<raw.length&&raw[c]!==clean[i])c++;if(c>=raw.length)throw timestampIntegrityError(`Auditoria de timestamps falhou na limpeza (${label}) no bloco preservado ${i+1}.`);c++;}console.log(`[AUDIT TIMESTAMP] ${label} RAW->CLEAN: OK — ${clean.length}/${raw.length} timing(s) preservado(s) exatamente; removidos=${raw.length-clean.length}; assinatura=${timingSignature(clean)}.`);return true;}
-function parseSrt(srt){const n=normalizeSrt(srt);if(!n)return[];const out=[];for(const rb of n.split(/\n{2,}/).map(x=>x.trim()).filter(Boolean)){const l=rb.split('\n');if(l.length<3)continue;const idx=l[0].trim(),tim=l[1].trim();if(!/^\d+$/.test(idx)||!TIMING_LINE_REGEX.test(tim))continue;const tx=l.slice(2);let sp='';if(tx.length){const m=tx[0].match(SPEAKER_HINT_MARKER_REGEX);if(m){sp=decodeSpeakerHint(m[1]);tx[0]=tx[0].replace(SPEAKER_HINT_MARKER_REGEX,'');}}out.push({index:Number(idx),timing:tim,text:tx.join('\n'),speakerHint:sp||null});}return out;}
-function auditFinalTimestamps(sourceSrt,finalSrt,label='FINAL'){const a=parseSrt(sourceSrt),b=parseSrt(finalSrt);if(a.length!==b.length)throw timestampIntegrityError(`Auditoria de timestamps falhou (${label}): fonte=${a.length}, final=${b.length}.`);for(let i=0;i<a.length;i++)if(a[i].index!==b[i].index||a[i].timing!==b[i].timing)throw timestampIntegrityError(`Auditoria de timestamps falhou (${label}) no bloco ${i+1}.`);console.log(`[AUDIT TIMESTAMP] ${label}: OK — ${a.length}/${a.length} bloco(s), 0 alteração(ões), assinatura=${timingSignature(a.map(x=>[x.index,x.timing]))}.`);return true;}
-function cleanSrtForTranslation(srt){const n=normalizeSrt(srt);if(!n)return'';const raw=n.split(/\n{2,}/),out=[];let removed=0,changed=0,speakers=0,elong=0;const stats=newCharStats();for(const rb of raw){const lines=rb.trim().split('\n'),ti=lines.findIndex(x=>/-->/.test(x));if(ti<0)continue;const timing=lines[ti].trim(),dialog=[],sp=new Set();for(const line of lines.slice(ti+1)){const si=extractSpeakerHint(line);if(si.speaker)sp.add(si.speaker);const pre=cleanDialogueLine(si.lineForCleaning),san=sanitizeSubtitleText(pre);addCharStats(stats,san.stats);const cl=normalizeVocalElongationsHard(san.text);if(cl!==san.text)elong++;if(cl!==line.trim())changed++;if(cl)dialog.push(cl);}if(!dialog.length){removed++;continue;}if(sp.size===1){dialog[0]=`@@SPK:${encodeSpeakerHint([...sp][0])}@@ ${dialog[0]}`;speakers++;}out.push({timing,dialog});}const r=out.map((b,i)=>[i+1,b.timing,...b.dialog].join('\n')).join('\n\n').trim(),final=r?r+'\n':'';console.log(`[CLEAN] SDH/CC: ${raw.length} -> ${out.length} blocos; ${removed} removidos; ${changed} linha(s) alterada(s).`);console.log(`[CLEAN] Contexto de falante: ${speakers} bloco(s) preservado(s) SOMENTE como contexto oculto.`);console.log(`[CLEAN] Alongamentos vocais na fonte: ${elong} linha(s) normalizada(s).`);logCharStats('FONTE',stats);if(final)auditCleaningTimestamps(n,final,'FONTE');return final;}
+const GEMINI_MODEL = String(
+    process.env.GEMINI_MODEL ||
+    "gemini-3.5-flash-lite"
+).trim();
 
-const COMMON_NON_SPEAKER_PREFIXES=new Set(['sim','não','nao','olha','bom','bem','então','entao','tipo','gente','cara','amor','enfim','atenção','atencao','exemplo','resposta','pergunta','motivo','problema','verdade','sério','serio','calma','agora','depois','antes','hoje','amanhã','amanha','ontem','aqui','ali','isso','aquilo']);
-function looksLikeSpeakerLabelPrefix(p){const v=String(p||'').replace(/\s+/g,' ').trim();if(!v||v.length>42||/[!?;=<>\[\]{}]/u.test(v)||COMMON_NON_SPEAKER_PREFIXES.has(v.toLocaleLowerCase('pt-BR')))return false;const w=v.split(/\s+/).filter(Boolean);if(w.length<1||w.length>5)return false;return w.every(x=>{const c=x.replace(/[.'’'-]/g,'');return !c||/^[A-ZÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ][A-Za-zÀ-ÖØ-öø-ÿ]*$/u.test(c)||/^[A-ZÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ]{2,}$/u.test(c);});}
-function stripTranslatedAnnotations(text){let r=String(text??''),annotationsRemoved=0,speakerLabelsRemoved=0,musicSymbolsRemoved=0;r=r.replace(/<[^>\n]{1,80}>/gu,'').replace(/\{[^}\n]{1,100}\}/gu,'').replace(/\[[^\]\n]{1,100}\]\s*:?\s*/gu,()=>{annotationsRemoved++;return' ';}).replace(/[♪♫♬]+/gu,()=>{musicSymbolsRemoved++;return' ';}).replace(/\(([^)\n]{1,90})\)\s*:?\s*/gu,(m,x)=>{const v=String(x||'');if(SDH_CUE_WORDS.test(v)||PT_SDH_CUE_WORDS.test(v)||looksLikeSpeakerLabelPrefix(v)){annotationsRemoved++;return' ';}return m;});r=r.split('\n').map(line=>{let c=line;for(let p=0;p<2;p++){const m=c.match(/^\s*[-–—]?\s*([^:\n]{1,42}):\s+(.*)$/u);if(!m||!looksLikeSpeakerLabelPrefix(m[1]))break;c=m[2];speakerLabelsRemoved++;}return c;}).join('\n');return{text:r,annotationsRemoved,speakerLabelsRemoved,musicSymbolsRemoved};}
-function cleanTranslatedDialogueMarkers(t){const n=String(t??'').replace(/\r\n/g,'\n').replace(/\r/g,'\n'),l=n.split('\n'),re=/^\s*[-–—/]+\s+(?=\S)/u;let m=0,e=0;for(const x of l){if(x.trim())e++;if(re.test(x))m++;}return e>=2&&m>=2?n:l.map(x=>x.replace(re,'')).join('\n');}
-function finalizeTranslatedText(t){const s=sanitizeSubtitleText(String(t??'')),st=stripTranslatedAnnotations(s.text);let r=cleanTranslatedDialogueMarkers(normalizeVocalElongationsHard(st.text));r=r.split('\n').map(x=>x.replace(/[ \t]{2,}/g,' ').trim()).filter(Boolean).join('\n');return sanitizeSubtitleText(r).text;}
-function finalizeAllTranslatedTexts(texts){const stats=newCharStats();let ch=0,vo=0,ma=0,ab=0,an=0,sp=0,mu=0;const out=texts.map(t=>{const o=String(t??''),s=sanitizeSubtitleText(o);addCharStats(stats,s.stats);if(s.text!==o)ch++;const st=stripTranslatedAnnotations(s.text);if(st.annotationsRemoved||st.speakerLabelsRemoved||st.musicSymbolsRemoved)ab++;an+=st.annotationsRemoved;sp+=st.speakerLabelsRemoved;mu+=st.musicSymbolsRemoved;const v=normalizeVocalElongationsHard(st.text);if(v!==st.text)vo++;const m=cleanTranslatedDialogueMarkers(v);if(m!==v)ma++;return sanitizeSubtitleText(m.split('\n').map(x=>x.replace(/[ \t]{2,}/g,' ').trim()).filter(Boolean).join('\n')).text;});logCharStats(`TRADUÇÃO (${ch} bloco(s) alterado(s))`,stats);console.log(`[CLEAN] Alongamentos vocais traduzidos: ${vo} bloco(s) ajustado(s) — representação de nota segurada BLOQUEADA.`);console.log(`[CLEAN] Marcadores de diálogo: ${ma} bloco(s) ajustado(s).`);console.log(`[CLEAN META] ${ab} bloco(s) limpos; anotações=${an}, speaker-labels=${sp}, símbolos-musicais=${mu}.`);return out;}
-const buildSrt=(blocks,texts)=>blocks.map((b,i)=>[b.index,b.timing,texts[i]??b.text].join('\n')).join('\n\n').trim()+'\n';
+const TRANSLATION_CACHE_VERSION = "6.0";
 
-function applicableProtectedGlossaries(job){const m=compactMediaContext(job);return PROTECTED_GLOSSARIES.filter(g=>g.media.test(m));}
-function protectedMatchesForBlock(block,job){const text=String(block?.text||''),out=[];for(const g of applicableProtectedGlossaries(job))for(const term of g.terms){term.re.lastIndex=0;let m;while((m=term.re.exec(text))!==null){out.push({glossaryId:g.id,termId:term.id,sourceSurface:m[0],canonical:term.canonical||m[0]});if(m[0]==='')term.re.lastIndex++;}}return out;}
-const normalizeProtectedCompare=v=>String(v||'').normalize('NFC').replace(/[‐-‒–—]/g,'-').replace(/\s+/g,' ').trim().toLocaleLowerCase('en-US');
-function translatedContainsProtectedTerm(text,m){const h=normalizeProtectedCompare(text);return h.includes(normalizeProtectedCompare(m.canonical))||h.includes(normalizeProtectedCompare(m.sourceSurface));}
-function protectedTermViolationIndices(blocks,texts,job){const out=[];for(let i=0;i<blocks.length;i++){const m=protectedMatchesForBlock(blocks[i],job);if(m.length&&m.some(x=>!translatedContainsProtectedTerm(texts[i],x)))out.push(i);}return out;}
-function protectedTermOccurrenceIndices(blocks,job){const out=[];for(let i=0;i<blocks.length;i++)if(protectedMatchesForBlock(blocks[i],job).length)out.push(i);return out;}
-function protectedTermsForPrompt(blocks,job){const out=[];for(const b of blocks){const m=protectedMatchesForBlock(b,job);if(m.length)out.push({i:b.index,keep:[...new Set(m.map(x=>x.canonical))]});}return out;}
-function assertProtectedTerms(blocks,texts,job,label='FINAL'){const v=protectedTermViolationIndices(blocks,texts,job);if(v.length)throw protectedTermError(`${label}: termo(s) protegido(s) ausente(s)/traduzido(s) nos IDs ${v.slice(0,12).map(i=>blocks[i].index).join(', ')}.`);const n=protectedTermOccurrenceIndices(blocks,job).length;if(n)console.log(`[PROTECTED TERMS] ${label}: OK — ${n} bloco(s) com bordão/marca protegida.`);return true;}
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
 
-function splitIntoBatches(blocks){const out=[];let cur=[],chars=0;for(const b of blocks){const n=String(b.text||'').length+24;if(cur.length&&(cur.length>=MAX_BATCH_BLOCKS||chars+n>MAX_BATCH_CHARS)){out.push(cur);cur=[];chars=0;}cur.push(b);chars+=n;}if(cur.length)out.push(cur);return out;}
-function cancelJobOperations(job,reason){if(!job||job.cancelled)return;job.cancelled=true;job.cancelReason=getErrorMessage(reason||'Job cancelado.');try{job.abortController?.abort();}catch{}let removed=0;for(let i=geminiQueue.length-1;i>=0;i--){const x=geminiQueue[i];if(x?.job===job){geminiQueue.splice(i,1);removed++;try{x.reject(jobCancelledError(job.cancelReason));}catch{}}}if(removed)console.warn(`[CANCEL] Job ${job.id}: ${removed} request(s) pendente(s) removida(s) da fila Gemini.`);}
+const MISTRAL_TIMEOUT_MS = Number(
+    process.env.MISTRAL_TIMEOUT_MS ||
+    120_000
+);
 
-const getCooldownRemaining=()=>Math.max(0,geminiCooldownUntil-Date.now());
-function setGeminiCooldown(ms,reason='quota'){const n=Math.min(Math.max(Number(ms)||30000,1000),MAX_RATE_LIMIT_COOLDOWN_MS);geminiCooldownUntil=Math.max(geminiCooldownUntil,Date.now()+n);console.log(`[GEMINI] Cooldown global (${reason}) de ${Math.ceil(n/1000)}s; job permanece vivo.`);}
-function pruneRequestStarts(now=Date.now()){while(geminiRequestStarts.length&&now-geminiRequestStarts[0]>=RPM_WINDOW_MS)geminiRequestStarts.shift();while(geminiTokenStarts.length&&now-geminiTokenStarts[0].at>=RPM_WINDOW_MS)geminiTokenStarts.shift();}
-const currentEstimatedTokensInWindow=()=>geminiTokenStarts.reduce((s,x)=>s+x.tokens,0);
-function effectiveRpmLimit(){return Number.isFinite(observedRpmLimit)&&observedRpmLimit>0?Math.max(1,Math.min(SAFE_RPM,Math.floor(observedRpmLimit*.93))):SAFE_RPM;}
-const effectiveMinIntervalMs=()=>Math.max(MIN_REQUEST_INTERVAL_MS,Math.ceil(60000/effectiveRpmLimit()));
-function parseDurationMs(v){if(v==null)return 0;if(typeof v==='number'&&Number.isFinite(v))return Math.max(0,v*1000);if(typeof v==='object'){const s=Number(v.seconds||0),n=Number(v.nanos||0);if(Number.isFinite(s)&&Number.isFinite(n))return Math.max(0,s*1000+n/1e6);}const m=String(v).trim().match(/^(\d+(?:\.\d+)?)s$/i);return m?Math.ceil(Number(m[1])*1000):0;}
-function quotaDetailsFromErrorData(d){const details=Array.isArray(d?.error?.details)?d.error.details:[],violations=[];let retryMs=0;for(const x of details){const t=String(x?.['@type']||x?.type||'');if(/RetryInfo/i.test(t)||x?.retryDelay)retryMs=Math.max(retryMs,parseDurationMs(x.retryDelay));if(/QuotaFailure/i.test(t)&&Array.isArray(x?.violations))violations.push(...x.violations);}return{violations,retryMs};}
-function classifyQuotaViolation(v,msg,code,status){const s=[msg,code,status,...v.flatMap(x=>[x?.quotaId,x?.quotaMetric,x?.description,JSON.stringify(x?.quotaDimensions||{})])].join(' ').toLowerCase();if(/quota_exceeded|per.?day|requests.?per.?day|rpd|daily|day.*quota|quota.*day/.test(s))return'rpd';if(/token|tpm|input.?token|tokens.?per.?minute/.test(s))return'tpm';if(/request.*per.*minute|per.?minute.*request|rpm|requests.?per.?minute/.test(s))return'rpm';if(/rate_limit_exceeded/.test(s))return'rate';if(/resource_exhausted|resource has been exhausted|capacity|overload/.test(s))return'capacity';return'unknown';}
-function numericQuotaValue(v){if(typeof v==='number'&&Number.isFinite(v))return v;const m=String(v??'').match(/[\d.]+/);if(!m)return null;const n=Number(m[0]);return Number.isFinite(n)?n:null;}
-function learnQuotaLimits(v,kind){for(const x of v){const n=numericQuotaValue(x?.quotaValue);if(!n||n<=0)continue;const s=`${x?.quotaId||''} ${x?.quotaMetric||''}`.toLowerCase();if(kind==='rpm'||/request.*minute|rpm/.test(s))observedRpmLimit=observedRpmLimit==null?n:Math.min(observedRpmLimit,n);if(kind==='tpm'||/token.*minute|input.?token|tpm/.test(s))observedInputTpmLimit=observedInputTpmLimit==null?n:Math.min(observedInputTpmLimit,n);}}
-function quotaBackoffMs(e,a){if(e?.retryAfterMs>0)return Math.min(e.retryAfterMs,MAX_RATE_LIMIT_COOLDOWN_MS);if(['rpm','tpm','rate'].includes(e?.quotaKind))return Math.min(65000,15000*Math.max(1,a));return Math.min(60000,jitterMs(5000*Math.pow(2,Math.min(4,Math.max(0,a-1)))));}
-async function sleepAbortable(ms,job){assertJobActive(job);const sig=job?.abortController?.signal;await new Promise((resolve,reject)=>{let done=false;const finish=(fn,v)=>{if(done)return;done=true;clearTimeout(timer);try{sig?.removeEventListener('abort',onAbort);}catch{}fn(v);},onAbort=()=>finish(reject,jobCancelledError(job?.cancelReason||'Job cancelado.')),timer=setTimeout(()=>finish(resolve),Math.max(0,Number(ms)||0));if(sig){if(sig.aborted)onAbort();else sig.addEventListener('abort',onAbort,{once:true});}});assertJobActive(job);}
-async function acquireGeminiRateSlot(job,estimatedTokens=1){let resolveOuter,rejectOuter;const outer=new Promise((r,j)=>{resolveOuter=r;rejectOuter=j;});rateSlotChain=rateSlotChain.catch(()=>{}).then(async()=>{try{for(;;){assertJobActive(job);const now=Date.now();pruneRequestStarts(now);const cd=getCooldownRemaining();if(cd>0){console.log(`[GEMINI] Fila aguardando cooldown de ${Math.ceil(cd/1000)}s.`);await sleepAbortable(cd,job);continue;}let wait=0,limit=effectiveRpmLimit(),gap=effectiveMinIntervalMs();if(lastGeminiRequestAt>0)wait=Math.max(wait,gap-(now-lastGeminiRequestAt));if(geminiRequestStarts.length>=limit)wait=Math.max(wait,RPM_WINDOW_MS-(now-geminiRequestStarts[0])+75);if(Number.isFinite(observedInputTpmLimit)&&observedInputTpmLimit>0){const budget=Math.max(1,Math.floor(observedInputTpmLimit*.88)),used=currentEstimatedTokensInWindow();if(used>0&&used+estimatedTokens>budget&&geminiTokenStarts.length)wait=Math.max(wait,RPM_WINDOW_MS-(now-geminiTokenStarts[0].at)+100);}if(wait>0){await sleepAbortable(wait,job);continue;}const at=Date.now();geminiRequestStarts.push(at);geminiTokenStarts.push({at,tokens:Math.max(1,estimatedTokens)});lastGeminiRequestAt=at;resolveOuter();return;}}catch(e){rejectOuter(e);}});return outer;}
-function retryAfterHeaderMs(r){const h=r?.headers?.get('retry-after');if(!h)return 0;const n=Number(h);if(Number.isFinite(n)&&n>0)return Math.min(n*1000,MAX_RATE_LIMIT_COOLDOWN_MS);const d=Date.parse(h);return Number.isFinite(d)?Math.min(Math.max(0,d-Date.now()),MAX_RATE_LIMIT_COOLDOWN_MS):0;}
-function retryAfterMessageMs(msg){const s=String(msg||'');let m=s.match(/retry in\s+([\d.]+)s/i);if(m)return Math.min((Number(m[1])+1)*1000,MAX_RATE_LIMIT_COOLDOWN_MS);m=s.match(/retry in\s+(\d+)m\s*(\d+(?:\.\d+)?)?s?/i);return m?Math.min((Number(m[1])*60+Number(m[2]||0)+1)*1000,MAX_RATE_LIMIT_COOLDOWN_MS):0;}
-const isTransientHttpStatus=s=>[408,409,425,429,500,502,503,504].includes(s);
-function isTransientGeminiError(e){return !!e&&(e.code==='GEMINI_REQUEST_TIMEOUT'||e.name==='AbortError'||e.transient===true||isTransientHttpStatus(Number(e.status))||/timeout|timed out|network|fetch failed|socket|ECONNRESET|ETIMEDOUT|EAI_AGAIN|temporar|unavailable|deadline/i.test(getErrorMessage(e)));}
+const GROQ_REVIEW_TIMEOUT_MS = Number(
+    process.env.GROQ_REVIEW_TIMEOUT_MS ||
+    90_000
+);
 
-function translationSystemPrompt(){return 'Você é um tradutor e localizador profissional de legendas para Português do Brasil, padrão premium de streaming. Leia TODO o lote e o contexto antes de responder. Entenda cena, interlocutores, humor, época, intenção, referências e continuidade. Cada ID é unidade ATÔMICA: nenhum conteúdo pode migrar para ID anterior/seguinte. Prioridade: ID correto → sentido/intenção → contexto → gênero/pronome correto → voz → naturalidade PT-BR atual → humor/ritmo → literalidade. Faça revisão silenciosa de CADA tradução e descarte escolhas sem nexo, artificiais, datadas ou incompatíveis com a cena. NÃO invente gênero. Inglês you/your é neutro: sem evidência contextual, escreva PT-BR natural sem flexão desnecessária. Se o contexto identifica homem, não o trate no feminino; se identifica mulher, não a trate no masculino. speaker é contexto oculto e NUNCA pode aparecer. É proibido [Nome]:, NOME:, JURADO:, PARTICIPANTE:, SDH/CC, [risos], [música], (cantando), ♪♫♬ ou explicações. É proibido representar nota/canto alongado: nada de casa-a-a-a, amooooor etc.; escreva a palavra normal. TERMOS PROTEGIDOS são invioláveis: marcas, bordões, slogans, títulos de desafios/segmentos e neologismos intencionais da franquia permanecem na forma indicada em keep. Nunca invente tradução criativa de bordão só para aportuguesar. Se catchphrase/neologismo não tem forma PT-BR oficial claramente consagrada, preserve o original. Condragulations permanece Condragulations; nunca crie Parabenações. Evite palavra-por-palavra, falsos cognatos, dublagem antiga e termos deslocados. Não force memes/gírias: contemporâneo significa natural. Em contexto LGBTQIAPN+, queer, drag, ballroom, camp, shade e cultura pop, preserve identidade, pronome, ironia, afeto, provocação e intensidade. Vocativos como girl, bitch, honey, sis, queen, baby e babe são contextuais. Adapte idiomatismos/piadas quando preserva melhor o efeito; não censure palavrões. Antes de enviar, confirme silenciosamente em cada ID: conteúdo certo, sentido na cena, gênero sustentado, vocabulário atual, zero metadado, zero alongamento e todos os keep preservados. Entrada: b=[i,l,x,s?]. Retorne SOMENTE JSON na ordem recebida, i=id, l=lock, t=tradução; preserve i/l.';}
-function auditSystemPrompt(){return 'Você é revisor bilíngue independente EN→PT-BR. NÃO reescreva na resposta. Cada registro: i=id,l=lock,s=source,t=translation,c=contexto temporal real ±2 blocos,k=termos protegidos. Primeiro FRONTEIRA: t deve corresponder exclusivamente a s; conteúdo deslocado ao vizinho imediato => m=ID vizinho,f=false. Depois CONTEXTO: sentido, intenção, humor, registro, relação, naturalidade atual, falsas equivalências e escolha lexical. GÊNERO: homem claramente no feminino ou mulher no masculino => f=false; fonte neutra com gênero inventado sem sustentação em c => f=false. TERMOS PROTEGIDOS: todo k deve permanecer exato/reconhecível; bordão/marca traduzido inventivamente => f=false. Speaker-label, SDH/CC, som ou alongamento gráfico => f=false. Aceite localização/gíria/drag/camp/shade quando natural e fiel. m só pode ser i ou ID imediatamente adjacente presente em c. Se tudo correto, m=i,f=true. Preserve i/l. Retorne somente JSON.';}
-function blockTranslationLock(b){return sha256(JSON.stringify([BLOCK_LOCK_VERSION,Number(b?.index),String(b?.timing??''),String(b?.text??''),String(b?.speakerHint??'')])).slice(0,12);}
-const contextBlockPayload=b=>b?[b.index,b.text]:null;
-function buildTranslationPrompt(blocks,context={},options={},job=null){const items=blocks.map(b=>{const x=[b.index,blockTranslationLock(b),b.text];if(b.speakerHint)x.push(b.speakerHint);return x;});let mode='TRADUÇÃO PREMIUM CONTEXTUAL. Leia o lote inteiro, mas mantenha cada ID semanticamente isolado.';if(options.strictStructure)mode='REPETIÇÃO ESTRUTURAL. Traduza todos os itens exatamente uma vez; preserve ordem/i/l; não omita nem duplique.';if(options.repairMode)mode='REPARO CIRÚRGICO. Corrija SOMENTE b: sentido, gênero, naturalidade, bordões protegidos e fronteira; não absorva p/n.';const media=compactMediaContext(job),pt=protectedTermsForPrompt(blocks,job);return `${mode}\n${media?`MÍDIA/RELEASE (pista contextual; não invente fatos): ${media}\n`:''}QUANTIDADE OBRIGATÓRIA NA RESPOSTA: ${blocks.length}.\n${pt.length?`TERMOS PROTEGIDOS POR ID — keep deve ser copiado sem tradução: ${JSON.stringify(pt)}\n`:''}p/n são contexto externo. b=[i,l,x,s?]. SAÍDA EXATA: [{"i":123,"l":"abc","t":"..."}]\n${JSON.stringify({p:contextBlockPayload(context.before),b:items,n:contextBlockPayload(context.after)})}`;}
-function requestTimeoutForKind(k){return k==='semantic-audit'?SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS:k==='translation-structure-retry'?STRUCTURE_RETRY_TIMEOUT_MS:k==='translation-rescue'?RESCUE_TRANSLATION_REQUEST_TIMEOUT_MS:k==='translation-repair'?REPAIR_TRANSLATION_REQUEST_TIMEOUT_MS:k==='translation-single'?SINGLE_TRANSLATION_REQUEST_TIMEOUT_MS:TRANSLATION_REQUEST_TIMEOUT_MS;}
-function translationResponseSchema(n){return{type:'ARRAY',minItems:n,maxItems:n,items:{type:'OBJECT',propertyOrdering:['i','l','t'],properties:{i:{type:'INTEGER'},l:{type:'STRING'},t:{type:'STRING'}},required:['i','l','t'],additionalProperties:false}};}
-function auditResponseSchema(n){return{type:'ARRAY',minItems:n,maxItems:n,items:{type:'OBJECT',propertyOrdering:['i','l','m','f'],properties:{i:{type:'INTEGER'},l:{type:'STRING'},m:{type:'INTEGER'},f:{type:'BOOLEAN'}},required:['i','l','m','f'],additionalProperties:false}};}
-async function rawGeminiRequest(prompt,kind,job,expectedItems){if(!GEMINI_API_KEY)throw new Error('GEMINI_API_KEY não configurada.');assertJobActive(job);const endpoint=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,audit=kind==='semantic-audit',sys=audit?auditSystemPrompt():translationSystemPrompt(),body={systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{thinkingConfig:{thinkingLevel:'MINIMAL'},responseMimeType:'application/json',responseSchema:audit?auditResponseSchema(expectedItems):translationResponseSchema(expectedItems),maxOutputTokens:audit?AUDIT_MAX_OUTPUT_TOKENS:MAX_OUTPUT_TOKENS}},c=new AbortController();let timed=false,aborted=false;const onAbort=()=>{aborted=true;c.abort();},sig=job?.abortController?.signal;if(sig){if(sig.aborted)onAbort();else sig.addEventListener('abort',onAbort,{once:true});}const timer=setTimeout(()=>{timed=true;c.abort();},requestTimeoutForKind(kind));let response,raw;try{response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':GEMINI_API_KEY},body:JSON.stringify(body),signal:c.signal});raw=await response.text();}catch(e){if(aborted||job?.cancelled)throw jobCancelledError(job?.cancelReason||'Job cancelado.');if(timed)throw geminiRequestTimeoutError(kind);const w=new Error(getErrorMessage(e));w.transient=true;throw w;}finally{clearTimeout(timer);try{sig?.removeEventListener('abort',onAbort);}catch{}}assertJobActive(job);let data;try{data=JSON.parse(raw);}catch{const e=new Error(`Resposta não-JSON do Gemini. HTTP ${response.status}.`);e.status=response.status;e.transient=isTransientHttpStatus(response.status);throw e;}if(!response.ok){const msg=data?.error?.message||`HTTP ${response.status}`,code=data?.error?.code,status=data?.error?.status,{violations,retryMs}=quotaDetailsFromErrorData(data),qk=response.status===429?classifyQuotaViolation(violations,msg,code,status):'none';if(response.status===429)learnQuotaLimits(violations,qk);const first=violations[0]||{},e=new Error(msg);Object.assign(e,{status:response.status,apiCode:code,apiStatus:status,quota:response.status===429,quotaKind:qk,quotaViolations:violations,quotaId:String(first?.quotaId||''),quotaMetric:String(first?.quotaMetric||''),retryAfterMs:Math.max(retryAfterHeaderMs(response),retryMs,retryAfterMessageMs(msg)),dailyQuota:qk==='rpd',transient:isTransientHttpStatus(response.status)&&qk!=='rpd'});throw e;}const text=data?.candidates?.[0]?.content?.parts?.map(p=>p?.text||'').join('').trim();if(!text){const e=new Error('Gemini não retornou conteúdo.');e.transient=true;throw e;}return text;}
+const MAX_TRANSLATION_TIME_MS = Number(
+    process.env.MAX_TRANSLATION_TIME_MS ||
+    480_000
+);
 
-function kindPriorityBoost(k){return k==='translation-repair'?35:k==='semantic-audit'?25:k==='translation-structure-retry'?18:['translation-rescue','translation-single'].includes(k)?15:0;}
-function itemPriorityScore(x,now=Date.now()){const base=Number(x?.job?.priority||0),kind=kindPriorityBoost(x?.requestKind),age=Math.min(45,Math.floor(Math.max(0,(now-x.enqueuedAt)/1000)/20));return base+kind+age;}
-function takeNextGeminiItem(){if(!geminiQueue.length)return null;const now=Date.now();let bi=0,bs=itemPriorityScore(geminiQueue[0],now);for(let i=1;i<geminiQueue.length;i++){const s=itemPriorityScore(geminiQueue[i],now);if(s>bs||(s===bs&&geminiQueue[i].sequence<geminiQueue[bi].sequence)){bi=i;bs=s;}}return geminiQueue.splice(bi,1)[0];}
-function enqueueGemini(prompt,requestKind,job,expectedItems){return new Promise((resolve,reject)=>{try{assertJobActive(job);}catch(e){reject(e);return;}const sys=requestKind==='semantic-audit'?auditSystemPrompt():translationSystemPrompt();geminiQueue.push({prompt,requestKind,job,expectedItems,estimatedTokens:estimateTokensFromText(prompt+sys),enqueuedAt:Date.now(),sequence:++geminiQueueSequence,resolve,reject});pumpGeminiQueue();});}
-function pumpGeminiQueue(){while(activeGeminiWorkers<GEMINI_CONCURRENCY&&geminiQueue.length){const item=takeNextGeminiItem();if(!item)return;activeGeminiWorkers++;runGeminiItem(item).catch(()=>{}).finally(()=>{activeGeminiWorkers--;pumpGeminiQueue();});}}
-async function runGeminiItem(item){let transientAttempt=0,quotaAttempt=0;try{for(;;){try{assertJobActive(item.job);await acquireGeminiRateSlot(item.job,item.estimatedTokens);assertJobActive(item.job);item.job.geminiRequestsUsed=Number(item.job.geminiRequestsUsed||0)+1;lifetimeGeminiRequests++;pruneRequestStarts();console.log(`[GEMINI] Request job=${item.job.geminiRequestsUsed} total=${lifetimeGeminiRequests} (${item.requestKind||'translation'}) | jobprio=${item.job.priority} | ativos=${activeGeminiWorkers}/${GEMINI_CONCURRENCY} | fila=${geminiQueue.length} | janela=${geminiRequestStarts.length}/${effectiveRpmLimit()}`);const out=await rawGeminiRequest(item.prompt,item.requestKind||'translation',item.job,item.expectedItems);item.resolve(out);return;}catch(e){if(e?.code==='JOB_CANCELLED'){item.reject(e);return;}if(e?.quota){quotaAttempt++;lastQuotaKind=e.quotaKind||'unknown';lastQuotaId=e.quotaId||'';lastQuotaMetric=e.quotaMetric||'';lastQuotaMessage=getErrorMessage(e).slice(0,500);console.warn(`[QUOTA] 429 | kind=${lastQuotaKind} | quotaId=${lastQuotaId||'(não informado)'} | metric=${lastQuotaMetric||'(não informado)'} | attempt=${quotaAttempt} | localWindow=${geminiRequestStarts.length}/${effectiveRpmLimit()} | observedRPM=${observedRpmLimit??'?'} | observedTPM=${observedInputTpmLimit??'?'}.`);if(e.dailyQuota){item.reject(makeError('DAILY_QUOTA_EXCEEDED',`Cota diária REAL do Gemini atingida; checkpoint preservado. ${getErrorMessage(e)}`,{quotaId:e.quotaId,quotaMetric:e.quotaMetric}));return;}const wait=quotaBackoffMs(e,quotaAttempt);setGeminiCooldown(wait,`429/${lastQuotaKind}`);await sleepAbortable(wait,item.job);continue;}if(isTransientGeminiError(e)&&transientAttempt<MAX_TRANSIENT_RETRIES){transientAttempt++;const wait=transientBackoffMs(transientAttempt);console.warn(`[GEMINI] Erro transitório (${item.requestKind||'translation'}): ${getErrorMessage(e)} | retry ${transientAttempt}/${MAX_TRANSIENT_RETRIES} em ${(wait/1000).toFixed(1)}s.`);await sleepAbortable(wait,item.job);continue;}item.reject(e);return;}}}catch(e){item.reject(e);}}
+const MAX_SOURCE_CHARS = 800_000;
 
-async function translateBatchOnce(blocks,context,job,options={}){const raw=await enqueueGemini(buildTranslationPrompt(blocks,context,options,job),options.requestKind||'translation',job,blocks.length);let parsed;try{parsed=JSON.parse(stripCodeFences(raw));}catch{throw badModelOutputError('Gemini retornou JSON inválido.');}if(!Array.isArray(parsed)||parsed.length!==blocks.length)throw badModelOutputError(`Quantidade incorreta de blocos: esperado=${blocks.length}, recebido=${Array.isArray(parsed)?parsed.length:0}.`);const seen=new Set(),texts=[];for(let i=0;i<blocks.length;i++){const b=blocks[i],lock=blockTranslationLock(b),x=parsed[i];if(!x||!Number.isInteger(x.i)||x.i!==b.index||seen.has(x.i)||x.l!==lock||typeof x.t!=='string'||!x.t.trim())throw badModelOutputError(`Contrato ID/lock inválido na posição ${i+1}; esperado ID ${b.index}.`);seen.add(x.i);texts.push(x.t);}console.log(`[AUDIT ID] OK — ${blocks.length}/${blocks.length} bloco(s); ordem, IDs, locks e cardinalidade preservados.`);return texts;}
-const contextForLocalSlice=(b,s,e,o)=>({before:s>0?b[s-1]:o?.before||null,after:e<b.length?b[e]:o?.after||null});
-const contextForGlobalWindow=(b,s,e)=>({before:s>0?b[s-1]:null,after:e<b.length-1?b[e+1]:null});
-function splitFixedRescueBatches(blocks){const out=[];let cur=[],chars=0;for(const b of blocks){const n=String(b.text||'').length+20;if(cur.length&&(cur.length>=RESCUE_BATCH_BLOCKS||chars+n>RESCUE_BATCH_CHARS)){out.push(cur);cur=[];chars=0;}cur.push(b);chars+=n;}if(cur.length)out.push(cur);return out;}
-const translateSingleLastChance=(b,c,j,repair=false)=>translateBatchOnce([b],c,j,{requestKind:repair?'translation-repair':'translation-single',strictStructure:true,repairMode:repair});
-async function translateRescueChunk(blocks,context,job,depth=0){try{return await translateBatchOnce(blocks,context,job,{requestKind:'translation-rescue',strictStructure:true});}catch(e){const reducible=e?.code==='BAD_MODEL_OUTPUT'||isTransientGeminiError(e);if(!reducible)throw e;if(blocks.length===1)return translateSingleLastChance(blocks[0],context,job,false);if(depth>=MAX_RESCUE_SPLIT_DEPTH)throw e;const m=Math.ceil(blocks.length/2),left=blocks.slice(0,m),right=blocks.slice(m);console.warn(`[RESCUE 6.7] ${blocks.length} -> ${left.length}+${right.length}.`);const[a,b]=await Promise.all([translateRescueChunk(left,contextForLocalSlice(blocks,0,m,context),job,depth+1),translateRescueChunk(right,contextForLocalSlice(blocks,m,blocks.length,context),job,depth+1)]);return[...a,...b];}}
-async function translateBatchRescue(blocks,context,job){const chunks=splitFixedRescueBatches(blocks);console.warn(`[RESCUE 6.7] ${blocks.length} bloco(s) -> ${chunks.length} micro-lote(s), máx ${RESCUE_BATCH_BLOCKS}/${RESCUE_BATCH_CHARS}.`);let cur=0;const tasks=chunks.map(ch=>{const s=cur;cur+=ch.length;return translateRescueChunk(ch,contextForLocalSlice(blocks,s,s+ch.length,context),job,0);});return(await Promise.all(tasks)).flat();}
-async function translateMainBatch(blocks,context,job){try{return await translateBatchOnce(blocks,context,job,{requestKind:'translation'});}catch(e){if(e?.code==='BAD_MODEL_OUTPUT'){console.warn(`[FAST 6.7] Contrato inválido em lote ${blocks.length}; UMA repetição estrutural.`);try{return await translateBatchOnce(blocks,context,job,{requestKind:'translation-structure-retry',strictStructure:true});}catch(r){if(r?.code!=='BAD_MODEL_OUTPUT'&&!isTransientGeminiError(r))throw r;console.warn(`[FAST 6.7] Repetição estrutural permaneceu inválida/lenta; RESCUE somente deste lote.`);return translateBatchRescue(blocks,context,job);}}if(isTransientGeminiError(e)){console.warn(`[FAST 6.7] Lote ${blocks.length} permaneceu lento; RESCUE menor.`);return translateBatchRescue(blocks,context,job);}throw e;}}
+const CACHE_TTL_MS =
+    7 * 24 * 60 * 60 * 1000;
 
-function normalizedRiskText(v){return String(v||'').replace(/<[^>]+>|\{[^}]+\}/g,' ').replace(/\s+/g,' ').trim();}
-const strongSentenceEnd=t=>/[.!?…]["'”’\)\]]*$/u.test(normalizedRiskText(t));
-function strictFragmentTail(t){const v=normalizedRiskText(t);return /[,;:–—-]\s*$/u.test(v)||/\b(?:and|but|or|because|so|to|of|for|with|that|which|who|when|if|than|as)\s*$/iu.test(v);}
-function startsLikeContinuation(t){const v=normalizedRiskText(t);return /^[a-z]/u.test(v)||/^(?:and|but|or|so|because|then|that|which|who|when|if|to|of|for|with)\b/iu.test(v);}
-function strongBoundaryRisk(a,b){if(!a||!b)return false;const l=normalizedRiskText(a.text),r=normalizedRiskText(b.text);return !!l&&!!r&&(strictFragmentTail(l)||(!strongSentenceEnd(l)&&l.length<=44&&startsLikeContinuation(r)));}
-function translationLengthRisk(a,b){const x=normalizedRiskText(a).length,y=normalizedRiskText(b).length;if(x<24||!y)return false;const r=y/x;return r<.24||r>4.2;}
-function suspiciousNeighborDuplicate(texts,i,blocks){const c=normalizedRiskText(texts[i]).toLowerCase();if(c.length<16)return false;for(const n of[i-1,i+1]){if(n<0||n>=texts.length)continue;const x=normalizedRiskText(texts[n]).toLowerCase(),s=normalizedRiskText(blocks[i]?.text).toLowerCase(),ns=normalizedRiskText(blocks[n]?.text).toLowerCase();if(c===x&&s!==ns)return true;}return false;}
-const PT_MALE=/\b(?:ele|dele|nele|aquele|garoto|menino|homem|moço|rapaz|senhor|pai|irmão|irmao|marido|namorado|filho)\b/iu,PT_FEMALE=/\b(?:ela|dela|nela|aquela|garota|menina|mulher|moça|senhora|mãe|mae|irmã|irma|esposa|namorada|filha)\b/iu,EN_MALE=/\b(?:he|him|his|man|boy|guy|male|father|brother|husband|boyfriend|son|mr\.?)\b/i,EN_FEMALE=/\b(?:she|her|hers|woman|girl|lady|female|mother|sister|wife|girlfriend|daughter|mrs\.?|ms\.?)\b/i;
-const PT_EXPLICIT_GENDER=new RegExp(`${PT_MALE.source}|${PT_FEMALE.source}`,'iu'),EN_EXPLICIT_GENDER=new RegExp(`${EN_MALE.source}|${EN_FEMALE.source}`,'i');
-function genderRiskScore(src,tr){const pt=normalizedRiskText(tr);if(!PT_EXPLICIT_GENDER.test(pt))return 0;return EN_EXPLICIT_GENDER.test(normalizedRiskText(src))?1:2;}
-function highConfidenceGenderContradiction(src,tr){const e=normalizedRiskText(src),p=normalizedRiskText(tr),em=EN_MALE.test(e),ef=EN_FEMALE.test(e),pm=PT_MALE.test(p),pf=PT_FEMALE.test(p);return (em&&!ef&&pf&&!pm)||(ef&&!em&&pm&&!pf);}
-function annotationOrStretchRisk(t){const v=String(t||'');return /\[[^\]]+\]/u.test(v)||/[♪♫♬]/u.test(v)||/([A-Za-zÀ-ÖØ-öø-ÿ])(?:\s*[-–—~]\s*\1){1,}/iu.test(v)||/([AEIOUÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜaeiouáàâãäéèêëíìîïóòôõöúùûü])\1{2,}/u.test(v);}
-function evenlySpacedIndices(len,target){if(len<=0||target<=0)return[];if(target>=len)return Array.from({length:len},(_,i)=>i);if(target===1)return[Math.floor((len-1)/2)];const s=new Set();for(let i=0;i<target;i++)s.add(Math.round(i*(len-1)/(target-1)));return[...s].sort((a,b)=>a-b);}
-function spreadPick(vals,target){const u=[...new Set(vals)].sort((a,b)=>a-b);return u.length<=target?u:evenlySpacedIndices(u.length,target).map(i=>u[i]);}
-const safeAuditTarget=n=>Math.min(n,Math.max(SAFE_AUDIT_MIN_RECORDS,Math.ceil(n*SAFE_AUDIT_RATIO)));
-function canaryTargetFor(n,k){return k==='embedded'?Math.min(n,Math.max(EMBEDDED_CANARY_MIN,Math.ceil(n/EMBEDDED_CANARY_EVERY))):Math.min(n,Math.max(OPENSUB_CANARY_MIN,Math.ceil(n/OPENSUB_CANARY_EVERY)));}
-function selectFinalAuditIndices(blocks,texts,boundaries,jobKind,job){const base=safeAuditTarget(blocks.length),canary=Math.min(base,canaryTargetFor(blocks.length,jobKind)),prot=protectedTermOccurrenceIndices(blocks,job),high=[],normal=[],contr=[],anom=[];for(let i=0;i<blocks.length;i++){const g=genderRiskScore(blocks[i]?.text,texts[i]);if(g>=2)high.push(i);else if(g===1)normal.push(i);if(highConfidenceGenderContradiction(blocks[i]?.text,texts[i]))contr.push(i);if(translationLengthRisk(blocks[i]?.text,texts[i])||suspiciousNeighborDuplicate(texts,i,blocks)||annotationOrStretchRisk(texts[i]))anom.push(i);}const mandatory=new Set([...prot,...high,...contr]),target=Math.min(blocks.length,Math.max(base,mandatory.size+canary)),sel=new Set(),reasons=new Map();const add=(i,r,force=false)=>{if(!Number.isInteger(i)||i<0||i>=blocks.length)return false;if(!force&&sel.size>=target&&!sel.has(i))return false;if(!sel.has(i)){sel.add(i);reasons.set(i,r);return true;}return false;};for(const i of prot)add(i,'protected-term',true);for(const i of contr)add(i,'gender-contradiction',true);for(const i of high)add(i,'gender-high',true);for(const i of evenlySpacedIndices(blocks.length,canary))add(i,'canary');for(const s of[...boundaries].sort((a,b)=>a-b)){add(s-1,'batch-boundary');add(s,'batch-boundary');}for(const i of anom)add(i,'anomaly');const reserve=Math.max(6,Math.floor(target*NORMAL_GENDER_RESERVE_RATIO));for(const i of spreadPick(normal.filter(i=>!sel.has(i)),reserve))add(i,'gender');const strong=[];for(let i=0;i<blocks.length-1;i++)if(strongBoundaryRisk(blocks[i],blocks[i+1]))strong.push(i,i+1);for(const i of spreadPick(strong.filter(i=>!sel.has(i)),Math.max(0,target-sel.size)))add(i,'strong-boundary');const indices=[...sel].sort((a,b)=>a-b),counts={};for(const i of indices){const r=reasons.get(i)||'unknown';counts[r]=(counts[r]||0)+1;}return{indices,counts,target,baseTarget:base,canaryTarget:canary,protectedCandidates:prot.length,highGenderCandidates:high.length,genderContradictions:contr.length,normalGenderCandidates:normal.length,strongCandidates:new Set(strong).size,anomalyCandidates:anom.length};}
-function contextWindowForAudit(blocks,texts,index,r=2){const out=[];for(let i=Math.max(0,index-r);i<=Math.min(blocks.length-1,index+r);i++){if(i===index)continue;const b=blocks[i],x=[b.index,b.text,texts[i]];if(b.speakerHint)x.push(b.speakerHint);out.push(x);}return out;}
-function buildAuditRecord(blocks,texts,index,job){const b=blocks[index];return{id:b.index,lock:blockTranslationLock(b),source:b.text,translation:texts[index],speaker:b.speakerHint||null,context:contextWindowForAudit(blocks,texts,index,2),protected:protectedMatchesForBlock(b,job).map(x=>x.canonical),_index:index};}
-function auditRecordForModel(r){const x={i:r.id,l:r.lock,s:r.source,t:r.translation,c:r.context};if(r.speaker)x.h=r.speaker;if(r.protected?.length)x.k=r.protected;return x;}
-function buildSemanticAuditPrompt(records,job){const media=compactMediaContext(job);return `AUDITORIA FINAL CIRÚRGICA. Verifique fronteira EN↔PT, sentido na cena, gênero/pronomes, naturalidade atual e termos protegidos. Use c como contexto real; não invente fatos. k é obrigatório e não pode ser traduzido/deformado. m só pode ser i ou ID imediatamente adjacente. ${media?`MÍDIA/RELEASE: ${media}. `:''}QUANTIDADE OBRIGATÓRIA: ${records.length}. SAÍDA EXATA: [{"i":123,"l":"abc","m":123,"f":true}]\n${JSON.stringify(records.map(auditRecordForModel))}`;}
-function allowedMatchedIds(r){const s=new Set([r.id]);for(const x of r.context||[]){const id=x?.[0];if(Number.isInteger(id)&&Math.abs(id-r.id)===1)s.add(id);}return s;}
+const JOB_TTL_MS =
+    24 * 60 * 60 * 1000;
 
-async function auditRecordsOnce(records,job){const raw=await enqueueGemini(buildSemanticAuditPrompt(records,job),'semantic-audit',job,records.length);let parsed;try{parsed=JSON.parse(stripCodeFences(raw));}catch{throw badAuditOutputError('Auditoria retornou JSON inválido.');}if(!Array.isArray(parsed)||parsed.length!==records.length)throw badAuditOutputError(`Auditoria incompleta: esperado=${records.length}, recebido=${Array.isArray(parsed)?parsed.length:0}.`);const failures=[],invalid=[];for(let i=0;i<records.length;i++){const r=records[i],x=parsed[i];if(!x||x.i!==r.id||x.l!==r.lock||!Number.isInteger(x.m)||typeof x.f!=='boolean'){invalid.push(r);continue;}if(!allowedMatchedIds(r).has(x.m)){console.warn(`[AUDIT 6.7] matchedSourceId inválido ${r.id}->${x.m}; rechecagem isolada.`);invalid.push(r);continue;}if(x.f!==true||x.m!==r.id)failures.push({id:r.id,matchedSourceId:x.m,faithful:x.f,_index:r._index});}const sample=failures.slice(0,8).map(x=>`${x.id}->${x.matchedSourceId}`).join(', ');if(failures.length)console.warn(`[AUDIT SAFE] ${failures.length}/${records.length} suspeito(s)${sample?`: ${sample}`:''}.`);else console.log(`[AUDIT SAFE] OK — ${records.length}/${records.length} bloco(s).`);return{failures,invalid};}
-async function auditRecordsResilient(records,job,cycle=0){try{return await auditRecordsOnce(records,job);}catch(e){const reducible=e?.code==='BAD_AUDIT_OUTPUT'||isTransientGeminiError(e);if(!reducible)throw e;if(records.length===1){if(cycle>=MAX_SINGLE_AUDIT_RECOVERY_CYCLES)throw e;const wait=2500+cycle*1500;console.warn(`[AUDIT 6.7] Auditoria de 1 ID transitória; ciclo ${cycle+1}/${MAX_SINGLE_AUDIT_RECOVERY_CYCLES}.`);await sleepAbortable(wait,job);return auditRecordsResilient(records,job,cycle+1);}const m=Math.ceil(records.length/2);console.warn(`[AUDIT 6.7] Chunk ${records.length} lento/inválido; reduzindo para ${m}+${records.length-m}.`);const[a,b]=await Promise.all([auditRecordsResilient(records.slice(0,m),job,0),auditRecordsResilient(records.slice(m),job,0)]);return{failures:[...a.failures,...b.failures],invalid:[...a.invalid,...b.invalid]};}}
-async function runAuditChunks(records,job,size=AUDIT_CHUNK_SIZE){if(!records.length)return{failures:[],invalid:[]};const chunks=[];for(let i=0;i<records.length;i+=size)chunks.push(records.slice(i,i+size));const r=await Promise.all(chunks.map(x=>auditRecordsResilient(x,job)));return{failures:r.flatMap(x=>x.failures),invalid:r.flatMap(x=>x.invalid)};}
-async function recheckRecordsInGroups(records,job,label){if(!records.length)return[];const chunks=[];for(let i=0;i<records.length;i+=RECHECK_GROUP_SIZE)chunks.push(records.slice(i,i+RECHECK_GROUP_SIZE));console.log(`[AUDIT SAFE] ${label}: rechecando ${records.length} registro(s) em ${chunks.length} grupo(s).`);const results=await Promise.all(chunks.map(x=>auditRecordsResilient(x,job))),fail=[];for(const r of results){fail.push(...r.failures);for(const x of r.invalid)fail.push({id:x.id,matchedSourceId:x.id,faithful:false,_index:x._index});}return fail;}
+const MAX_CACHE_ENTRIES = 200;
+const MAX_JOBS = 300;
 
-function buildRepairWindows(failures,blocks){const map=new Map(blocks.map((b,i)=>[b.index,i])),s=new Set();for(const f of failures){const a=map.get(f.id),b=map.get(f.matchedSourceId);if(Number.isInteger(a))s.add(a);if(Number.isInteger(a)&&Number.isInteger(b)&&Math.abs(a-b)<=1)s.add(b);}return windowsFromIndices([...s]);}
-function windowsFromIndices(indices){const sorted=[...new Set(indices)].sort((a,b)=>a-b),out=[];let cur=[];for(const i of sorted){if(!cur.length||(i<=cur[cur.length-1]+1&&cur.length<MAX_REPAIR_WINDOW_BLOCKS))cur.push(i);else{out.push(cur);cur=[i];}}if(cur.length)out.push(cur);return out;}
-function logRepairDetails(blocks,texts,indices,stage){for(const i of indices){const b=blocks[i];console.log(`[REPAIR DETAIL] ${stage} | ID=${b.index} | ${b.timing} | EN=${JSON.stringify(b.text)} | PT=${JSON.stringify(texts[i])}`);}}
-async function repairWindow(blocks,texts,indices,job){const rb=indices.map(i=>blocks[i]),ctx=contextForGlobalWindow(blocks,indices[0],indices[indices.length-1]);console.warn(`[REPAIR 6.7] IDs ${rb.map(x=>x.index).join(',')} (${rb.length}).`);logRepairDetails(blocks,texts,indices,'ANTES');let repaired;try{repaired=await translateBatchOnce(rb,ctx,job,{requestKind:'translation-repair',strictStructure:true,repairMode:true});}catch(e){if(e?.code!=='BAD_MODEL_OUTPUT'&&!isTransientGeminiError(e))throw e;console.warn('[REPAIR 6.7] Janela lenta/inválida; reparando por ID.');repaired=[];for(let k=0;k<rb.length;k++){const gi=indices[k],one=await translateSingleLastChance(rb[k],contextForGlobalWindow(blocks,gi,gi),job,true);repaired.push(one[0]);}}for(let k=0;k<indices.length;k++)texts[indices[k]]=finalizeTranslatedText(repaired[k]);logRepairDetails(blocks,texts,indices,'DEPOIS');}
-async function verifyRepairWindow(blocks,texts,indices,job){const rec=indices.map(i=>buildAuditRecord(blocks,texts,i,job));console.log(`[REPAIR VERIFY] Reauditando janela ${rec.map(x=>x.id).join(',')} (${rec.length}).`);const r=await auditRecordsResilient(rec,job),subBlocks=indices.map(i=>blocks[i]),subTexts=indices.map(i=>texts[i]),pv=protectedTermViolationIndices(subBlocks,subTexts,job);if(r.invalid.length||r.failures.length||pv.length){const ids=[...r.failures.map(x=>x.id),...r.invalid.map(x=>x.id),...pv.map(i=>blocks[indices[i]].index)];return{ok:false,ids:[...new Set(ids)]};}console.log(`[REPAIR VERIFY] OK — ${rec.length}/${rec.length} ID(s) aprovados.`);return{ok:true,ids:[]};}
-async function repairAndVerifyWindow(blocks,texts,indices,job){await repairWindow(blocks,texts,indices,job);let v=await verifyRepairWindow(blocks,texts,indices,job);if(v.ok)return;console.warn(`[REPAIR 6.7] Janela ${v.ids.join(',')} ainda reprovada; segunda tradução cirúrgica.`);await repairWindow(blocks,texts,indices,job);v=await verifyRepairWindow(blocks,texts,indices,job);if(!v.ok)throw badAuditOutputError(`Reparo não aprovado após segunda tradução. IDs: ${v.ids.join(', ')}.`);}
-async function repairProtectedTermViolations(blocks,texts,job){const v=protectedTermViolationIndices(blocks,texts,job);if(!v.length)return;console.warn(`[PROTECTED TERMS] ${v.length} bloco(s) deformaram/traduziram bordão protegido; reparo obrigatório.`);for(const w of windowsFromIndices(v))await repairAndVerifyWindow(blocks,texts,w,job);assertProtectedTerms(blocks,texts,job,'PÓS-REPARO');}
+const AI_REQUEST_MAX_RETRIES = 4;
 
-async function translateSrt(originalSrt,job){
- const blocks=parseSrt(originalSrt);if(!blocks.length)throw new Error('Nenhum bloco SRT válido.');
- const batches=splitIntoBatches(blocks),startedAt=Date.now();job.startedAt=startedAt;job.updatedAt=startedAt;job.geminiRequestsUsed=0;job.completedBatches=0;job.totalBatches=batches.length;
- console.log(`[TRANSLATE] ${blocks.length} blocos.`);console.log(`[TRANSLATE] ${batches.length} lote(s).`);
- console.log(`[FAST 6.7] ${MAX_BATCH_BLOCKS} blocos/${MAX_BATCH_CHARS} chars; schema JSON cardinalidade EXATA; concorrência=${GEMINI_CONCURRENCY}; prioridade por request; SEM CAP por job; SEM timeout global.`);
- const texts=new Array(blocks.length),pos=new Map();blocks.forEach((b,i)=>pos.set(b,i));const boundaries=[];
- const sig=sha256(originalSrt).slice(0,24),cp=getOrCreatePartialCheckpoint(job.cacheKey,blocks.length,sig);let reused=0;
- for(let i=0;i<blocks.length;i++)if(cp.done[i]&&typeof cp.texts[i]==='string'){texts[i]=cp.texts[i];reused++;}
- if(reused)console.log(`[CHECKPOINT] Reutilizando ${reused}/${blocks.length} bloco(s) FAST.`);
- console.log(`[PHASE FAST] Job ${job.id} ativo simultaneamente; prioridade=${job.priority}. Requests Embedded podem ultrapassar OpenSub pendente.`);
- const tasks=batches.map(async(batch,bi)=>{assertJobActive(job);const start=pos.get(batch[0]),end=pos.get(batch[batch.length-1]);if(bi>0&&Number.isInteger(start))boundaries.push(start);
-  if(checkpointRangeComplete(cp,start,batch.length)){for(let i=0;i<batch.length;i++)texts[start+i]=cp.texts[start+i];job.completedBatches++;console.log(`[CHECKPOINT] Lote ${bi+1}/${batches.length} reutilizado — ${batch.length} blocos; 0 request Gemini.`);return;}
-  const context={before:start>0?blocks[start-1]:null,after:end<blocks.length-1?blocks[end+1]:null},chars=batch.reduce((s,b)=>s+String(b.text||'').length,0),t0=Date.now();
-  console.log(`[PHASE FAST] Lote ${bi+1}/${batches.length} enfileirado - ${batch.length} blocos/${chars} chars.`);
-  const tr=await translateMainBatch(batch,context,job);assertJobActive(job);for(let i=0;i<batch.length;i++)texts[start+i]=tr[i];writeCheckpointRange(cp,start,tr);job.completedBatches++;job.progress=Math.round(job.completedBatches/batches.length*82);job.updatedAt=Date.now();console.log(`[CHECKPOINT] Lote ${bi+1}/${batches.length} salvo.`);console.log(`[PHASE FAST] Lote ${bi+1}/${batches.length} OK em ${((Date.now()-t0)/1000).toFixed(1)}s.`);
- });
- try{await Promise.all(tasks);}catch(e){cancelJobOperations(job,e);console.warn(`[CHECKPOINT] Progresso FAST aprovado preservado por ${Math.round(PARTIAL_CHECKPOINT_TTL_MS/3600000)}h.`);throw e;}
- if(texts.some(x=>typeof x!=='string'))throw new Error('A fase FAST terminou com blocos ausentes.');
- const fastElapsed=Date.now()-startedAt;console.log(`[PHASE FAST] Tradução completa em ${(fastElapsed/1000).toFixed(1)}s; requests-do-job=${job.geminiRequestsUsed}; checkpoint=${blocks.length}/${blocks.length}.`);
- const finalTexts=finalizeAllTranslatedTexts(texts);
- /* Bordões/franchise terms não dependem de amostragem SAFE. */
- await repairProtectedTermViolations(blocks,finalTexts,job);assertProtectedTerms(blocks,finalTexts,job,'PRÉ-SAFE');
- assertJobActive(job);
- const selection=selectFinalAuditIndices(blocks,finalTexts,boundaries,job.jobKind,job);
- console.log(`[PHASE SAFE] ${selection.indices.length}/${blocks.length} selecionados | base=${selection.baseTarget} | alvo=${selection.target} | tipo=${job.jobKind} | canários=${selection.canaryTarget} | protected=${selection.protectedCandidates} | gender-high=${selection.highGenderCandidates} | gender-contradictions=${selection.genderContradictions} | gender-normal=${selection.normalGenderCandidates} | fronteiras=${selection.strongCandidates} | anomalias=${selection.anomalyCandidates} | composição=${JSON.stringify(selection.counts)}.`);
- const records=selection.indices.map(i=>buildAuditRecord(blocks,finalTexts,i,job));let failures=[];
- try{
-  if(records.length){const base=await runAuditChunks(records,job);failures.push(...base.failures);if(base.invalid.length)failures.push(...await recheckRecordsInGroups(base.invalid,job,'matchedSourceId/contrato inválido'));
-   const own=failures.filter(x=>x.matchedSourceId===x.id),migration=failures.filter(x=>x.matchedSourceId!==x.id);if(own.length){const rr=own.map(x=>buildAuditRecord(blocks,finalTexts,x._index,job));failures=[...migration,...await recheckRecordsInGroups(rr,job,'f=false/m=i (contexto/gênero/qualidade/protected)')];}else failures=migration;
-  }
-  const uniq=new Map();for(const f of failures)uniq.set(`${f.id}:${f.matchedSourceId}`,f);failures=[...uniq.values()];
-  if(failures.length){console.warn(`[PHASE SAFE] ${failures.length} falha(s) confirmada(s); reparo localizado.`);for(const w of buildRepairWindows(failures,blocks))await repairAndVerifyWindow(blocks,finalTexts,w,job);}
- }catch(e){cancelJobOperations(job,e);console.warn('[CHECKPOINT] FAST completo permanece preservado.');throw e;}
- assertJobActive(job);
- for(let i=0;i<finalTexts.length;i++)finalTexts[i]=finalizeTranslatedText(finalTexts[i]);
- assertProtectedTerms(blocks,finalTexts,job,'FINAL');
- const finalSrt=buildSrt(blocks,finalTexts);auditFinalTimestamps(originalSrt,finalSrt,'TRADUÇÃO FINAL');job.timestampAuditPassed=true;job.contentAuditPassed=true;job.progress=100;
- const elapsed=Date.now()-startedAt;console.log(`[TRANSLATE] Finalizada em ${(elapsed/1000).toFixed(1)}s.`);console.log(`[PERF] FAST=${(fastElapsed/1000).toFixed(1)}s | SAFE+REPAIR=${((elapsed-fastElapsed)/1000).toFixed(1)}s | TOTAL=${(elapsed/1000).toFixed(1)}s | requests-do-job=${job.geminiRequestsUsed} | janela-RPM=${geminiRequestStarts.length}/${effectiveRpmLimit()}.`);console.log(elapsed<=PERFORMANCE_TARGET_MS?'[PERF] META ≤90s: ATINGIDA ✅':`[PERF] Acima de 90s, mas job NÃO foi abortado: ${(elapsed/1000).toFixed(1)}s.`);console.log('[AUDIT CONTENT] TRADUÇÃO FINAL: OK — contexto, gênero/pronomes, protected terms, zero speaker-label/SDH/alongamento, ID/lock e timestamps íntegros.');partialTranslationCache.delete(partialCheckpointKey(job.cacheKey));return finalSrt;
+// Poucos lotes grandes:
+// reduz prompt repetido e chamadas.
+const MISTRAL_BATCH_CHARS = Number(
+    process.env.MISTRAL_BATCH_CHARS ||
+    18_000
+);
+
+const MISTRAL_BATCH_GROUPS = Number(
+    process.env.MISTRAL_BATCH_GROUPS ||
+    320
+);
+
+const MISTRAL_MAX_OUTPUT_TOKENS = Number(
+    process.env.MISTRAL_MAX_OUTPUT_TOKENS ||
+    16_000
+);
+
+// O reviewer vê EN + PT
+// e devolve SOMENTE correções.
+const REVIEW_BATCH_CHARS = Number(
+    process.env.REVIEW_BATCH_CHARS ||
+    42_000
+);
+
+const REVIEW_BATCH_GROUPS = Number(
+    process.env.REVIEW_BATCH_GROUPS ||
+    450
+);
+
+const GROQ_REVIEW_MAX_OUTPUT_TOKENS = Number(
+    process.env.GROQ_REVIEW_MAX_OUTPUT_TOKENS ||
+    8_000
+);
+
+// ============================================================
+// MEMÓRIA / FILA
+// ============================================================
+
+const translationCache = new Map();
+const jobs = new Map();
+
+const translationJobQueue = [];
+
+let translationJobWorkerRunning = false;
+
+// ============================================================
+// UTILS
+// ============================================================
+
+function sleep(ms) {
+    return new Promise(
+        resolve =>
+            setTimeout(
+                resolve,
+                ms
+            )
+    );
 }
 
-function createJob({jobId,cacheKey,type,videoId,sourceHash,sourceSrt,mediaContext=''}){const now=Date.now(),j={id:jobId,cacheKey,type,videoId,sourceHash,sourceSrt,mediaContext,status:'processing',result:null,error:null,progress:0,completedBatches:0,totalBatches:0,createdAt:now,updatedAt:now,startedAt:null,priority:50,jobKind:'generic',lazyStartScheduled:false,expiresAt:now+JOB_TTL_MS,timestampAuditPassed:false,contentAuditPassed:false,geminiRequestsUsed:0,cancelled:false,cancelReason:null,abortController:new AbortController(),promise:null};jobs.set(jobId,j);cleanupMemory();return j;}
-function getJob(id){const j=jobs.get(id);if(!j)return null;if(j.expiresAt<=Date.now()&&!['processing','pending'].includes(j.status)){jobs.delete(id);return null;}return j;}
-async function processJob(job){activeTranslationJobs.add(job.id);console.log(`[JOB ${job.id}] Iniciando simultaneamente. tipo=${job.jobKind}; prioridade=${job.priority}; ativos=${activeTranslationJobs.size}.`);try{const cached=getTranslationCache(job.cacheKey);if(cached){auditFinalTimestamps(job.sourceSrt,cached,'CACHE');job.timestampAuditPassed=true;job.contentAuditPassed=true;job.status='completed';job.result=cached;job.progress=100;job.updatedAt=Date.now();console.log(`[JOB ${job.id}] Cache utilizado.`);return;}const translated=await translateSrt(job.sourceSrt,job);setTranslationCache(job.cacheKey,translated);job.result=translated;job.status='completed';job.progress=100;job.updatedAt=Date.now();console.log(`[JOB ${job.id}] Concluído.`);}catch(e){cancelJobOperations(job,e);job.status='failed';job.error=getErrorMessage(e);job.updatedAt=Date.now();console.error(`[JOB ${job.id}] Falhou: ${job.error}`);}finally{activeTranslationJobs.delete(job.id);console.log(`[JOB ${job.id}] Saiu dos ativos; restantes=${activeTranslationJobs.size}.`);}}
-function startTranslationJob(job,label='JOB'){if(!job)return null;if(['completed','failed'].includes(job.status))return job.promise;if(job.promise)return job.promise;if(job.status==='pending'){job.status='processing';job.updatedAt=Date.now();}job.promise=processJob(job).catch(e=>{cancelJobOperations(job,e);console.error(`[${label} ${job.id}] Erro inesperado:`,e);job.status='failed';job.error=getErrorMessage(e);job.updatedAt=Date.now();});return job.promise;}
-function findProcessingJob(cacheKey){for(const j of jobs.values())if(j.cacheKey===cacheKey&&['processing','pending'].includes(j.status))return j;return null;}
-
-function buildProcessingSrt(job){const p=Number.isFinite(job?.progress)?job.progress:0;return['1','00:00:01,000 --> 09:59:59,000',`⏳ Traduzindo legenda PT-BR... ${p}%`].join('\n');}
-function buildErrorSrt(msg){const s=String(msg||'Erro desconhecido.').replace(/\s+/g,' ').slice(0,350);return['1','00:00:01,000 --> 09:59:59,000',`Não foi possível traduzir esta legenda. ${s}`].join('\n');}
-function sendSubtitleResponse(res,srt,cacheControl='no-store'){res.status(200);res.set({'Content-Type':'text/plain; charset=utf-8','Cache-Control':cacheControl,'Access-Control-Allow-Origin':'*'});return res.send(srt);}
-async function waitForJob(job,timeoutMs){if(job.status==='completed')return true;if(job.status==='failed')return false;const st=Date.now();while(job.status==='processing'&&Date.now()-st<timeoutMs)await sleep(500);return job.status==='completed';}
-
-function scoreSubtitle(s){let x=0,l=String(s?.lang||'').toLowerCase();if(l==='eng')x+=100;else if(l==='en')x+=90;if(s?.hearingImpaired===false)x+=20;if(String(s?.format||'').toLowerCase()==='srt')x+=20;if(/english/i.test(String(s?.name||'')))x+=10;return x;}
-function isUsableEnglishSubtitle(s){const l=String(s?.lang||'').toLowerCase();return(l==='eng'||l==='en')&&typeof s?.url==='string'&&/^https?:\/\//i.test(s.url);}
-function selectBestSubtitle(subtitles,{releaseAware=false}={}){if(!Array.isArray(subtitles))return null;const usable=subtitles.filter(isUsableEnglishSubtitle);if(!usable.length)return null;if(releaseAware)return usable[0];return usable.sort((a,b)=>scoreSubtitle(b)-scoreSubtitle(a))[0]||null;}
-function rawSubtitleExtraSegment(req){const pathname=String(req.originalUrl||req.url||'').split('?')[0],m=pathname.match(/^\/subtitles\/[^/]+\/[^/]+\/(.+)\.json$/);return m?.[1]||String(req.params.extra||'').trim();}
-function parseStremioSubtitleExtra(req){const rawExtra=rawSubtitleExtraSegment(req);if(!rawExtra)return{rawExtra:'',videoHash:'',videoSize:'',filename:''};const p=new URLSearchParams(rawExtra),rh=String(p.get('videoHash')||'').trim(),rs=String(p.get('videoSize')||'').trim(),filename=String(p.get('filename')||'').replace(/[\u0000-\u001F\u007F]/g,'').trim().slice(0,1000),videoHash=/^[a-f0-9]{16}$/i.test(rh)?rh.toLowerCase():'',n=Number(rs),videoSize=Number.isSafeInteger(n)&&n>0?String(n):'';return{rawExtra,videoHash,videoSize,filename};}
-function buildOpenSubtitlesSearchUrl(type,id,{videoHash='',videoSize='',filename=''}={}){const base=`https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}`,p=new URLSearchParams();if(videoHash)p.set('videoHash',videoHash);if(videoSize)p.set('videoSize',videoSize);if(filename)p.set('filename',filename);const e=p.toString();return e?`${base}/${e}.json`:`${base}.json`;}
-function releaseIdentityDescription(x){return[x.videoHash&&'videoHash',x.videoSize&&'videoSize',x.filename&&'filename'].filter(Boolean).join(' + ')||'nenhuma';}
-async function findEnglishSubtitle(type,id,extra={}){const releaseAware=!!(extra.videoHash||extra.videoSize||extra.filename),url=buildOpenSubtitlesSearchUrl(type,id,extra);console.log(`[OPENSUBTITLES MATCH] Modo: ${releaseAware?'RELEASE-AWARE':'GENÉRICO'}; identidade: ${releaseIdentityDescription(extra)}.`);console.log(`[STREMIO] Procurando legenda: ${url}`);const r=await fetchWithTimeout(url,{headers:{Accept:'application/json','User-Agent':'Stremio-Gemini-Subtitle-Translator/6.7'}},SOURCE_FETCH_TIMEOUT_MS);if(!r.ok)throw new Error(`OpenSubtitles HTTP ${r.status}.`);const data=await r.json(),subs=Array.isArray(data?.subtitles)?data.subtitles:[],target=selectBestSubtitle(subs,{releaseAware});if(target){const pos=subs.indexOf(target);console.log(`[OPENSUBTITLES MATCH] Selecionada posição upstream ${pos>=0?pos+1:'?'}/${subs.length}; id=${String(target.id||'(sem id)')}; nome=${String(target.name||'(sem nome)')}.`);}else console.log(`[OPENSUBTITLES MATCH] Nenhuma legenda inglesa utilizável (${subs.length} resultado(s)).`);return target;}
-async function downloadSubtitle(url){console.log(`[SOURCE] Baixando legenda: ${url}`);const r=await fetchWithTimeout(url,{headers:{'User-Agent':'Stremio-Gemini-Subtitle-Translator/6.7'}},SOURCE_FETCH_TIMEOUT_MS);if(!r.ok)throw new Error(`Falha ao baixar legenda: HTTP ${r.status}.`);const raw=normalizeSrt(await r.text());if(!raw)throw new Error('Legenda vazia.');if(raw.length>MAX_SOURCE_CHARS)throw new Error(`Legenda muito grande: ${raw.length} caracteres.`);const text=cleanSrtForTranslation(raw);if(!text)throw new Error('A legenda ficou vazia após a limpeza SDH/CC.');return text;}
-
-async function createEmbeddedTranslationJob({type,videoId,sourceSrt,sourceName='embedded'}){
- const raw=normalizeSrt(sourceSrt);if(!raw)throw new Error('A legenda embutida está vazia.');if(raw.length>MAX_SOURCE_CHARS)throw new Error(`Legenda embutida muito grande: ${raw.length} caracteres.`);const normalized=cleanSrtForTranslation(raw);if(!normalized)throw new Error('A legenda embutida ficou vazia após a limpeza SDH/CC.');const blocks=parseSrt(normalized);if(!blocks.length)throw new Error('A legenda embutida não possui blocos SRT válidos.');const sourceHash=sha256(normalized),cacheKey=`${TRANSLATION_CACHE_VERSION}:embedded:${sourceHash}`,cached=getTranslationCache(cacheKey);
- if(cached){auditFinalTimestamps(normalized,cached,'EMBEDDED CACHE');const id=`embedded-cached-${sourceHash.slice(0,24)}`;let j=getJob(id);if(!j){j=createJob({jobId:id,cacheKey,type,videoId,sourceHash,sourceSrt:normalized,mediaContext:sourceName});j.jobKind='embedded';j.priority=100;j.status='completed';j.result=cached;j.progress=100;j.timestampAuditPassed=true;j.contentAuditPassed=true;}console.log(`[EMBEDDED] Cache utilizado para ${sourceName}.`);return j;}
- const existing=findProcessingJob(cacheKey);if(existing){console.log(`[EMBEDDED] Job existente reutilizado: ${existing.id}`);return existing;}
- const id=`embedded-${sourceHash.slice(0,24)}-${randomId(8)}`,j=createJob({jobId:id,cacheKey,type,videoId,sourceHash,sourceSrt:normalized,mediaContext:sourceName});j.source=sourceName;j.priority=100;j.jobKind='embedded';j.totalBatches=splitIntoBatches(blocks).length;startTranslationJob(j,'EMBEDDED JOB');console.log(`[EMBEDDED] Novo job ${j.id} criado; ${blocks.length} blocos / ${j.totalBatches} lote(s); prioridade request=${j.priority}.`);return j;
+function sha256(value) {
+    return crypto
+        .createHash("sha256")
+        .update(
+            String(value),
+            "utf8"
+        )
+        .digest("hex");
 }
 
-async function subtitlesHandler(req,res){const type=String(req.params.type||'').trim(),id=String(req.params.id||'').trim();console.log(`[STREMIO] Pedido: ${type}/${id}`);const extra=parseStremioSubtitleExtra(req);console.log(`[STREMIO EXTRA] filename: ${extra.filename||'(não enviado)'}`);console.log(`[STREMIO EXTRA] videoSize: ${extra.videoSize||'(não enviado)'}`);console.log(`[STREMIO EXTRA] videoHash: ${extra.videoHash||'(não enviado)'}`);if(!type||!id)return safeJson(res,{subtitles:[]});
- try{const target=await findEnglishSubtitle(type,id,extra);if(!target)return safeJson(res,{subtitles:[]});const sourceSrt=await downloadSubtitle(target.url),blocks=parseSrt(sourceSrt);if(!blocks.length)return safeJson(res,{subtitles:[]});const sourceHash=sha256(sourceSrt),cacheKey=`${TRANSLATION_CACHE_VERSION}:${type}:${id}:${sourceHash}`,base=cleanBaseUrl(req),cached=getTranslationCache(cacheKey);
-  if(cached){auditFinalTimestamps(sourceSrt,cached,'OPENSUBTITLES CACHE');const jid=`cached-${sourceHash.slice(0,24)}`;let j=getJob(jid);if(!j){j=createJob({jobId:jid,cacheKey,type,videoId:id,sourceHash,sourceSrt,mediaContext:extra.filename||id});j.jobKind='opensubtitles';j.priority=10;j.status='completed';j.result=cached;j.progress=100;j.timestampAuditPassed=true;j.contentAuditPassed=true;}return safeJson(res,{subtitles:[{id:`${id}-gemini-${sourceHash.slice(0,12)}`,url:`${base}/subtitle/${encodeURIComponent(jid)}.srt`,lang:'por'}]});}
-  let j=findProcessingJob(cacheKey);if(!j){const jid=`job-${sourceHash.slice(0,24)}-${randomId(8)}`;j=createJob({jobId:jid,cacheKey,type,videoId:id,sourceHash,sourceSrt,mediaContext:extra.filename||id});j.totalBatches=splitIntoBatches(blocks).length;j.priority=10;j.jobKind='opensubtitles';j.status='pending';j.lazyStart=true;console.log(`[LAZY] Job OpenSubtitles ${j.id} criado sem consumir Gemini; prioridade request=${j.priority}.`);}const subtitleUrl=`${base}/subtitle/${encodeURIComponent(j.id)}.srt`;console.log(`[STREMIO] Subtitle URL: ${subtitleUrl}`);return safeJson(res,{subtitles:[{id:`${id}-gemini-${sourceHash.slice(0,12)}`,url:subtitleUrl,lang:'por'}]});
- }catch(e){console.error(`[STREMIO] Erro: ${getErrorMessage(e)}`);return safeJson(res,{subtitles:[]});}}
-app.get('/subtitles/:type/:id.json',subtitlesHandler);app.get('/subtitles/:type/:id/:extra.json',subtitlesHandler);
+function randomId(bytes = 8) {
+    return crypto
+        .randomBytes(bytes)
+        .toString("hex");
+}
 
-app.post('/api/translate-embedded',async(req,res)=>{if(!isAuthorizedLocalBridge(req)){console.warn('[EMBEDDED API] Tentativa não autorizada.');return safeJson(res,{error:'Unauthorized'},401);}try{const{type,id,srt,name}=req.body||{};if(!srt||typeof srt!=='string')return safeJson(res,{error:"Campo 'srt' é obrigatório."},400);if(srt.length>MAX_SOURCE_CHARS)return safeJson(res,{error:`SRT muito grande. Limite: ${MAX_SOURCE_CHARS} caracteres.`},413);const mediaType=String(type||'unknown').trim(),videoId=String(id||'unknown').trim(),sourceName=String(name||'embedded').trim();console.log(`[EMBEDDED API] Recebido SRT de ${sourceName} para ${mediaType}/${videoId}; ${srt.length} caracteres.`);const job=await createEmbeddedTranslationJob({type:mediaType,videoId,sourceSrt:srt,sourceName}),base=cleanBaseUrl(req);return safeJson(res,{ok:true,jobId:job.id,status:job.status,progress:job.progress,subtitleUrl:`${base}/subtitle/${encodeURIComponent(job.id)}.srt`});}catch(e){console.error('[EMBEDDED API] Erro:',e);return safeJson(res,{error:getErrorMessage(e)},500);}});
+function getErrorMessage(error) {
+    return String(
+        error?.message ||
+        error ||
+        "Erro desconhecido."
+    );
+}
 
-async function subtitleResultHandler(req,res){let id;try{id=decodeURIComponent(String(req.params.jobId||'').trim());}catch{id=String(req.params.jobId||'').trim();}if(!id)return sendSubtitleResponse(res,buildErrorSrt('Job inválido.'));const job=getJob(id);if(!job)return sendSubtitleResponse(res,buildErrorSrt('Esta tradução expirou. Recarregue as legendas.'));
- if(job.status==='pending'&&!job.lazyStartScheduled){job.lazyStartScheduled=true;console.log(`[LAZY] URL ${job.id} requisitada; grace ${LAZY_OPENSUB_START_GRACE_MS}ms.`);const timer=setTimeout(()=>{job.lazyStartScheduled=false;if(job.status==='pending')startTranslationJob(job,'JOB');},LAZY_OPENSUB_START_GRACE_MS);if(typeof timer.unref==='function')timer.unref();}
- async function serve(){if(!job.timestampAuditPassed){try{auditFinalTimestamps(job.sourceSrt,job.result,'SERVING');job.timestampAuditPassed=true;}catch(e){console.error(`[AUDIT TIMESTAMP] Bloqueando ${job.id}: ${getErrorMessage(e)}`);return sendSubtitleResponse(res,buildErrorSrt('A auditoria de timestamps bloqueou esta legenda.'),'no-store');}}if(!job.contentAuditPassed){console.error(`[AUDIT CONTENT] Bloqueando ${job.id}: conteúdo não aprovado.`);return sendSubtitleResponse(res,buildErrorSrt('A auditoria semântica/contextual não confirmou esta legenda.'),'no-store');}return sendSubtitleResponse(res,job.result,'public, max-age=604800');}
- if(job.status==='completed'&&job.result)return serve();if(job.status==='failed')return sendSubtitleResponse(res,buildErrorSrt(job.error),'no-store');const done=await waitForJob(job,15000);if(done&&job.status==='completed'&&job.result)return serve();if(job.status==='failed')return sendSubtitleResponse(res,buildErrorSrt(job.error),'no-store');return sendSubtitleResponse(res,buildProcessingSrt(job),'no-store, no-cache, must-revalidate');}
-app.get('/subtitle/:jobId.srt',subtitleResultHandler);
+function safeJson(
+    res,
+    payload,
+    status = 200
+) {
+    res
+        .status(status)
+        .json(payload);
+}
 
-const manifest={id:'org.tradutor.stateless.gemini.free',version:'6.7.0',name:'Tradutor Gemini PT-BR',description:'Traduz automaticamente legendas para Português do Brasil usando Gemini.',logo:'',resources:['subtitles'],types:['movie','series'],idPrefixes:['tt'],catalogs:[],behaviorHints:{configurable:false,adult:false}};
-app.get('/manifest.json',(req,res)=>res.json(manifest));
-function statusPayload(){pruneRequestStarts();return{name:manifest.name,version:manifest.version,status:'online',model:GEMINI_MODEL,renderEngineVersion:RENDER_ENGINE_VERSION,performanceMode:'fast-quality-quota-aware',thinkingLevel:'MINIMAL',translationCacheVersion:TRANSLATION_CACHE_VERSION,bridgeCompatibleCacheVersion:'5.8',batchMaxBlocks:MAX_BATCH_BLOCKS,batchMaxChars:MAX_BATCH_CHARS,exactSchemaCardinality:true,geminiConcurrency:GEMINI_CONCURRENCY,baseSafeRpm:SAFE_RPM,effectiveRpmLimit:effectiveRpmLimit(),observedRpmLimit,observedInputTpmLimit,requestIntervalMs:MIN_REQUEST_INTERVAL_MS,requestsInRollingMinute:geminiRequestStarts.length,estimatedInputTokensInRollingMinute:currentEstimatedTokensInWindow(),lastQuotaKind,lastQuotaId,lastQuotaMetric,lastQuotaMessage,hardRequestCapPerJob:null,globalJobTimeoutMs:null,activeTranslationJobs:activeTranslationJobs.size,priorityPerGeminiRequest:true,embeddedPriority:100,openSubtitlesPriority:10,geminiQueue:geminiQueue.length,activeGeminiWorkers,cooldownSeconds:Math.ceil(getCooldownRemaining()/1000),transientRetriesPerRequest:MAX_TRANSIENT_RETRIES,partialCheckpointHours:PARTIAL_CHECKPOINT_TTL_MS/3600000,safeAuditRatio:SAFE_AUDIT_RATIO,safeAuditMinRecords:SAFE_AUDIT_MIN_RECORDS,protectedTermsGuard:true,genderAwareAudit:true,wideContextAuditRadius:2,speakerLabelsBlocked:true,sdhBlocked:true,vocalStretchBlocked:true,timestampAudit:true,structuralIdLock:true,releaseAwareOpenSubtitles:true,lazyOpenSubtitles:true,partialCheckpoints:partialTranslationCache.size};}
-app.get('/',(req,res)=>res.json(statusPayload()));app.get('/health',(req,res)=>res.json({...statusPayload(),uptime:process.uptime(),jobs:jobs.size,cache:translationCache.size}));
+function cleanBaseUrl(req) {
+    if (PUBLIC_URL) {
+        return PUBLIC_URL;
+    }
 
-app.listen(PORT,()=>{
- console.log('==============================================');
- console.log(' STREMIO GEMINI SUBTITLE TRANSLATOR 6.7 FAST-QUALITY / QUOTA-AWARE');
- console.log('==============================================');
- console.log(`Porta: ${PORT}`);console.log(`Modelo Gemini: ${GEMINI_MODEL}`);console.log('Thinking Gemini: MINIMAL ✅');console.log('Sampling temperature/top_p/top_k: REMOVIDOS ✅');console.log(`PUBLIC_URL: ${PUBLIC_URL||'(automático)'}`);
- console.log(`Batch FAST: ${MAX_BATCH_BLOCKS} blocos / ${MAX_BATCH_CHARS} chars ✅`);console.log('JSON Schema: cardinalidade EXATA minItems=maxItems por request ✅');console.log(`Concorrência Gemini global: ${GEMINI_CONCURRENCY} ✅`);console.log(`Limitador-base: ${SAFE_RPM} RPM / intervalo mínimo ${MIN_REQUEST_INTERVAL_MS}ms ✅`);console.log('Quota-aware: RPM + TPM + RPD + capacity/retryInfo ✅');console.log('Jobs simultâneos: ATIVOS; não existe mais fila serial de job inteiro ✅');console.log('Prioridade real por request: Embedded=100 | OpenSubtitles=10 ✅');console.log('Limite máximo de requests por job: NÃO EXISTE ✅');console.log('Timeout global da legenda/filme: NÃO EXISTE ✅');console.log(`Timeout por request: tradução=${TRANSLATION_REQUEST_TIMEOUT_MS}ms | audit=${SEMANTIC_AUDIT_REQUEST_TIMEOUT_MS}ms ✅`);console.log(`Checkpoint FAST parcial: ${Math.round(PARTIAL_CHECKPOINT_TTL_MS/3600000)}h ✅`);console.log(`SAFE proporcional: ${Math.round(SAFE_AUDIT_RATIO*1000)/10}% / mínimo ${SAFE_AUDIT_MIN_RECORDS}; riscos obrigatórios podem exceder o mínimo ✅`);console.log('Protected Terms Guard: bordões/marcas/neologismos da franquia fiscalizados fora da amostragem ✅');console.log('RuPaul Guard: Condragulations permanece Condragulations; “Parabenações” bloqueado ✅');console.log('Gênero/pronomes: riscos altos e contradições entram obrigatoriamente na SAFE ✅');console.log('Contexto auditado: ±2 blocos reais ✅');console.log('Speaker labels + SDH/CC + símbolos musicais: bloqueio determinístico 100% ✅');console.log('Alongamento gráfico de canto/nota: bloqueio determinístico 100% ✅');console.log('Reparo: janela localizada + reauditoria independente ✅');console.log('ID + lock: 100% DOS BLOCOS ✅');console.log('Auditoria absoluta de timestamps: ATIVA ✅');console.log('PT-BR premium contemporâneo + contexto + cultura/drag/camp/shade: ATIVO ✅');console.log('Ponte Local 2.5.1: COMPATÍVEL + protocolo inalterado ✅');console.log(`Namespace de cache: ${TRANSLATION_CACHE_VERSION}`);console.log('Status: ONLINE');console.log('==============================================');
-});
-process.on('unhandledRejection',e=>console.error('[PROCESS] Unhandled rejection:',e));process.on('uncaughtException',e=>console.error('[PROCESS] Uncaught exception:',e));
+    const proto =
+        String(
+            req.headers[
+                "x-forwarded-proto"
+            ] ||
+            req.protocol ||
+            "https"
+        )
+            .split(",")[0]
+            .trim();
+
+    const host =
+        String(
+            req.headers[
+                "x-forwarded-host"
+            ] ||
+            req.headers.host ||
+            ""
+        )
+            .split(",")[0]
+            .trim();
+
+    return `${proto}://${host}`
+        .replace(/\/+$/, "");
+}
+
+function normalizeSrt(value) {
+    return String(
+        value ||
+        ""
+    )
+        .replace(/^\uFEFF/, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .trim();
+}
+
+function stripCodeFences(value) {
+    return String(
+        value ||
+        ""
+    )
+        .replace(
+            /^\s*```(?:json)?\s*/i,
+            ""
+        )
+        .replace(
+            /\s*```\s*$/i,
+            ""
+        )
+        .trim();
+}
+
+function translationTimeoutError() {
+    const error =
+        new Error(
+            "Tempo máximo da tradução atingido."
+        );
+
+    error.code =
+        "TRANSLATION_TIMEOUT";
+
+    return error;
+}
+
+function badModelOutputError(
+    message
+) {
+    const error =
+        new Error(message);
+
+    error.code =
+        "BAD_MODEL_OUTPUT";
+
+    return error;
+}
+
+function remainingBeforeDeadline(
+    deadlineAt
+) {
+    return Number.isFinite(
+        deadlineAt
+    )
+        ? deadlineAt -
+            Date.now()
+        : Infinity;
+}
+
+function assertBeforeDeadline(
+    deadlineAt
+) {
+    if (
+        remainingBeforeDeadline(
+            deadlineAt
+        ) <= 0
+    ) {
+        throw translationTimeoutError();
+    }
+}
+
+// ============================================================
+// CACHE / JOBS
+// ============================================================
+
+function pruneMapByTime(
+    map,
+    ttlMs,
+    maxEntries
+) {
+    const now =
+        Date.now();
+
+    for (
+        const [
+            key,
+            value
+        ]
+        of map
+    ) {
+        const timestamp =
+            Number(
+                value?.updatedAt ||
+                value?.createdAt ||
+                value?.storedAt ||
+                0
+            );
+
+        if (
+            timestamp &&
+            now - timestamp >
+                ttlMs
+        ) {
+            map.delete(key);
+        }
+    }
+
+    while (
+        map.size >
+        maxEntries
+    ) {
+        const first =
+            map
+                .keys()
+                .next()
+                .value;
+
+        if (
+            first ===
+            undefined
+        ) {
+            break;
+        }
+
+        map.delete(first);
+    }
+}
+
+function getTranslationCache(
+    key
+) {
+    const item =
+        translationCache.get(
+            key
+        );
+
+    if (!item) {
+        return null;
+    }
+
+    if (
+        Date.now() -
+            item.storedAt >
+        CACHE_TTL_MS
+    ) {
+        translationCache.delete(
+            key
+        );
+
+        return null;
+    }
+
+    return item.srt;
+}
+
+function setTranslationCache(
+    key,
+    srt
+) {
+    translationCache.set(
+        key,
+        {
+            srt,
+            storedAt:
+                Date.now()
+        }
+    );
+
+    pruneMapByTime(
+        translationCache,
+        CACHE_TTL_MS,
+        MAX_CACHE_ENTRIES
+    );
+}
+
+function getJob(id) {
+    const job =
+        jobs.get(id);
+
+    if (!job) {
+        return null;
+    }
+
+    if (
+        Date.now() -
+            job.updatedAt >
+        JOB_TTL_MS
+    ) {
+        jobs.delete(id);
+
+        return null;
+    }
+
+    return job;
+}
+
+function createJob({
+    jobId,
+    cacheKey,
+    type,
+    videoId,
+    sourceHash,
+    sourceSrt,
+    sourceName = ""
+}) {
+    const now =
+        Date.now();
+
+    const job = {
+        id:
+            jobId,
+
+        cacheKey,
+
+        type,
+
+        videoId,
+
+        sourceHash,
+
+        sourceSrt,
+
+        sourceName,
+
+        status:
+            "processing",
+
+        progress:
+            0,
+
+        result:
+            null,
+
+        error:
+            null,
+
+        createdAt:
+            now,
+
+        updatedAt:
+            now,
+
+        deadlineAt:
+            now +
+            MAX_TRANSLATION_TIME_MS,
+
+        timestampAuditPassed:
+            false,
+
+        contentAuditPassed:
+            false,
+
+        mistralCalls:
+            0,
+
+        groqReviewCalls:
+            0,
+
+        reviewChanges:
+            0,
+
+        providerUsage:
+            {}
+    };
+
+    jobs.set(
+        job.id,
+        job
+    );
+
+    pruneMapByTime(
+        jobs,
+        JOB_TTL_MS,
+        MAX_JOBS
+    );
+
+    return job;
+}
+
+function findProcessingJob(
+    cacheKey
+) {
+    for (
+        const job
+        of jobs.values()
+    ) {
+        if (
+            job.cacheKey ===
+                cacheKey &&
+            job.status ===
+                "processing"
+        ) {
+            return job;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================
+// AUTH PONTE LOCAL
+// ============================================================
+
+function isAuthorizedLocalBridge(
+    req
+) {
+    if (
+        !LOCAL_BRIDGE_SECRET
+    ) {
+        return false;
+    }
+
+    const auth =
+        String(
+            req.headers
+                .authorization ||
+            ""
+        );
+
+    const expected =
+        `Bearer ${LOCAL_BRIDGE_SECRET}`;
+
+    const a =
+        Buffer.from(auth);
+
+    const b =
+        Buffer.from(
+            expected
+        );
+
+    return (
+        a.length ===
+            b.length &&
+        crypto.timingSafeEqual(
+            a,
+            b
+        )
+    );
+}
+
+// ============================================================
+// SRT / LIMPEZA DA FONTE
+// ============================================================
+
+const TIMING_LINE_REGEX =
+    /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
+
+const SPEAKER_HINT_MARKER_REGEX =
+    /^@@SPK:([^@]+)@@\s*/u;
+
+const SDH_WORDS =
+    /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
+
+function normalizeSpeakerHint(
+    value
+) {
+    const speaker =
+        String(
+            value ||
+            ""
+        )
+            .replace(
+                /<[^>]+>/g,
+                " "
+            )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .trim();
+
+    if (
+        !speaker ||
+        speaker.length >
+            60 ||
+        SDH_WORDS.test(
+            speaker
+        ) ||
+        /[!?;]/u.test(
+            speaker
+        )
+    ) {
+        return "";
+    }
+
+    return speaker;
+}
+
+function encodeSpeakerHint(
+    value
+) {
+    return encodeURIComponent(
+        String(
+            value ||
+            ""
+        )
+    );
+}
+
+function decodeSpeakerHint(
+    value
+) {
+    try {
+        return normalizeSpeakerHint(
+            decodeURIComponent(
+                String(
+                    value ||
+                    ""
+                )
+            )
+        );
+    }
+    catch {
+        return "";
+    }
+}
+
+function extractSpeakerHint(
+    line
+) {
+    const original =
+        String(
+            line ||
+            ""
+        );
+
+    const hidden =
+        original.match(
+            SPEAKER_HINT_MARKER_REGEX
+        );
+
+    if (hidden) {
+        return {
+            speaker:
+                decodeSpeakerHint(
+                    hidden[1]
+                ),
+
+            text:
+                original.replace(
+                    SPEAKER_HINT_MARKER_REGEX,
+                    ""
+                )
+        };
+    }
+
+    const bracket =
+        original.match(
+            /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*:?[ \t]*/u
+        );
+
+    if (bracket) {
+        const speaker =
+            normalizeSpeakerHint(
+                bracket[1]
+            );
+
+        if (speaker) {
+            return {
+                speaker,
+
+                text:
+                    original.slice(
+                        bracket[0]
+                            .length
+                    )
+            };
+        }
+    }
+
+    const colon =
+        original.match(
+            /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50})\s*:\s+(?=\S)/u
+        );
+
+    if (colon) {
+        const speaker =
+            normalizeSpeakerHint(
+                colon[1]
+            );
+
+        if (speaker) {
+            return {
+                speaker,
+
+                text:
+                    original.slice(
+                        colon[0]
+                            .length
+                    )
+            };
+        }
+    }
+
+    return {
+        speaker:
+            "",
+
+        text:
+            original
+    };
+}
+
+function normalizeVocalElongations(
+    text
+) {
+    let value =
+        String(
+            text ||
+            ""
+        );
+
+    /*
+     * você-e-e-e-e
+     * home-e-e-e
+     * amo-o-o-o
+     */
+    value =
+        value.replace(
+            /([A-Za-zÀ-ÖØ-öø-ÿ]+?)([-–—])([A-Za-zÀ-ÖØ-öø-ÿ])(?:\2\3){2,}/gu,
+            "$1$3"
+        );
+
+    value =
+        value.replace(
+            /([A-Za-zÀ-ÖØ-öø-ÿ])(?:[-–—]\1){2,}[-–—]?/giu,
+            "$1"
+        );
+
+    /*
+     * sooooo
+     * nããããão
+     */
+    value =
+        value.replace(
+            /([aeiouáéíóúãõâêô])\1{3,}/giu,
+            "$1"
+        );
+
+    return value;
+}
+
+function cleanSourceLine(
+    line
+) {
+    let text =
+        String(
+            line ||
+            ""
+        ).trim();
+
+    if (!text) {
+        return "";
+    }
+
+    /*
+     * SDH em colchetes.
+     * Speaker já foi
+     * extraído antes.
+     */
+    text =
+        text.replace(
+            /\s*\[[^\]]+\]\s*/gu,
+            " "
+        );
+
+    text =
+        text.replace(
+            /\s*\(([^)]*)\)\s*/gu,
+            (
+                match,
+                inside
+            ) =>
+                SDH_WORDS.test(
+                    String(
+                        inside ||
+                        ""
+                    )
+                )
+                    ? " "
+                    : match
+        );
+
+    text =
+        text.replace(
+            /♪|♫|♬/gu,
+            " "
+        );
+
+    text =
+        normalizeVocalElongations(
+            text
+        );
+
+    text =
+        text.replace(
+            /[ \t]{2,}/g,
+            " "
+        ).trim();
+
+    if (
+        !text ||
+        /^[-–—/\s]*$/u.test(
+            text
+        )
+    ) {
+        return "";
+    }
+
+    return text;
+}
+
+function cleanSrtForTranslation(
+    srt
+) {
+    const normalized =
+        normalizeSrt(srt);
+
+    if (!normalized) {
+        return "";
+    }
+
+    const rawBlocks =
+        normalized
+            .split(
+                /\n{2,}/
+            )
+            .filter(Boolean);
+
+    const out = [];
+
+    let removed = 0;
+    let speakerBlocks = 0;
+    let elongationChanges = 0;
+
+    for (
+        const rawBlock
+        of rawBlocks
+    ) {
+        const lines =
+            rawBlock
+                .trim()
+                .split("\n");
+
+        const timingIndex =
+            lines.findIndex(
+                line =>
+                    /-->/.test(
+                        line
+                    )
+            );
+
+        if (
+            timingIndex <
+            0
+        ) {
+            continue;
+        }
+
+        const timing =
+            lines[
+                timingIndex
+            ].trim();
+
+        if (
+            !TIMING_LINE_REGEX.test(
+                timing
+            )
+        ) {
+            continue;
+        }
+
+        const dialogue = [];
+        const speakers =
+            new Set();
+
+        for (
+            const sourceLine
+            of lines.slice(
+                timingIndex +
+                1
+            )
+        ) {
+            const info =
+                extractSpeakerHint(
+                    sourceLine
+                );
+
+            if (
+                info.speaker
+            ) {
+                speakers.add(
+                    info.speaker
+                );
+            }
+
+            const before =
+                String(
+                    info.text ||
+                    ""
+                );
+
+            const cleaned =
+                cleanSourceLine(
+                    before
+                );
+
+            if (
+                cleaned !==
+                    before.trim() &&
+                /(?:[-–—][A-Za-zÀ-ÿ]){2,}|([aeiouáéíóúãõâêô])\1{3,}/iu.test(
+                    before
+                )
+            ) {
+                elongationChanges++;
+            }
+
+            if (cleaned) {
+                dialogue.push(
+                    cleaned
+                );
+            }
+        }
+
+        if (
+            !dialogue.length
+        ) {
+            removed++;
+            continue;
+        }
+
+        if (
+            speakers.size ===
+            1
+        ) {
+            const speaker =
+                [
+                    ...speakers
+                ][0];
+
+            dialogue[0] =
+                `@@SPK:${encodeSpeakerHint(
+                    speaker
+                )}@@ ${dialogue[0]}`;
+
+            speakerBlocks++;
+        }
+
+        out.push({
+            timing,
+            dialogue
+        });
+    }
+
+    console.log(
+        `[CLEAN] SDH/CC: ${rawBlocks.length} -> ${out.length}; removidos=${removed}; speakerHints=${speakerBlocks}; alongamentos=${elongationChanges}.`
+    );
+
+    return (
+        out
+            .map(
+                (
+                    block,
+                    index
+                ) =>
+                    [
+                        index +
+                            1,
+
+                        block.timing,
+
+                        ...block.dialogue
+                    ].join(
+                        "\n"
+                    )
+            )
+            .join(
+                "\n\n"
+            )
+            .trim() +
+        (
+            out.length
+                ? "\n"
+                : ""
+        )
+    );
+}
+
+function parseSrt(
+    srt
+) {
+    const normalized =
+        normalizeSrt(srt);
+
+    if (!normalized) {
+        return [];
+    }
+
+    const result = [];
+
+    for (
+        const raw
+        of normalized.split(
+            /\n{2,}/
+        )
+    ) {
+        const lines =
+            raw
+                .trim()
+                .split("\n");
+
+        if (
+            lines.length <
+                3 ||
+            !/^\d+$/.test(
+                lines[0]
+                    .trim()
+            ) ||
+            !TIMING_LINE_REGEX.test(
+                lines[1]
+                    .trim()
+            )
+        ) {
+            continue;
+        }
+
+        const textLines =
+            lines.slice(2);
+
+        let speakerHint =
+            "";
+
+        if (
+            textLines.length
+        ) {
+            const match =
+                textLines[0]
+                    .match(
+                        SPEAKER_HINT_MARKER_REGEX
+                    );
+
+            if (match) {
+                speakerHint =
+                    decodeSpeakerHint(
+                        match[1]
+                    );
+
+                textLines[0] =
+                    textLines[0]
+                        .replace(
+                            SPEAKER_HINT_MARKER_REGEX,
+                            ""
+                        );
+            }
+        }
+
+        result.push({
+            index:
+                Number(
+                    lines[0]
+                        .trim()
+                ),
+
+            timing:
+                lines[1]
+                    .trim(),
+
+            text:
+                textLines
+                    .join("\n")
+                    .trim(),
+
+            speakerHint:
+                speakerHint ||
+                null
+        });
+    }
+
+    return result;
+}
+
+function buildSrt(
+    blocks,
+    translatedTexts
+) {
+    return (
+        blocks
+            .map(
+                (
+                    block,
+                    i
+                ) =>
+                    [
+                        block.index,
+
+                        block.timing,
+
+                        translatedTexts[
+                            i
+                        ] ??
+                            block.text
+                    ].join(
+                        "\n"
+                    )
+            )
+            .join(
+                "\n\n"
+            )
+            .trim() +
+        "\n"
+    );
+}
+
+function auditFinalTimestamps(
+    sourceSrt,
+    finalSrt,
+    label = "FINAL"
+) {
+    const source =
+        parseSrt(
+            sourceSrt
+        );
+
+    const final =
+        parseSrt(
+            finalSrt
+        );
+
+    if (
+        source.length !==
+        final.length
+    ) {
+        throw new Error(
+            `TIMING LOCK ${label}: quantidade diferente ${source.length}/${final.length}.`
+        );
+    }
+
+    for (
+        let i = 0;
+        i <
+        source.length;
+        i++
+    ) {
+        if (
+            source[i]
+                .index !==
+                final[i]
+                    .index ||
+            source[i]
+                .timing !==
+                final[i]
+                    .timing
+        ) {
+            throw new Error(
+                `TIMING LOCK ${label}: divergência no cue ${source[i].index}.`
+            );
+        }
+    }
+
+    console.log(
+        `[AUDIT TIMESTAMP] ${label}: PASSOU — ${source.length}/${source.length}; 0 alterações.`
+    );
+
+    return true;
+}
+
+// ============================================================
+// SENTENCE GROUPS
+// ============================================================
+
+function parseTimeSeconds(
+    value
+) {
+    const m =
+        String(
+            value ||
+            ""
+        ).match(
+            /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
+        );
+
+    if (!m) {
+        return NaN;
+    }
+
+    return (
+        Number(m[1]) *
+            3600 +
+        Number(m[2]) *
+            60 +
+        Number(m[3]) +
+        Number(m[4]) /
+            1000
+    );
+}
+
+function timingParts(
+    timing
+) {
+    const m =
+        String(
+            timing ||
+            ""
+        ).match(
+            /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
+        );
+
+    return m
+        ? {
+            start:
+                parseTimeSeconds(
+                    m[1]
+                ),
+
+            end:
+                parseTimeSeconds(
+                    m[2]
+                )
+        }
+        : {
+            start:
+                NaN,
+
+            end:
+                NaN
+        };
+}
+
+function groupingText(
+    text
+) {
+    return String(
+        text ||
+        ""
+    )
+        .replace(
+            /<[^>]+>/g,
+            " "
+        )
+        .replace(
+            /\{\\[^}]+\}/g,
+            " "
+        )
+        .replace(
+            /\s+/g,
+            " "
+        )
+        .trim();
+}
+
+function isMultiSpeakerSource(
+    text
+) {
+    const lines =
+        String(
+            text ||
+            ""
+        )
+            .split("\n")
+            .filter(
+                line =>
+                    line.trim()
+            );
+
+    const marked =
+        lines.filter(
+            line =>
+                /^\s*[-–—]\s*\S/u.test(
+                    line
+                )
+        ).length;
+
+    return (
+        lines.length >=
+            2 &&
+        marked >=
+            2
+    );
+}
+
+function endsStrongSentence(
+    text
+) {
+    return /[.!?…]["'”’\)\]\}]*$/u.test(
+        groupingText(
+            text
+        )
+    );
+}
+
+function startsLowercaseContinuation(
+    text
+) {
+    const value =
+        groupingText(
+            text
+        )
+            .replace(
+                /^[-–—]\s*/u,
+                ""
+            )
+            .replace(
+                /^["'“‘\(\[]+/u,
+                ""
+            )
+            .trim();
+
+    return /^[a-zà-öø-ÿ]/u.test(
+        value
+    );
+}
+
+function shouldMergeSentenceCue(
+    group,
+    next
+) {
+    if (
+        !group.length ||
+        group.length >=
+            4
+    ) {
+        return false;
+    }
+
+    const prev =
+        group[
+            group.length -
+            1
+        ];
+
+    if (
+        isMultiSpeakerSource(
+            prev.text
+        ) ||
+        isMultiSpeakerSource(
+            next.text
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        prev.speakerHint &&
+        next.speakerHint &&
+        normalizeSpeakerHint(
+            prev.speakerHint
+        ).toLowerCase() !==
+            normalizeSpeakerHint(
+                next.speakerHint
+            ).toLowerCase()
+    ) {
+        return false;
+    }
+
+    const a =
+        timingParts(
+            prev.timing
+        );
+
+    const b =
+        timingParts(
+            next.timing
+        );
+
+    const gap =
+        b.start -
+        a.end;
+
+    if (
+        Number.isFinite(
+            gap
+        ) &&
+        gap >
+            0.9
+    ) {
+        return false;
+    }
+
+    if (
+        startsLowercaseContinuation(
+            next.text
+        )
+    ) {
+        return true;
+    }
+
+    const previous =
+        groupingText(
+            prev.text
+        );
+
+    if (
+        /[,;:]$/u.test(
+            previous
+        )
+    ) {
+        return true;
+    }
+
+    if (
+        !endsStrongSentence(
+            prev.text
+        ) &&
+        /\b(?:the|to|of|or|with|for|in|at|from|that|who|which|about|into|as|than|while)\s*$/iu.test(
+            previous
+        )
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
+function buildSentenceGroups(
+    blocks
+) {
+    const groups = [];
+
+    let current = [];
+
+    const flush =
+        () => {
+            if (
+                !current.length
+            ) {
+                return;
+            }
+
+            groups.push({
+                groupId:
+                    groups.length +
+                    1,
+
+                cues:
+                    current,
+
+                multiSpeaker:
+                    current.some(
+                        cue =>
+                            isMultiSpeakerSource(
+                                cue.text
+                            )
+                    )
+            });
+
+            current = [];
+        };
+
+    for (
+        const block
+        of blocks
+    ) {
+        if (
+            !current.length
+        ) {
+            current.push(
+                block
+            );
+        }
+        else if (
+            shouldMergeSentenceCue(
+                current,
+                block
+            )
+        ) {
+            current.push(
+                block
+            );
+        }
+        else {
+            flush();
+
+            current.push(
+                block
+            );
+        }
+    }
+
+    flush();
+
+    return groups;
+}
+
+function compactTranslationGroup(
+    group
+) {
+    return {
+        g:
+            group.groupId,
+
+        c:
+            group.cues.map(
+                cue => {
+                    const item = {
+                        i:
+                            cue.index,
+
+                        t:
+                            cue.text
+                    };
+
+                    if (
+                        cue.speakerHint
+                    ) {
+                        item.speaker =
+                            cue.speakerHint;
+                    }
+
+                    return item;
+                }
+            ),
+
+        m:
+            group.multiSpeaker
+                ? 1
+                : 0
+    };
+}
+
+function splitByBudget(
+    groups,
+    maxChars,
+    maxGroups,
+    itemBuilder
+) {
+    const batches = [];
+
+    let current = [];
+    let chars = 0;
+
+    for (
+        const group
+        of groups
+    ) {
+        const item =
+            itemBuilder(
+                group
+            );
+
+        const size =
+            JSON.stringify(
+                item
+            ).length +
+            8;
+
+        if (
+            current.length &&
+            (
+                current.length >=
+                    maxGroups ||
+                chars +
+                    size >
+                    maxChars
+            )
+        ) {
+            batches.push(
+                current
+            );
+
+            current = [];
+            chars = 0;
+        }
+
+        current.push(
+            group
+        );
+
+        chars +=
+            size;
+    }
+
+    if (
+        current.length
+    ) {
+        batches.push(
+            current
+        );
+    }
+
+    return batches;
+}
+
+// ============================================================
+// PROMPTS
+// ============================================================
+
+const TRANSLATOR_SYSTEM_PROMPT = `
+Você é o TRADUTOR PRINCIPAL de legendas EN→PT-BR de um pipeline de produção.
+
+Traduza como uma ótima legenda brasileira de streaming: natural, contemporânea, oral, fiel e contextual. Evite português literal, engessado, lusitano, datado ou com cara de tradução automática.
+
+CONTRATO TEMPORAL:
+Cada Sentence Group é uma frase/ideia com um ou mais cues.
+Traduza holisticamente para entender contexto, MAS devolva exatamente um segmento PT para cada cue EN, na mesma ordem.
+Cada segmento PT deve conter somente o conteúdo semanticamente pronunciado naquele cue.
+Não antecipe conteúdo do próximo cue e não atrase conteúdo para outro cue.
+
+Preserve humor, ironia, shade, camp, personalidade, vulgaridade e intensidade.
+Não censure.
+
+Adapte idioms, gírias e memes de reality, drag, LGBTQIA+, música, moda e cultura pop quando houver equivalente brasileiro natural, sem forçar internetês ou gíria queer.
+
+"I'm gagged" não é "estou amordaçada".
+"She ate" não é comer literalmente quando for gíria.
+"off the top" monetário é comissão/corte.
+"closing ranks" pode ser panelinha/proteção.
+"Carry the two" é "vai dois".
+
+Preserve nomes, marcas, títulos e catchphrases reconhecidas.
+
+Preserve exatamente quando aparecerem:
+Werkroom
+Condragulations
+Shantay, you stay
+Sashay away
+You betta werk
+Racers, start your engines
+
+O campo opcional speaker é CONTEXTO OCULTO.
+NUNCA escreva [NOME], NOME:, rótulo de personagem ou nome do falante.
+
+Quando speaker/contexto identificar claramente uma pessoa, use o gênero gramatical correto.
+
+Se o gênero não for seguro, NÃO chute masculino/feminino.
+Prefira formulação brasileira naturalmente neutra.
+
+Nunca use:
+empolgado(a)
+ele/ela
+ela/ele
+barras de gênero
+
+Não desenhe notas sustentadas:
+nada de você-e-e-e
+amo-o-o-o
+sooooo
+nãããão
+
+O áudio já carrega a duração.
+
+Não acrescente hífen, travessão, meia-risca, barra ou marcador decorativo de diálogo.
+
+Em cue com mais de um falante, use linhas limpas sem prefixos.
+
+Não acrescente SDH/CC, sons, explicações ou markdown.
+
+Traduza letras de música somente quando a letra real estiver transcrita.
+
+Responda SOMENTE JSON no formato:
+
+{"items":[{"g":1,"s":["segmento cue 1","segmento cue 2"]}]}
+
+g deve repetir exatamente o group id.
+s deve ter exatamente a mesma quantidade de elementos que c.
+`;
+
+const REVIEWER_SYSTEM_PROMPT = `
+Você é a SEGUNDA IA, editora independente de legendas EN→PT-BR.
+
+A tradução já está pronta.
+
+Revise TODO o lote e corrija SOMENTE erros reais e de alta confiança.
+
+NÃO retraduza tudo.
+NÃO altere frases que já estão boas.
+
+Procure especialmente:
+
+1. sentido errado, omissão ou antecipação;
+2. conteúdo colocado no cue errado;
+3. português literal, engessado, lusitano ou datado;
+4. idiom, gíria, meme, reality, drag, LGBTQIA+, camp, shade, música, moda ou cultura pop culturalmente deslocados;
+5. palavrão censurado ou colocado de forma artificial;
+6. concordância ou gênero errado;
+7. speaker vazado, como [Kelly]:, Kelly:, personagem:;
+8. alongamento gráfico como você-e-e-e, amo-o-o-o ou sooooo;
+9. hífen, travessão, barra ou símbolo decorativo de diálogo;
+10. catchphrases ou termos protegidos alterados.
+
+Termos/catchphrases protegidos incluem:
+Werkroom
+Condragulations
+Shantay, you stay
+Sashay away
+You betta werk
+Racers, start your engines
+
+GÊNERO:
+
+Se speaker/contexto identifica homem, NÃO use feminino.
+
+Se speaker/contexto identifica mulher, NÃO use masculino.
+
+Se não há segurança, use frase natural sem marca de gênero.
+
+speaker é pista oculta e NUNCA pode aparecer na saída.
+
+CONTRATO TEMPORAL:
+
+EN e PT são arrays por cue.
+
+Qualquer correção deve manter exatamente o mesmo número de segmentos.
+
+Cada segmento continua preso ao mesmo cue EN.
+
+Nunca mova conteúdo entre cues.
+
+Não faça mudanças cosméticas pequenas.
+
+Se está correto e natural, não inclua em corrections.
+
+Responda SOMENTE:
+
+{"corrections":[{"g":123,"s":["segmento corrigido"],"why":"motivo curto"}]}
+
+Se não houver correção:
+
+{"corrections":[]}
+`;
+
+// ============================================================
+// HTTP PARA IAs
+// ============================================================
+
+function extractProviderText(
+    content
+) {
+    if (
+        typeof content ===
+        "string"
+    ) {
+        return content;
+    }
+
+    if (
+        Array.isArray(
+            content
+        )
+    ) {
+        return content
+            .filter(
+                item =>
+                    item?.type ===
+                        "text" &&
+                    typeof item.text ===
+                        "string"
+            )
+            .map(
+                item =>
+                    item.text
+            )
+            .join("");
+    }
+
+    return "";
+}
+
+function retryAfterMs(
+    response,
+    fallbackMs
+) {
+    const header =
+        response?.headers?.get(
+            "retry-after"
+        );
+
+    if (header) {
+        const seconds =
+            Number(
+                header
+            );
+
+        if (
+            Number.isFinite(
+                seconds
+            ) &&
+            seconds >
+                0
+        ) {
+            return Math.min(
+                Math.ceil(
+                    seconds *
+                    1000
+                ),
+                120_000
+            );
+        }
+
+        const date =
+            Date.parse(
+                header
+            );
+
+        if (
+            Number.isFinite(
+                date
+            )
+        ) {
+            return Math.min(
+                Math.max(
+                    1000,
+                    date -
+                        Date.now()
+                ),
+                120_000
+            );
+        }
+    }
+
+    return Math.min(
+        Math.max(
+            Number(
+                fallbackMs
+            ) ||
+            5000,
+            1000
+        ),
+        120_000
+    );
+}
+
+async function providerFetchJson({
+    url,
+    headers,
+    body,
+    timeoutMs,
+    deadlineAt,
+    provider,
+    job,
+    counter
+}) {
+    let lastError =
+        null;
+
+    for (
+        let attempt = 1;
+        attempt <=
+        AI_REQUEST_MAX_RETRIES;
+        attempt++
+    ) {
+        assertBeforeDeadline(
+            deadlineAt
+        );
+
+        const remaining =
+            remainingBeforeDeadline(
+                deadlineAt
+            );
+
+        const requestTimeout =
+            Math.max(
+                1,
+                Math.min(
+                    timeoutMs,
+                    Number.isFinite(
+                        remaining
+                    )
+                        ? remaining
+                        : timeoutMs
+                )
+            );
+
+        const controller =
+            new AbortController();
+
+        const timer =
+            setTimeout(
+                () =>
+                    controller.abort(),
+                requestTimeout
+            );
+
+        try {
+            console.log(
+                `[${provider}] Request ${attempt}/${AI_REQUEST_MAX_RETRIES}.`
+            );
+
+            const response =
+                await fetch(
+                    url,
+                    {
+                        method:
+                            "POST",
+
+                        headers,
+
+                        body:
+                            JSON.stringify(
+                                body
+                            ),
+
+                        signal:
+                            controller.signal
+                    }
+                );
+
+            const raw =
+                await response.text();
+
+            let data =
+                null;
+
+            try {
+                data =
+                    raw
+                        ? JSON.parse(
+                            raw
+                        )
+                        : {};
+            }
+            catch {
+                data =
+                    null;
+            }
+
+            if (
+                response.ok &&
+                data
+            ) {
+                if (job) {
+                    job[counter] =
+                        Number(
+                            job[counter] ||
+                            0
+                        ) +
+                        1;
+
+                    const usage =
+                        data.usage ||
+                        {};
+
+                    const prev =
+                        job
+                            .providerUsage[
+                                provider
+                            ] ||
+                        {
+                            promptTokens:
+                                0,
+
+                            completionTokens:
+                                0,
+
+                            totalTokens:
+                                0
+                        };
+
+                    prev.promptTokens +=
+                        Number(
+                            usage.prompt_tokens ??
+                            usage.input_tokens ??
+                            0
+                        );
+
+                    prev.completionTokens +=
+                        Number(
+                            usage.completion_tokens ??
+                            usage.output_tokens ??
+                            0
+                        );
+
+                    prev.totalTokens +=
+                        Number(
+                            usage.total_tokens ??
+                            (
+                                Number(
+                                    usage.prompt_tokens ||
+                                    0
+                                ) +
+                                Number(
+                                    usage.completion_tokens ||
+                                    0
+                                )
+                            )
+                        );
+
+                    job.providerUsage[
+                        provider
+                    ] =
+                        prev;
+                }
+
+                return data;
+            }
+
+            const message =
+                data?.error?.message ||
+                data?.message ||
+                raw ||
+                `${provider} HTTP ${response.status}`;
+
+            const retryable =
+                response.status ===
+                    408 ||
+                response.status ===
+                    429 ||
+                response.status >=
+                    500;
+
+            if (
+                !retryable ||
+                attempt ===
+                    AI_REQUEST_MAX_RETRIES
+            ) {
+                throw new Error(
+                    `${provider} HTTP ${response.status}: ${String(
+                        message
+                    ).slice(
+                        0,
+                        1500
+                    )}`
+                );
+            }
+
+            const wait =
+                retryAfterMs(
+                    response,
+                    4000 *
+                        attempt
+                );
+
+            console.warn(
+                `[${provider}] HTTP ${response.status}; aguardando ${Math.ceil(
+                    wait /
+                    1000
+                )}s.`
+            );
+
+            await sleep(
+                wait
+            );
+        }
+        catch (error) {
+            lastError =
+                error?.name ===
+                    "AbortError"
+                    ? new Error(
+                        `${provider}: timeout.`
+                    )
+                    : error;
+
+            if (
+                attempt ===
+                AI_REQUEST_MAX_RETRIES
+            ) {
+                throw lastError;
+            }
+
+            const message =
+                getErrorMessage(
+                    lastError
+                );
+
+            if (
+                /HTTP 4\d\d/i.test(
+                    message
+                ) &&
+                !/HTTP 408|HTTP 429/i.test(
+                    message
+                )
+            ) {
+                throw lastError;
+            }
+
+            const wait =
+                2500 *
+                attempt;
+
+            console.warn(
+                `[${provider}] ${message.slice(
+                    0,
+                    250
+                )}; retry em ${(wait / 1000).toFixed(
+                    1
+                )}s.`
+            );
+
+            await sleep(
+                wait
+            );
+        }
+        finally {
+            clearTimeout(
+                timer
+            );
+        }
+    }
+
+    throw (
+        lastError ||
+        new Error(
+            `${provider}: falha desconhecida.`
+        )
+    );
+}
+
+// ============================================================
+// MISTRAL
+// ============================================================
+
+async function mistralTranslate(
+    payload,
+    deadlineAt,
+    job
+) {
+    if (
+        !MISTRAL_API_KEY
+    ) {
+        throw new Error(
+            "MISTRAL_API_KEY não configurada."
+        );
+    }
+
+    const data =
+        await providerFetchJson({
+            url:
+                "https://api.mistral.ai/v1/chat/completions",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${MISTRAL_API_KEY}`
+            },
+
+            body: {
+                model:
+                    MISTRAL_MODEL,
+
+                messages: [
+                    {
+                        role:
+                            "system",
+
+                        content:
+                            TRANSLATOR_SYSTEM_PROMPT
+                    },
+
+                    {
+                        role:
+                            "user",
+
+                        content:
+                            `Traduza este lote. JSON de entrada:\n${JSON.stringify(
+                                {
+                                    groups:
+                                        payload
+                                }
+                            )}`
+                    }
+                ],
+
+                response_format: {
+                    type:
+                        "json_object"
+                },
+
+                reasoning_effort:
+                    "none",
+
+                temperature:
+                    0.15,
+
+                max_tokens:
+                    MISTRAL_MAX_OUTPUT_TOKENS,
+
+                prompt_cache_key:
+                    "stremio-ptbr-v6-translator"
+            },
+
+            timeoutMs:
+                MISTRAL_TIMEOUT_MS,
+
+            deadlineAt,
+
+            provider:
+                "MISTRAL",
+
+            job,
+
+            counter:
+                "mistralCalls"
+        });
+
+    const text =
+        extractProviderText(
+            data
+                ?.choices
+                ?.[0]
+                ?.message
+                ?.content
+        );
+
+    if (!text) {
+        throw badModelOutputError(
+            "Mistral retornou resposta vazia."
+        );
+    }
+
+    return text;
+}
+
+// ============================================================
+// GROQ REVIEWER
+// ============================================================
+
+async function groqReview(
+    payload,
+    deadlineAt,
+    job,
+    mandatory = false
+) {
+    if (
+        !GROQ_API_KEY
+    ) {
+        throw new Error(
+            "GROQ_API_KEY não configurada."
+        );
+    }
+
+    const data =
+        await providerFetchJson({
+            url:
+                "https://api.groq.com/openai/v1/chat/completions",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${GROQ_API_KEY}`
+            },
+
+            body: {
+                model:
+                    GROQ_REVIEW_MODEL,
+
+                messages: [
+                    {
+                        role:
+                            "system",
+
+                        content:
+                            REVIEWER_SYSTEM_PROMPT
+                    },
+
+                    {
+                        role:
+                            "user",
+
+                        content:
+                            `${
+                                mandatory
+                                    ? "Quality Guard encontrou riscos. Corrija obrigatoriamente os erros reais destes grupos."
+                                    : "Revise integralmente este lote; não mexa no que já está bom."
+                            }\nJSON de entrada:\n${JSON.stringify(
+                                {
+                                    groups:
+                                        payload
+                                }
+                            )}`
+                    }
+                ],
+
+                response_format: {
+                    type:
+                        "json_object"
+                },
+
+                temperature:
+                    0,
+
+                max_completion_tokens:
+                    GROQ_REVIEW_MAX_OUTPUT_TOKENS,
+
+                /*
+                 * Compound Mini não deve
+                 * usar web/code/tools
+                 * nesta função.
+                 */
+                tool_choice:
+                    "none",
+
+                citation_options:
+                    "disabled"
+            },
+
+            timeoutMs:
+                GROQ_REVIEW_TIMEOUT_MS,
+
+            deadlineAt,
+
+            provider:
+                "GROQ_REVIEW",
+
+            job,
+
+            counter:
+                "groqReviewCalls"
+        });
+
+    const text =
+        extractProviderText(
+            data
+                ?.choices
+                ?.[0]
+                ?.message
+                ?.content
+        );
+
+    if (!text) {
+        throw badModelOutputError(
+            "Groq reviewer retornou resposta vazia."
+        );
+    }
+
+    return text;
+}
+
+// ============================================================
+// TRADUÇÃO ESTRUTURADA
+// ============================================================
+
+function validateMistralBatch(
+    groups,
+    raw
+) {
+    let parsed;
+
+    try {
+        parsed =
+            JSON.parse(
+                stripCodeFences(
+                    raw
+                )
+            );
+    }
+    catch {
+        throw badModelOutputError(
+            "Mistral retornou JSON inválido."
+        );
+    }
+
+    if (
+        !Array.isArray(
+            parsed?.items
+        ) ||
+        parsed.items.length !==
+            groups.length
+    ) {
+        throw badModelOutputError(
+            `Mistral: groups esperados=${groups.length}, recebidos=${parsed?.items?.length ?? "?"}.`
+        );
+    }
+
+    const map =
+        new Map();
+
+    for (
+        let i = 0;
+        i <
+        groups.length;
+        i++
+    ) {
+        const group =
+            groups[i];
+
+        const item =
+            parsed.items[i];
+
+        if (
+            !item ||
+            Number(
+                item.g
+            ) !==
+                group.groupId ||
+            !Array.isArray(
+                item.s
+            ) ||
+            item.s.length !==
+                group.cues.length ||
+            item.s.some(
+                text =>
+                    typeof text !==
+                        "string" ||
+                    !text.trim()
+            )
+        ) {
+            throw badModelOutputError(
+                `Contrato temporal inválido no group ${group.groupId}.`
+            );
+        }
+
+        map.set(
+            group.groupId,
+
+            item.s.map(
+                text =>
+                    String(
+                        text
+                    ).trim()
+            )
+        );
+    }
+
+    return map;
+}
+
+async function translateGroupBatch(
+    groups,
+    deadlineAt,
+    job,
+    depth = 0,
+    atomicRetry = 0
+) {
+    try {
+        const raw =
+            await mistralTranslate(
+                groups.map(
+                    compactTranslationGroup
+                ),
+                deadlineAt,
+                job
+            );
+
+        return validateMistralBatch(
+            groups,
+            raw
+        );
+    }
+    catch (error) {
+        if (
+            error?.code !==
+            "BAD_MODEL_OUTPUT"
+        ) {
+            throw error;
+        }
+
+        if (
+            groups.length ===
+                1 &&
+            atomicRetry <
+                1
+        ) {
+            console.warn(
+                `[MISTRAL] Repetindo group atômico ${groups[0].groupId}.`
+            );
+
+            return translateGroupBatch(
+                groups,
+                deadlineAt,
+                job,
+                depth,
+                atomicRetry +
+                    1
+            );
+        }
+
+        if (
+            groups.length <=
+                1 ||
+            depth >=
+                7
+        ) {
+            throw error;
+        }
+
+        const middle =
+            Math.ceil(
+                groups.length /
+                2
+            );
+
+        const left =
+            groups.slice(
+                0,
+                middle
+            );
+
+        const right =
+            groups.slice(
+                middle
+            );
+
+        console.warn(
+            `[MISTRAL] Lote inválido; split ${groups.length} -> ${left.length}+${right.length}.`
+        );
+
+        const a =
+            await translateGroupBatch(
+                left,
+                deadlineAt,
+                job,
+                depth +
+                    1,
+                0
+            );
+
+        const b =
+            await translateGroupBatch(
+                right,
+                deadlineAt,
+                job,
+                depth +
+                    1,
+                0
+            );
+
+        return new Map([
+            ...a,
+            ...b
+        ]);
+    }
+}
+
+// ============================================================
+// REVIEW
+// ============================================================
+
+function compactReviewGroup(
+    group,
+    segments
+) {
+    const item = {
+        g:
+            group.groupId,
+
+        en:
+            group.cues.map(
+                cue =>
+                    cue.text
+            ),
+
+        pt:
+            segments
+    };
+
+    const speakers =
+        group.cues.map(
+            cue =>
+                cue.speakerHint ||
+                null
+        );
+
+    if (
+        speakers.some(
+            Boolean
+        )
+    ) {
+        item.speaker =
+            speakers;
+    }
+
+    return item;
+}
+
+function parseReviewerCorrections(
+    raw,
+    batch,
+    translations
+) {
+    let parsed;
+
+    try {
+        parsed =
+            JSON.parse(
+                stripCodeFences(
+                    raw
+                )
+            );
+    }
+    catch {
+        throw badModelOutputError(
+            "Groq reviewer retornou JSON inválido."
+        );
+    }
+
+    if (
+        !Array.isArray(
+            parsed
+                ?.corrections
+        )
+    ) {
+        throw badModelOutputError(
+            "Groq reviewer não retornou corrections[]."
+        );
+    }
+
+    const allowed =
+        new Map(
+            batch.map(
+                group => [
+                    group.groupId,
+                    group
+                ]
+            )
+        );
+
+    const seen =
+        new Set();
+
+    const accepted = [];
+
+    for (
+        const correction
+        of parsed.corrections
+    ) {
+        const groupId =
+            Number(
+                correction?.g
+            );
+
+        const group =
+            allowed.get(
+                groupId
+            );
+
+        if (
+            !group ||
+            seen.has(
+                groupId
+            ) ||
+            !Array.isArray(
+                correction?.s
+            ) ||
+            correction.s.length !==
+                group.cues.length ||
+            correction.s.some(
+                text =>
+                    typeof text !==
+                        "string" ||
+                    !text.trim()
+            )
+        ) {
+            console.warn(
+                `[GROQ REVIEW] Correção inválida ignorada g=${correction?.g}.`
+            );
+
+            continue;
+        }
+
+        seen.add(
+            groupId
+        );
+
+        const before =
+            translations.get(
+                groupId
+            );
+
+        const after =
+            correction.s.map(
+                text =>
+                    String(
+                        text
+                    ).trim()
+            );
+
+        if (
+            JSON.stringify(
+                before
+            ) ===
+            JSON.stringify(
+                after
+            )
+        ) {
+            continue;
+        }
+
+        accepted.push({
+            groupId,
+
+            before,
+
+            after,
+
+            why:
+                String(
+                    correction?.why ||
+                    "correção editorial"
+                ).slice(
+                    0,
+                    240
+                )
+        });
+    }
+
+    return accepted;
+}
+
+async function reviewAll(
+    groups,
+    translations,
+    deadlineAt,
+    job
+) {
+    const batches =
+        splitByBudget(
+            groups,
+            REVIEW_BATCH_CHARS,
+            REVIEW_BATCH_GROUPS,
+            group =>
+                compactReviewGroup(
+                    group,
+                    translations.get(
+                        group.groupId
+                    )
+                )
+        );
+
+    const changes = [];
+
+    console.log(
+        `[GROQ REVIEW] Revisão completa: ${batches.length} lote(s).`
+    );
+
+    for (
+        let i = 0;
+        i <
+        batches.length;
+        i++
+    ) {
+        const batch =
+            batches[i];
+
+        const payload =
+            batch.map(
+                group =>
+                    compactReviewGroup(
+                        group,
+                        translations.get(
+                            group.groupId
+                        )
+                    )
+            );
+
+        const raw =
+            await groqReview(
+                payload,
+                deadlineAt,
+                job,
+                false
+            );
+
+        const accepted =
+            parseReviewerCorrections(
+                raw,
+                batch,
+                translations
+            );
+
+        for (
+            const change
+            of accepted
+        ) {
+            translations.set(
+                change.groupId,
+                change.after
+            );
+
+            changes.push(
+                change
+            );
+        }
+
+        console.log(
+            `[GROQ REVIEW] ${i + 1}/${batches.length}: ${accepted.length} correção(ões).`
+        );
+
+        job.progress =
+            Math.max(
+                job.progress,
+                72 +
+                    Math.round(
+                        (
+                            (
+                                i +
+                                1
+                            ) /
+                            batches.length
+                        ) *
+                        23
+                    )
+            );
+
+        job.updatedAt =
+            Date.now();
+    }
+
+    return changes;
+}
+
+// ============================================================
+// LIMPEZA FINAL / QUALITY GUARD
+// ============================================================
+
+function escapeRegExp(
+    value
+) {
+    return String(
+        value ||
+        ""
+    ).replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+    );
+}
+
+function cleanFinalText(
+    text,
+    speakerHint
+) {
+    let value =
+        normalizeVocalElongations(
+            String(
+                text ||
+                ""
+            )
+                .replace(
+                    /\r\n/g,
+                    "\n"
+                )
+                .replace(
+                    /\r/g,
+                    "\n"
+                )
+        );
+
+    const speaker =
+        normalizeSpeakerHint(
+            speakerHint ||
+            ""
+        );
+
+    const speakerRegex =
+        speaker
+            ? new RegExp(
+                `^\\s*(?:\\[\\s*)?${escapeRegExp(
+                    speaker
+                )}(?:\\s*\\])?\\s*:\\s*`,
+                "iu"
+            )
+            : null;
+
+    value =
+        value
+            .split("\n")
+            .map(
+                line => {
+                    let clean =
+                        String(
+                            line ||
+                            ""
+                        );
+
+                    /*
+                     * [Kelly]&#58;                      */
+                    clean =
+                        clean.replace(
+                            /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
+                            ""
+                        );
+
+                    /*
+                     * Speaker conhecido.
+                     */
+                    if (
+                        speakerRegex
+                    ) {
+                        clean =
+                            clean.replace(
+                                speakerRegex,
+                                ""
+                            );
+                    }
+
+                    /*
+                     * KELLY:
+                     * Kelly Clarkson:
+                     */
+                    clean =
+                        clean.replace(
+                            /^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+(?=\S)/u,
+                            ""
+                        );
+
+                    /*
+                     * Sem - fala
+                     * Sem — fala
+                     * Sem / fala
+                     */
+                    clean =
+                        clean.replace(
+                            /^\s*[-–—/]+\s*(?=\S)/u,
+                            ""
+                        );
+
+                    clean =
+                        clean
+                            .replace(
+                                /[♪♫♬]+/gu,
+                                ""
+                            )
+                            .replace(
+                                /[ \t]{2,}/g,
+                                " "
+                            )
+                            .trim();
+
+                    return clean;
+                }
+            )
+            .filter(Boolean)
+            .join("\n");
+
+    /*
+     * Slash usado como divisor
+     * artificial de dois falantes
+     * vira quebra limpa de linha.
+     */
+    value =
+        value.replace(
+            /\s+\/\s+(?=\S)/g,
+            "\n"
+        );
+
+    return value.trim();
+}
+
+function applyProtectedRules(
+    source,
+    target
+) {
+    let text =
+        String(
+            target ||
+            ""
+        );
+
+    const en =
+        String(
+            source ||
+            ""
+        );
+
+    if (
+        /\bWerkroom\b/i.test(
+            en
+        )
+    ) {
+        text =
+            text
+                .replace(
+                    /\bworkroom\b/gi,
+                    "Werkroom"
+                )
+                .replace(
+                    /\bwerkroom\b/g,
+                    "Werkroom"
+                );
+    }
+
+    if (
+        /\bCondragulations\b/i.test(
+            en
+        )
+    ) {
+        text =
+            text.replace(
+                /\bcondragulations\b/gi,
+                "Condragulations"
+            );
+    }
+
+    if (
+        /Shantay,? you stay/i.test(
+            en
+        )
+    ) {
+        text =
+            text.replace(
+                /shantay,?\s+you\s+stay/gi,
+                "Shantay, you stay"
+            );
+    }
+
+    if (
+        /Sashay away/i.test(
+            en
+        )
+    ) {
+        text =
+            text.replace(
+                /sashay\s+away/gi,
+                "Sashay away"
+            );
+    }
+
+    if (
+        /You betta werk/i.test(
+            en
+        )
+    ) {
+        text =
+            text.replace(
+                /you\s+betta\s+werk/gi,
+                "You betta werk"
+            );
+    }
+
+    if (
+        /Racers,? start your engines/i.test(
+            en
+        )
+    ) {
+        text =
+            text.replace(
+                /racers,?\s+start\s+your\s+engines/gi,
+                "Racers, start your engines"
+            );
+    }
+
+    return text;
+}
+
+function finalRiskScan(
+    blocks,
+    texts
+) {
+    const issues = [];
+
+    for (
+        let i = 0;
+        i <
+        texts.length;
+        i++
+    ) {
+        const text =
+            String(
+                texts[i] ||
+                ""
+            );
+
+        const source =
+            String(
+                blocks[i]
+                    ?.text ||
+                ""
+            );
+
+        const reasons = [];
+
+        if (
+            /^\s*\[[^\]]{1,60}\]\s*:|^\s*[A-ZÀ-Ý][\p{L}0-9.'’_-]*(?:\s+[A-ZÀ-Ý][\p{L}0-9.'’_-]*){0,3}\s*:\s+/mu.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "SPEAKER_LABEL"
+            );
+        }
+
+        if (
+            /^\s*[-–—/]\s*\S/mu.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "DIALOGUE_MARKER"
+            );
+        }
+
+        if (
+            /(?:[A-Za-zÀ-ÖØ-öø-ÿ][-–—]){3,}[A-Za-zÀ-ÖØ-öø-ÿ]|([aeiouáéíóúãõâêô])\1{3,}/iu.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "VOCAL_ELONGATION"
+            );
+        }
+
+        if (
+            /empolgado\(a\)|empolgada\(o\)|\bele\/ela\b|\bela\/ele\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "ARTIFICIAL_GENDER"
+            );
+        }
+
+        if (
+            /\buma alçapão\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "GRAMMAR_ALCAPAO"
+            );
+        }
+
+        if (
+            /\bcabina de votação\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "CABINA_VOTACAO"
+            );
+        }
+
+        if (
+            /\bse eu manter\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "SE_EU_MANTER"
+            );
+        }
+
+        if (
+            /\bv(?:ão|ao)\b[^.!?\n]{0,80}\be serem\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "VAO_E_SEREM"
+            );
+        }
+
+        if (
+            /\bforam pedidas para\b/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "FORAM_PEDIDAS"
+            );
+        }
+
+        if (
+            /Family that slays/i.test(
+                source
+            ) &&
+            /Família que mata/i.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "SLAY_LITERAL"
+            );
+        }
+
+        if (
+            /\bWerkroom\b/i.test(
+                source
+            ) &&
+            !/\bWerkroom\b/.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "WERKROOM"
+            );
+        }
+
+        if (
+            /\bCondragulations\b/i.test(
+                source
+            ) &&
+            !/\bCondragulations\b/.test(
+                text
+            )
+        ) {
+            reasons.push(
+                "CONDRAGULATIONS"
+            );
+        }
+
+        if (
+            reasons.length
+        ) {
+            issues.push({
+                id:
+                    blocks[i]
+                        .index,
+
+                reasons,
+
+                source,
+
+                text
+            });
+        }
+    }
+
+    return issues;
+}
+
+function flattenTranslations(
+    blocks,
+    groups,
+    translations
+) {
+    const positions =
+        new Map(
+            blocks.map(
+                (
+                    block,
+                    index
+                ) => [
+                    block.index,
+                    index
+                ]
+            )
+        );
+
+    const texts =
+        new Array(
+            blocks.length
+        );
+
+    for (
+        const group
+        of groups
+    ) {
+        const segments =
+            translations.get(
+                group.groupId
+            );
+
+        if (
+            !segments ||
+            segments.length !==
+                group.cues.length
+        ) {
+            throw new Error(
+                `Flatten inválido no group ${group.groupId}.`
+            );
+        }
+
+        group.cues.forEach(
+            (
+                cue,
+                i
+            ) => {
+                texts[
+                    positions.get(
+                        cue.index
+                    )
+                ] =
+                    segments[i];
+            }
+        );
+    }
+
+    if (
+        texts.some(
+            text =>
+                typeof text !==
+                    "string" ||
+                !text.trim()
+        )
+    ) {
+        throw new Error(
+            "Cue ausente/vazio na tradução."
+        );
+    }
+
+    return texts;
+}
+
+function cleanAllFinal(
+    blocks,
+    texts
+) {
+    return texts.map(
+        (
+            text,
+            i
+        ) =>
+            applyProtectedRules(
+                blocks[i]
+                    .text,
+
+                cleanFinalText(
+                    text,
+                    blocks[i]
+                        .speakerHint
+                )
+            )
+    );
+}
+
+async function targetedRiskRepair(
+    blocks,
+    groups,
+    translations,
+    issues,
+    deadlineAt,
+    job
+) {
+    if (
+        !issues.length
+    ) {
+        return [];
+    }
+
+    const cueToGroup =
+        new Map();
+
+    for (
+        const group
+        of groups
+    ) {
+        for (
+            const cue
+            of group.cues
+        ) {
+            cueToGroup.set(
+                cue.index,
+                group.groupId
+            );
+        }
+    }
+
+    const wanted =
+        new Set(
+            issues
+                .map(
+                    issue =>
+                        cueToGroup.get(
+                            issue.id
+                        )
+                )
+                .filter(
+                    Boolean
+                )
+        );
+
+    const riskyGroups =
+        groups.filter(
+            group =>
+                wanted.has(
+                    group.groupId
+                )
+        );
+
+    if (
+        !riskyGroups.length
+    ) {
+        return [];
+    }
+
+    console.warn(
+        `[QUALITY GUARD] ${issues.length} risco(s) em ${riskyGroups.length} group(s); reparo localizado.`
+    );
+
+    const payload =
+        riskyGroups.map(
+            group =>
+                compactReviewGroup(
+                    group,
+                    translations.get(
+                        group.groupId
+                    )
+                )
+        );
+
+    const raw =
+        await groqReview(
+            payload,
+            deadlineAt,
+            job,
+            true
+        );
+
+    const accepted =
+        parseReviewerCorrections(
+            raw,
+            riskyGroups,
+            translations
+        );
+
+    for (
+        const change
+        of accepted
+    ) {
+        translations.set(
+            change.groupId,
+            change.after
+        );
+    }
+
+    return accepted;
+}
+
+// ============================================================
+// PIPELINE FINAL
+// ============================================================
+
+async function translateSrt(
+    sourceSrt,
+    job
+) {
+    const blocks =
+        parseSrt(
+            sourceSrt
+        );
+
+    if (
+        !blocks.length
+    ) {
+        throw new Error(
+            "Nenhum cue SRT válido."
+        );
+    }
+
+    if (
+        !MISTRAL_API_KEY
+    ) {
+        throw new Error(
+            "MISTRAL_API_KEY não configurada no Render."
+        );
+    }
+
+    if (
+        !GROQ_API_KEY
+    ) {
+        throw new Error(
+            "GROQ_API_KEY não configurada no Render."
+        );
+    }
+
+    const groups =
+        buildSentenceGroups(
+            blocks
+        );
+
+    const batches =
+        splitByBudget(
+            groups,
+            MISTRAL_BATCH_CHARS,
+            MISTRAL_BATCH_GROUPS,
+            compactTranslationGroup
+        );
+
+    const deadlineAt =
+        job.deadlineAt;
+
+    const startedAt =
+        Date.now();
+
+    const translations =
+        new Map();
+
+    job.sentenceGroups =
+        groups.length;
+
+    job.totalBatches =
+        batches.length;
+
+    job.completedBatches =
+        0;
+
+    job.progress =
+        1;
+
+    console.log(
+        `[PIPELINE 6.0] ${blocks.length} cues -> ${groups.length} Sentence Groups -> ${batches.length} lote(s) Mistral.`
+    );
+
+    for (
+        let i = 0;
+        i <
+        batches.length;
+        i++
+    ) {
+        assertBeforeDeadline(
+            deadlineAt
+        );
+
+        console.log(
+            `[MISTRAL] Lote ${i + 1}/${batches.length}: ${batches[i].length} group(s).`
+        );
+
+        const result =
+            await translateGroupBatch(
+                batches[i],
+                deadlineAt,
+                job
+            );
+
+        for (
+            const [
+                groupId,
+                segments
+            ]
+            of result
+        ) {
+            translations.set(
+                groupId,
+                segments
+            );
+        }
+
+        job.completedBatches =
+            i +
+            1;
+
+        job.progress =
+            Math.round(
+                (
+                    (
+                        i +
+                        1
+                    ) /
+                    batches.length
+                ) *
+                70
+            );
+
+        job.updatedAt =
+            Date.now();
+    }
+
+    if (
+        translations.size !==
+        groups.length
+    ) {
+        throw new Error(
+            `Tradução incompleta: ${translations.size}/${groups.length} groups.`
+        );
+    }
+
+    const reviewChanges =
+        await reviewAll(
+            groups,
+            translations,
+            deadlineAt,
+            job
+        );
+
+    job.reviewChanges =
+        reviewChanges.length;
+
+    let texts =
+        cleanAllFinal(
+            blocks,
+            flattenTranslations(
+                blocks,
+                groups,
+                translations
+            )
+        );
+
+    let risks =
+        finalRiskScan(
+            blocks,
+            texts
+        );
+
+    if (
+        risks.length
+    ) {
+        const repaired =
+            await targetedRiskRepair(
+                blocks,
+                groups,
+                translations,
+                risks,
+                deadlineAt,
+                job
+            );
+
+        job.reviewChanges +=
+            repaired.length;
+
+        if (
+            repaired.length
+        ) {
+            texts =
+                cleanAllFinal(
+                    blocks,
+                    flattenTranslations(
+                        blocks,
+                        groups,
+                        translations
+                    )
+                );
+
+            risks =
+                finalRiskScan(
+                    blocks,
+                    texts
+                );
+        }
+    }
+
+    /*
+     * Estes quatro tipos jamais
+     * podem chegar ao usuário.
+     */
+    const hard =
+        risks.filter(
+            issue =>
+                issue.reasons.some(
+                    reason =>
+                        [
+                            "SPEAKER_LABEL",
+                            "DIALOGUE_MARKER",
+                            "VOCAL_ELONGATION",
+                            "ARTIFICIAL_GENDER"
+                        ].includes(
+                            reason
+                        )
+                )
+        );
+
+    if (
+        hard.length
+    ) {
+        throw new Error(
+            `Quality Guard bloqueou ${hard.length} cue(s) por speaker/marcador/alongamento/gênero artificial.`
+        );
+    }
+
+    if (
+        risks.length
+    ) {
+        console.warn(
+            `[QUALITY GUARD] ${risks.length} alerta(s) não estrutural(is): ${risks
+                .slice(
+                    0,
+                    15
+                )
+                .map(
+                    item =>
+                        `${item.id}:${item.reasons.join(
+                            "+"
+                        )}`
+                )
+                .join(
+                    ", "
+                )}`
+        );
+    }
+    else {
+        console.log(
+            "[QUALITY GUARD] PASSOU — 0 padrão(s) conhecido(s) restante(s)."
+        );
+    }
+
+    const finalSrt =
+        buildSrt(
+            blocks,
+            texts
+        );
+
+    auditFinalTimestamps(
+        sourceSrt,
+        finalSrt,
+        "FINAL 6.0"
+    );
+
+    job.timestampAuditPassed =
+        true;
+
+    job.contentAuditPassed =
+        true;
+
+    job.qualityGuardRisks =
+        risks.length;
+
+    job.progress =
+        100;
+
+    job.updatedAt =
+        Date.now();
+
+    const elapsed =
+        (
+            Date.now() -
+            startedAt
+        ) /
+        1000;
+
+    console.log(
+        `[PIPELINE 6.0] OK em ${elapsed.toFixed(
+            1
+        )}s | Mistral=${job.mistralCalls} | GroqReview=${job.groqReviewCalls} | correções=${job.reviewChanges} | riscos finais=${risks.length}.`
+    );
+
+    return finalSrt;
+}
+
+// ============================================================
+// FILA DE JOBS
+// ============================================================
+
+async function processJob(
+    job
+) {
+    try {
+        const cached =
+            getTranslationCache(
+                job.cacheKey
+            );
+
+        if (cached) {
+            auditFinalTimestamps(
+                job.sourceSrt,
+                cached,
+                "CACHE"
+            );
+
+            job.result =
+                cached;
+
+            job.status =
+                "completed";
+
+            job.progress =
+                100;
+
+            job.timestampAuditPassed =
+                true;
+
+            job.contentAuditPassed =
+                true;
+
+            job.updatedAt =
+                Date.now();
+
+            return;
+        }
+
+        const finalSrt =
+            await translateSrt(
+                job.sourceSrt,
+                job
+            );
+
+        /*
+         * Cache recebe somente
+         * versão final revisada.
+         */
+        setTranslationCache(
+            job.cacheKey,
+            finalSrt
+        );
+
+        job.result =
+            finalSrt;
+
+        job.status =
+            "completed";
+
+        job.progress =
+            100;
+
+        job.updatedAt =
+            Date.now();
+
+        console.log(
+            `[JOB ${job.id}] Concluído.`
+        );
+    }
+    catch (error) {
+        job.status =
+            "failed";
+
+        job.error =
+            getErrorMessage(
+                error
+            );
+
+        job.updatedAt =
+            Date.now();
+
+        console.error(
+            `[JOB ${job.id}] Falhou: ${job.error}`
+        );
+    }
+}
+
+function enqueueTranslationJob(
+    job
+) {
+    return new Promise(
+        resolve => {
+            translationJobQueue.push({
+                job,
+                resolve
+            });
+
+            console.log(
+                `[JOB QUEUE] ${job.id} entrou na fila; aguardando=${translationJobQueue.length}.`
+            );
+
+            processTranslationJobQueue();
+        }
+    );
+}
+
+async function processTranslationJobQueue() {
+    if (
+        translationJobWorkerRunning
+    ) {
+        return;
+    }
+
+    translationJobWorkerRunning =
+        true;
+
+    try {
+        while (
+            translationJobQueue.length
+        ) {
+            const item =
+                translationJobQueue.shift();
+
+            if (!item) {
+                continue;
+            }
+
+            if (
+                item.job.status ===
+                "processing"
+            ) {
+                await processJob(
+                    item.job
+                );
+            }
+
+            item.resolve();
+        }
+    }
+    finally {
+        translationJobWorkerRunning =
+            false;
+
+        if (
+            translationJobQueue.length
+        ) {
+            processTranslationJobQueue();
+        }
+    }
+}
+
+function getOrCreateTranslationJob({
+    type,
+    videoId,
+    cleanedSrt,
+    sourceName = ""
+}) {
+    const sourceHash =
+        sha256(
+            cleanedSrt
+        );
+
+    const cacheKey =
+        `${TRANSLATION_CACHE_VERSION}:${type}:${videoId}:${sourceHash}`;
+
+    const cached =
+        getTranslationCache(
+            cacheKey
+        );
+
+    if (cached) {
+        const jobId =
+            `cached-${sourceHash.slice(
+                0,
+                24
+            )}`;
+
+        let job =
+            getJob(
+                jobId
+            );
+
+        if (!job) {
+            job =
+                createJob({
+                    jobId,
+                    cacheKey,
+                    type,
+                    videoId,
+                    sourceHash,
+                    sourceSrt:
+                        cleanedSrt,
+                    sourceName
+                });
+
+            job.status =
+                "completed";
+
+            job.result =
+                cached;
+
+            job.progress =
+                100;
+
+            job.timestampAuditPassed =
+                true;
+
+            job.contentAuditPassed =
+                true;
+        }
+
+        return job;
+    }
+
+    let job =
+        findProcessingJob(
+            cacheKey
+        );
+
+    if (job) {
+        return job;
+    }
+
+    const jobId =
+        `job-${sourceHash.slice(
+            0,
+            24
+        )}-${randomId(6)}`;
+
+    job =
+        createJob({
+            jobId,
+            cacheKey,
+            type,
+            videoId,
+            sourceHash,
+            sourceSrt:
+                cleanedSrt,
+            sourceName
+        });
+
+    job.promise =
+        enqueueTranslationJob(
+            job
+        ).catch(
+            error => {
+                job.status =
+                    "failed";
+
+                job.error =
+                    getErrorMessage(
+                        error
+                    );
+
+                job.updatedAt =
+                    Date.now();
+            }
+        );
+
+    return job;
+}
+
+// ============================================================
+// OPEN SUBTITLES - RELEASE AWARE
+// ============================================================
+
+async function fetchWithTimeout(
+    url,
+    options = {},
+    timeoutMs =
+        SOURCE_FETCH_TIMEOUT_MS
+) {
+    const controller =
+        new AbortController();
+
+    const timer =
+        setTimeout(
+            () =>
+                controller.abort(),
+            timeoutMs
+        );
+
+    try {
+        return await fetch(
+            url,
+            {
+                ...options,
+                signal:
+                    controller.signal
+            }
+        );
+    }
+    finally {
+        clearTimeout(
+            timer
+        );
+    }
+}
+
+function buildOpenSubtitlesSearchUrl(
+    type,
+    id,
+    extra = {}
+) {
+    const base =
+        `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(
+            type
+        )}/${encodeURIComponent(
+            id
+        )}`;
+
+    const params =
+        new URLSearchParams();
+
+    if (
+        extra.videoHash
+    ) {
+        params.set(
+            "videoHash",
+            extra.videoHash
+        );
+    }
+
+    if (
+        extra.videoSize
+    ) {
+        params.set(
+            "videoSize",
+            extra.videoSize
+        );
+    }
+
+    if (
+        extra.filename
+    ) {
+        params.set(
+            "filename",
+            extra.filename
+        );
+    }
+
+    const suffix =
+        params.toString();
+
+    return suffix
+        ? `${base}/${suffix}.json`
+        : `${base}.json`;
+}
+
+function scoreSubtitle(
+    subtitle
+) {
+    let score = 0;
+
+    const lang =
+        String(
+            subtitle?.lang ||
+            ""
+        ).toLowerCase();
+
+    if (
+        lang ===
+        "eng"
+    ) {
+        score +=
+            100;
+    }
+    else if (
+        lang ===
+        "en"
+    ) {
+        score +=
+            90;
+    }
+
+    if (
+        subtitle
+            ?.hearingImpaired ===
+        false
+    ) {
+        score +=
+            20;
+    }
+
+    if (
+        String(
+            subtitle?.format ||
+            ""
+        ).toLowerCase() ===
+        "srt"
+    ) {
+        score +=
+            20;
+    }
+
+    if (
+        /english/i.test(
+            String(
+                subtitle?.name ||
+                ""
+            )
+        )
+    ) {
+        score +=
+            10;
+    }
+
+    return score;
+}
+
+function selectBestSubtitle(
+    subtitles
+) {
+    if (
+        !Array.isArray(
+            subtitles
+        )
+    ) {
+        return null;
+    }
+
+    return (
+        subtitles
+            .filter(
+                sub => {
+                    const lang =
+                        String(
+                            sub?.lang ||
+                            ""
+                        ).toLowerCase();
+
+                    return (
+                        (
+                            lang ===
+                                "eng" ||
+                            lang ===
+                                "en"
+                        ) &&
+                        typeof sub?.url ===
+                            "string" &&
+                        /^https?:\/\//i.test(
+                            sub.url
+                        )
+                    );
+                }
+            )
+            .sort(
+                (
+                    a,
+                    b
+                ) =>
+                    scoreSubtitle(
+                        b
+                    ) -
+                    scoreSubtitle(
+                        a
+                    )
+            )[0] ||
+        null
+    );
+}
+
+async function findEnglishSubtitle(
+    type,
+    id,
+    extra
+) {
+    const url =
+        buildOpenSubtitlesSearchUrl(
+            type,
+            id,
+            extra
+        );
+
+    console.log(
+        `[OPENSUBTITLES] ${url}`
+    );
+
+    const response =
+        await fetchWithTimeout(
+            url,
+            {
+                headers: {
+                    Accept:
+                        "application/json",
+
+                    "User-Agent":
+                        "Stremio-PTBR-DualAI/6.0"
+                }
+            }
+        );
+
+    if (
+        !response.ok
+    ) {
+        throw new Error(
+            `OpenSubtitles HTTP ${response.status}.`
+        );
+    }
+
+    const data =
+        await response.json();
+
+    const subtitles =
+        Array.isArray(
+            data?.subtitles
+        )
+            ? data.subtitles
+            : [];
+
+    const target =
+        selectBestSubtitle(
+            subtitles
+        );
+
+    console.log(
+        target
+            ? `[OPENSUBTITLES] Inglês selecionado; resultados=${subtitles.length}.`
+            : `[OPENSUBTITLES] Nenhuma legenda inglesa utilizável; resultados=${subtitles.length}.`
+    );
+
+    return target;
+}
+
+async function downloadAndCleanSubtitle(
+    url
+) {
+    const response =
+        await fetchWithTimeout(
+            url,
+            {
+                headers: {
+                    "User-Agent":
+                        "Stremio-PTBR-DualAI/6.0"
+                }
+            }
+        );
+
+    if (
+        !response.ok
+    ) {
+        throw new Error(
+            `Falha ao baixar legenda: HTTP ${response.status}.`
+        );
+    }
+
+    const raw =
+        normalizeSrt(
+            await response.text()
+        );
+
+    if (!raw) {
+        throw new Error(
+            "Legenda vazia."
+        );
+    }
+
+    if (
+        raw.length >
+        MAX_SOURCE_CHARS
+    ) {
+        throw new Error(
+            `Legenda muito grande: ${raw.length} caracteres.`
+        );
+    }
+
+    const clean =
+        cleanSrtForTranslation(
+            raw
+        );
+
+    if (!clean) {
+        throw new Error(
+            "Legenda vazia após limpeza."
+        );
+    }
+
+    return clean;
+}
+
+function parseExtra(
+    req
+) {
+    const raw =
+        String(
+            req.params.extra ||
+            ""
+        ).trim();
+
+    const params =
+        new URLSearchParams(
+            raw
+        );
+
+    return {
+        filename:
+            String(
+                params.get(
+                    "filename"
+                ) ||
+                req.query
+                    .filename ||
+                ""
+            ).trim(),
+
+        videoSize:
+            String(
+                params.get(
+                    "videoSize"
+                ) ||
+                req.query
+                    .videoSize ||
+                ""
+            ).trim(),
+
+        videoHash:
+            String(
+                params.get(
+                    "videoHash"
+                ) ||
+                req.query
+                    .videoHash ||
+                ""
+            ).trim()
+    };
+}
+
+// ============================================================
+// RESPOSTAS SRT
+// ============================================================
+
+function sendSubtitleResponse(
+    res,
+    srt,
+    cacheControl =
+        "no-store"
+) {
+    res.status(200);
+
+    res.set(
+        "Content-Type",
+        "application/x-subrip; charset=utf-8"
+    );
+
+    res.set(
+        "Cache-Control",
+        cacheControl
+    );
+
+    res.send(
+        String(
+            srt ||
+            ""
+        )
+    );
+}
+
+function buildProcessingSrt(
+    job
+) {
+    return [
+        "1",
+
+        "00:00:01,000 --> 00:00:06,000",
+
+        "Traduzindo e revisando legenda...",
+
+        "",
+
+        "2",
+
+        "00:00:06,500 --> 00:00:12,000",
+
+        `Progresso: ${Number(
+            job?.progress ||
+            0
+        )}%. Aguarde alguns instantes.`
+    ].join("\n");
+}
+
+function buildErrorSrt(
+    message
+) {
+    return [
+        "1",
+
+        "00:00:01,000 --> 00:00:08,000",
+
+        "Não foi possível concluir a legenda PT-BR.",
+
+        "",
+
+        "2",
+
+        "00:00:08,500 --> 00:00:18,000",
+
+        String(
+            message ||
+            "Erro desconhecido."
+        )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .slice(
+                0,
+                300
+            )
+    ].join("\n");
+}
+
+// ============================================================
+// STREMIO
+// ============================================================
+
+const manifest = {
+    /*
+     * Mantido para não
+     * duplicar o addon
+     * já instalado.
+     */
+    id:
+        "org.tradutor.stateless.gemini.free",
+
+    version:
+        "6.0.0",
+
+    name:
+        "Tradutor PT-BR Premium",
+
+    description:
+        "Traduz com Mistral Medium 3.5, revisa com Groq Compound Mini e preserva os timestamps da fonte.",
+
+    resources: [
+        "subtitles"
+    ],
+
+    types: [
+        "movie",
+        "series"
+    ],
+
+    idPrefixes: [
+        "tt"
+    ],
+
+    catalogs: [],
+
+    behaviorHints: {
+        configurable:
+            false,
+
+        adult:
+            false
+    }
+};
+
+app.get(
+    "/manifest.json",
+    (
+        req,
+        res
+    ) =>
+        res.json(
+            manifest
+        )
+);
+
+app.get(
+    "/",
+    (
+        req,
+        res
+    ) => {
+        res.json({
+            status:
+                "online",
+
+            name:
+                manifest.name,
+
+            version:
+                manifest.version,
+
+            translator:
+                MISTRAL_MODEL,
+
+            reviewer:
+                GROQ_REVIEW_MODEL,
+
+            translationCacheVersion:
+                TRANSLATION_CACHE_VERSION,
+
+            embeddedBridge:
+                Boolean(
+                    LOCAL_BRIDGE_SECRET
+                ),
+
+            mistralConfigured:
+                Boolean(
+                    MISTRAL_API_KEY
+                ),
+
+            groqConfigured:
+                Boolean(
+                    GROQ_API_KEY
+                ),
+
+            geminiRollbackConfigured:
+                Boolean(
+                    GEMINI_API_KEY
+                ),
+
+            geminiRollbackModel:
+                GEMINI_MODEL,
+
+            queue:
+                translationJobQueue.length,
+
+            processing:
+                translationJobWorkerRunning,
+
+            cache:
+                translationCache.size,
+
+            jobs:
+                jobs.size,
+
+            rules: {
+                sentenceGroups:
+                    true,
+
+                secondAiReview:
+                    true,
+
+                timestampsImmutable:
+                    true,
+
+                speakerLabelsForbidden:
+                    true,
+
+                hiddenSpeakerContext:
+                    true,
+
+                genderGuessForbidden:
+                    true,
+
+                vocalElongationNormalization:
+                    true,
+
+                decorativeDialogueMarkersForbidden:
+                    true
+            }
+        });
+    }
+);
+
+app.get(
+    "/health",
+    (
+        req,
+        res
+    ) => {
+        res.json({
+            status:
+                "ok",
+
+            uptime:
+                process.uptime(),
+
+            translator:
+                MISTRAL_MODEL,
+
+            reviewer:
+                GROQ_REVIEW_MODEL,
+
+            cacheVersion:
+                TRANSLATION_CACHE_VERSION,
+
+            queue:
+                translationJobQueue.length,
+
+            processing:
+                translationJobWorkerRunning
+        });
+    }
+);
+
+async function subtitlesHandler(
+    req,
+    res
+) {
+    try {
+        const type =
+            String(
+                req.params
+                    .type ||
+                ""
+            ).trim();
+
+        const id =
+            String(
+                req.params
+                    .id ||
+                ""
+            ).trim();
+
+        const extra =
+            parseExtra(
+                req
+            );
+
+        console.log(
+            `[STREMIO] Pedido: ${type}/${id}`
+        );
+
+        console.log(
+            `[STREMIO] filename=${extra.filename || "(não enviado)"}; videoSize=${extra.videoSize || "(não enviado)"}; videoHash=${extra.videoHash || "(não enviado)"}`
+        );
+
+        const target =
+            await findEnglishSubtitle(
+                type,
+                id,
+                extra
+            );
+
+        if (!target) {
+            return safeJson(
+                res,
+                {
+                    subtitles: []
+                }
+            );
+        }
+
+        const sourceSrt =
+            await downloadAndCleanSubtitle(
+                target.url
+            );
+
+        const job =
+            getOrCreateTranslationJob({
+                type,
+
+                videoId:
+                    id,
+
+                cleanedSrt:
+                    sourceSrt,
+
+                sourceName:
+                    target.name ||
+                    "OpenSubtitles"
+            });
+
+        const baseUrl =
+            cleanBaseUrl(
+                req
+            );
+
+        return safeJson(
+            res,
+            {
+                subtitles: [
+                    {
+                        id:
+                            `${id}-ptbr-${job.sourceHash.slice(
+                                0,
+                                12
+                            )}`,
+
+                        url:
+                            `${baseUrl}/subtitle/${encodeURIComponent(
+                                job.id
+                            )}.srt`,
+
+                        lang:
+                            "por"
+                    }
+                ]
+            }
+        );
+    }
+    catch (error) {
+        console.error(
+            `[STREMIO] ${getErrorMessage(
+                error
+            )}`
+        );
+
+        return safeJson(
+            res,
+            {
+                subtitles: []
+            }
+        );
+    }
+}
+
+app.get(
+    "/subtitles/:type/:id.json",
+    subtitlesHandler
+);
+
+app.get(
+    "/subtitles/:type/:id/:extra.json",
+    subtitlesHandler
+);
+
+// ============================================================
+// API DA PONTE LOCAL
+// PROTOCOLO COMPATÍVEL
+// ============================================================
+
+app.post(
+    "/api/translate-embedded",
+    async (
+        req,
+        res
+    ) => {
+        if (
+            !isAuthorizedLocalBridge(
+                req
+            )
+        ) {
+            return safeJson(
+                res,
+                {
+                    error:
+                        "Unauthorized"
+                },
+                401
+            );
+        }
+
+        try {
+            const type =
+                String(
+                    req.body
+                        ?.type ||
+                    "unknown"
+                ).trim();
+
+            const videoId =
+                String(
+                    req.body
+                        ?.id ||
+                    "unknown"
+                ).trim();
+
+            const sourceName =
+                String(
+                    req.body
+                        ?.name ||
+                    "embedded"
+                ).trim();
+
+            const rawSrt =
+                req.body?.srt;
+
+            if (
+                typeof rawSrt !==
+                    "string" ||
+                !rawSrt.trim()
+            ) {
+                return safeJson(
+                    res,
+                    {
+                        error:
+                            "Campo 'srt' é obrigatório."
+                    },
+                    400
+                );
+            }
+
+            if (
+                rawSrt.length >
+                MAX_SOURCE_CHARS
+            ) {
+                return safeJson(
+                    res,
+                    {
+                        error:
+                            `SRT muito grande. Limite: ${MAX_SOURCE_CHARS}.`
+                    },
+                    413
+                );
+            }
+
+            const cleanedSrt =
+                cleanSrtForTranslation(
+                    rawSrt
+                );
+
+            if (
+                !cleanedSrt ||
+                !parseSrt(
+                    cleanedSrt
+                ).length
+            ) {
+                throw new Error(
+                    "Legenda embutida vazia/inválida após limpeza."
+                );
+            }
+
+            console.log(
+                `[EMBEDDED API] ${type}/${videoId} | ${sourceName} | ${parseSrt(
+                    cleanedSrt
+                ).length} cues.`
+            );
+
+            const job =
+                getOrCreateTranslationJob({
+                    type,
+
+                    videoId,
+
+                    cleanedSrt,
+
+                    sourceName
+                });
+
+            const baseUrl =
+                cleanBaseUrl(
+                    req
+                );
+
+            return safeJson(
+                res,
+                {
+                    ok:
+                        true,
+
+                    jobId:
+                        job.id,
+
+                    status:
+                        job.status,
+
+                    progress:
+                        job.progress,
+
+                    subtitleUrl:
+                        `${baseUrl}/subtitle/${encodeURIComponent(
+                            job.id
+                        )}.srt`
+                }
+            );
+        }
+        catch (error) {
+            console.error(
+                `[EMBEDDED API] ${getErrorMessage(
+                    error
+                )}`
+            );
+
+            return safeJson(
+                res,
+                {
+                    error:
+                        getErrorMessage(
+                            error
+                        )
+                },
+                500
+            );
+        }
+    }
+);
+
+// ============================================================
+// RESULTADO / STATUS DO JOB
+// ============================================================
+
+app.get(
+    "/job/:jobId",
+    (
+        req,
+        res
+    ) => {
+        const job =
+            getJob(
+                String(
+                    req.params
+                        .jobId ||
+                    ""
+                )
+            );
+
+        if (!job) {
+            return safeJson(
+                res,
+                {
+                    error:
+                        "Job não encontrado/expirado."
+                },
+                404
+            );
+        }
+
+        return safeJson(
+            res,
+            {
+                id:
+                    job.id,
+
+                status:
+                    job.status,
+
+                progress:
+                    job.progress,
+
+                error:
+                    job.error,
+
+                sentenceGroups:
+                    job.sentenceGroups ||
+                    0,
+
+                mistralCalls:
+                    job.mistralCalls ||
+                    0,
+
+                groqReviewCalls:
+                    job.groqReviewCalls ||
+                    0,
+
+                reviewChanges:
+                    job.reviewChanges ||
+                    0,
+
+                qualityGuardRisks:
+                    job.qualityGuardRisks ||
+                    0,
+
+                providerUsage:
+                    job.providerUsage ||
+                    {}
+            }
+        );
+    }
+);
+
+app.get(
+    "/subtitle/:jobId.srt",
+    (
+        req,
+        res
+    ) => {
+        let jobId;
+
+        try {
+            jobId =
+                decodeURIComponent(
+                    String(
+                        req.params
+                            .jobId ||
+                        ""
+                    )
+                );
+        }
+        catch {
+            jobId =
+                String(
+                    req.params
+                        .jobId ||
+                    ""
+                );
+        }
+
+        const job =
+            getJob(
+                jobId
+            );
+
+        if (!job) {
+            return sendSubtitleResponse(
+                res,
+                buildErrorSrt(
+                    "Esta tradução expirou. Recarregue as legendas."
+                )
+            );
+        }
+
+        if (
+            job.status ===
+                "completed" &&
+            job.result
+        ) {
+            try {
+                auditFinalTimestamps(
+                    job.sourceSrt,
+                    job.result,
+                    "SERVING"
+                );
+            }
+            catch {
+                return sendSubtitleResponse(
+                    res,
+                    buildErrorSrt(
+                        "A auditoria de timestamps bloqueou esta legenda."
+                    )
+                );
+            }
+
+            if (
+                !job.contentAuditPassed
+            ) {
+                return sendSubtitleResponse(
+                    res,
+                    buildErrorSrt(
+                        "A revisão de conteúdo não foi concluída."
+                    )
+                );
+            }
+
+            return sendSubtitleResponse(
+                res,
+                job.result,
+                "public, max-age=604800"
+            );
+        }
+
+        if (
+            job.status ===
+            "failed"
+        ) {
+            return sendSubtitleResponse(
+                res,
+                buildErrorSrt(
+                    job.error
+                )
+            );
+        }
+
+        return sendSubtitleResponse(
+            res,
+            buildProcessingSrt(
+                job
+            ),
+            "no-store, no-cache, must-revalidate"
+        );
+    }
+);
+
+// ============================================================
+// MANUTENÇÃO
+// ============================================================
+
+setInterval(
+    () => {
+        pruneMapByTime(
+            translationCache,
+            CACHE_TTL_MS,
+            MAX_CACHE_ENTRIES
+        );
+
+        pruneMapByTime(
+            jobs,
+            JOB_TTL_MS,
+            MAX_JOBS
+        );
+    },
+    10 * 60 * 1000
+).unref();
+
+// ============================================================
+// START
+// ============================================================
+
+app.listen(
+    PORT,
+    () => {
+        console.log(
+            "============================================================"
+        );
+
+        console.log(
+            " STREMIO PT-BR DUAL AI TRANSLATOR 6.0"
+        );
+
+        console.log(
+            "============================================================"
+        );
+
+        console.log(
+            `Porta: ${PORT}`
+        );
+
+        console.log(
+            `Tradutor principal: ${MISTRAL_MODEL}`
+        );
+
+        console.log(
+            `Revisor independente: ${GROQ_REVIEW_MODEL}`
+        );
+
+        console.log(
+            `Mistral: ${
+                MISTRAL_API_KEY
+                    ? "CONFIGURADO ✅"
+                    : "FALTANDO ❌"
+            }`
+        );
+
+        console.log(
+            `Groq: ${
+                GROQ_API_KEY
+                    ? "CONFIGURADO ✅"
+                    : "FALTANDO ❌"
+            }`
+        );
+
+        console.log(
+            `Gemini rollback: ${
+                GEMINI_API_KEY
+                    ? `DISPONÍVEL (${GEMINI_MODEL}) ✅`
+                    : "não configurado"
+            }`
+        );
+
+        console.log(
+            `Ponte Local: ${
+                LOCAL_BRIDGE_SECRET
+                    ? "COMPATÍVEL ✅"
+                    : "SECRET FALTANDO ❌"
+            }`
+        );
+
+        console.log(
+            `Mistral batch: ${MISTRAL_BATCH_GROUPS} groups / ${MISTRAL_BATCH_CHARS} chars`
+        );
+
+        console.log(
+            `Groq review batch: ${REVIEW_BATCH_GROUPS} groups / ${REVIEW_BATCH_CHARS} chars`
+        );
+
+        console.log(
+            "Sentence Groups + segmentação temporal: ATIVA ✅"
+        );
+
+        console.log(
+            "Segunda IA revisando EN↔PT-BR: ATIVA ✅"
+        );
+
+        console.log(
+            "Speaker labels/nomes na saída: PROIBIDOS ✅"
+        );
+
+        console.log(
+            "Gênero chutado: PROIBIDO ✅"
+        );
+
+        console.log(
+            "Alongamentos gráficos: PROIBIDOS ✅"
+        );
+
+        console.log(
+            "Hífens/travessões decorativos: PROIBIDOS ✅"
+        );
+
+        console.log(
+            "Timestamps: IMUTÁVEIS ✅"
+        );
+
+        console.log(
+            `Namespace de cache: ${TRANSLATION_CACHE_VERSION}`
+        );
+
+        console.log(
+            "Fila de episódios: SEQUENCIAL (1 por vez)"
+        );
+
+        console.log(
+            "Status: ONLINE"
+        );
+
+        console.log(
+            "============================================================"
+        );
+    }
+);
+
+process.on(
+    "unhandledRejection",
+    error =>
+        console.error(
+            "[PROCESS] Unhandled rejection:",
+            error
+        )
+);
+
+process.on(
+    "uncaughtException",
+    error =>
+        console.error(
+            "[PROCESS] Uncaught exception:",
+            error
+        )
+);
