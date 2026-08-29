@@ -8,19 +8,25 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
-// STREMIO PT-BR BACKEND 6.6.2 — GEMINI INTERACTIONS FIX
+// STREMIO PT-BR BACKEND 7.0 FINAL — GEMINI 3.5 FLASH-LITE ONLY
 // ============================================================
-// Tradutor: Gemini 3.6 Flash
-// Auditor: Gemini 3.5 Flash-Lite
-// API: Gemini Interactions API
+// Objetivo: qualidade + coerência + sincronização + velocidade.
+// Modelo único: gemini-3.5-flash-lite.
 //
-// IMPORTANTE:
-// - NÃO envia safety_settings: a Gemini Developer API rejeitou esse
-//   parâmetro no POST /interactions com API key.
-// - NÃO envia temperature, top_p ou top_k.
-// - NÃO usa Mistral nem Groq.
-// - NÃO existe teto global do episódio.
-// - Ponte Local 4.1 permanece compatível.
+// Limites observados pelo usuário no Free Tier:
+//   15 RPM | 250K TPM | 500 RPD
+//
+// Arquitetura por episódio:
+//   1 chamada curta de CONTEXTO GLOBAL
+//   4 lotes principais em PARALELO
+//   até 8 lotes de AUDITORIA ampla
+//   1 micro-auditoria PROFUNDA dos grupos de maior risco
+//   reparo SOMENTE do que foi sinalizado
+//   rechecagem SOMENTE do que foi reparado
+//
+// O gate de RPM NÃO é um pacer arbitrário: ele só impede ultrapassar
+// o limite real de 15 requisições nos últimos 60 segundos.
+// Não existe teto global do episódio.
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -28,129 +34,79 @@ const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 
-const GEMINI_TRANSLATOR_MODEL = String(
-  process.env.GEMINI_TRANSLATOR_MODEL || "gemini-3.6-flash"
-).trim();
+// Deliberadamente fixo para impedir que uma variável antiga volte ao 3.6.
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
-const GEMINI_AUDITOR_MODEL = String(
-  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite"
-).trim();
-
-const CACHE_VERSION = "6.6.2-interactions-fix";
+const CACHE_VERSION = "7.0.0-flash-lite-final";
 const MAX_SOURCE_CHARS = 800000;
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 25000;
 
-// Timeouts são por REQUEST, nunca do episódio inteiro.
-const MAIN_REQUEST_TIMEOUT_MS = Number(
-  process.env.GEMINI_MAIN_TIMEOUT_MS || 180000
-);
+// Limites reais fornecidos pelo usuário.
+const GEMINI_RPM_LIMIT = 15;
+const GEMINI_TPM_LIMIT = 250000;
+const GEMINI_RPD_LIMIT = 500;
 
-const AUDIT_REQUEST_TIMEOUT_MS = Number(
-  process.env.GEMINI_AUDIT_TIMEOUT_MS || 90000
-);
+// 4 lotes principais: boa combinação de paralelismo + margem de RPM.
+const MAIN_PARALLEL_BATCHES = 4;
+const MAIN_CONTEXT_OVERLAP_GROUPS = 8;
+const MAIN_THINKING = "low";
+const MAIN_MAX_OUTPUT_TOKENS = 18000;
+const MAIN_TIMEOUT_MS = 150000;
+const MAIN_RETRIES = 4;
 
-const REPAIR_REQUEST_TIMEOUT_MS = Number(
-  process.env.GEMINI_REPAIR_TIMEOUT_MS || 120000
-);
+// Planner curto: extrai apenas contexto útil para manter coerência.
+const PLAN_THINKING = "minimal";
+const PLAN_MAX_OUTPUT_TOKENS = 2600;
+const PLAN_TIMEOUT_MS = 45000;
 
-const MAIN_MAX_RETRIES = Number(
-  process.env.GEMINI_MAIN_RETRIES || 5
-);
+// Auditoria ampla: 1150 groups normalmente viram 8 lotes (~144 cada).
+const AUDIT_BATCH_GROUPS = 150;
+const AUDIT_BATCH_CHARS = 34000;
+const AUDIT_CONCURRENCY = 4;
+const AUDIT_THINKING = "minimal";
+const AUDIT_MAX_OUTPUT_TOKENS = 7000;
+const AUDIT_TIMEOUT_MS = 70000;
+const AUDIT_RETRIES = 3;
 
-const AUDIT_MAX_RETRIES = Number(
-  process.env.GEMINI_AUDIT_RETRIES || 4
-);
+// Uma micro-auditoria extra para os 40 trechos mais arriscados.
+const DEEP_AUDIT_MAX_GROUPS = 40;
+const DEEP_AUDIT_THINKING = "low";
+const DEEP_AUDIT_MAX_OUTPUT_TOKENS = 5000;
 
-const REPAIR_MAX_RETRIES = Number(
-  process.env.GEMINI_REPAIR_RETRIES || 5
-);
+// Reparo focado: poucos groups, mais raciocínio.
+const REPAIR_BATCH_GROUPS = 100;
+const REPAIR_BATCH_CHARS = 32000;
+const REPAIR_THINKING = "medium";
+const REPAIR_MAX_OUTPUT_TOKENS = 14000;
+const REPAIR_TIMEOUT_MS = 100000;
+const REPAIR_RETRIES = 4;
 
-const MAIN_MAX_OUTPUT_TOKENS = Number(
-  process.env.GEMINI_MAIN_MAX_OUTPUT_TOKENS || 50000
-);
-
-const AUDIT_MAX_OUTPUT_TOKENS = Number(
-  process.env.GEMINI_AUDIT_MAX_OUTPUT_TOKENS || 12000
-);
-
-const REPAIR_MAX_OUTPUT_TOKENS = Number(
-  process.env.GEMINI_REPAIR_MAX_OUTPUT_TOKENS || 24000
-);
-
-const MAIN_THINKING_LEVEL = String(
-  process.env.GEMINI_TRANSLATOR_THINKING || "medium"
-)
-  .trim()
-  .toLowerCase();
-
-const AUDIT_THINKING_LEVEL = "minimal";
-const REPAIR_THINKING_LEVEL = "high";
-
-const AUDIT_BATCH_GROUPS = Number(
-  process.env.GEMINI_AUDIT_GROUPS || 80
-);
-
-const AUDIT_BATCH_CHARS = Number(
-  process.env.GEMINI_AUDIT_CHARS || 22000
-);
-
-const AUDIT_CONCURRENCY = Math.max(
-  1,
-  Math.min(
-    3,
-    Number(
-      process.env.GEMINI_AUDIT_CONCURRENCY || 3
-    )
-  )
-);
-
-const REPAIR_BATCH_GROUPS = Number(
-  process.env.GEMINI_REPAIR_GROUPS || 100
-);
-
-const REPAIR_BATCH_CHARS = Number(
-  process.env.GEMINI_REPAIR_CHARS || 28000
-);
+// Última tentativa só para residual realmente conhecido.
+const EMERGENCY_THINKING = "high";
 
 const translationCache = new Map();
 const jobs = new Map();
 const queue = [];
-
 let queueRunning = false;
 
-const sleep = ms =>
-  new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // ============================================================
 // HELPERS
 // ============================================================
 
 function sha256(value) {
-  return crypto
-    .createHash("sha256")
-    .update(
-      String(value),
-      "utf8"
-    )
-    .digest("hex");
+  return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
 }
 
 function randomId(bytes = 6) {
-  return crypto
-    .randomBytes(bytes)
-    .toString("hex");
+  return crypto.randomBytes(bytes).toString("hex");
 }
 
 function errorMessage(error) {
-  return String(
-    error?.message ||
-    error ||
-    "Erro desconhecido."
-  );
+  return String(error?.message || error || "Erro desconhecido.");
 }
 
 function normalizeSrt(value) {
@@ -163,133 +119,59 @@ function normalizeSrt(value) {
 
 function stripCodeFences(value) {
   return String(value || "")
-    .replace(
-      /^\s*```(?:json|text|plaintext|srt)?\s*/i,
-      ""
-    )
-    .replace(
-      /\s*```\s*$/i,
-      ""
-    )
+    .replace(/^\s*```(?:json|text|plaintext|srt)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
     .trim();
 }
 
 function baseUrl(req) {
-  if (PUBLIC_URL) {
-    return PUBLIC_URL;
-  }
+  if (PUBLIC_URL) return PUBLIC_URL;
 
-  const proto = String(
-    req.headers["x-forwarded-proto"] ||
-    req.protocol ||
-    "https"
-  )
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
     .split(",")[0]
     .trim();
 
-  const host = String(
-    req.headers["x-forwarded-host"] ||
-    req.headers.host ||
-    ""
-  )
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "")
     .split(",")[0]
     .trim();
 
-  return `${proto}://${host}`
-    .replace(/\/+$/, "");
+  return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
-function safeJson(
-  res,
-  payload,
-  status = 200
-) {
-  res.set(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate"
-  );
-
-  return res
-    .status(status)
-    .json(payload);
+function safeJson(res, payload, status = 200) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  return res.status(status).json(payload);
 }
 
-function sendSrt(
-  res,
-  srt,
-  cacheControl = "no-store"
-) {
+function sendSrt(res, srt, cacheControl = "no-store") {
   res.status(200);
-
-  res.set(
-    "Content-Type",
-    "application/x-subrip; charset=utf-8"
-  );
-
-  res.set(
-    "Cache-Control",
-    cacheControl
-  );
-
-  res.send(
-    String(srt || "")
-  );
+  res.set("Content-Type", "application/x-subrip; charset=utf-8");
+  res.set("Cache-Control", cacheControl);
+  res.send(String(srt || ""));
 }
 
 function authorized(req) {
-  if (!LOCAL_BRIDGE_SECRET) {
-    return false;
-  }
+  if (!LOCAL_BRIDGE_SECRET) return false;
 
-  const a = Buffer.from(
-    String(
-      req.headers.authorization ||
-      ""
-    ).trim()
-  );
+  const a = Buffer.from(String(req.headers.authorization || "").trim());
+  const b = Buffer.from(`Bearer ${LOCAL_BRIDGE_SECRET}`);
 
-  const b = Buffer.from(
-    `Bearer ${LOCAL_BRIDGE_SECRET}`
-  );
-
-  return (
-    a.length === b.length &&
-    crypto.timingSafeEqual(
-      a,
-      b
-    )
-  );
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ============================================================
 // CACHE / JOBS
 // ============================================================
 
-function makeCacheKey(
-  type,
-  videoId,
-  sourceSrt
-) {
-  return (
-    `${CACHE_VERSION}:` +
-    `${type}:` +
-    `${videoId}:` +
-    `${sha256(sourceSrt)}`
-  );
+function makeCacheKey(type, videoId, sourceSrt) {
+  return `${CACHE_VERSION}:${type}:${videoId}:${sha256(sourceSrt)}`;
 }
 
 function getCache(key) {
-  const item =
-    translationCache.get(key);
+  const item = translationCache.get(key);
+  if (!item) return null;
 
-  if (!item) {
-    return null;
-  }
-
-  if (
-    item.expiresAt <=
-    Date.now()
-  ) {
+  if (item.expiresAt <= Date.now()) {
     translationCache.delete(key);
     return null;
   }
@@ -297,101 +179,49 @@ function getCache(key) {
   return item.srt;
 }
 
-function setCache(
-  key,
-  srt
-) {
-  translationCache.set(
-    key,
-    {
-      srt,
-
-      expiresAt:
-        Date.now() +
-        CACHE_TTL_MS
-    }
-  );
+function setCache(key, srt) {
+  translationCache.set(key, {
+    srt,
+    expiresAt: Date.now() + CACHE_TTL_MS
+  });
 }
 
-function createJob({
-  type,
-  videoId,
-  filename,
-  sourceSrt,
-  sourceKind
-}) {
-  const now =
-    Date.now();
-
-  const sourceHash =
-    sha256(sourceSrt);
+function createJob({ type, videoId, filename, sourceSrt, sourceKind }) {
+  const now = Date.now();
+  const sourceHash = sha256(sourceSrt);
 
   const job = {
-    id:
-      `job-` +
-      `${sourceHash.slice(
-        0,
-        24
-      )}-` +
-      `${randomId()}`,
-
+    id: `job-${sourceHash.slice(0, 24)}-${randomId()}`,
     type,
-
     videoId,
-
     filename,
-
     sourceSrt,
-
     sourceKind,
-
     sourceHash,
+    cacheKey: makeCacheKey(type, videoId, sourceSrt),
 
-    cacheKey:
-      makeCacheKey(
-        type,
-        videoId,
-        sourceSrt
-      ),
+    status: "processing",
+    progress: 1,
+    result: null,
+    error: null,
 
-    status:
-      "processing",
-
-    progress:
-      1,
-
-    result:
-      null,
-
-    error:
-      null,
-
-    createdAt:
-      now,
-
-    updatedAt:
-      now,
-
-    expiresAt:
-      now +
-      JOB_TTL_MS,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + JOB_TTL_MS,
 
     stats: {
+      planCalls: 0,
+
       mainCalls: 0,
       mainAttempts: 0,
       main429: 0,
       mainSplits: 0,
       mainRescueGroups: 0,
 
-      mainInputTokens: 0,
-      mainOutputTokens: 0,
-      mainThoughtTokens: 0,
-
       auditCalls: 0,
       auditAttempts: 0,
       audit429: 0,
-      auditFallbackCalls: 0,
-
+      deepAuditCalls: 0,
       auditPrimaryGroups: 0,
       auditRecheckGroups: 0,
       auditFlagged: 0,
@@ -405,32 +235,23 @@ function createJob({
       emergencyRepairGroups: 0,
 
       localStyleFlags: 0,
-      omissionFlags: 0
+      omissionFlags: 0,
+
+      rpmWaitMs: 0,
+
+      inputTokens: 0,
+      outputTokens: 0,
+      thoughtTokens: 0
     }
   };
 
-  jobs.set(
-    job.id,
-    job
-  );
-
+  jobs.set(job.id, job);
   return job;
 }
 
-function findJobByCache(
-  key,
-  statuses
-) {
-  for (
-    const job
-    of jobs.values()
-  ) {
-    if (
-      job.cacheKey === key &&
-      statuses.includes(
-        job.status
-      )
-    ) {
+function findJobByCache(key, statuses) {
+  for (const job of jobs.values()) {
+    if (job.cacheKey === key && statuses.includes(job.status)) {
       return job;
     }
   }
@@ -438,117 +259,54 @@ function findJobByCache(
   return null;
 }
 
-function getOrCreateJob(
-  args
-) {
-  const key =
-    makeCacheKey(
-      args.type,
-      args.videoId,
-      args.sourceSrt
-    );
+function getOrCreateJob(args) {
+  const key = makeCacheKey(args.type, args.videoId, args.sourceSrt);
 
-  const cached =
-    getCache(key);
+  const cached = getCache(key);
 
   if (cached) {
-    let job =
-      findJobByCache(
-        key,
-        ["completed"]
-      );
+    let job = findJobByCache(key, ["completed"]);
 
     if (!job) {
-      job =
-        createJob(args);
-
-      job.status =
-        "completed";
-
-      job.progress =
-        100;
-
-      job.result =
-        cached;
+      job = createJob(args);
+      job.status = "completed";
+      job.progress = 100;
+      job.result = cached;
     }
 
     return job;
   }
 
-  const active =
-    findJobByCache(
-      key,
-      ["processing"]
-    );
+  const active = findJobByCache(key, ["processing"]);
+  if (active) return active;
 
-  if (active) {
-    return active;
-  }
+  const done = findJobByCache(key, ["completed"]);
+  if (done) return done;
 
-  const done =
-    findJobByCache(
-      key,
-      ["completed"]
-    );
-
-  if (done) {
-    return done;
-  }
-
-  const job =
-    createJob(args);
-
+  const job = createJob(args);
   enqueue(job);
 
   return job;
 }
 
-setInterval(
-  () => {
-    const now =
-      Date.now();
+setInterval(() => {
+  const now = Date.now();
 
-    for (
-      const [
-        key,
-        item
-      ]
-      of translationCache.entries()
-    ) {
-      if (
-        item.expiresAt <=
-        now
-      ) {
-        translationCache.delete(
-          key
-        );
-      }
+  for (const [key, item] of translationCache.entries()) {
+    if (item.expiresAt <= now) {
+      translationCache.delete(key);
     }
+  }
 
-    for (
-      const [
-        id,
-        job
-      ]
-      of jobs.entries()
+  for (const [id, job] of jobs.entries()) {
+    if (
+      job.expiresAt <= now &&
+      job.status !== "processing"
     ) {
-      if (
-        job.expiresAt <=
-          now &&
-        job.status !==
-          "processing"
-      ) {
-        jobs.delete(
-          id
-        );
-      }
+      jobs.delete(id);
     }
-  },
-
-  10 *
-  60 *
-  1000
-).unref();
+  }
+}, 10 * 60 * 1000).unref();
 
 // ============================================================
 // SRT CLEAN / PARSE
@@ -563,34 +321,17 @@ const SPEAKER_RE =
 const SDH_WORDS =
   /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough/i;
 
-function normalizeSpeaker(
-  value
-) {
-  const speaker =
-    String(
-      value ||
-      ""
-    )
-      .replace(
-        /<[^>]+>/g,
-        " "
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
+function normalizeSpeaker(value) {
+  const speaker = String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   if (
     !speaker ||
-    speaker.length >
-      60 ||
-    SDH_WORDS.test(
-      speaker
-    ) ||
-    /[!?;]/u.test(
-      speaker
-    )
+    speaker.length > 60 ||
+    SDH_WORDS.test(speaker) ||
+    /[!?;]/u.test(speaker)
   ) {
     return "";
   }
@@ -598,107 +339,64 @@ function normalizeSpeaker(
   return speaker;
 }
 
-function extractSpeaker(
-  line
-) {
-  const original =
-    String(
-      line ||
-      ""
-    );
+function extractSpeaker(line) {
+  const original = String(line || "");
 
-  const hidden =
-    original.match(
-      SPEAKER_RE
-    );
+  const hidden = original.match(SPEAKER_RE);
 
   if (hidden) {
-    let speaker =
-      "";
+    let speaker = "";
 
     try {
-      speaker =
-        normalizeSpeaker(
-          decodeURIComponent(
-            hidden[1]
-          )
-        );
-    }
-    catch {}
+      speaker = normalizeSpeaker(
+        decodeURIComponent(hidden[1])
+      );
+    } catch {}
 
     return {
       speaker,
-
-      text:
-        original.replace(
-          SPEAKER_RE,
-          ""
-        )
+      text: original.replace(SPEAKER_RE, "")
     };
   }
 
-  const bracket =
-    original.match(
-      /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*:?[ \t]*/u
-    );
+  const bracket = original.match(
+    /^\s*[-–—]?\s*\[([^\]]{1,60})\]\s*:?[ \t]*/u
+  );
 
   if (bracket) {
-    const speaker =
-      normalizeSpeaker(
-        bracket[1]
-      );
+    const speaker = normalizeSpeaker(bracket[1]);
 
     if (speaker) {
       return {
         speaker,
-
-        text:
-          original.slice(
-            bracket[0].length
-          )
+        text: original.slice(bracket[0].length)
       };
     }
   }
 
-  const colon =
-    original.match(
-      /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50})\s*:\s+(?=\S)/u
-    );
+  const colon = original.match(
+    /^\s*[-–—]?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{0,50})\s*:\s+(?=\S)/u
+  );
 
   if (colon) {
-    const speaker =
-      normalizeSpeaker(
-        colon[1]
-      );
+    const speaker = normalizeSpeaker(colon[1]);
 
     if (speaker) {
       return {
         speaker,
-
-        text:
-          original.slice(
-            colon[0].length
-          )
+        text: original.slice(colon[0].length)
       };
     }
   }
 
   return {
-    speaker:
-      "",
-
-    text:
-      original
+    speaker: "",
+    text: original
   };
 }
 
-function normalizeElongations(
-  text
-) {
-  return String(
-    text ||
-    ""
-  )
+function normalizeElongations(text) {
+  return String(text || "")
     .replace(
       /([A-Za-zÀ-ÖØ-öø-ÿ]+?)([-–—])([A-Za-zÀ-ÖØ-öø-ÿ])(?:\2\3){2,}/gu,
       "$1"
@@ -713,89 +411,45 @@ function normalizeElongations(
     );
 }
 
-// NÃO remove uh-huh / uh-uh:
-// eles podem carregar sentido de sim/não.
-function isEmptyVocalization(
-  text
-) {
-  const value =
-    String(
-      text ||
-      ""
-    )
-      .toLowerCase()
-      .replace(
-        /[.,!?…]+/g,
-        " "
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
+// uh-huh / uh-uh NÃO são removidos: podem significar sim/não.
+function isEmptyVocalization(text) {
+  const value = String(text || "")
+    .toLowerCase()
+    .replace(/[.,!?…]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  return /^(?:ah|ha|heh)(?:\s+(?:ah|ha|heh)){1,5}$/.test(
-    value
-  );
+  return /^(?:ah|ha|heh)(?:\s+(?:ah|ha|heh)){1,5}$/.test(value);
 }
 
-function cleanSourceLine(
-  line
-) {
-  let text =
-    String(
-      line ||
-      ""
-    ).trim();
+function cleanSourceLine(line) {
+  let text = String(line || "").trim();
 
-  if (!text) {
-    return "";
-  }
+  if (!text) return "";
 
-  text =
-    text.replace(
-      /\s*\[[^\]]+\]\s*/gu,
-      " "
-    );
+  text = text.replace(
+    /\s*\[[^\]]+\]\s*/gu,
+    " "
+  );
 
-  text =
-    text.replace(
-      /\s*\(([^)]*)\)\s*/gu,
-      (
-        match,
-        inside
-      ) =>
-        SDH_WORDS.test(
-          String(
-            inside ||
-            ""
-          )
-        )
-          ? " "
-          : match
-    );
+  text = text.replace(
+    /\s*\(([^)]*)\)\s*/gu,
+    (match, inside) =>
+      SDH_WORDS.test(String(inside || ""))
+        ? " "
+        : match
+  );
 
-  text =
-    normalizeElongations(
-      text.replace(
-        /[♪♫♬]/gu,
-        " "
-      )
-    )
-      .replace(
-        /[ \t]{2,}/g,
-        " "
-      )
-      .trim();
+  text = normalizeElongations(
+    text.replace(/[♪♫♬]/gu, " ")
+  )
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 
   if (
     !text ||
-    /^[-–—/\s]*$/u.test(
-      text
-    ) ||
-    isEmptyVocalization(
-      text
-    )
+    /^[-–—/\s]*$/u.test(text) ||
+    isEmptyVocalization(text)
   ) {
     return "";
   }
@@ -803,155 +457,88 @@ function cleanSourceLine(
   return text;
 }
 
-function cleanSrtForTranslation(
-  srt
-) {
-  const normalized =
-    normalizeSrt(
-      srt
-    );
+function cleanSrtForTranslation(srt) {
+  const normalized = normalizeSrt(srt);
 
-  if (!normalized) {
-    return "";
-  }
+  if (!normalized) return "";
 
   const rawBlocks =
     normalized
-      .split(
-        /\n{2,}/
-      )
-      .filter(
-        Boolean
-      );
+      .split(/\n{2,}/)
+      .filter(Boolean);
 
-  const out =
-    [];
+  const out = [];
 
-  let removed =
-    0;
+  let removed = 0;
+  let speakerHints = 0;
+  let vocalizations = 0;
 
-  let speakerHints =
-    0;
-
-  let vocalizations =
-    0;
-
-  for (
-    const raw
-    of rawBlocks
-  ) {
+  for (const raw of rawBlocks) {
     const lines =
       raw
         .trim()
-        .split(
-          "\n"
-        );
+        .split("\n");
 
     const timingIndex =
       lines.findIndex(
         line =>
-          /-->/.test(
-            line
-          )
+          /-->/.test(line)
       );
 
-    if (
-      timingIndex <
-      0
-    ) {
+    if (timingIndex < 0) {
       continue;
     }
 
     const timing =
-      lines[
-        timingIndex
-      ].trim();
+      lines[timingIndex].trim();
 
-    if (
-      !TIMING_RE.test(
-        timing
-      )
-    ) {
+    if (!TIMING_RE.test(timing)) {
       continue;
     }
 
-    const dialogue =
-      [];
-
-    const speakers =
-      new Set();
+    const dialogue = [];
+    const speakers = new Set();
 
     for (
       const sourceLine
-      of lines.slice(
-        timingIndex +
-        1
-      )
+      of lines.slice(timingIndex + 1)
     ) {
       const info =
-        extractSpeaker(
-          sourceLine
-        );
+        extractSpeaker(sourceLine);
 
-      if (
-        info.speaker
-      ) {
-        speakers.add(
-          info.speaker
-        );
+      if (info.speaker) {
+        speakers.add(info.speaker);
       }
 
       const before =
-        String(
-          info.text ||
-          ""
-        ).trim();
+        String(info.text || "").trim();
 
       const cleaned =
-        cleanSourceLine(
-          before
-        );
+        cleanSourceLine(before);
 
       if (
         !cleaned &&
-        isEmptyVocalization(
-          before
-        )
+        isEmptyVocalization(before)
       ) {
         vocalizations++;
       }
 
-      if (
-        cleaned
-      ) {
-        dialogue.push(
-          cleaned
-        );
+      if (cleaned) {
+        dialogue.push(cleaned);
       }
     }
 
-    if (
-      !dialogue.length
-    ) {
+    if (!dialogue.length) {
       removed++;
       continue;
     }
 
-    if (
-      speakers.size ===
-      1
-    ) {
+    if (speakers.size === 1) {
       const speaker =
-        [
-          ...speakers
-        ][0];
+        [...speakers][0];
 
       dialogue[0] =
-        `@@SPK:` +
-        `${encodeURIComponent(
-          speaker
-        )}` +
-        `@@ ${dialogue[0]}`;
+        `@@SPK:${encodeURIComponent(speaker)}@@ ${dialogue[0]}`;
 
       speakerHints++;
     }
@@ -969,69 +556,45 @@ function cleanSrtForTranslation(
     `vocalizações=${vocalizations}.`
   );
 
-  if (
-    !out.length
-  ) {
-    return "";
-  }
+  if (!out.length) return "";
 
   return (
     out
       .map(
-        (
-          block,
-          index
-        ) =>
+        (block, index) =>
           [
-            index +
-            1,
-
+            index + 1,
             block.timing,
-
             ...block.dialogue
-          ].join(
-            "\n"
-          )
+          ].join("\n")
       )
-      .join(
-        "\n\n"
-      )
+      .join("\n\n")
       .trim() +
     "\n"
   );
 }
 
-function parseSrt(
-  srt
-) {
+function parseSrt(srt) {
   const normalized =
-    normalizeSrt(
-      srt
-    );
+    normalizeSrt(srt);
 
   if (!normalized) {
     return [];
   }
 
-  const result =
-    [];
+  const result = [];
 
   for (
     const raw
-    of normalized.split(
-      /\n{2,}/
-    )
+    of normalized.split(/\n{2,}/)
   ) {
     const lines =
       raw
         .trim()
-        .split(
-          "\n"
-        );
+        .split("\n");
 
     if (
-      lines.length <
-        3 ||
+      lines.length < 3 ||
       !/^\d+$/.test(
         lines[0].trim()
       ) ||
@@ -1043,21 +606,13 @@ function parseSrt(
     }
 
     const textLines =
-      lines.slice(
-        2
-      );
+      lines.slice(2);
 
-    let speakerHint =
-      null;
+    let speakerHint = null;
 
-    if (
-      textLines.length
-    ) {
+    if (textLines.length) {
       const match =
-        textLines[0]
-          .match(
-            SPEAKER_RE
-          );
+        textLines[0].match(SPEAKER_RE);
 
       if (match) {
         try {
@@ -1067,34 +622,28 @@ function parseSrt(
                 match[1]
               )
             );
-        }
-        catch {}
+        } catch {}
 
         textLines[0] =
-          textLines[0]
-            .replace(
-              SPEAKER_RE,
-              ""
-            );
+          textLines[0].replace(
+            SPEAKER_RE,
+            ""
+          );
       }
     }
 
     result.push({
       index:
         Number(
-          lines[0]
-            .trim()
+          lines[0].trim()
         ),
 
       timing:
-        lines[1]
-          .trim(),
+        lines[1].trim(),
 
       text:
         textLines
-          .join(
-            "\n"
-          )
+          .join("\n")
           .trim(),
 
       speakerHint
@@ -1111,24 +660,15 @@ function buildSrt(
   return (
     blocks
       .map(
-        (
-          block,
-          index
-        ) =>
+        (block, index) =>
           [
             block.index,
-
             block.timing,
-
             texts[index] ??
-            block.text
-          ].join(
-            "\n"
-          )
+              block.text
+          ].join("\n")
       )
-      .join(
-        "\n\n"
-      )
+      .join("\n\n")
       .trim() +
     "\n"
   );
@@ -1140,14 +680,10 @@ function auditTimestamps(
   label
 ) {
   const source =
-    parseSrt(
-      sourceSrt
-    );
+    parseSrt(sourceSrt);
 
   const final =
-    parseSrt(
-      finalSrt
-    );
+    parseSrt(finalSrt);
 
   if (
     source.length !==
@@ -1161,8 +697,7 @@ function auditTimestamps(
 
   for (
     let i = 0;
-    i <
-    source.length;
+    i < source.length;
     i++
   ) {
     if (
@@ -1172,16 +707,14 @@ function auditTimestamps(
         final[i].timing
     ) {
       throw new Error(
-        `TIMING LOCK ${label}: ` +
-        `cue ${source[i].index}.`
+        `TIMING LOCK ${label}: cue ${source[i].index}.`
       );
     }
   }
 
   console.log(
     `[AUDIT TIMESTAMP] ${label}: PASSOU — ` +
-    `${source.length}/${source.length}; ` +
-    `0 alterações.`
+    `${source.length}/${source.length}; 0 alterações.`
   );
 }
 
@@ -1189,53 +722,27 @@ function auditTimestamps(
 // SENTENCE GROUPS
 // ============================================================
 
-function parseTimeSeconds(
-  value
-) {
+function parseTimeSeconds(value) {
   const match =
-    String(
-      value ||
-      ""
-    ).match(
+    String(value || "").match(
       /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
     );
 
-  if (
-    !match
-  ) {
+  if (!match) {
     return NaN;
   }
 
   return (
-    Number(
-      match[1]
-    ) *
-      3600 +
-
-    Number(
-      match[2]
-    ) *
-      60 +
-
-    Number(
-      match[3]
-    ) +
-
-    Number(
-      match[4]
-    ) /
-      1000
+    Number(match[1]) * 3600 +
+    Number(match[2]) * 60 +
+    Number(match[3]) +
+    Number(match[4]) / 1000
   );
 }
 
-function timingParts(
-  timing
-) {
+function timingParts(timing) {
   const match =
-    String(
-      timing ||
-      ""
-    ).match(
+    String(timing || "").match(
       /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
     );
 
@@ -1252,62 +759,34 @@ function timingParts(
           )
       }
     : {
-        start:
-          NaN,
-
-        end:
-          NaN
+        start: NaN,
+        end: NaN
       };
 }
 
-function groupingText(
-  text
-) {
-  return String(
-    text ||
-    ""
-  )
-    .replace(
-      /<[^>]+>/g,
-      " "
-    )
-    .replace(
-      /\{\\[^}]+\}/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
+function groupingText(text) {
+  return String(text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\{\\[^}]+\}/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-function isMultiSpeaker(
-  text
-) {
+function isMultiSpeaker(text) {
   const lines =
-    String(
-      text ||
-      ""
-    )
-      .split(
-        "\n"
-      )
+    String(text || "")
+      .split("\n")
       .filter(
         line =>
           line.trim()
       );
 
   return (
-    lines.length >=
-      2 &&
+    lines.length >= 2 &&
     lines.filter(
       line =>
-        /^\s*[-–—]\s*\S/u.test(
-          line
-        )
-    ).length >=
-      2
+        /^\s*[-–—]\s*\S/u.test(line)
+    ).length >= 2
   );
 }
 
@@ -1317,17 +796,13 @@ function shouldMerge(
 ) {
   if (
     !group.length ||
-    group.length >=
-      4
+    group.length >= 4
   ) {
     return false;
   }
 
   const previous =
-    group[
-      group.length -
-      1
-    ];
+    group[group.length - 1];
 
   if (
     isMultiSpeaker(
@@ -1354,33 +829,21 @@ function shouldMerge(
   }
 
   const a =
-    timingParts(
-      previous.timing
-    );
+    timingParts(previous.timing);
 
   const b =
-    timingParts(
-      next.timing
-    );
+    timingParts(next.timing);
 
   if (
-    Number.isFinite(
-      a.end
-    ) &&
-    Number.isFinite(
-      b.start
-    ) &&
-    b.start -
-      a.end >
-      0.9
+    Number.isFinite(a.end) &&
+    Number.isFinite(b.start) &&
+    b.start - a.end > 0.9
   ) {
     return false;
   }
 
   const nextText =
-    groupingText(
-      next.text
-    )
+    groupingText(next.text)
       .replace(
         /^[-–—]\s*/u,
         ""
@@ -1399,9 +862,7 @@ function shouldMerge(
   }
 
   const previousText =
-    groupingText(
-      previous.text
-    );
+    groupingText(previous.text);
 
   if (
     /[,;:]$/u.test(
@@ -1424,45 +885,35 @@ function shouldMerge(
 function buildSentenceGroups(
   blocks
 ) {
-  const groups =
-    [];
+  const groups = [];
 
-  let current =
-    [];
+  let current = [];
 
-  const flush =
-    () => {
-      if (
-        !current.length
-      ) {
-        return;
-      }
+  const flush = () => {
+    if (!current.length) {
+      return;
+    }
 
-      groups.push({
-        groupId:
-          groups.length +
-          1,
+    groups.push({
+      groupId:
+        groups.length + 1,
 
-        cues:
-          current,
+      cues:
+        current,
 
-        multiSpeaker:
-          current.some(
-            cue =>
-              isMultiSpeaker(
-                cue.text
-              )
-          )
-      });
+      multiSpeaker:
+        current.some(
+          cue =>
+            isMultiSpeaker(
+              cue.text
+            )
+        )
+    });
 
-      current =
-        [];
-    };
+    current = [];
+  };
 
-  for (
-    const block
-    of blocks
-  ) {
+  for (const block of blocks) {
     if (
       !current.length ||
       shouldMerge(
@@ -1470,16 +921,10 @@ function buildSentenceGroups(
         block
       )
     ) {
-      current.push(
-        block
-      );
-    }
-    else {
+      current.push(block);
+    } else {
       flush();
-
-      current.push(
-        block
-      );
+      current.push(block);
     }
   }
 
@@ -1488,9 +933,7 @@ function buildSentenceGroups(
   return groups;
 }
 
-function compactGroup(
-  group
-) {
+function compactGroup(group) {
   return {
     g:
       group.groupId,
@@ -1517,30 +960,72 @@ function compactGroup(
   };
 }
 
+function countCues(groups) {
+  return groups.reduce(
+    (sum, group) =>
+      sum +
+      group.cues.length,
+
+    0
+  );
+}
+
+function splitEvenly(
+  items,
+  parts
+) {
+  const out = [];
+
+  let start = 0;
+
+  for (
+    let p = 0;
+    p < parts;
+    p++
+  ) {
+    const remaining =
+      items.length - start;
+
+    const remainingParts =
+      parts - p;
+
+    const size =
+      Math.ceil(
+        remaining /
+        remainingParts
+      );
+
+    out.push(
+      items.slice(
+        start,
+        start + size
+      )
+    );
+
+    start += size;
+  }
+
+  return out.filter(
+    batch =>
+      batch.length
+  );
+}
+
 function splitByBudget(
   items,
   maxChars,
   maxItems,
   builder
 ) {
-  const batches =
-    [];
+  const batches = [];
 
-  let current =
-    [];
+  let current = [];
+  let chars = 0;
 
-  let chars =
-    0;
-
-  for (
-    const item
-    of items
-  ) {
+  for (const item of items) {
     const size =
       JSON.stringify(
-        builder(
-          item
-        )
+        builder(item)
       ).length +
       8;
 
@@ -1549,146 +1034,154 @@ function splitByBudget(
       (
         current.length >=
           maxItems ||
-        chars +
-          size >
+        chars + size >
           maxChars
       )
     ) {
-      batches.push(
-        current
-      );
+      batches.push(current);
 
-      current =
-        [];
-
-      chars =
-        0;
+      current = [];
+      chars = 0;
     }
 
-    current.push(
-      item
-    );
-
-    chars +=
-      size;
+    current.push(item);
+    chars += size;
   }
 
-  if (
-    current.length
-  ) {
-    batches.push(
-      current
-    );
+  if (current.length) {
+    batches.push(current);
   }
 
   return batches;
 }
 
-function countCues(
-  groups
+function withOverlap(
+  allGroups,
+  targetBatch
 ) {
-  return groups.reduce(
-    (
-      sum,
-      group
-    ) =>
-      sum +
-      group.cues.length,
+  const firstId =
+    targetBatch[0].groupId;
 
-    0
-  );
+  const lastId =
+    targetBatch[
+      targetBatch.length - 1
+    ].groupId;
+
+  const firstIndex =
+    allGroups.findIndex(
+      group =>
+        group.groupId ===
+        firstId
+    );
+
+  const lastIndex =
+    allGroups.findIndex(
+      group =>
+        group.groupId ===
+        lastId
+    );
+
+  return {
+    before:
+      allGroups.slice(
+        Math.max(
+          0,
+          firstIndex -
+            MAIN_CONTEXT_OVERLAP_GROUPS
+        ),
+
+        firstIndex
+      ).map(compactGroup),
+
+    target:
+      targetBatch.map(
+        compactGroup
+      ),
+
+    after:
+      allGroups.slice(
+        lastIndex + 1,
+
+        Math.min(
+          allGroups.length,
+          lastIndex +
+            1 +
+            MAIN_CONTEXT_OVERLAP_GROUPS
+        )
+      ).map(compactGroup)
+  };
 }
 
 // ============================================================
-// STYLE PACK 2026
+// PROMPTS / STYLE PACK
 // ============================================================
 
-const TRANSLATOR_PROMPT = `
-Você é o tradutor principal EN→PT-BR de legendas de entretenimento em 2026.
+const CORE_STYLE = `
+PORTUGUÊS BRASILEIRO 2026 — REGRAS EDITORIAIS OBRIGATÓRIAS
 
-PRIORIDADES ABSOLUTAS:
-- português brasileiro natural, oral, atual, coerente e fiel;
-- sincronização semântica cue a cue;
-- adaptação cultural inteligente sem caricatura;
-- concisão de legenda sem perder informação.
-
-Não soe literal, engessado, lusitano, burocrático, antiquado, "tiozão" ou com internetês forçado.
-Use linguagem Gen Z/Alpha apenas quando personagem, contexto e tom pedirem.
+Objetivo: legenda natural, oral, atual, fiel, coerente e curta o suficiente para leitura.
+Nunca traduza como "inglês vestido de português".
+Evite literalidade, rigidez, lusitanismo, linguagem burocrática, gíria de tiozão ou internetês forçado.
+Use Gen Z/Alpha apenas quando personagem, fandom e contexto pedirem.
 
 DRAG / REALITY / LGBTQIA+ / POP / MODA / MÚSICA:
 
-- "bitch" como vocativo amigável:
+- bitch como vocativo amigável:
   bicha, gata, amiga, menina ou omitir.
-  NÃO use "puta" automaticamente.
+  Nunca "puta" automaticamente.
 
-- "I'm gagged" / "gagged" como reação:
-  "Tô passada",
-  "Tô muito passada",
-  "Tô em choque",
-  "Tô sem reação".
+- I'm gagged / gagged como reação:
+  Tô passada / Tô muito passada / Tô em choque / Tô sem reação.
   Nunca "amordaçada".
 
-- "she ate":
-  "arrasou",
-  "entregou tudo",
-  "serviu demais",
-  quando for gíria.
+- she ate:
+  arrasou / entregou tudo / serviu demais,
+  conforme contexto.
 
-- "no crumbs":
-  "não deixou nada pra ninguém",
+- no crumbs:
+  não deixou nada pra ninguém,
   quando couber.
 
-- fucking / motherfucking:
-  são intensificadores.
-  Preserve força em posição natural brasileira.
+- fucking/motherfucking:
+  preserve intensidade de forma brasileira natural.
 
-  Nunca por literalidade:
-  "competição da porra",
-  "competição do caralho",
-  "lip sync da porra",
-  "lip sync do caralho",
-  "cheque da porra",
-  "cheque do caralho".
+  NUNCA:
+  competição da porra,
+  competição do caralho,
+  lip sync da porra,
+  lip sync do caralho,
+  cheque da porra,
+  cheque do caralho.
 
-- "fucking lip sync":
-  pode ser
-  "um puta lip sync",
-  "um lip sync foda",
-  "um lip sync absurdo",
+- fucking lip sync:
+  um puta lip sync /
+  um lip sync foda /
+  um lip sync absurdo,
   conforme contexto.
 
 - supportive:
-  prefira
-  "sempre me apoiou",
-  "sempre esteve do meu lado".
+  "sempre me apoiou muito",
+  "sempre esteve do meu lado" etc.
   Evite "super apoiador".
 
 - judges em Drag Race:
   jurados,
   não juízes.
 
-- "the judgers are now the judgees":
+- the judgers are now the judgees:
   "agora quem julgava vai ser julgado"
   ou
   "agora os jurados é que vão ser julgados".
 
-  Nunca:
-  "os juízes viraram os julgados".
-
-- "plucking pussy hairs":
+- plucking pussy hairs:
   preserve corpo + vulgaridade;
-  ex. "catar pelo de xereca".
+  exemplo "catar pelo de xereca".
+  Nunca "fio de bigode".
 
-  Nunca:
-  "fio de bigode".
-
-- double win / shared win:
-  "vitória dupla",
-  "as duas ganharam"
-  ou equivalente.
-
-  Não invente "empate duplo"
-  quando não há empate.
+- double win/shared win:
+  vitória dupla /
+  as duas ganharam.
+  Não "empate duplo" sem empate.
 
 - week one:
   primeira semana.
@@ -1704,11 +1197,11 @@ DRAG / REALITY / LGBTQIA+ / POP / MODA / MÚSICA:
 
 - evite "apoiante".
 
-- "The talent performers"
+- The talent performers
   não é
   "As artistas do talento".
 
-Preserve quando presentes e reconhecíveis:
+Preserve quando culturalmente reconhecíveis:
 
 Werkroom
 Condragulations
@@ -1719,12 +1212,11 @@ Racers, start your engines
 
 PALAVRÃO:
 não censure.
-Preserve intensidade de maneira que brasileiro realmente fala.
+Preserve intensidade no lugar em que brasileiro realmente fala.
 
 GÊNERO:
-"speaker" é contexto oculto.
-Use quando seguro.
-Se não for, reformule naturalmente.
+use speaker apenas como contexto oculto.
+Se não houver segurança, reformule.
 
 Nunca escreva:
 empolgado(a)
@@ -1732,52 +1224,80 @@ animado(a)
 ele/ela
 ela/ele
 
-FORMATAÇÃO:
+FORMATO:
 sem speaker labels,
 [NOME],
 NOME:,
-barras como separador de diálogo,
-hífens/travessões decorativos,
+barras como separador,
+hífen/travessão decorativo,
 SDH/CC
 ou alongamentos gráficos.
 
 CUE LOCK ABSOLUTO:
 
-Sentence Groups servem SOMENTE para contexto.
-Cada cue tem id "i".
-
-Devolva exatamente UM "pt"
-para CADA "i",
-com o MESMO id.
+Cada cue tem um id "i".
+Devolva exatamente um texto PT por id-alvo.
 
 Não resuma.
 Não omita fim de frase/raciocínio.
 Não antecipe o cue seguinte.
 Não empurre conteúdo para cue posterior.
 
-Mantenha cada pedaço no timestamp
-em que é falado.
+Sentence Groups e contexto vizinho servem para compreender a frase,
+NÃO para mover texto entre timestamps.
+`;
 
-Você está fazendo transformação/tradução
-de diálogo ficcional/reality já fornecido.
-Preserve o registro do original,
-inclusive vulgaridade quando necessária à fidelidade.
+const PLAN_PROMPT = `
+Você é um editor de continuidade de legendas EN→PT-BR.
 
-Responda somente pelo JSON Schema fornecido pela API.
+Leia o material do episódio e crie uma BÍBLIA EDITORIAL CURTA
+para outra instância do mesmo modelo traduzir o episódio em lotes paralelos.
+
+Extraia somente informações úteis para consistência:
+
+- nomes;
+- relações;
+- gênero quando claro;
+- termos recorrentes;
+- catchphrases;
+- referências de fandom;
+- piadas/expressões repetidas;
+- tom geral.
+
+Não traduza o episódio.
+Não invente informações.
+`;
+
+const TRANSLATOR_PROMPT = `
+Você é o tradutor principal EN→PT-BR de legendas de entretenimento.
+
+${CORE_STYLE}
+
+Você receberá:
+
+1) uma bíblia editorial global do episódio;
+2) alguns groups ANTERIORES apenas como contexto;
+3) os groups ALVO que precisam ser traduzidos;
+4) alguns groups POSTERIORES apenas como contexto.
+
+TRADUZA SOMENTE os cues dos groups ALVO.
+
+Não devolva os cues de contexto.
+Respeite exatamente os ids.
+Use a bíblia global para manter coerência entre lotes paralelos.
 `;
 
 const AUDITOR_PROMPT = `
-Você é auditor editorial independente EN→PT-BR em 2026.
+Você é auditor editorial EN→PT-BR.
+
+${CORE_STYLE}
 
 Compare EN × PT cue por cue.
-Não reescreva por gosto.
 
-Para cada group devolva:
-"ok"
-ou
-"fix".
+Não marque erro por gosto pessoal.
+Marque somente problema REAL.
 
-Marque fix somente por problema real:
+Categorias:
 
 SEMANTIC
 OMISSION
@@ -1788,105 +1308,160 @@ CULTURE
 PROFANITY
 GENDER
 FORMAT
+UNTRANSLATED
 
-Cheque especialmente:
+Verifique especialmente:
 
-- bitch-vocativo não vira puta automaticamente;
-- intensificadores não viram competição/lip sync/cheque da porra/do caralho por tradução mecânica;
-- supportive não vira super apoiador;
-- judges em Drag Race = jurados;
-- judgers/judgees não vira juízes viraram os julgados;
-- plucking pussy hairs não vira fio de bigode;
-- shared/double win não vira empate duplo se não há empate;
-- gagged como reação deve soar natural;
-- nenhuma frase/raciocínio pode ficar incompleta;
-- conteúdo não pode migrar entre cues.
+- fim de raciocínio omitido;
+- conteúdo que migrou para cue vizinho;
+- termos de Drag/reality traduzidos mecanicamente;
+- bitch-vocativo → puta;
+- competição/lip sync/cheque da porra/do caralho;
+- supportive → super apoiador;
+- judges → juízes em Drag Race;
+- judgers/judgees literal;
+- plucking pussy hairs → fio de bigode;
+- shared/double win → empate duplo;
+- gagged → amordaçada;
+- português duro, velho ou artificial.
 
-Para fix:
-reasons + hint curto e concreto.
+Para cada group:
 
-Para ok:
+v="ok"
+ou
+v="fix".
+
+Em fix:
+reasons curtos + hint objetivo.
+
+Em ok:
 reasons=[]
 hint=""
+`;
 
-Responda somente pelo JSON Schema fornecido.
+const DEEP_AUDITOR_PROMPT = `
+Você é o REVISOR SÊNIOR de uma legenda EN→PT-BR.
+
+Estes são os trechos de MAIOR RISCO do episódio.
+
+${CORE_STYLE}
+
+Faça comparação minuciosa EN × PT, cue por cue.
+
+Priorize:
+
+- sentido;
+- naturalidade brasileira;
+- referência cultural;
+- vulgaridade correta;
+- gênero;
+- CUE_SYNC.
+
+Se houver qualquer defeito concreto,
+marque fix e explique exatamente o que deve ser corrigido.
+
+Não aprove uma tradução só porque é gramatical:
+ela precisa soar humana e adequada ao universo do programa.
 `;
 
 const REPAIR_PROMPT = `
 Você é o editor final EN→PT-BR.
 
-Recebe apenas groups com problema concreto.
-Corrija somente o necessário.
+${CORE_STYLE}
 
-Mantenha:
-naturalidade,
-contemporaneidade,
-fidelidade,
-cultura,
-vulgaridade
-e sincronização cue a cue.
+Recebe apenas groups sinalizados com:
 
-Regras:
+- EN original;
+- PT atual;
+- reasons;
+- hint.
 
-- bitch-vocativo =
-  bicha/gata/amiga/menina
-  ou omitir;
-  não puta automática.
+Corrija somente o necessário,
+mas reescreva livremente quando a frase atual estiver literal/engessada.
 
-- fucking/motherfucking =
-  intensificador natural;
-  nunca competição/lip sync/cheque da porra
-  por literalidade.
-
-- supportive =
-  sempre me apoiou/
-  esteve do meu lado.
-
-- judges =
-  jurados.
-
-- judgers/judgees =
-  quem julgava vai ser julgado
-  ou equivalente natural.
-
-- plucking pussy hairs =
-  preserve pelo de xereca
-  ou equivalente vulgar;
-  nunca fio de bigode.
-
-- shared/double win =
-  vitória dupla/
-  as duas ganharam;
-  não empate duplo
-  sem empate.
-
-- gagged =
-  Tô passada/
-  Tô muito passada/
-  Tô em choque
-  conforme contexto.
-
-- preserve catchphrases reconhecíveis de Drag Race.
-
-CUE LOCK:
-exatamente um pt por cue i;
-mesmo i;
-sem omissão
-ou migração.
-
-speaker é contexto oculto.
-
-Sem labels,
-barras,
-marcadores
-ou alongamentos.
-
-Responda somente pelo JSON Schema fornecido.
+Exatamente um pt para cada id recebido.
+Mesmo id.
+Sem omissão.
+Sem migração entre cues.
 `;
 
 // ============================================================
 // JSON SCHEMAS
 // ============================================================
+
+const PLAN_SCHEMA = {
+  type: "object",
+
+  additionalProperties:
+    false,
+
+  properties: {
+    tone: {
+      type:
+        "string"
+    },
+
+    people: {
+      type:
+        "array",
+
+      items: {
+        type:
+          "string"
+      },
+
+      maxItems:
+        30
+    },
+
+    glossary: {
+      type:
+        "array",
+
+      items: {
+        type:
+          "string"
+      },
+
+      maxItems:
+        40
+    },
+
+    continuity: {
+      type:
+        "array",
+
+      items: {
+        type:
+          "string"
+      },
+
+      maxItems:
+        30
+    },
+
+    warnings: {
+      type:
+        "array",
+
+      items: {
+        type:
+          "string"
+      },
+
+      maxItems:
+        30
+    }
+  },
+
+  required: [
+    "tone",
+    "people",
+    "glossary",
+    "continuity",
+    "warnings"
+  ]
+};
 
 function cueTranslationSchema(
   expectedCount
@@ -1993,7 +1568,10 @@ function auditSchema(
               items: {
                 type:
                   "string"
-              }
+              },
+
+              maxItems:
+                8
             },
 
             hint: {
@@ -2019,17 +1597,95 @@ function auditSchema(
 }
 
 // ============================================================
+// REAL RPM GATE
+// somente o limite real de 15 RPM
+// ============================================================
+
+const requestStarts = [];
+
+let rpmMutex =
+  Promise.resolve();
+
+async function acquireGeminiRpmSlot(
+  job
+) {
+  let release;
+
+  const previous =
+    rpmMutex;
+
+  rpmMutex =
+    new Promise(
+      resolve => {
+        release =
+          resolve;
+      }
+    );
+
+  await previous;
+
+  try {
+    while (true) {
+      const now =
+        Date.now();
+
+      while (
+        requestStarts.length &&
+        now -
+          requestStarts[0] >=
+          60000
+      ) {
+        requestStarts.shift();
+      }
+
+      if (
+        requestStarts.length <
+        GEMINI_RPM_LIMIT
+      ) {
+        requestStarts.push(
+          Date.now()
+        );
+
+        return;
+      }
+
+      const wait =
+        Math.max(
+          50,
+
+          60000 -
+          (
+            now -
+            requestStarts[0]
+          ) +
+          50
+        );
+
+      if (job) {
+        job.stats.rpmWaitMs +=
+          wait;
+      }
+
+      console.log(
+        `[GEMINI QUOTA] 15 RPM reais atingidos; ` +
+        `aguardando ${(wait / 1000).toFixed(1)}s ` +
+        `até abrir o próximo slot da própria API.`
+      );
+
+      await sleep(wait);
+    }
+  } finally {
+    release();
+  }
+}
+
+// ============================================================
 // GEMINI INTERACTIONS API
 // ============================================================
 
-function parseDurationMs(
-  value
-) {
+function parseDurationMs(value) {
   const text =
-    String(
-      value ||
-      ""
-    )
+    String(value || "")
       .trim()
       .toLowerCase();
 
@@ -2045,9 +1701,7 @@ function parseDurationMs(
   if (ms) {
     return Math.max(
       250,
-      Number(
-        ms[1]
-      )
+      Number(ms[1])
     );
   }
 
@@ -2059,29 +1713,21 @@ function parseDurationMs(
   if (sec) {
     return Math.max(
       1000,
-      Number(
-        sec[1]
-      ) *
+      Number(sec[1]) *
         1000
     );
   }
 
   const num =
-    Number(
-      text
-    );
+    Number(text);
 
   if (
-    Number.isFinite(
-      num
-    ) &&
-    num >
-      0
+    Number.isFinite(num) &&
+    num > 0
   ) {
     return Math.max(
       1000,
-      num *
-        1000
+      num * 1000
     );
   }
 
@@ -2093,7 +1739,7 @@ function retryDelayMs(
   data,
   attempt
 ) {
-  const fromHeader =
+  const header =
     parseDurationMs(
       response
         ?.headers
@@ -2102,13 +1748,10 @@ function retryDelayMs(
         )
     );
 
-  if (
-    fromHeader
-  ) {
+  if (header) {
     return Math.min(
       90000,
-      fromHeader +
-      250
+      header + 250
     );
   }
 
@@ -2135,27 +1778,21 @@ function retryDelayMs(
           ?.retry_delay
       );
 
-    if (
-      parsed
-    ) {
+    if (parsed) {
       return Math.min(
         90000,
-        parsed +
-        250
+        parsed + 250
       );
     }
   }
 
   return Math.min(
-    10000 *
-    attempt,
-    60000
+    5000 * attempt,
+    30000
   );
 }
 
-function extractInteractionText(
-  data
-) {
+function extractInteractionText(data) {
   const steps =
     Array.isArray(
       data?.steps
@@ -2163,8 +1800,7 @@ function extractInteractionText(
       ? data.steps
       : [];
 
-  let last =
-    "";
+  let out = "";
 
   for (
     const step
@@ -2193,28 +1829,21 @@ function extractInteractionText(
           part =>
             part.text
         )
-        .join(
-          ""
-        );
+        .join("");
 
-    if (
-      text
-    ) {
-      last =
-        text;
+    if (text) {
+      out += text;
     }
   }
 
-  return last.trim();
+  return out.trim();
 }
 
 function markAttempt(
   job,
   metric
 ) {
-  if (!job) {
-    return;
-  }
+  if (!job) return;
 
   if (
     metric ===
@@ -2225,7 +1854,9 @@ function markAttempt(
 
   if (
     metric ===
-    "audit"
+      "audit" ||
+    metric ===
+      "deep"
   ) {
     job.stats.auditAttempts++;
   }
@@ -2242,9 +1873,7 @@ function mark429(
   job,
   metric
 ) {
-  if (!job) {
-    return;
-  }
+  if (!job) return;
 
   if (
     metric ===
@@ -2255,7 +1884,9 @@ function mark429(
 
   if (
     metric ===
-    "audit"
+      "audit" ||
+    metric ===
+      "deep"
   ) {
     job.stats.audit429++;
   }
@@ -2273,8 +1904,13 @@ function markSuccess(
   metric,
   data
 ) {
-  if (!job) {
-    return;
+  if (!job) return;
+
+  if (
+    metric ===
+    "plan"
+  ) {
+    job.stats.planCalls++;
   }
 
   if (
@@ -2282,30 +1918,6 @@ function markSuccess(
     "main"
   ) {
     job.stats.mainCalls++;
-
-    job.stats.mainInputTokens +=
-      Number(
-        data
-          ?.usage
-          ?.total_input_tokens ||
-        0
-      );
-
-    job.stats.mainOutputTokens +=
-      Number(
-        data
-          ?.usage
-          ?.total_output_tokens ||
-        0
-      );
-
-    job.stats.mainThoughtTokens +=
-      Number(
-        data
-          ?.usage
-          ?.total_thought_tokens ||
-        0
-      );
   }
 
   if (
@@ -2317,14 +1929,45 @@ function markSuccess(
 
   if (
     metric ===
+    "deep"
+  ) {
+    job.stats.auditCalls++;
+    job.stats.deepAuditCalls++;
+  }
+
+  if (
+    metric ===
     "repair"
   ) {
     job.stats.repairCalls++;
   }
+
+  job.stats.inputTokens +=
+    Number(
+      data
+        ?.usage
+        ?.total_input_tokens ||
+      0
+    );
+
+  job.stats.outputTokens +=
+    Number(
+      data
+        ?.usage
+        ?.total_output_tokens ||
+      0
+    );
+
+  job.stats.thoughtTokens +=
+    Number(
+      data
+        ?.usage
+        ?.total_thought_tokens ||
+      0
+    );
 }
 
 async function geminiRequest({
-  model,
   system,
   user,
   schema,
@@ -2333,28 +1976,28 @@ async function geminiRequest({
   timeoutMs,
   maxRetries,
   job = null,
-  metric = "probe"
+  metric = "main"
 }) {
-  if (
-    !GEMINI_API_KEY
-  ) {
+  if (!GEMINI_API_KEY) {
     throw new Error(
       "GEMINI_API_KEY não configurada."
     );
   }
 
-  let lastError =
-    null;
+  let lastError = null;
 
   for (
     let attempt = 1;
-    attempt <=
-    maxRetries;
+    attempt <= maxRetries;
     attempt++
   ) {
     markAttempt(
       job,
       metric
+    );
+
+    await acquireGeminiRpmSlot(
+      job
     );
 
     const controller =
@@ -2371,44 +2014,11 @@ async function geminiRequest({
     try {
       console.log(
         `[GEMINI ${metric.toUpperCase()}] ` +
-        `${model} request ` +
+        `${GEMINI_MODEL} request ` +
         `${attempt}/${maxRetries} | ` +
-        `interactions | ` +
         `thinking=${thinkingLevel} | ` +
         `maxOutput=${maxOutputTokens}.`
       );
-
-      // NÃO adicionar safety_settings aqui.
-      const body = {
-        model,
-
-        input:
-          user,
-
-        system_instruction:
-          system,
-
-        response_format: {
-          type:
-            "text",
-
-          mime_type:
-            "application/json",
-
-          schema
-        },
-
-        generation_config: {
-          max_output_tokens:
-            maxOutputTokens,
-
-          thinking_level:
-            thinkingLevel
-        },
-
-        store:
-          false
-      };
 
       const response =
         await fetch(
@@ -2423,13 +2033,44 @@ async function geminiRequest({
                 "application/json",
 
               "x-goog-api-key":
-                GEMINI_API_KEY
+                GEMINI_API_KEY,
+
+              "Api-Revision":
+                "2026-05-20"
             },
 
             body:
-              JSON.stringify(
-                body
-              ),
+              JSON.stringify({
+                model:
+                  GEMINI_MODEL,
+
+                input:
+                  user,
+
+                system_instruction:
+                  system,
+
+                response_format: {
+                  type:
+                    "text",
+
+                  mime_type:
+                    "application/json",
+
+                  schema
+                },
+
+                generation_config: {
+                  max_output_tokens:
+                    maxOutputTokens,
+
+                  thinking_level:
+                    thinkingLevel
+                },
+
+                store:
+                  false
+              }),
 
             signal:
               controller.signal
@@ -2439,18 +2080,14 @@ async function geminiRequest({
       const raw =
         await response.text();
 
-      let data =
-        null;
+      let data = null;
 
       try {
         data =
           raw
-            ? JSON.parse(
-                raw
-              )
+            ? JSON.parse(raw)
             : {};
-      }
-      catch {}
+      } catch {}
 
       if (
         response.ok &&
@@ -2472,25 +2109,18 @@ async function geminiRequest({
             "failed",
             "cancelled",
             "budget_exceeded"
-          ].includes(
-            status
-          )
+          ].includes(status)
         ) {
           const inner =
             data?.error?.message ||
             data?.message ||
-            "interaction sem mensagem de erro";
+            "interaction sem detalhe";
 
           const e =
             new Error(
               `Gemini ${metric} ` +
               `status=${status}: ` +
-              `${String(
-                inner
-              ).slice(
-                0,
-                1200
-              )}`
+              `${String(inner).slice(0, 1200)}`
             );
 
           e.nonRetryable =
@@ -2500,13 +2130,10 @@ async function geminiRequest({
           throw e;
         }
 
-        if (
-          !text
-        ) {
+        if (!text) {
           const e =
             new Error(
-              `Gemini ${metric} ` +
-              `retornou resposta vazia; ` +
+              `Gemini ${metric} retornou resposta vazia; ` +
               `status=${status}.`
             );
 
@@ -2548,9 +2175,7 @@ async function geminiRequest({
 
         return {
           text,
-
           status,
-
           usage:
             data?.usage ||
             {}
@@ -2568,14 +2193,9 @@ async function geminiRequest({
 
       const error =
         new Error(
-          `GEMINI ${model} ` +
+          `GEMINI ${GEMINI_MODEL} ` +
           `HTTP ${response.status}: ` +
-          `${String(
-            message
-          ).slice(
-            0,
-            1800
-          )}`
+          `${String(message).slice(0, 1800)}`
         );
 
       error.status =
@@ -2606,18 +2226,10 @@ async function geminiRequest({
 
         console.warn(
           `[GEMINI ${metric.toUpperCase()}] ` +
-          `429; aguardando ` +
-          `${(
-            wait /
-            1000
-          ).toFixed(
-            1
-          )}s.`
+          `429; retry em ${(wait / 1000).toFixed(1)}s.`
         );
 
-        await sleep(
-          wait
-        );
+        await sleep(wait);
 
         continue;
       }
@@ -2643,35 +2255,23 @@ async function geminiRequest({
 
       const wait =
         Math.min(
-          2500 *
-          attempt,
-          15000
+          2000 * attempt,
+          10000
         );
 
       console.warn(
         `[GEMINI ${metric.toUpperCase()}] ` +
         `HTTP ${response.status}; ` +
-        `retry em ` +
-        `${(
-          wait /
-          1000
-        ).toFixed(
-          1
-        )}s.`
+        `retry em ${(wait / 1000).toFixed(1)}s.`
       );
 
-      await sleep(
-        wait
-      );
-    }
-    catch (
-      error
-    ) {
+      await sleep(wait);
+    } catch (error) {
       lastError =
         error?.name ===
           "AbortError"
           ? new Error(
-              `GEMINI ${model} ${metric}: ` +
+              `GEMINI ${GEMINI_MODEL} ${metric}: ` +
               `timeout desta request.`
             )
           : error;
@@ -2691,8 +2291,7 @@ async function geminiRequest({
       }
 
       if (
-        lastError
-          ?.nonRetryable
+        lastError?.nonRetryable
       ) {
         throw lastError;
       }
@@ -2721,36 +2320,19 @@ async function geminiRequest({
 
       const wait =
         Math.min(
-          2500 *
-          attempt,
-          15000
+          2000 * attempt,
+          10000
         );
 
       console.warn(
         `[GEMINI ${metric.toUpperCase()}] ` +
-        `${errorMessage(
-          lastError
-        ).slice(
-          0,
-          220
-        )}; ` +
-        `retry em ` +
-        `${(
-          wait /
-          1000
-        ).toFixed(
-          1
-        )}s.`
+        `${errorMessage(lastError).slice(0, 220)}; ` +
+        `retry em ${(wait / 1000).toFixed(1)}s.`
       );
 
-      await sleep(
-        wait
-      );
-    }
-    finally {
-      clearTimeout(
-        timer
-      );
+      await sleep(wait);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -2763,138 +2345,95 @@ async function geminiRequest({
 }
 
 // ============================================================
-// STARTUP SELF-TEST
+// CONTEXTO GLOBAL
 // ============================================================
 
-const SELFTEST_SCHEMA = {
-  type:
-    "object",
-
-  additionalProperties:
-    false,
-
-  properties: {
-    ok: {
-      type:
-        "string",
-
-      enum: [
-        "ok"
-      ]
-    }
-  },
-
-  required: [
-    "ok"
-  ]
-};
-
-async function probeModel(
-  model,
-  thinkingLevel,
-  label
+async function buildEpisodePlan(
+  groups,
+  job
 ) {
-  const result =
-    await geminiRequest({
-      model,
-
-      system:
-        "Responda estritamente pelo JSON Schema fornecido.",
-
-      user:
-        'Retorne {"ok":"ok"}.',
-
-      schema:
-        SELFTEST_SCHEMA,
-
-      thinkingLevel,
-
-      maxOutputTokens:
-        128,
-
-      timeoutMs:
-        30000,
-
-      maxRetries:
-        1,
-
-      metric:
-        "selftest"
-    });
-
-  const parsed =
-    JSON.parse(
-      stripCodeFences(
-        result.text
-      )
+  const compact =
+    groups.map(
+      compactGroup
     );
-
-  if (
-    parsed?.ok !==
-    "ok"
-  ) {
-    throw new Error(
-      `Self-test ${label}: JSON inesperado.`
-    );
-  }
-
-  console.log(
-    `[GEMINI SELFTEST] ${label}: ` +
-    `PASSOU ✅ ` +
-    `(${model}, thinking=${thinkingLevel})`
-  );
-}
-
-async function runStartupSelfTests() {
-  if (
-    !GEMINI_API_KEY
-  ) {
-    console.error(
-      "[GEMINI SELFTEST] NÃO EXECUTADO: GEMINI_API_KEY ausente ❌"
-    );
-
-    return;
-  }
-
-  console.log(
-    "[GEMINI SELFTEST] Iniciando testes mínimos da API..."
-  );
 
   try {
-    await probeModel(
-      GEMINI_TRANSLATOR_MODEL,
-      MAIN_THINKING_LEVEL,
-      "Tradutor 3.6"
-    );
+    const response =
+      await geminiRequest({
+        system:
+          PLAN_PROMPT,
 
-    await probeModel(
-      GEMINI_AUDITOR_MODEL,
-      "minimal",
-      "Auditor Flash-Lite"
-    );
+        user:
+          `Arquivo: ${job.filename || "desconhecido"}\n\n` +
+          `Crie uma bíblia editorial CURTA para este episódio.\n\n` +
+          JSON.stringify({
+            groups:
+              compact
+          }),
+
+        schema:
+          PLAN_SCHEMA,
+
+        thinkingLevel:
+          PLAN_THINKING,
+
+        maxOutputTokens:
+          PLAN_MAX_OUTPUT_TOKENS,
+
+        timeoutMs:
+          PLAN_TIMEOUT_MS,
+
+        maxRetries:
+          2,
+
+        job,
+
+        metric:
+          "plan"
+      });
+
+    const plan =
+      JSON.parse(
+        stripCodeFences(
+          response.text
+        )
+      );
 
     console.log(
-      "[GEMINI SELFTEST] TUDO PASSOU — pode testar o episódio ✅"
-    );
-  }
-  catch (
-    error
-  ) {
-    console.error(
-      `[GEMINI SELFTEST] FALHOU ❌: ` +
-      `${errorMessage(
-        error
-      )}`
+      `[EPISODE PLAN] OK | ` +
+      `people=${plan.people?.length || 0} | ` +
+      `glossary=${plan.glossary?.length || 0} | ` +
+      `continuity=${plan.continuity?.length || 0}.`
     );
 
-    console.error(
-      "[GEMINI SELFTEST] NÃO teste o episódio enquanto esta linha não passar."
+    return plan;
+  } catch (error) {
+    console.warn(
+      `[EPISODE PLAN] Falhou, seguindo sem bloquear: ` +
+      `${errorMessage(error).slice(0, 220)}`
     );
+
+    return {
+      tone:
+        "Natural spoken Brazilian Portuguese; preserve show/fandom register.",
+
+      people:
+        [],
+
+      glossary:
+        [],
+
+      continuity:
+        [],
+
+      warnings:
+        []
+    };
   }
 }
 
 // ============================================================
-// TRANSLATION PARSER / RESILIENCE
+// MAIN TRANSLATION
 // ============================================================
 
 function parseCueTranslation(
@@ -2910,8 +2449,7 @@ function parseCueTranslation(
           raw
         )
       );
-  }
-  catch {
+  } catch {
     return {
       groupMap:
         new Map(),
@@ -2964,22 +2502,16 @@ function parseCueTranslation(
       ).trim();
 
     if (
-      !expectedIds.has(
-        id
-      ) ||
+      !expectedIds.has(id) ||
       !pt
     ) {
       continue;
     }
 
     if (
-      byId.has(
-        id
-      )
+      byId.has(id)
     ) {
-      duplicates.add(
-        id
-      );
+      duplicates.add(id);
 
       continue;
     }
@@ -3000,11 +2532,11 @@ function parseCueTranslation(
     const group
     of groups
   ) {
-    let valid =
-      true;
-
     const segments =
       [];
+
+    let valid =
+      true;
 
     for (
       const cue
@@ -3031,15 +2563,12 @@ function parseCueTranslation(
       );
     }
 
-    if (
-      valid
-    ) {
+    if (valid) {
       groupMap.set(
         group.groupId,
         segments
       );
-    }
-    else {
+    } else {
       invalidGroups.push(
         group
       );
@@ -3053,61 +2582,42 @@ function parseCueTranslation(
 
     issue:
       invalidGroups.length
-        ? `INCOMPLETE:` +
-          `${groupMap.size}/` +
-          `${groups.length}`
+        ? `INCOMPLETE:${groupMap.size}/${groups.length}`
         : null
   };
 }
 
-function translatorInput(
-  groups
-) {
-  return JSON.stringify({
-    context:
-      "Subtitle Sentence Groups in chronological episode order.",
-
-    groups:
-      groups.map(
-        compactGroup
-      )
-  });
-}
-
-async function translateGroupsResilient(
-  groups,
+async function translateBatchResilient({
+  allGroups,
+  targetGroups,
+  plan,
   job,
-  depth = 0,
-  mode = "main"
-) {
+  depth = 0
+}) {
   const expectedCues =
     countCues(
-      groups
+      targetGroups
     );
 
-  const isMain =
-    mode ===
-    "main";
+  const contextual =
+    withOverlap(
+      allGroups,
+      targetGroups
+    );
 
   let response;
 
   try {
     response =
       await geminiRequest({
-        model:
-          GEMINI_TRANSLATOR_MODEL,
-
         system:
           TRANSLATOR_PROMPT,
 
         user:
-          `Traduza TODOS os cues abaixo. ` +
-          `O output deve conter exatamente ` +
-          `${expectedCues} objetos de cue, ` +
-          `um por id recebido.\n\n` +
-          `${translatorInput(
-            groups
-          )}`,
+          `BÍBLIA GLOBAL:\n${JSON.stringify(plan)}\n\n` +
+          `CONTEXTO E ALVOS:\n${JSON.stringify(contextual)}\n\n` +
+          `Traduza SOMENTE target. ` +
+          `O JSON deve conter exatamente ${expectedCues} cues-alvo.`,
 
         schema:
           cueTranslationSchema(
@@ -3115,112 +2625,106 @@ async function translateGroupsResilient(
           ),
 
         thinkingLevel:
-          isMain
-            ? MAIN_THINKING_LEVEL
-            : "high",
+          MAIN_THINKING,
 
         maxOutputTokens:
-          isMain
-            ? MAIN_MAX_OUTPUT_TOKENS
-            : REPAIR_MAX_OUTPUT_TOKENS,
+          MAIN_MAX_OUTPUT_TOKENS,
 
         timeoutMs:
-          isMain
-            ? MAIN_REQUEST_TIMEOUT_MS
-            : REPAIR_REQUEST_TIMEOUT_MS,
+          MAIN_TIMEOUT_MS,
 
         maxRetries:
-          isMain
-            ? MAIN_MAX_RETRIES
-            : REPAIR_MAX_RETRIES,
+          MAIN_RETRIES,
 
         job,
 
         metric:
-          isMain
-            ? "main"
-            : "repair"
+          "main"
       });
-  }
-  catch (
-    error
-  ) {
+  } catch (error) {
     const msg =
-      errorMessage(
-        error
-      ).toLowerCase();
+      errorMessage(error)
+        .toLowerCase();
 
-    const splittable400 =
-      error?.status ===
-        400 &&
-      /schema|too large|size|token|request contains an invalid argument/.test(
-        msg
-      );
-
-    if (
-      splittable400 &&
-      groups.length >
-        80 &&
+    const splittable =
+      targetGroups.length >
+        40 &&
       depth <
-        5
-    ) {
-      job.stats.mainSplits++;
-
-      const middle =
-        Math.ceil(
-          groups.length /
-          2
-        );
-
-      console.warn(
-        `[GEMINI MAIN SPLIT] ` +
-        `HTTP 400 no lote grande; ` +
-        `${groups.length} -> ` +
-        `${middle}+` +
-        `${groups.length - middle}.`
+        5 &&
+      (
+        /timeout|response vazia|invalid argument|schema|too large|token|incomplete/.test(
+          msg
+        ) ||
+        error?.status ===
+          400 ||
+        error?.status >=
+          500
       );
 
-      const left =
-        await translateGroupsResilient(
-          groups.slice(
-            0,
-            middle
-          ),
-
-          job,
-
-          depth +
-          1,
-
-          mode
-        );
-
-      const right =
-        await translateGroupsResilient(
-          groups.slice(
-            middle
-          ),
-
-          job,
-
-          depth +
-          1,
-
-          mode
-        );
-
-      return new Map([
-        ...left,
-        ...right
-      ]);
+    if (!splittable) {
+      throw error;
     }
 
-    throw error;
+    job.stats.mainSplits++;
+
+    const middle =
+      Math.ceil(
+        targetGroups.length /
+        2
+      );
+
+    console.warn(
+      `[GEMINI MAIN SPLIT] ` +
+      `${targetGroups.length} -> ` +
+      `${middle}+${targetGroups.length - middle}.`
+    );
+
+    const [
+      left,
+      right
+    ] =
+      await Promise.all([
+        translateBatchResilient({
+          allGroups,
+
+          targetGroups:
+            targetGroups.slice(
+              0,
+              middle
+            ),
+
+          plan,
+          job,
+
+          depth:
+            depth + 1
+        }),
+
+        translateBatchResilient({
+          allGroups,
+
+          targetGroups:
+            targetGroups.slice(
+              middle
+            ),
+
+          plan,
+          job,
+
+          depth:
+            depth + 1
+        })
+      ]);
+
+    return new Map([
+      ...left,
+      ...right
+    ]);
   }
 
   const parsed =
     parseCueTranslation(
-      groups,
+      targetGroups,
       response.text
     );
 
@@ -3241,8 +2745,8 @@ async function translateGroupsResilient(
       parsed.issue ===
         "JSON_INVALID"
     ) &&
-    groups.length >
-      50 &&
+    targetGroups.length >
+      40 &&
     depth <
       5
   ) {
@@ -3250,51 +2754,53 @@ async function translateGroupsResilient(
 
     const middle =
       Math.ceil(
-        groups.length /
+        targetGroups.length /
         2
       );
 
     console.warn(
       `[GEMINI MAIN SPLIT] ` +
-      `${groups.length} groups -> ` +
-      `${middle}+` +
-      `${groups.length - middle}; ` +
-      `motivo=` +
-      `${
-        incomplete
-          ? "INCOMPLETE"
-          : parsed.issue
-      }.`
+      `${targetGroups.length} -> ` +
+      `${middle}+${targetGroups.length - middle}; ` +
+      `motivo=${incomplete ? "INCOMPLETE" : parsed.issue}.`
     );
 
-    const left =
-      await translateGroupsResilient(
-        groups.slice(
-          0,
-          middle
-        ),
+    const [
+      left,
+      right
+    ] =
+      await Promise.all([
+        translateBatchResilient({
+          allGroups,
 
-        job,
+          targetGroups:
+            targetGroups.slice(
+              0,
+              middle
+            ),
 
-        depth +
-        1,
+          plan,
+          job,
 
-        mode
-      );
+          depth:
+            depth + 1
+        }),
 
-    const right =
-      await translateGroupsResilient(
-        groups.slice(
-          middle
-        ),
+        translateBatchResilient({
+          allGroups,
 
-        job,
+          targetGroups:
+            targetGroups.slice(
+              middle
+            ),
 
-        depth +
-        1,
+          plan,
+          job,
 
-        mode
-      );
+          depth:
+            depth + 1
+        })
+      ]);
 
     return new Map([
       ...left,
@@ -3310,8 +2816,7 @@ async function translateGroupsResilient(
       6
     ) {
       throw new Error(
-        `Gemini não preservou estrutura ` +
-        `após resgates: ` +
+        `Gemini não preservou estrutura após resgates: ` +
         `${parsed.invalidGroups.length} group(s).`
       );
     }
@@ -3321,23 +2826,23 @@ async function translateGroupsResilient(
 
     console.warn(
       `[GEMINI MAIN RESCUE] ` +
-      `válidos=${parsed.groupMap.size}/` +
-      `${groups.length}; ` +
-      `refazendo ` +
-      `${parsed.invalidGroups.length} group(s).`
+      `válidos=${parsed.groupMap.size}/${targetGroups.length}; ` +
+      `refazendo somente ${parsed.invalidGroups.length} group(s).`
     );
 
     const rescued =
-      await translateGroupsResilient(
-        parsed.invalidGroups,
+      await translateBatchResilient({
+        allGroups,
 
+        targetGroups:
+          parsed.invalidGroups,
+
+        plan,
         job,
 
-        depth +
-        1,
-
-        "rescue"
-      );
+        depth:
+          depth + 1
+      });
 
     return new Map([
       ...parsed.groupMap,
@@ -3348,496 +2853,83 @@ async function translateGroupsResilient(
   return parsed.groupMap;
 }
 
-// ============================================================
-// AUDIT
-// ============================================================
-
-function reviewPayload(
-  group,
-  translations
-) {
-  const pt =
-    translations.get(
-      group.groupId
-    );
-
-  return {
-    g:
-      group.groupId,
-
-    cues:
-      group.cues.map(
-        (
-          cue,
-          index
-        ) => ({
-          i:
-            cue.index,
-
-          en:
-            cue.text,
-
-          pt:
-            pt[index],
-
-          ...(
-            cue.speakerHint
-              ? {
-                  speaker:
-                    cue.speakerHint
-                }
-              : {}
-          )
-        })
-      )
-  };
-}
-
-function parseAudit(
+async function translateMainParallel(
   groups,
-  raw
-) {
-  let parsed;
-
-  try {
-    parsed =
-      JSON.parse(
-        stripCodeFences(
-          raw
-        )
-      );
-  }
-  catch {
-    throw new Error(
-      "Audit JSON inválido."
-    );
-  }
-
-  if (
-    !Array.isArray(
-      parsed?.items
-    )
-  ) {
-    throw new Error(
-      "Audit sem items."
-    );
-  }
-
-  const expected =
-    new Set(
-      groups.map(
-        group =>
-          group.groupId
-      )
-    );
-
-  const seen =
-    new Set();
-
-  const flags =
-    new Map();
-
-  for (
-    const item
-    of parsed.items
-  ) {
-    const groupId =
-      Number(
-        item?.g
-      );
-
-    if (
-      !expected.has(
-        groupId
-      ) ||
-      seen.has(
-        groupId
-      )
-    ) {
-      continue;
-    }
-
-    const verdict =
-      String(
-        item?.v ||
-        ""
-      ).toLowerCase();
-
-    if (
-      ![
-        "ok",
-        "fix"
-      ].includes(
-        verdict
-      )
-    ) {
-      continue;
-    }
-
-    seen.add(
-      groupId
-    );
-
-    if (
-      verdict ===
-      "fix"
-    ) {
-      flags.set(
-        groupId,
-
-        {
-          reasons:
-            Array.isArray(
-              item?.reasons
-            )
-              ? item.reasons
-                  .map(
-                    value =>
-                      String(
-                        value
-                      ).toUpperCase()
-                  )
-                  .slice(
-                    0,
-                    8
-                  )
-              : [
-                  "REVIEW"
-                ],
-
-          hint:
-            String(
-              item?.hint ||
-              ""
-            ).slice(
-              0,
-              350
-            )
-        }
-      );
-    }
-  }
-
-  if (
-    seen.size !==
-    groups.length
-  ) {
-    throw new Error(
-      `Audit incompleto ` +
-      `${seen.size}/` +
-      `${groups.length}.`
-    );
-  }
-
-  return flags;
-}
-
-async function auditBatchWithModel(
-  groups,
-  translations,
-  job,
-  model,
-  fallback
-) {
-  const response =
-    await geminiRequest({
-      model,
-
-      system:
-        AUDITOR_PROMPT,
-
-      user:
-        `Audite exatamente estes ` +
-        `${groups.length} groups. ` +
-        `Devolva um item por group.\n\n` +
-        JSON.stringify({
-          groups:
-            groups.map(
-              group =>
-                reviewPayload(
-                  group,
-                  translations
-                )
-            )
-        }),
-
-      schema:
-        auditSchema(
-          groups.length
-        ),
-
-      thinkingLevel:
-        fallback
-          ? "low"
-          : AUDIT_THINKING_LEVEL,
-
-      maxOutputTokens:
-        AUDIT_MAX_OUTPUT_TOKENS,
-
-      timeoutMs:
-        AUDIT_REQUEST_TIMEOUT_MS,
-
-      maxRetries:
-        fallback
-          ? 2
-          : AUDIT_MAX_RETRIES,
-
-      job,
-
-      metric:
-        "audit"
-    });
-
-  if (
-    fallback
-  ) {
-    job.stats.auditFallbackCalls++;
-  }
-
-  return parseAudit(
-    groups,
-    response.text
-  );
-}
-
-async function auditBatchResilient(
-  groups,
-  translations,
-  job,
-  depth = 0
-) {
-  try {
-    return await auditBatchWithModel(
-      groups,
-      translations,
-      job,
-      GEMINI_AUDITOR_MODEL,
-      false
-    );
-  }
-  catch (
-    error
-  ) {
-    if (
-      groups.length >
-        20 &&
-      depth <
-        3
-    ) {
-      const middle =
-        Math.ceil(
-          groups.length /
-          2
-        );
-
-      console.warn(
-        `[GEMINI AUDIT SPLIT] ` +
-        `${groups.length} -> ` +
-        `${middle}+` +
-        `${groups.length - middle}; ` +
-        `${errorMessage(
-          error
-        ).slice(
-          0,
-          120
-        )}`
-      );
-
-      const left =
-        await auditBatchResilient(
-          groups.slice(
-            0,
-            middle
-          ),
-
-          translations,
-
-          job,
-
-          depth +
-          1
-        );
-
-      const right =
-        await auditBatchResilient(
-          groups.slice(
-            middle
-          ),
-
-          translations,
-
-          job,
-
-          depth +
-          1
-        );
-
-      return new Map([
-        ...left,
-        ...right
-      ]);
-    }
-
-    console.warn(
-      `[GEMINI AUDIT FALLBACK] ` +
-      `${GEMINI_AUDITOR_MODEL} falhou; ` +
-      `${GEMINI_TRANSLATOR_MODEL} assume ` +
-      `${groups.length} group(s).`
-    );
-
-    return auditBatchWithModel(
-      groups,
-      translations,
-      job,
-      GEMINI_TRANSLATOR_MODEL,
-      true
-    );
-  }
-}
-
-async function mapWithConcurrency(
-  items,
-  concurrency,
-  worker
-) {
-  const results =
-    new Array(
-      items.length
-    );
-
-  let cursor =
-    0;
-
-  async function runner() {
-    while (
-      true
-    ) {
-      const index =
-        cursor++;
-
-      if (
-        index >=
-        items.length
-      ) {
-        return;
-      }
-
-      results[index] =
-        await worker(
-          items[index],
-          index
-        );
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      {
-        length:
-          Math.min(
-            concurrency,
-            items.length
-          )
-      },
-
-      () =>
-        runner()
-    )
-  );
-
-  return results;
-}
-
-async function auditGroups(
-  groups,
-  translations,
-  job,
-  phase = "primary"
+  plan,
+  job
 ) {
   const batches =
-    splitByBudget(
+    splitEvenly(
       groups,
 
-      AUDIT_BATCH_CHARS,
-
-      AUDIT_BATCH_GROUPS,
-
-      group =>
-        reviewPayload(
-          group,
-          translations
-        )
+      Math.min(
+        MAIN_PARALLEL_BATCHES,
+        groups.length
+      )
     );
 
   console.log(
-    `[GEMINI AUDIT ${phase.toUpperCase()}] ` +
-    `${groups.length} groups -> ` +
-    `${batches.length} lote(s), ` +
-    `concorrência=${AUDIT_CONCURRENCY}.`
+    `[GEMINI MAIN] ${groups.length} groups -> ` +
+    `${batches.length} lote(s) PARALELOS ` +
+    `(~${batches.map(batch => batch.length).join("/")} groups).`
   );
 
   const results =
-    await mapWithConcurrency(
-      batches,
-
-      AUDIT_CONCURRENCY,
-
-      async batch => {
-        const flags =
-          await auditBatchResilient(
-            batch,
-            translations,
-            job
+    await Promise.all(
+      batches.map(
+        (
+          batch,
+          index
+        ) => {
+          console.log(
+            `[GEMINI MAIN] Iniciando lote ` +
+            `${index + 1}/${batches.length}: ` +
+            `${batch.length} group(s).`
           );
 
-        if (
-          phase ===
-          "primary"
-        ) {
-          job.stats.auditPrimaryGroups +=
-            batch.length;
+          return translateBatchResilient({
+            allGroups:
+              groups,
+
+            targetGroups:
+              batch,
+
+            plan,
+            job
+          });
         }
-        else {
-          job.stats.auditRecheckGroups +=
-            batch.length;
-        }
-
-        job.stats.auditFlagged +=
-          flags.size;
-
-        console.log(
-          `[GEMINI AUDIT ${phase.toUpperCase()}] ` +
-          `${batch.length} revisados; ` +
-          `${flags.size} marcado(s).`
-        );
-
-        return flags;
-      }
+      )
     );
 
-  return new Map(
-    results.flatMap(
-      map =>
-        [
-          ...map.entries()
-        ]
-    )
-  );
+  const merged =
+    new Map(
+      results.flatMap(
+        map =>
+          [...map.entries()]
+      )
+    );
+
+  if (
+    merged.size !==
+    groups.length
+  ) {
+    throw new Error(
+      `Tradução principal incompleta ` +
+      `${merged.size}/${groups.length}.`
+    );
+  }
+
+  return merged;
 }
 
 // ============================================================
-// FINAL CLEAN / QUALITY GUARD
+// CLEAN / LOCAL GUARDS
 // ============================================================
 
-function cleanFinalText(
-  text
-) {
+function cleanFinalText(text) {
   let value =
     normalizeElongations(
-      String(
-        text ||
-        ""
-      )
+      String(text || "")
         .replace(
           /\r\n/g,
           "\n"
@@ -3855,15 +2947,10 @@ function cleanFinalText(
     );
 
   return value
-    .split(
-      "\n"
-    )
+    .split("\n")
     .map(
       line =>
-        String(
-          line ||
-          ""
-        )
+        String(line || "")
           .replace(
             /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
             ""
@@ -3894,24 +2981,32 @@ function cleanFinalText(
           )
           .trim()
     )
-    .filter(
-      Boolean
-    )
-    .join(
-      "\n"
-    )
+    .filter(Boolean)
+    .join("\n")
     .trim();
 }
 
-function applySafeFixes(
+function applySourceAwareHardFix(
   source,
-  target
+  target,
+  filename = ""
 ) {
-  let text =
-    String(
-      target ||
-      ""
-    )
+  const en =
+    String(source || "");
+
+  let pt =
+    String(target || "");
+
+  const dragContext =
+    /rupaul|drag[ ._-]*race/i.test(
+      filename
+    ) ||
+    /\bwerkroom\b|\blip sync\b|\bshantay\b|\bsashay\b/i.test(
+      en
+    );
+
+  pt =
+    pt
       .replace(
         /\buma alçapão\b/gi,
         "um alçapão"
@@ -3929,19 +3024,11 @@ function applySafeFixes(
         "banheiro feminino"
       );
 
-  const english =
-    String(
-      source ||
-      ""
-    );
-
   if (
-    /\bWerkroom\b/i.test(
-      english
-    )
+    /\bWerkroom\b/i.test(en)
   ) {
-    text =
-      text
+    pt =
+      pt
         .replace(
           /\bworkroom\b/gi,
           "Werkroom"
@@ -3954,36 +3041,204 @@ function applySafeFixes(
 
   if (
     /\bCondragulations\b/i.test(
-      english
+      en
     )
   ) {
-    text =
-      text.replace(
+    pt =
+      pt.replace(
         /\bcondragulations\b/gi,
         "Condragulations"
       );
   }
 
-  return text;
+  if (
+    /^\s*bitch[,!]/i.test(en) &&
+    /^\s*puta[,!]/i.test(pt)
+  ) {
+    pt =
+      pt.replace(
+        /^\s*puta([,!])/i,
+        "Bicha$1"
+      );
+  }
+
+  if (
+    /\bgagged\b/i.test(en) &&
+    /amordaçad/i.test(pt)
+  ) {
+    pt =
+      pt.replace(
+        /(?:t[oô]\s+)?amordaçad[oa]s?/gi,
+        "tô passada"
+      );
+  }
+
+  if (
+    /\b(?:double|shared)\s+win\b/i.test(
+      en
+    ) &&
+    /\bempate duplo\b/i.test(
+      pt
+    )
+  ) {
+    pt =
+      pt.replace(
+        /\bempate duplo\b/gi,
+        "vitória dupla"
+      );
+  }
+
+  if (
+    /\bplucking\s+pussy\s+hairs?\b|\bpussy\s+hairs?\b/i.test(
+      en
+    ) &&
+    /\bfio(?:s)? de bigode\b/i.test(
+      pt
+    )
+  ) {
+    pt =
+      pt.replace(
+        /\bfio(?:s)? de bigode\b/gi,
+        "pelo de xereca"
+      );
+  }
+
+  if (
+    /\bthe judgers are now the judgees\b/i.test(
+      en
+    )
+  ) {
+    if (
+      /ju[ií]zes?.*julgad/i.test(
+        pt
+      )
+    ) {
+      pt =
+        "Agora quem julgava vai ser julgado.";
+    }
+  }
+
+  if (
+    dragContext &&
+    /\bjudges?\b/i.test(en)
+  ) {
+    pt =
+      pt
+        .replace(
+          /\bjuízes\b/gi,
+          "jurados"
+        )
+        .replace(
+          /\bjuiz\b/gi,
+          "jurado"
+        );
+  }
+
+  if (
+    /\blip sync\b/i.test(en)
+  ) {
+    pt =
+      pt
+        .replace(
+          /\bum lip sync da porra\b/gi,
+          "um puta lip sync"
+        )
+        .replace(
+          /\blip sync da porra\b/gi,
+          "lip sync foda"
+        )
+        .replace(
+          /\bum lip sync do caralho\b/gi,
+          "um puta lip sync"
+        )
+        .replace(
+          /\blip sync do caralho\b/gi,
+          "lip sync foda"
+        );
+  }
+
+  if (
+    /\bgame[- ]playing girls\b/i.test(
+      en
+    ) &&
+    /\bmotherfucking competition\b/i.test(
+      en
+    )
+  ) {
+    if (
+      /competição (?:da porra|do caralho)/i.test(
+        pt
+      )
+    ) {
+      pt =
+        "Tem umas meninas jogando sujo pra caralho nessa competição.";
+    }
+  }
+
+  return pt;
 }
 
-function wordCount(
-  text
-) {
+function wordCount(text) {
   return (
-    String(
-      text ||
-      ""
-    ).match(
-      /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
-    ) ||
+    String(text || "")
+      .match(
+        /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
+      ) ||
     []
   ).length;
 }
 
+function normalizedWordSet(text) {
+  return new Set(
+    (
+      String(text || "")
+        .toLowerCase()
+        .match(
+          /[a-zà-ÿ0-9]+/g
+        ) ||
+      []
+    ).filter(
+      word =>
+        word.length > 2
+    )
+  );
+}
+
+function copiedEnglishRatio(
+  en,
+  pt
+) {
+  const enWords =
+    normalizedWordSet(en);
+
+  const ptWords =
+    [
+      ...normalizedWordSet(pt)
+    ];
+
+  if (
+    ptWords.length < 6 ||
+    enWords.size < 6
+  ) {
+    return 0;
+  }
+
+  const copied =
+    ptWords.filter(
+      word =>
+        enWords.has(word)
+    ).length;
+
+  return (
+    copied /
+    ptWords.length
+  );
+}
+
 function knownIssuesForGroup(
   group,
-  segments
+  segments,
+  filename = ""
 ) {
   const english =
     group.cues
@@ -3991,17 +3246,21 @@ function knownIssuesForGroup(
         cue =>
           cue.text
       )
-      .join(
-        " "
-      );
+      .join(" ");
 
   const pt =
-    segments.join(
-      " "
-    );
+    segments.join(" ");
 
   const reasons =
     new Set();
+
+  const dragContext =
+    /rupaul|drag[ ._-]*race/i.test(
+      filename
+    ) ||
+    /\bwerkroom\b|\blip sync\b|\bshantay\b|\bsashay\b/i.test(
+      english
+    );
 
   if (
     /\b(?:competição|competicao) (?:da porra|do caralho)\b/i.test(
@@ -4152,12 +3411,8 @@ function knownIssuesForGroup(
   }
 
   if (
-    /\s\/\s/u.test(
-      pt
-    ) ||
-    /--+/u.test(
-      pt
-    ) ||
+    /\s\/\s/u.test(pt) ||
+    /--+/u.test(pt) ||
     /^\s*[-–—/]\s*\S/mu.test(
       pt
     )
@@ -4177,6 +3432,20 @@ function knownIssuesForGroup(
     );
   }
 
+  if (
+    dragContext &&
+    /\bjudges?\b/i.test(
+      english
+    ) &&
+    /\bju[ií]zes?\b/i.test(
+      pt
+    )
+  ) {
+    reasons.add(
+      "DRAG_JUDGES"
+    );
+  }
+
   const enWords =
     wordCount(
       english
@@ -4188,8 +3457,7 @@ function knownIssuesForGroup(
     );
 
   if (
-    enWords >=
-      12 &&
+    enWords >= 12 &&
     ptWords <=
       Math.max(
         2,
@@ -4205,8 +3473,7 @@ function knownIssuesForGroup(
   }
 
   if (
-    english.length >=
-      80 &&
+    english.length >= 80 &&
     pt.length <=
       Math.floor(
         english.length *
@@ -4218,9 +3485,98 @@ function knownIssuesForGroup(
     );
   }
 
+  if (
+    copiedEnglishRatio(
+      english,
+      pt
+    ) >=
+    0.68
+  ) {
+    reasons.add(
+      "POSSIBLE_UNTRANSLATED"
+    );
+  }
+
   return [
     ...reasons
   ];
+}
+
+function riskScore(
+  group,
+  translations,
+  filename = ""
+) {
+  const en =
+    group.cues
+      .map(
+        cue =>
+          cue.text
+      )
+      .join(" ");
+
+  const pt =
+    (
+      translations.get(
+        group.groupId
+      ) ||
+      []
+    ).join(" ");
+
+  let score = 0;
+
+  const hot =
+    /\bbitch\b|\bgagged\b|\bshe ate\b|no crumbs|motherfucking|\bfucking\b|lip sync|\bjudges?\b|judgers|judgees|supportive|pussy hairs?|double win|shared win|Werkroom|Condragulations|Shantay|Sashay|closing ranks|carry the two|off the top/i;
+
+  if (
+    hot.test(en)
+  ) {
+    score += 8;
+  }
+
+  if (
+    group.cues.length >= 3
+  ) {
+    score += 3;
+  }
+
+  if (
+    en.length > 180
+  ) {
+    score += 3;
+  }
+
+  if (
+    group.multiSpeaker
+  ) {
+    score += 3;
+  }
+
+  const issues =
+    knownIssuesForGroup(
+      group,
+
+      translations.get(
+        group.groupId
+      ),
+
+      filename
+    );
+
+  score +=
+    issues.length * 10;
+
+  if (
+    copiedEnglishRatio(
+      en,
+      pt
+    ) >
+    0.45
+  ) {
+    score += 5;
+  }
+
+  return score;
 }
 
 function addIssue(
@@ -4254,21 +3610,15 @@ function addIssue(
     current
       .reasons
       .add(
-        String(
-          reason
-        )
+        String(reason)
       );
   }
 
-  if (
-    hint
-  ) {
+  if (hint) {
     current
       .hints
       .push(
-        String(
-          hint
-        )
+        String(hint)
       );
   }
 
@@ -4296,33 +3646,37 @@ function deterministicIssueMap(
 
         translations.get(
           group.groupId
-        )
+        ),
+
+        job.filename
       );
 
     if (
-      reasons.length
+      !reasons.length
     ) {
-      job.stats.localStyleFlags +=
-        reasons.length;
-
-      if (
-        reasons.includes(
-          "POSSIBLE_OMISSION"
-        )
-      ) {
-        job.stats.omissionFlags++;
-      }
-
-      addIssue(
-        out,
-
-        group.groupId,
-
-        reasons,
-
-        "Corrija sem perder sentido, naturalidade nem alinhamento por cue."
-      );
+      continue;
     }
+
+    job.stats.localStyleFlags +=
+      reasons.length;
+
+    if (
+      reasons.includes(
+        "POSSIBLE_OMISSION"
+      )
+    ) {
+      job.stats.omissionFlags++;
+    }
+
+    addIssue(
+      out,
+
+      group.groupId,
+
+      reasons,
+
+      "Corrija o defeito sem perder naturalidade, conteúdo nem alinhamento cue a cue."
+    );
   }
 
   return out;
@@ -4355,292 +3709,12 @@ function mergeIssueMaps(
       (
         item.hints ||
         []
-      ).join(
-        " | "
-      )
+      ).join(" | ")
     );
   }
 
   return target;
 }
-
-// ============================================================
-// REPAIR
-// ============================================================
-
-function repairPayload(
-  group,
-  translations,
-  issue
-) {
-  return {
-    g:
-      group.groupId,
-
-    reasons:
-      [
-        ...issue.reasons
-      ],
-
-    hint:
-      issue
-        .hints
-        .join(
-          " | "
-        )
-        .slice(
-          0,
-          700
-        ),
-
-    cues:
-      group.cues.map(
-        (
-          cue,
-          index
-        ) => ({
-          i:
-            cue.index,
-
-          en:
-            cue.text,
-
-          pt:
-            translations
-              .get(
-                group.groupId
-              )[
-                index
-              ],
-
-          ...(
-            cue.speakerHint
-              ? {
-                  speaker:
-                    cue.speakerHint
-                }
-              : {}
-          )
-        })
-      )
-  };
-}
-
-async function repairBatch(
-  groups,
-  translations,
-  issueMap,
-  job,
-  thinkingLevel
-) {
-  const expectedCues =
-    countCues(
-      groups
-    );
-
-  const response =
-    await geminiRequest({
-      model:
-        GEMINI_TRANSLATOR_MODEL,
-
-      system:
-        REPAIR_PROMPT,
-
-      user:
-        `Repare estes ` +
-        `${groups.length} groups. ` +
-        `O output deve conter exatamente ` +
-        `${expectedCues} cues.\n\n` +
-        JSON.stringify({
-          groups:
-            groups.map(
-              group =>
-                repairPayload(
-                  group,
-                  translations,
-                  issueMap.get(
-                    group.groupId
-                  )
-                )
-            )
-        }),
-
-      schema:
-        cueTranslationSchema(
-          expectedCues
-        ),
-
-      thinkingLevel,
-
-      maxOutputTokens:
-        REPAIR_MAX_OUTPUT_TOKENS,
-
-      timeoutMs:
-        REPAIR_REQUEST_TIMEOUT_MS,
-
-      maxRetries:
-        REPAIR_MAX_RETRIES,
-
-      job,
-
-      metric:
-        "repair"
-    });
-
-  const parsed =
-    parseCueTranslation(
-      groups,
-      response.text
-    );
-
-  if (
-    !parsed.invalidGroups.length &&
-    response.status !==
-      "incomplete"
-  ) {
-    return parsed.groupMap;
-  }
-
-  if (
-    groups.length >
-    1
-  ) {
-    const middle =
-      Math.ceil(
-        groups.length /
-        2
-      );
-
-    console.warn(
-      `[GEMINI REPAIR SPLIT] ` +
-      `${groups.length} -> ` +
-      `${middle}+` +
-      `${groups.length - middle}.`
-    );
-
-    const left =
-      await repairBatch(
-        groups.slice(
-          0,
-          middle
-        ),
-
-        translations,
-
-        issueMap,
-
-        job,
-
-        thinkingLevel
-      );
-
-    const right =
-      await repairBatch(
-        groups.slice(
-          middle
-        ),
-
-        translations,
-
-        issueMap,
-
-        job,
-
-        thinkingLevel
-      );
-
-    return new Map([
-      ...left,
-      ...right
-    ]);
-  }
-
-  throw new Error(
-    `Reparo estruturado falhou ` +
-    `no group ${groups[0].groupId}.`
-  );
-}
-
-async function repairIssueMap(
-  allGroups,
-  translations,
-  issueMap,
-  job,
-  thinkingLevel =
-    REPAIR_THINKING_LEVEL
-) {
-  const selected =
-    allGroups.filter(
-      group =>
-        issueMap.has(
-          group.groupId
-        )
-    );
-
-  if (
-    !selected.length
-  ) {
-    return;
-  }
-
-  const batches =
-    splitByBudget(
-      selected,
-
-      REPAIR_BATCH_CHARS,
-
-      REPAIR_BATCH_GROUPS,
-
-      group =>
-        repairPayload(
-          group,
-          translations,
-          issueMap.get(
-            group.groupId
-          )
-        )
-    );
-
-  console.log(
-    `[GEMINI REPAIR] ` +
-    `${selected.length} group(s) -> ` +
-    `${batches.length} lote(s) | ` +
-    `thinking=${thinkingLevel}.`
-  );
-
-  for (
-    const batch
-    of batches
-  ) {
-    const repaired =
-      await repairBatch(
-        batch,
-        translations,
-        issueMap,
-        job,
-        thinkingLevel
-      );
-
-    for (
-      const [
-        groupId,
-        segments
-      ]
-      of repaired
-    ) {
-      translations.set(
-        groupId,
-        segments
-      );
-
-      job.stats.repairedGroups++;
-    }
-  }
-}
-
-// ============================================================
-// FLATTEN
-// ============================================================
 
 function flattenTranslations(
   blocks,
@@ -4680,8 +3754,7 @@ function flattenTranslations(
         group.cues.length
     ) {
       throw new Error(
-        `Flatten inválido ` +
-        `g=${group.groupId}.`
+        `Flatten inválido g=${group.groupId}.`
       );
     }
 
@@ -4718,19 +3791,22 @@ function flattenTranslations(
 
 function cleanAll(
   blocks,
-  texts
+  texts,
+  filename
 ) {
   return texts.map(
     (
       text,
       index
     ) =>
-      applySafeFixes(
+      applySourceAwareHardFix(
         blocks[index].text,
 
         cleanFinalText(
           text
-        )
+        ),
+
+        filename
       )
   );
 }
@@ -4774,7 +3850,852 @@ function writeCleanBack(
 }
 
 // ============================================================
-// MAIN PIPELINE
+// AUDIT
+// ============================================================
+
+function reviewPayload(
+  group,
+  translations
+) {
+  const pt =
+    translations.get(
+      group.groupId
+    );
+
+  return {
+    g:
+      group.groupId,
+
+    cues:
+      group.cues.map(
+        (
+          cue,
+          index
+        ) => ({
+          i:
+            cue.index,
+
+          en:
+            cue.text,
+
+          pt:
+            pt[index],
+
+          ...(
+            cue.speakerHint
+              ? {
+                  speaker:
+                    cue.speakerHint
+                }
+              : {}
+          )
+        })
+      )
+  };
+}
+
+function parseAudit(
+  groups,
+  raw
+) {
+  let parsed;
+
+  try {
+    parsed =
+      JSON.parse(
+        stripCodeFences(
+          raw
+        )
+      );
+  } catch {
+    throw new Error(
+      "Audit JSON inválido."
+    );
+  }
+
+  if (
+    !Array.isArray(
+      parsed?.items
+    )
+  ) {
+    throw new Error(
+      "Audit sem items."
+    );
+  }
+
+  const expected =
+    new Set(
+      groups.map(
+        group =>
+          group.groupId
+      )
+    );
+
+  const seen =
+    new Set();
+
+  const flags =
+    new Map();
+
+  for (
+    const item
+    of parsed.items
+  ) {
+    const groupId =
+      Number(
+        item?.g
+      );
+
+    if (
+      !expected.has(
+        groupId
+      ) ||
+      seen.has(
+        groupId
+      )
+    ) {
+      continue;
+    }
+
+    const verdict =
+      String(
+        item?.v ||
+        ""
+      ).toLowerCase();
+
+    if (
+      ![
+        "ok",
+        "fix"
+      ].includes(
+        verdict
+      )
+    ) {
+      continue;
+    }
+
+    seen.add(
+      groupId
+    );
+
+    if (
+      verdict ===
+      "fix"
+    ) {
+      flags.set(
+        groupId,
+
+        {
+          reasons:
+            Array.isArray(
+              item?.reasons
+            )
+              ? item.reasons
+                  .map(
+                    value =>
+                      String(
+                        value
+                      ).toUpperCase()
+                  )
+                  .slice(
+                    0,
+                    8
+                  )
+              : [
+                  "REVIEW"
+                ],
+
+          hint:
+            String(
+              item?.hint ||
+              ""
+            ).slice(
+              0,
+              450
+            )
+        }
+      );
+    }
+  }
+
+  if (
+    seen.size !==
+    groups.length
+  ) {
+    throw new Error(
+      `Audit incompleto ` +
+      `${seen.size}/${groups.length}.`
+    );
+  }
+
+  return flags;
+}
+
+async function auditBatchResilient(
+  groups,
+  translations,
+  plan,
+  job,
+  deep = false,
+  depth = 0
+) {
+  try {
+    const response =
+      await geminiRequest({
+        system:
+          deep
+            ? DEEP_AUDITOR_PROMPT
+            : AUDITOR_PROMPT,
+
+        user:
+          `BÍBLIA GLOBAL:\n${JSON.stringify(plan)}\n\n` +
+          `Audite exatamente ${groups.length} groups ` +
+          `e devolva um item por group.\n\n` +
+          JSON.stringify({
+            groups:
+              groups.map(
+                group =>
+                  reviewPayload(
+                    group,
+                    translations
+                  )
+              )
+          }),
+
+        schema:
+          auditSchema(
+            groups.length
+          ),
+
+        thinkingLevel:
+          deep
+            ? DEEP_AUDIT_THINKING
+            : AUDIT_THINKING,
+
+        maxOutputTokens:
+          deep
+            ? DEEP_AUDIT_MAX_OUTPUT_TOKENS
+            : AUDIT_MAX_OUTPUT_TOKENS,
+
+        timeoutMs:
+          AUDIT_TIMEOUT_MS,
+
+        maxRetries:
+          AUDIT_RETRIES,
+
+        job,
+
+        metric:
+          deep
+            ? "deep"
+            : "audit"
+      });
+
+    return parseAudit(
+      groups,
+      response.text
+    );
+  } catch (error) {
+    if (
+      groups.length > 30 &&
+      depth < 3
+    ) {
+      const middle =
+        Math.ceil(
+          groups.length /
+          2
+        );
+
+      console.warn(
+        `[GEMINI AUDIT SPLIT] ` +
+        `${groups.length} -> ` +
+        `${middle}+${groups.length - middle}.`
+      );
+
+      const [
+        left,
+        right
+      ] =
+        await Promise.all([
+          auditBatchResilient(
+            groups.slice(
+              0,
+              middle
+            ),
+
+            translations,
+            plan,
+            job,
+            deep,
+            depth + 1
+          ),
+
+          auditBatchResilient(
+            groups.slice(
+              middle
+            ),
+
+            translations,
+            plan,
+            job,
+            deep,
+            depth + 1
+          )
+        ]);
+
+      return new Map([
+        ...left,
+        ...right
+      ]);
+    }
+
+    throw error;
+  }
+}
+
+async function mapWithConcurrency(
+  items,
+  concurrency,
+  worker
+) {
+  const results =
+    new Array(
+      items.length
+    );
+
+  let cursor = 0;
+
+  async function runner() {
+    while (true) {
+      const index =
+        cursor++;
+
+      if (
+        index >=
+        items.length
+      ) {
+        return;
+      }
+
+      results[index] =
+        await worker(
+          items[index],
+          index
+        );
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      {
+        length:
+          Math.min(
+            concurrency,
+            items.length
+          )
+      },
+
+      () =>
+        runner()
+    )
+  );
+
+  return results;
+}
+
+async function auditAllGroups(
+  groups,
+  translations,
+  plan,
+  job
+) {
+  const batches =
+    splitByBudget(
+      groups,
+
+      AUDIT_BATCH_CHARS,
+
+      AUDIT_BATCH_GROUPS,
+
+      group =>
+        reviewPayload(
+          group,
+          translations
+        )
+    );
+
+  console.log(
+    `[GEMINI AUDIT] ${groups.length} groups -> ` +
+    `${batches.length} lote(s), ` +
+    `concorrência=${AUDIT_CONCURRENCY}.`
+  );
+
+  const maps =
+    await mapWithConcurrency(
+      batches,
+
+      AUDIT_CONCURRENCY,
+
+      async batch => {
+        const flags =
+          await auditBatchResilient(
+            batch,
+            translations,
+            plan,
+            job,
+            false
+          );
+
+        job.stats.auditPrimaryGroups +=
+          batch.length;
+
+        job.stats.auditFlagged +=
+          flags.size;
+
+        console.log(
+          `[GEMINI AUDIT] ${batch.length} revisados; ` +
+          `${flags.size} marcado(s).`
+        );
+
+        return flags;
+      }
+    );
+
+  return new Map(
+    maps.flatMap(
+      map =>
+        [...map.entries()]
+    )
+  );
+}
+
+async function deepAuditHighRisk(
+  groups,
+  translations,
+  plan,
+  job
+) {
+  const ranked =
+    groups
+      .map(
+        group => ({
+          group,
+
+          score:
+            riskScore(
+              group,
+              translations,
+              job.filename
+            )
+        })
+      )
+      .filter(
+        item =>
+          item.score > 0
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.score -
+          a.score
+      )
+      .slice(
+        0,
+        DEEP_AUDIT_MAX_GROUPS
+      )
+      .map(
+        item =>
+          item.group
+      );
+
+  if (
+    !ranked.length
+  ) {
+    return new Map();
+  }
+
+  console.log(
+    `[GEMINI DEEP AUDIT] ` +
+    `${ranked.length} group(s) de maior risco.`
+  );
+
+  const flags =
+    await auditBatchResilient(
+      ranked,
+      translations,
+      plan,
+      job,
+      true
+    );
+
+  job.stats.auditFlagged +=
+    flags.size;
+
+  console.log(
+    `[GEMINI DEEP AUDIT] ` +
+    `${flags.size} marcado(s).`
+  );
+
+  return flags;
+}
+
+// ============================================================
+// REPAIR
+// ============================================================
+
+function repairPayload(
+  group,
+  translations,
+  issue
+) {
+  return {
+    g:
+      group.groupId,
+
+    reasons:
+      [
+        ...issue.reasons
+      ],
+
+    hint:
+      issue
+        .hints
+        .join(" | ")
+        .slice(
+          0,
+          800
+        ),
+
+    cues:
+      group.cues.map(
+        (
+          cue,
+          index
+        ) => ({
+          i:
+            cue.index,
+
+          en:
+            cue.text,
+
+          pt:
+            translations
+              .get(
+                group.groupId
+              )[index],
+
+          ...(
+            cue.speakerHint
+              ? {
+                  speaker:
+                    cue.speakerHint
+                }
+              : {}
+          )
+        })
+      )
+  };
+}
+
+async function repairBatch(
+  groups,
+  translations,
+  issueMap,
+  plan,
+  job,
+  thinkingLevel,
+  depth = 0
+) {
+  const expectedCues =
+    countCues(
+      groups
+    );
+
+  try {
+    const response =
+      await geminiRequest({
+        system:
+          REPAIR_PROMPT,
+
+        user:
+          `BÍBLIA GLOBAL:\n${JSON.stringify(plan)}\n\n` +
+          `Repare estes ${groups.length} groups. ` +
+          `Exatamente ${expectedCues} cues no output.\n\n` +
+          JSON.stringify({
+            groups:
+              groups.map(
+                group =>
+                  repairPayload(
+                    group,
+                    translations,
+
+                    issueMap.get(
+                      group.groupId
+                    )
+                  )
+              )
+          }),
+
+        schema:
+          cueTranslationSchema(
+            expectedCues
+          ),
+
+        thinkingLevel,
+
+        maxOutputTokens:
+          REPAIR_MAX_OUTPUT_TOKENS,
+
+        timeoutMs:
+          REPAIR_TIMEOUT_MS,
+
+        maxRetries:
+          REPAIR_RETRIES,
+
+        job,
+
+        metric:
+          "repair"
+      });
+
+    const parsed =
+      parseCueTranslation(
+        groups,
+        response.text
+      );
+
+    if (
+      !parsed.invalidGroups.length &&
+      response.status !==
+        "incomplete"
+    ) {
+      return parsed.groupMap;
+    }
+
+    throw new Error(
+      `Reparo incompleto: ` +
+      `${parsed.invalidGroups.length} invalid group(s), ` +
+      `status=${response.status}.`
+    );
+  } catch (error) {
+    if (
+      groups.length > 1 &&
+      depth < 4
+    ) {
+      const middle =
+        Math.ceil(
+          groups.length /
+          2
+        );
+
+      console.warn(
+        `[GEMINI REPAIR SPLIT] ` +
+        `${groups.length} -> ` +
+        `${middle}+${groups.length - middle}.`
+      );
+
+      const [
+        left,
+        right
+      ] =
+        await Promise.all([
+          repairBatch(
+            groups.slice(
+              0,
+              middle
+            ),
+
+            translations,
+            issueMap,
+            plan,
+            job,
+            thinkingLevel,
+            depth + 1
+          ),
+
+          repairBatch(
+            groups.slice(
+              middle
+            ),
+
+            translations,
+            issueMap,
+            plan,
+            job,
+            thinkingLevel,
+            depth + 1
+          )
+        ]);
+
+      return new Map([
+        ...left,
+        ...right
+      ]);
+    }
+
+    throw error;
+  }
+}
+
+async function repairIssueMap(
+  allGroups,
+  translations,
+  issueMap,
+  plan,
+  job,
+  thinkingLevel =
+    REPAIR_THINKING
+) {
+  const selected =
+    allGroups.filter(
+      group =>
+        issueMap.has(
+          group.groupId
+        )
+    );
+
+  if (
+    !selected.length
+  ) {
+    return;
+  }
+
+  const batches =
+    splitByBudget(
+      selected,
+
+      REPAIR_BATCH_CHARS,
+
+      REPAIR_BATCH_GROUPS,
+
+      group =>
+        repairPayload(
+          group,
+          translations,
+
+          issueMap.get(
+            group.groupId
+          )
+        )
+    );
+
+  console.log(
+    `[GEMINI REPAIR] ` +
+    `${selected.length} group(s) -> ` +
+    `${batches.length} lote(s) | ` +
+    `thinking=${thinkingLevel}.`
+  );
+
+  for (
+    const batch
+    of batches
+  ) {
+    const repaired =
+      await repairBatch(
+        batch,
+        translations,
+        issueMap,
+        plan,
+        job,
+        thinkingLevel
+      );
+
+    for (
+      const [
+        groupId,
+        segments
+      ]
+      of repaired
+    ) {
+      translations.set(
+        groupId,
+        segments
+      );
+
+      job.stats.repairedGroups++;
+    }
+  }
+}
+
+async function recheckRepaired(
+  allGroups,
+  translations,
+  plan,
+  issueMap,
+  job
+) {
+  const repairedGroups =
+    allGroups.filter(
+      group =>
+        issueMap.has(
+          group.groupId
+        )
+    );
+
+  if (
+    !repairedGroups.length
+  ) {
+    return new Map();
+  }
+
+  const batches =
+    splitByBudget(
+      repairedGroups,
+
+      26000,
+
+      100,
+
+      group =>
+        reviewPayload(
+          group,
+          translations
+        )
+    );
+
+  const out =
+    new Map();
+
+  for (
+    const batch
+    of batches
+  ) {
+    const flags =
+      await auditBatchResilient(
+        batch,
+        translations,
+        plan,
+        job,
+        true
+      );
+
+    job.stats.auditRecheckGroups +=
+      batch.length;
+
+    job.stats.auditFlagged +=
+      flags.size;
+
+    for (
+      const [
+        id,
+        issue
+      ]
+      of flags
+    ) {
+      out.set(
+        id,
+        issue
+      );
+    }
+  }
+
+  return out;
+}
+
+// ============================================================
+// PIPELINE
 // ============================================================
 
 async function translateSrt(
@@ -4803,36 +4724,37 @@ async function translateSrt(
     );
 
   console.log(
-    `[PIPELINE 6.6.2] ` +
+    `[PIPELINE 7.0] ` +
     `fonte=${job.sourceKind} | ` +
     `${blocks.length} cues -> ` +
     `${groups.length} Sentence Groups.`
   );
 
   console.log(
-    `[GEMINI MAIN] ` +
-    `Tentativa inicial: ` +
-    `EPISÓDIO INTEIRO em uma chamada ` +
-    `(${groups.length} groups / ` +
-    `${blocks.length} cues).`
+    `[PIPELINE 7.0] Limites conhecidos: ` +
+    `${GEMINI_RPM_LIMIT} RPM | ` +
+    `${GEMINI_TPM_LIMIT} TPM | ` +
+    `${GEMINI_RPD_LIMIT} RPD.`
   );
 
-  const translations =
-    await translateGroupsResilient(
+  // 1) CONTEXTO GLOBAL
+  const plan =
+    await buildEpisodePlan(
       groups,
       job
     );
 
-  if (
-    translations.size !==
-    groups.length
-  ) {
-    throw new Error(
-      `Tradução principal incompleta ` +
-      `${translations.size}/` +
-      `${groups.length}.`
+  job.progress =
+    8;
+
+  // 2) TRADUÇÃO PRINCIPAL
+  // 4 lotes em paralelo
+  const translations =
+    await translateMainParallel(
+      groups,
+      plan,
+      job
     );
-  }
 
   let texts =
     cleanAll(
@@ -4842,7 +4764,9 @@ async function translateSrt(
         blocks,
         groups,
         translations
-      )
+      ),
+
+      job.filename
     );
 
   writeCleanBack(
@@ -4860,21 +4784,22 @@ async function translateSrt(
       texts
     ),
 
-    "CHECKPOINT GEMINI 3.6"
+    "CHECKPOINT FLASH-LITE"
   );
 
   job.progress =
-    72;
+    64;
 
   job.updatedAt =
     Date.now();
 
-  const auditIssues =
-    await auditGroups(
+  // 3) AUDITORIA AMPLA
+  const issues =
+    await auditAllGroups(
       groups,
       translations,
-      job,
-      "primary"
+      plan,
+      job
     );
 
   if (
@@ -4882,14 +4807,28 @@ async function translateSrt(
     groups.length
   ) {
     throw new Error(
-      `Auditoria primária incompleta ` +
-      `${job.stats.auditPrimaryGroups}/` +
-      `${groups.length}.`
+      `Auditoria ampla incompleta ` +
+      `${job.stats.auditPrimaryGroups}/${groups.length}.`
     );
   }
 
+  // 4) MICRO-AUDITORIA DOS TRECHOS MAIS ARRISCADOS
+  const deepIssues =
+    await deepAuditHighRisk(
+      groups,
+      translations,
+      plan,
+      job
+    );
+
   mergeIssueMaps(
-    auditIssues,
+    issues,
+    deepIssues
+  );
+
+  // 5) GUARDS LOCAIS
+  mergeIssueMaps(
+    issues,
 
     deterministicIssueMap(
       groups,
@@ -4900,49 +4839,66 @@ async function translateSrt(
 
   console.log(
     `[QUALITY MAP] ` +
-    `auditor+guard => ` +
-    `${auditIssues.size} group(s) ` +
-    `para reparo dirigido.`
+    `${issues.size} group(s) para reparo dirigido.`
   );
 
+  job.progress =
+    80;
+
+  // 6) REPARO SOMENTE DO QUE FOI SINALIZADO
   if (
-    auditIssues.size
+    issues.size
   ) {
     await repairIssueMap(
       groups,
       translations,
-      auditIssues,
+      issues,
+      plan,
       job,
-      REPAIR_THINKING_LEVEL
+      REPAIR_THINKING
     );
 
-    const repairedGroups =
-      groups.filter(
-        group =>
-          auditIssues.has(
-            group.groupId
-          )
+    texts =
+      cleanAll(
+        blocks,
+
+        flattenTranslations(
+          blocks,
+          groups,
+          translations
+        ),
+
+        job.filename
       );
 
-    job.progress =
-      90;
+    writeCleanBack(
+      blocks,
+      groups,
+      translations,
+      texts
+    );
 
-    job.updatedAt =
-      Date.now();
-
+    // 7) RECHECK SOMENTE DOS REPARADOS
     const secondIssues =
-      await auditGroups(
-        repairedGroups,
+      await recheckRepaired(
+        groups,
         translations,
-        job,
-        "recheck"
+        plan,
+        issues,
+        job
       );
 
     mergeIssueMaps(
       secondIssues,
 
       deterministicIssueMap(
-        repairedGroups,
+        groups.filter(
+          group =>
+            issues.has(
+              group.groupId
+            )
+        ),
+
         translations,
         job
       )
@@ -4956,21 +4912,22 @@ async function translateSrt(
 
       console.log(
         `[SECOND PASS] ` +
-        `${secondIssues.size} group(s) ` +
-        `ainda suspeito(s); ` +
-        `reparo HIGH focado.`
+        `${secondIssues.size} group(s) ainda suspeito(s); ` +
+        `reparo final HIGH.`
       );
 
       await repairIssueMap(
         groups,
         translations,
         secondIssues,
+        plan,
         job,
-        "high"
+        EMERGENCY_THINKING
       );
     }
   }
 
+  // 8) LIMPEZA + HARD FIXES SOURCE-AWARE
   texts =
     cleanAll(
       blocks,
@@ -4979,7 +4936,9 @@ async function translateSrt(
         blocks,
         groups,
         translations
-      )
+      ),
+
+      job.filename
     );
 
   writeCleanBack(
@@ -5012,44 +4971,52 @@ async function translateSrt(
 
     console.warn(
       `[QUALITY EMERGENCY] ` +
-      `${residualGroups.length} group(s) ` +
-      `ainda sinalizado(s); ` +
-      `última correção dirigida ` +
-      `sem travar por timer.`
+      `${residualGroups.length} group(s) residual(is); ` +
+      `última correção HIGH focada.`
     );
 
-    await repairIssueMap(
-      groups,
-      translations,
-      residual,
-      job,
-      "high"
-    );
-
-    texts =
-      cleanAll(
-        blocks,
-
-        flattenTranslations(
-          blocks,
-          groups,
-          translations
-        )
-      );
-
-    writeCleanBack(
-      blocks,
-      groups,
-      translations,
-      texts
-    );
-
-    residual =
-      deterministicIssueMap(
+    try {
+      await repairIssueMap(
         groups,
         translations,
-        job
+        residual,
+        plan,
+        job,
+        EMERGENCY_THINKING
       );
+
+      texts =
+        cleanAll(
+          blocks,
+
+          flattenTranslations(
+            blocks,
+            groups,
+            translations
+          ),
+
+          job.filename
+        );
+
+      writeCleanBack(
+        blocks,
+        groups,
+        translations,
+        texts
+      );
+
+      residual =
+        deterministicIssueMap(
+          groups,
+          translations,
+          job
+        );
+    } catch (error) {
+      console.warn(
+        `[QUALITY EMERGENCY] Falhou sem matar o episódio: ` +
+        `${errorMessage(error).slice(0, 220)}`
+      );
+    }
   }
 
   if (
@@ -5057,11 +5024,10 @@ async function translateSrt(
   ) {
     console.warn(
       `[QUALITY GUARD] AVISO — ` +
-      `${residual.size} group(s) residual(is); ` +
-      `SRT será entregue para não bloquear o sistema.`
+      `${residual.size} group(s) residual(is). ` +
+      `SRT será entregue para não travar o Stremio.`
     );
-  }
-  else {
+  } else {
     console.log(
       "[QUALITY GUARD] PASSOU — 0 padrão conhecido restante."
     );
@@ -5076,7 +5042,7 @@ async function translateSrt(
   auditTimestamps(
     sourceSrt,
     finalSrt,
-    "FINAL 6.6.2"
+    "FINAL 7.0"
   );
 
   const elapsed =
@@ -5087,67 +5053,35 @@ async function translateSrt(
     1000;
 
   console.log(
-    `[PIPELINE 6.6.2] OK em ` +
-    `${elapsed.toFixed(1)}s | ` +
+    `[PIPELINE 7.0] OK em ${elapsed.toFixed(1)}s | ` +
 
-    `MainCalls=` +
-    `${job.stats.mainCalls} | ` +
+    `Plan=${job.stats.planCalls} | ` +
 
-    `MainAttempts=` +
-    `${job.stats.mainAttempts} | ` +
+    `MainCalls=${job.stats.mainCalls} | ` +
+    `MainAttempts=${job.stats.mainAttempts} | ` +
+    `Main429=${job.stats.main429} | ` +
+    `MainSplits=${job.stats.mainSplits} | ` +
+    `MainRescueGroups=${job.stats.mainRescueGroups} | ` +
 
-    `Main429=` +
-    `${job.stats.main429} | ` +
+    `AuditCalls=${job.stats.auditCalls} | ` +
+    `DeepAudit=${job.stats.deepAuditCalls} | ` +
+    `Audit429=${job.stats.audit429} | ` +
+    `AuditPrimary=${job.stats.auditPrimaryGroups}/${groups.length} | ` +
+    `AuditRecheck=${job.stats.auditRecheckGroups} | ` +
+    `Flagged=${job.stats.auditFlagged} | ` +
 
-    `MainSplits=` +
-    `${job.stats.mainSplits} | ` +
+    `RepairCalls=${job.stats.repairCalls} | ` +
+    `Repair429=${job.stats.repair429} | ` +
+    `Repaired=${job.stats.repairedGroups} | ` +
 
-    `MainRescueGroups=` +
-    `${job.stats.mainRescueGroups} | ` +
+    `SecondPass=${job.stats.secondPassGroups} | ` +
+    `Emergency=${job.stats.emergencyRepairGroups} | ` +
+    `Residual=${residual.size} | ` +
 
-    `MainTokens=` +
-    `${job.stats.mainInputTokens}+` +
-    `${job.stats.mainOutputTokens} | ` +
+    `Tokens=${job.stats.inputTokens}+${job.stats.outputTokens}+` +
+    `thought:${job.stats.thoughtTokens} | ` +
 
-    `Thought=` +
-    `${job.stats.mainThoughtTokens} | ` +
-
-    `AuditCalls=` +
-    `${job.stats.auditCalls} | ` +
-
-    `Audit429=` +
-    `${job.stats.audit429} | ` +
-
-    `AuditFallback=` +
-    `${job.stats.auditFallbackCalls} | ` +
-
-    `AuditPrimary=` +
-    `${job.stats.auditPrimaryGroups}/` +
-    `${groups.length} | ` +
-
-    `AuditRecheck=` +
-    `${job.stats.auditRecheckGroups} | ` +
-
-    `Flagged=` +
-    `${job.stats.auditFlagged} | ` +
-
-    `RepairCalls=` +
-    `${job.stats.repairCalls} | ` +
-
-    `Repair429=` +
-    `${job.stats.repair429} | ` +
-
-    `Repaired=` +
-    `${job.stats.repairedGroups} | ` +
-
-    `SecondPass=` +
-    `${job.stats.secondPassGroups} | ` +
-
-    `Emergency=` +
-    `${job.stats.emergencyRepairGroups} | ` +
-
-    `Residual=` +
-    `${residual.size}.`
+    `RPMWait=${(job.stats.rpmWaitMs / 1000).toFixed(1)}s.`
   );
 
   return finalSrt;
@@ -5157,9 +5091,7 @@ async function translateSrt(
 // JOB QUEUE
 // ============================================================
 
-async function processJob(
-  job
-) {
+async function processJob(job) {
   job.status =
     "processing";
 
@@ -5178,9 +5110,7 @@ async function processJob(
         job.cacheKey
       );
 
-    if (
-      cached
-    ) {
+    if (cached) {
       auditTimestamps(
         job.sourceSrt,
         cached,
@@ -5222,10 +5152,7 @@ async function processJob(
     console.log(
       `[JOB ${job.id}] Concluído.`
     );
-  }
-  catch (
-    error
-  ) {
+  } catch (error) {
     job.status =
       "failed";
 
@@ -5244,9 +5171,7 @@ async function processJob(
     Date.now();
 }
 
-function enqueue(
-  job
-) {
+function enqueue(job) {
   if (
     queue.some(
       item =>
@@ -5257,9 +5182,7 @@ function enqueue(
     return;
   }
 
-  queue.push(
-    job
-  );
+  queue.push(job);
 
   console.log(
     `[JOB QUEUE] ${job.id} entrou; ` +
@@ -5270,9 +5193,7 @@ function enqueue(
 }
 
 async function runQueue() {
-  if (
-    queueRunning
-  ) {
+  if (queueRunning) {
     return;
   }
 
@@ -5291,13 +5212,10 @@ async function runQueue() {
         job.status ===
           "processing"
       ) {
-        await processJob(
-          job
-        );
+        await processJob(job);
       }
     }
-  }
-  finally {
+  } finally {
     queueRunning =
       false;
 
@@ -5341,11 +5259,8 @@ async function fetchWithTimeout(
           controller.signal
       }
     );
-  }
-  finally {
-    clearTimeout(
-      timer
-    );
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -5456,12 +5371,8 @@ function selectEnglishSubtitle(
             );
 
         return (
-          score(
-            b
-          ) -
-          score(
-            a
-          )
+          score(b) -
+          score(a)
         );
       }
     )[0] ||
@@ -5500,17 +5411,14 @@ async function fetchFallbackSrt({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/6.6.2"
+            "Stremio-PTBR/7.0"
         }
       }
     );
 
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
     throw new Error(
-      `OpenSubtitles HTTP ` +
-      `${response.status}.`
+      `OpenSubtitles HTTP ${response.status}.`
     );
   }
 
@@ -5522,9 +5430,7 @@ async function fetchFallbackSrt({
       data?.subtitles
     );
 
-  if (
-    !target
-  ) {
+  if (!target) {
     throw new Error(
       "OpenSubtitles não encontrou inglês utilizável."
     );
@@ -5537,7 +5443,7 @@ async function fetchFallbackSrt({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/6.6.2"
+            "Stremio-PTBR/7.0"
         }
       }
     );
@@ -5571,9 +5477,7 @@ async function fetchFallbackSrt({
       raw
     );
 
-  if (
-    !clean
-  ) {
+  if (!clean) {
     throw new Error(
       "Legenda fallback vazia após limpeza."
     );
@@ -5622,13 +5526,13 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "6.6.2",
+    "7.0.0",
 
   name:
     "Tradutor PT-BR Backend",
 
   description:
-    "Backend-only: Gemini 3.6 Flash + Gemini 3.5 Flash-Lite via Interactions API.",
+    "Backend-only: Gemini 3.5 Flash-Lite unificado, rápido e rate-aware.",
 
   resources: [
     "subtitles"
@@ -5683,23 +5587,31 @@ app.get(
       cacheVersion:
         CACHE_VERSION,
 
-      translator:
-        GEMINI_TRANSLATOR_MODEL,
-
-      auditor:
-        GEMINI_AUDITOR_MODEL,
+      model:
+        GEMINI_MODEL,
 
       api:
         "INTERACTIONS",
 
-      safetySettingsSent:
-        false,
+      limits: {
+        rpm:
+          GEMINI_RPM_LIMIT,
 
-      mainThinking:
-        MAIN_THINKING_LEVEL,
+        tpm:
+          GEMINI_TPM_LIMIT,
 
-      strategy:
-        "WHOLE_EPISODE_FIRST_TARGETED_REPAIR",
+        rpd:
+          GEMINI_RPD_LIMIT
+      },
+
+      mainParallelBatches:
+        MAIN_PARALLEL_BATCHES,
+
+      auditBatchGroups:
+        AUDIT_BATCH_GROUPS,
+
+      deepAuditMaxGroups:
+        DEEP_AUDIT_MAX_GROUPS,
 
       queue:
         queue.length,
@@ -5749,9 +5661,7 @@ app.post(
     res
   ) => {
     if (
-      !authorized(
-        req
-      )
+      !authorized(req)
     ) {
       return safeJson(
         res,
@@ -5869,15 +5779,10 @@ app.post(
           job
         )
       );
-    }
-    catch (
-      error
-    ) {
+    } catch (error) {
       console.error(
         `[EMBEDDED API] ` +
-        `${errorMessage(
-          error
-        )}`
+        `${errorMessage(error)}`
       );
 
       return safeJson(
@@ -5908,9 +5813,7 @@ app.post(
     res
   ) => {
     if (
-      !authorized(
-        req
-      )
+      !authorized(req)
     ) {
       return safeJson(
         res,
@@ -5971,9 +5874,7 @@ app.post(
 
       console.log(
         `[FALLBACK API] ` +
-        `${parseSrt(
-          sourceSrt
-        ).length} cues.`
+        `${parseSrt(sourceSrt).length} cues.`
       );
 
       const job =
@@ -5998,15 +5899,10 @@ app.post(
           job
         )
       );
-    }
-    catch (
-      error
-    ) {
+    } catch (error) {
       console.error(
         `[FALLBACK API] ` +
-        `${errorMessage(
-          error
-        )}`
+        `${errorMessage(error)}`
       );
 
       return safeJson(
@@ -6044,9 +5940,7 @@ app.get(
         )
       );
 
-    if (
-      !job
-    ) {
+    if (!job) {
       return safeJson(
         res,
 
@@ -6089,9 +5983,7 @@ app.get(
 // SRT DELIVERY
 // ============================================================
 
-function processingSrt(
-  job
-) {
+function processingSrt(job) {
   return [
     "1",
 
@@ -6110,14 +6002,10 @@ function processingSrt(
       job?.progress ||
       0
     )}%.`
-  ].join(
-    "\n"
-  );
+  ].join("\n");
 }
 
-function errorSrt(
-  error
-) {
+function errorSrt(error) {
   return [
     "1",
 
@@ -6143,9 +6031,7 @@ function errorSrt(
         0,
         300
       )
-  ].join(
-    "\n"
-  );
+  ].join("\n");
 }
 
 app.get(
@@ -6165,8 +6051,7 @@ app.get(
             ""
           )
         );
-    }
-    catch {
+    } catch {
       jobId =
         String(
           req.params.jobId ||
@@ -6179,9 +6064,7 @@ app.get(
         jobId
       );
 
-    if (
-      !job
-    ) {
+    if (!job) {
       return sendSrt(
         res,
 
@@ -6202,17 +6085,12 @@ app.get(
           job.result,
           "SERVING"
         );
-      }
-      catch (
-        error
-      ) {
+      } catch (error) {
         return sendSrt(
           res,
 
           errorSrt(
-            errorMessage(
-              error
-            )
+            errorMessage(error)
           )
         );
       }
@@ -6264,7 +6142,7 @@ app.listen(
     );
 
     console.log(
-      " STREMIO PT-BR BACKEND 6.6.2 GEMINI INTERACTIONS FIX"
+      " STREMIO PT-BR BACKEND 7.0 FINAL — FLASH-LITE ONLY"
     );
 
     console.log(
@@ -6281,33 +6159,11 @@ app.listen(
     );
 
     console.log(
-      `Tradutor principal: ` +
-      `${GEMINI_TRANSLATOR_MODEL} ✅`
+      `Modelo único: ${GEMINI_MODEL} ✅`
     );
 
     console.log(
-      `Auditor independente: ` +
-      `${GEMINI_AUDITOR_MODEL} ✅`
-    );
-
-    console.log(
-      "API Gemini: INTERACTIONS ✅"
-    );
-
-    console.log(
-      "safety_settings no POST /interactions: REMOVIDO ✅"
-    );
-
-    console.log(
-      "temperature/top_p/top_k: NÃO ENVIADOS ✅"
-    );
-
-    console.log(
-      "Structured Output: response_format + JSON Schema ✅"
-    );
-
-    console.log(
-      "Startup self-test de tradutor + auditor: ATIVO ✅"
+      "Gemini 3.6 Flash: NÃO USADO ✅"
     );
 
     console.log(
@@ -6319,26 +6175,56 @@ app.listen(
     );
 
     console.log(
-      "Ponte Local 4.1: COMPATÍVEL; NÃO ALTERAR ✅"
+      "API: Interactions + Structured Output ✅"
     );
 
     console.log(
-      "Tradução inicial: episódio inteiro em 1 chamada quando couber ✅"
+      "temperature/top_p/top_k: NÃO ENVIADOS ✅"
     );
 
     console.log(
-      `Thinking principal: ` +
-      `${MAIN_THINKING_LEVEL} ✅`
+      "safety_settings: NÃO ENVIADO ✅"
     );
 
     console.log(
-      `Auditoria: até ` +
-      `${AUDIT_BATCH_GROUPS} groups, ` +
-      `concorrência ${AUDIT_CONCURRENCY} ✅`
+      `Limite observado: ` +
+      `${GEMINI_RPM_LIMIT} RPM | ` +
+      `${GEMINI_TPM_LIMIT} TPM | ` +
+      `${GEMINI_RPD_LIMIT} RPD ✅`
     );
 
     console.log(
-      "Reparo: somente groups sinalizados ✅"
+      "Gate de RPM: SOMENTE quando os 15 RPM reais seriam ultrapassados ✅"
+    );
+
+    console.log(
+      "Pacer artificial/TPM inventado: NÃO EXISTE ✅"
+    );
+
+    console.log(
+      "Contexto global do episódio: 1 chamada curta ✅"
+    );
+
+    console.log(
+      `Tradução principal: ` +
+      `${MAIN_PARALLEL_BATCHES} lotes PARALELOS, ` +
+      `thinking=${MAIN_THINKING} ✅`
+    );
+
+    console.log(
+      `Auditoria ampla: até ` +
+      `${AUDIT_BATCH_GROUPS} groups/lote, ` +
+      `concorrência=${AUDIT_CONCURRENCY} ✅`
+    );
+
+    console.log(
+      `Micro-auditoria profunda: ` +
+      `top ${DEEP_AUDIT_MAX_GROUPS} groups de risco ✅`
+    );
+
+    console.log(
+      `Reparo: SOMENTE sinalizados, ` +
+      `thinking=${REPAIR_THINKING} ✅`
     );
 
     console.log(
@@ -6346,7 +6232,35 @@ app.listen(
     );
 
     console.log(
-      "uh-huh/uh-uh semânticos: NÃO são removidos ✅"
+      "bitch vocativo → bicha/gata/amiga; puta automática PROIBIDA ✅"
+    );
+
+    console.log(
+      "competição/lip sync/cheque 'da porra': GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "supportive→super apoiador: GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "judges Drag→jurados + judgers/judgees literal: GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "plucking pussy hairs→fio de bigode: GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "empate duplo indevido: GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "gagged→amordaçada: GUARD ATIVO ✅"
+    );
+
+    console.log(
+      "uh-huh/uh-uh semânticos: PRESERVADOS ✅"
     );
 
     console.log(
@@ -6354,11 +6268,11 @@ app.listen(
     );
 
     console.log(
-      "Quality residual: tenta reparo final, mas NÃO trava por timer ✅"
+      "OpenSubtitles: somente fallback solicitado pela Ponte ✅"
     );
 
     console.log(
-      "Pacer artificial: NÃO EXISTE ✅"
+      "Render no menu do Stremio: BACKEND ONLY ✅"
     );
 
     console.log(
@@ -6366,8 +6280,7 @@ app.listen(
     );
 
     console.log(
-      `Namespace de cache: ` +
-      `${CACHE_VERSION}`
+      `Namespace de cache: ${CACHE_VERSION}`
     );
 
     console.log(
@@ -6377,14 +6290,8 @@ app.listen(
     console.log(
       "============================================================"
     );
-
-    runStartupSelfTests();
   }
 );
-
-// ============================================================
-// PROCESS SAFETY
-// ============================================================
 
 process.on(
   "unhandledRejection",
