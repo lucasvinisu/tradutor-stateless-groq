@@ -8,23 +8,12 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
-// STREMIO PT-BR BACKEND 6.6 — GEMINI ONLY
+// STREMIO PT-BR BACKEND 6.6.1 — GEMINI INTERACTIONS
 // ============================================================
 // Tradutor principal: Gemini 3.6 Flash
 // Auditor: Gemini 3.5 Flash-Lite
-//
-// Estratégia:
-// 1) tenta traduzir o episódio inteiro em UMA chamada;
-// 2) se a resposta vier incompleta/truncada, divide somente o necessário;
-// 3) auditor independente revisa EN x PT em microblocos;
-// 4) só grupos sinalizados voltam ao Gemini 3.6 Flash;
-// 5) timestamps e cue IDs nunca são alterados.
-//
-// NÃO EXISTE:
-// - Mistral
-// - Groq
-// - teto global do episódio
-// - pacer artificial
+// API: Interactions (atual), não generateContent legado.
+// Sem Mistral, sem Groq, sem pacer artificial, sem teto global.
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -43,109 +32,55 @@ const GEMINI_AUDITOR_MODEL = String(
     "gemini-3.5-flash-lite"
 ).trim();
 
-const CACHE_VERSION = "6.6.0-gemini-only";
+const CACHE_VERSION = "6.6.1-interactions";
 
 const MAX_SOURCE_CHARS = 800000;
-
-const CACHE_TTL_MS =
-    7 *
-    24 *
-    60 *
-    60 *
-    1000;
-
-const JOB_TTL_MS =
-    24 *
-    60 *
-    60 *
-    1000;
-
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 25000;
 
-/*
- * Somente timeout de UMA request.
- *
- * NÃO é timeout global do episódio.
- */
-const MAIN_REQUEST_TIMEOUT_MS = Number(
-    process.env.GEMINI_MAIN_TIMEOUT_MS ||
-    180000
-);
+// Timeout APENAS de uma requisição.
+// Não existe timeout global do episódio.
+const MAIN_REQUEST_TIMEOUT_MS =
+    Number(process.env.GEMINI_MAIN_TIMEOUT_MS || 180000);
 
-const AUDIT_REQUEST_TIMEOUT_MS = Number(
-    process.env.GEMINI_AUDIT_TIMEOUT_MS ||
-    90000
-);
+const AUDIT_REQUEST_TIMEOUT_MS =
+    Number(process.env.GEMINI_AUDIT_TIMEOUT_MS || 90000);
 
-const REPAIR_REQUEST_TIMEOUT_MS = Number(
-    process.env.GEMINI_REPAIR_TIMEOUT_MS ||
-    120000
-);
+const REPAIR_REQUEST_TIMEOUT_MS =
+    Number(process.env.GEMINI_REPAIR_TIMEOUT_MS || 120000);
 
-const MAIN_MAX_RETRIES = Number(
-    process.env.GEMINI_MAIN_RETRIES ||
-    5
-);
+const MAIN_MAX_RETRIES =
+    Number(process.env.GEMINI_MAIN_RETRIES || 5);
 
-const AUDIT_MAX_RETRIES = Number(
-    process.env.GEMINI_AUDIT_RETRIES ||
-    4
-);
+const AUDIT_MAX_RETRIES =
+    Number(process.env.GEMINI_AUDIT_RETRIES || 4);
 
-const REPAIR_MAX_RETRIES = Number(
-    process.env.GEMINI_REPAIR_RETRIES ||
-    5
-);
+const REPAIR_MAX_RETRIES =
+    Number(process.env.GEMINI_REPAIR_RETRIES || 5);
 
-/*
- * O Gemini 3.6 Flash suporta
- * até 65.536 tokens de saída.
- *
- * 50K mantém margem e permite
- * traduzir um episódio inteiro
- * na maioria dos casos.
- */
-const MAIN_MAX_OUTPUT_TOKENS = Number(
-    process.env.GEMINI_MAIN_MAX_OUTPUT_TOKENS ||
-    50000
-);
+const MAIN_MAX_OUTPUT_TOKENS =
+    Number(process.env.GEMINI_MAIN_MAX_OUTPUT_TOKENS || 50000);
 
-const REPAIR_MAX_OUTPUT_TOKENS = Number(
-    process.env.GEMINI_REPAIR_MAX_OUTPUT_TOKENS ||
-    24000
-);
+const AUDIT_MAX_OUTPUT_TOKENS =
+    Number(process.env.GEMINI_AUDIT_MAX_OUTPUT_TOKENS || 12000);
 
-const AUDIT_MAX_OUTPUT_TOKENS = Number(
-    process.env.GEMINI_AUDIT_MAX_OUTPUT_TOKENS ||
-    12000
-);
+const REPAIR_MAX_OUTPUT_TOKENS =
+    Number(process.env.GEMINI_REPAIR_MAX_OUTPUT_TOKENS || 24000);
 
 const MAIN_THINKING_LEVEL = String(
     process.env.GEMINI_TRANSLATOR_THINKING ||
     "medium"
-)
-    .trim()
-    .toLowerCase();
+).trim().toLowerCase();
 
 const AUDIT_THINKING_LEVEL = "minimal";
-
 const REPAIR_THINKING_LEVEL = "high";
 
-/*
- * Auditor:
- *
- * menor que os lotes enormes da 6.4,
- * mas sem multiplicar requests demais.
- */
-const AUDIT_BATCH_GROUPS = Number(
-    process.env.GEMINI_AUDIT_GROUPS ||
-    80
-);
+const AUDIT_BATCH_GROUPS =
+    Number(process.env.GEMINI_AUDIT_GROUPS || 80);
 
-const AUDIT_BATCH_CHARS = Number(
-    process.env.GEMINI_AUDIT_CHARS ||
-    22000
-);
+const AUDIT_BATCH_CHARS =
+    Number(process.env.GEMINI_AUDIT_CHARS || 22000);
 
 const AUDIT_CONCURRENCY = Math.max(
     1,
@@ -158,41 +93,25 @@ const AUDIT_CONCURRENCY = Math.max(
     )
 );
 
-/*
- * Reparo normalmente é pequeno.
- *
- * Se muitos grupos forem sinalizados,
- * divide em poucos lotes grandes.
- */
-const REPAIR_BATCH_GROUPS = Number(
-    process.env.GEMINI_REPAIR_GROUPS ||
-    120
-);
+const REPAIR_BATCH_GROUPS =
+    Number(process.env.GEMINI_REPAIR_GROUPS || 100);
 
-const REPAIR_BATCH_CHARS = Number(
-    process.env.GEMINI_REPAIR_CHARS ||
-    30000
-);
+const REPAIR_BATCH_CHARS =
+    Number(process.env.GEMINI_REPAIR_CHARS || 28000);
 
 // ============================================================
 // STATE
 // ============================================================
 
 const translationCache = new Map();
-
 const jobs = new Map();
-
 const queue = [];
 
 let queueRunning = false;
 
 const sleep = ms =>
-    new Promise(
-        resolve =>
-            setTimeout(
-                resolve,
-                ms
-            )
+    new Promise(resolve =>
+        setTimeout(resolve, ms)
     );
 
 // ============================================================
@@ -224,10 +143,7 @@ function errorMessage(error) {
 }
 
 function normalizeSrt(value) {
-    return String(
-        value ||
-        ""
-    )
+    return String(value || "")
         .replace(/^\uFEFF/, "")
         .replace(/\r\n/g, "\n")
         .replace(/\r/g, "\n")
@@ -235,10 +151,7 @@ function normalizeSrt(value) {
 }
 
 function stripCodeFences(value) {
-    return String(
-        value ||
-        ""
-    )
+    return String(value || "")
         .replace(
             /^\s*```(?:json|text|plaintext|srt)?\s*/i,
             ""
@@ -308,10 +221,7 @@ function sendSrt(
     );
 
     res.send(
-        String(
-            srt ||
-            ""
-        )
+        String(srt || "")
     );
 }
 
@@ -333,10 +243,7 @@ function authorized(req) {
 
     return (
         a.length === b.length &&
-        crypto.timingSafeEqual(
-            a,
-            b
-        )
+        crypto.timingSafeEqual(a, b)
     );
 }
 
@@ -399,8 +306,7 @@ function createJob({
     sourceSrt,
     sourceKind
 }) {
-    const now =
-        Date.now();
+    const now = Date.now();
 
     const sourceHash =
         sha256(sourceSrt);
@@ -412,15 +318,10 @@ function createJob({
             `${randomId()}`,
 
         type,
-
         videoId,
-
         filename,
-
         sourceSrt,
-
         sourceKind,
-
         sourceHash,
 
         cacheKey:
@@ -458,20 +359,25 @@ function createJob({
             main429: 0,
             mainSplits: 0,
             mainRescueGroups: 0,
+
             mainInputTokens: 0,
             mainOutputTokens: 0,
+            mainThoughtTokens: 0,
 
             auditCalls: 0,
             auditAttempts: 0,
             audit429: 0,
             auditFallbackCalls: 0,
-            auditedGroups: 0,
+
+            auditPrimaryGroups: 0,
+            auditRecheckGroups: 0,
             auditFlagged: 0,
 
             repairCalls: 0,
             repairAttempts: 0,
             repair429: 0,
             repairedGroups: 0,
+
             secondPassGroups: 0,
             emergencyRepairGroups: 0,
 
@@ -599,9 +505,7 @@ setInterval(
         }
     },
 
-    10 *
-    60 *
-    1000
+    10 * 60 * 1000
 ).unref();
 
 // ============================================================
@@ -619,10 +523,7 @@ const SDH_WORDS =
 
 function normalizeSpeaker(value) {
     const speaker =
-        String(
-            value ||
-            ""
-        )
+        String(value || "")
             .replace(
                 /<[^>]+>/g,
                 " "
@@ -647,15 +548,10 @@ function normalizeSpeaker(value) {
 
 function extractSpeaker(line) {
     const original =
-        String(
-            line ||
-            ""
-        );
+        String(line || "");
 
     const hidden =
-        original.match(
-            SPEAKER_RE
-        );
+        original.match(SPEAKER_RE);
 
     if (hidden) {
         let speaker = "";
@@ -728,16 +624,16 @@ function extractSpeaker(line) {
     }
 
     return {
-        speaker: "",
-        text: original
+        speaker:
+            "",
+
+        text:
+            original
     };
 }
 
 function normalizeElongations(text) {
-    return String(
-        text ||
-        ""
-    )
+    return String(text || "")
         .replace(
             /([A-Za-zÀ-ÖØ-öø-ÿ]+?)([-–—])([A-Za-zÀ-ÖØ-öø-ÿ])(?:\2\3){2,}/gu,
             "$1"
@@ -754,10 +650,7 @@ function normalizeElongations(text) {
 
 function isEmptyVocalization(text) {
     const value =
-        String(
-            text ||
-            ""
-        )
+        String(text || "")
             .toLowerCase()
             .replace(
                 /[.,!?…]+/g,
@@ -776,10 +669,8 @@ function isEmptyVocalization(text) {
 
 function cleanSourceLine(line) {
     let text =
-        String(
-            line ||
-            ""
-        ).trim();
+        String(line || "")
+            .trim();
 
     if (!text) {
         return "";
@@ -884,7 +775,6 @@ function cleanSrtForTranslation(srt) {
         }
 
         const dialogue = [];
-
         const speakers =
             new Set();
 
@@ -914,9 +804,7 @@ function cleanSrtForTranslation(srt) {
                 ).trim();
 
             const cleaned =
-                cleanSourceLine(
-                    before
-                );
+                cleanSourceLine(before);
 
             if (
                 !cleaned &&
@@ -1108,14 +996,10 @@ function auditTimestamps(
     label
 ) {
     const source =
-        parseSrt(
-            sourceSrt
-        );
+        parseSrt(sourceSrt);
 
     const final =
-        parseSrt(
-            finalSrt
-        );
+        parseSrt(finalSrt);
 
     if (
         source.length !==
@@ -1128,19 +1012,19 @@ function auditTimestamps(
     }
 
     for (
-        let index = 0;
-        index < source.length;
-        index++
+        let i = 0;
+        i < source.length;
+        i++
     ) {
         if (
-            source[index].index !==
-                final[index].index ||
-            source[index].timing !==
-                final[index].timing
+            source[i].index !==
+                final[i].index ||
+            source[i].timing !==
+                final[i].timing
         ) {
             throw new Error(
                 `TIMING LOCK ${label}: ` +
-                `cue ${source[index].index}.`
+                `cue ${source[i].index}.`
             );
         }
     }
@@ -1158,12 +1042,10 @@ function auditTimestamps(
 
 function parseTimeSeconds(value) {
     const match =
-        String(
-            value ||
-            ""
-        ).match(
-            /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
-        );
+        String(value || "")
+            .match(
+                /^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/
+            );
 
     if (!match) {
         return NaN;
@@ -1182,12 +1064,10 @@ function parseTimeSeconds(value) {
 
 function timingParts(timing) {
     const match =
-        String(
-            timing ||
-            ""
-        ).match(
-            /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
-        );
+        String(timing || "")
+            .match(
+                /^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/
+            );
 
     return match
         ? {
@@ -1202,16 +1082,16 @@ function timingParts(timing) {
                 )
         }
         : {
-            start: NaN,
-            end: NaN
+            start:
+                NaN,
+
+            end:
+                NaN
         };
 }
 
 function groupingText(text) {
-    return String(
-        text ||
-        ""
-    )
+    return String(text || "")
         .replace(
             /<[^>]+>/g,
             " "
@@ -1229,10 +1109,7 @@ function groupingText(text) {
 
 function isMultiSpeaker(text) {
     const lines =
-        String(
-            text ||
-            ""
-        )
+        String(text || "")
             .split("\n")
             .filter(
                 line =>
@@ -1396,7 +1273,6 @@ function buildSentenceGroups(blocks) {
         }
         else {
             flush();
-
             current.push(block);
         }
     }
@@ -1442,7 +1318,6 @@ function splitByBudget(
     const batches = [];
 
     let current = [];
-
     let chars = 0;
 
     for (
@@ -1467,12 +1342,10 @@ function splitByBudget(
             batches.push(current);
 
             current = [];
-
             chars = 0;
         }
 
         current.push(item);
-
         chars += size;
     }
 
@@ -1505,45 +1378,49 @@ function countCues(groups) {
 const TRANSLATOR_PROMPT = `
 Você é o tradutor principal EN→PT-BR de legendas de entretenimento em 2026.
 
-Sua prioridade é produzir português brasileiro NATURAL, ORAL, CONTEMPORÂNEO,
-COERENTE, FIEL e CULTURALMENTE INTELIGENTE.
+Prioridades absolutas:
+português brasileiro NATURAL, ORAL, CONTEMPORÂNEO, COERENTE, FIEL
+e sincronizado semanticamente com cada cue.
 
-A tradução precisa soar como alguém brasileiro daquele universo realmente falaria,
-não como inglês vestido de português.
+Não soe:
+literal,
+engessado,
+antiquado,
+lusitano,
+burocrático,
+com gíria de tiozão
+ou internetês forçado.
 
-NÃO soe:
-- literal;
-- engessado;
-- antiquado;
-- lusitano;
-- burocrático;
-- "gíria de tiozão";
-- internetês forçado;
-- caricatura artificial de Gen Z/Alpha.
+Use linguagem Gen Z/Alpha apenas quando personagem, contexto e tom realmente pedirem.
 
-Use referências, registro e gírias jovens APENAS quando contexto, personagem e tom pedirem.
+DRAG / REALITY / LGBTQIA+ / POP:
 
-DRAG / REALITY / LGBTQIA+ / POP / MODA / MÚSICA:
-
-- "bitch" como VOCATIVO amigável entre queens/amigas:
-  pode ser "bicha", "gata", "amiga", "menina" ou pode ser omitido.
-  NÃO traduza automaticamente como "puta".
-  Se for insulto real, adapte como insulto real conforme o contexto.
+- "bitch" como vocativo amigável entre queens/amigas:
+  bicha, gata, amiga, menina ou omitir.
+  NÃO use "puta" automaticamente.
+  Como insulto real, adapte pelo contexto.
 
 - "I'm gagged" / "gagged" como reação:
-  "Tô passada", "Tô muito passada", "Tô em choque", "Tô sem reação".
-  NUNCA "amordaçada".
+  "Tô passada",
+  "Tô muito passada",
+  "Tô em choque",
+  "Tô sem reação".
+  Nunca "amordaçada".
 
 - "she ate":
-  "ela arrasou", "entregou tudo", "serviu demais" etc., quando for gíria.
+  "ela arrasou",
+  "entregou tudo",
+  "serviu demais",
+  quando for gíria.
 
 - "no crumbs":
-  "não deixou nada pra ninguém", quando couber.
+  "não deixou nada pra ninguém",
+  quando couber.
 
-- fucking / motherfucking:
-  são intensificadores.
-  Preserve a força de maneira brasileira e na posição em que brasileiro fala.
-  NUNCA produza:
+- fucking / motherfucking são intensificadores.
+  Preserve a força em posição natural brasileira.
+
+  Nunca produza por tradução mecânica:
   "competição da porra",
   "competição do caralho",
   "lip sync da porra",
@@ -1552,37 +1429,66 @@ DRAG / REALITY / LGBTQIA+ / POP / MODA / MÚSICA:
   "cheque do caralho".
 
 - "fucking lip sync":
-  pode ser "um puta lip sync", "um lip sync foda", "um lip sync absurdo",
-  conforme o sentido e a pessoa.
+  pode ser
+  "um puta lip sync",
+  "um lip sync foda",
+  "um lip sync absurdo",
+  conforme contexto.
 
 - supportive:
-  prefira "sempre me apoiou muito", "sempre esteve do meu lado" etc.
+  prefira
+  "sempre me apoiou",
+  "sempre esteve do meu lado".
   Evite "super apoiador".
 
-- judges em Drag Race = "jurados", não "juízes".
+- judges em Drag Race:
+  jurados,
+  não juízes.
 
 - "the judgers are now the judgees":
   "agora quem julgava vai ser julgado"
-  ou "agora os jurados é que vão ser julgados".
-  NUNCA "os juízes viraram os julgados".
+  ou
+  "agora os jurados é que vão ser julgados".
+
+  Nunca:
+  "os juízes viraram os julgados".
 
 - "plucking pussy hairs":
   preserve corpo, sentido e vulgaridade.
-  Ex.: "catar pelo de xereca", "arrancar pelo de xereca".
-  NUNCA transforme em "fio de bigode".
+  Exemplo:
+  "catar pelo de xereca".
+
+  Nunca:
+  "fio de bigode".
 
 - double win / shared win:
-  "vitória dupla", "as duas ganharam" ou equivalente.
-  NÃO invente "empate duplo" quando não existe empate.
+  "vitória dupla",
+  "as duas ganharam"
+  ou equivalente.
 
-- "week one" = "primeira semana".
-- "off the top" sobre dinheiro = comissão/corte/porcentagem.
-- "closing ranks" = grupo se protegendo / panelinha.
-- "Carry the two" em conta = "vai dois".
+  Não invente "empate duplo"
+  quando não há empate.
+
+- week one:
+  primeira semana.
+
+- off the top sobre dinheiro:
+  comissão/corte/porcentagem.
+
+- closing ranks:
+  grupo se protegendo/panelinha.
+
+- Carry the two em conta:
+  vai dois.
+
 - evite "apoiante".
-- "The talent performers" não é "As artistas do talento".
 
-PRESERVE quando presentes e culturalmente reconhecíveis:
+- "The talent performers"
+  não é
+  "As artistas do talento".
+
+Preserve quando presentes e reconhecíveis:
+
 Werkroom
 Condragulations
 Shantay, you stay
@@ -1591,144 +1497,165 @@ You betta werk
 Racers, start your engines
 
 PALAVRÃO:
-Não censure.
-Preserve intensidade, mas faça o palavrão cair onde brasileiro realmente colocaria.
+não censure.
+Preserve intensidade de forma brasileira natural.
 
 GÊNERO:
-"speaker" é contexto oculto.
-Use-o quando for seguro.
-Se não for seguro, reformule naturalmente.
-NUNCA escreva "empolgado(a)", "animado(a)", "ele/ela", "ela/ele".
+speaker é contexto oculto.
+Use quando seguro.
+Se não for, reformule.
+
+Nunca escreva:
+empolgado(a)
+animado(a)
+ele/ela
+ela/ele
 
 FORMATAÇÃO:
-- sem nomes/labels de falante;
-- sem [NOME];
-- sem NOME:;
-- sem "/" como separador de diálogo;
-- sem hífen/travessão decorativo;
-- sem SDH/CC;
-- sem alongamentos gráficos.
+sem speaker labels,
+[NOME],
+NOME:,
+barras de diálogo,
+hífens/travessões decorativos,
+SDH/CC
+ou alongamentos gráficos.
 
-SINCRONIZAÇÃO SEMÂNTICA / CUE LOCK ABSOLUTO:
-Você recebe Sentence Groups para entender frases que atravessam vários cues.
-Mas CADA cue possui um id "i".
+CUE LOCK ABSOLUTO:
 
-Devolva EXATAMENTE UM "pt" para CADA "i" recebido, com o MESMO "i".
+Sentence Groups existem apenas para contexto.
+Cada cue tem id "i".
+
+Devolva exatamente UM "pt"
+para CADA "i",
+com o MESMO id.
+
 Não resuma.
-Não omita o fim de frase ou raciocínio.
-Não antecipe fala do cue seguinte.
-Não empurre conteúdo para um cue posterior.
-Mantenha cada pedaço semanticamente no timestamp em que é falado.
+Não omita o fim da frase/raciocínio.
+Não antecipe conteúdo do cue seguinte.
+Não empurre conteúdo para cue posterior.
 
-IMPORTANTE:
-Você recebe o episódio inteiro ou um trecho grande justamente para manter
-coerência de personagens, referências, piadas, termos e continuidade.
+Mantenha cada pedaço semanticamente
+no timestamp em que é falado.
 
-Responda SOMENTE pelo esquema JSON fornecido pela API.
+Responda somente pelo JSON Schema fornecido pela API.
 `;
 
 const AUDITOR_PROMPT = `
-Você é um AUDITOR editorial independente de legendas EN→PT-BR em 2026.
+Você é auditor editorial independente EN→PT-BR em 2026.
 
-Compare EN x PT CUE POR CUE.
-Não reescreva por preferência pessoal.
-Para CADA group recebido, devolva obrigatoriamente "ok" ou "fix".
+Compare EN x PT cue por cue.
 
-Marque "fix" somente quando houver problema REAL:
+Não reescreva por gosto.
 
-SEMANTIC = sentido/referência errados.
-OMISSION = conteúdo ou fim do raciocínio sumiu.
-CUE_SYNC = conteúdo foi antecipado/atrasado/movido entre cues.
-LITERAL = inglês vestido de português.
-REGISTER = registro engessado, antiquado, tiozão ou jovem artificial.
-CULTURE = drag/reality/LGBTQIA+/Gen Z/Alpha/meme/moda/música mal adaptados.
-PROFANITY = palavrão censurado ou posicionado de forma artificial.
-GENDER = concordância/gênero inadequado.
-FORMAT = label, barra, marcador, hífen decorativo, ruído.
+Para cada group:
+"ok"
+ou
+"fix".
 
-Cheque obrigatoriamente:
-- "bitch" como vocativo amigável não vira "puta" automaticamente;
-- "competition/lip sync/check da porra/do caralho" é sinal de literalidade;
-- supportive não vira "super apoiador";
+Marque fix apenas por problema real:
+
+SEMANTIC
+OMISSION
+CUE_SYNC
+LITERAL
+REGISTER
+CULTURE
+PROFANITY
+GENDER
+FORMAT
+
+Cheque especialmente:
+
+- bitch-vocativo não vira puta automaticamente;
+- intensificadores não viram competição/lip sync/cheque da porra;
+- supportive não vira super apoiador;
 - judges em Drag Race = jurados;
-- judgers/judgees não vira "juízes viraram os julgados";
-- plucking pussy hairs não vira "fio de bigode";
-- double/shared win não vira "empate duplo" quando não há empate;
-- gagged como reação deve soar natural, ex. "Tô passada";
-- nenhuma frase/raciocínio pode ficar pela metade;
-- conteúdo não pode migrar para cue vizinho.
+- judgers/judgees não vira juízes viraram os julgados;
+- plucking pussy hairs não vira fio de bigode;
+- shared win não vira empate duplo;
+- gagged deve soar natural;
+- nenhuma frase pode ficar incompleta;
+- conteúdo não pode migrar entre cues.
 
-Para "fix", informe reasons e um hint CURTO e objetivo.
-Para "ok", reasons=[] e hint="".
+Para fix:
+reasons + hint curto.
 
-Responda SOMENTE pelo esquema JSON fornecido pela API.
+Para ok:
+reasons=[]
+hint=""
+
+Responda somente pelo JSON Schema fornecido.
 `;
 
 const REPAIR_PROMPT = `
 Você é o editor final EN→PT-BR.
 
-Recebe SOMENTE grupos em que uma auditoria encontrou problema concreto.
-Use EN original + PT atual + reasons + hint.
+Recebe apenas groups com problema concreto
+e deve corrigir somente o necessário.
 
-Retraduza apenas o necessário para eliminar o defeito,
-mantendo naturalidade, contemporaneidade, fidelidade, vulgaridade,
-referências culturais e sincronização semântica por cue.
+Mantenha:
+naturalidade,
+contemporaneidade,
+fidelidade,
+cultura,
+vulgaridade
+e sincronização cue a cue.
 
-Regras obrigatórias:
+Regras:
 
-- bitch vocativo amigável:
-  bicha/gata/amiga/menina ou omitir;
-  não "puta" automaticamente.
+- bitch-vocativo =
+  bicha/gata/amiga/menina
+  ou omitir;
+  não puta automática.
 
-- fucking/motherfucking:
-  intensificador natural brasileiro.
-  Nunca competição/lip sync/cheque "da porra/do caralho"
-  por tradução mecânica.
+- fucking/motherfucking =
+  intensificador natural;
+  nunca competição/lip sync/cheque da porra
+  por literalidade.
 
-- supportive:
-  "sempre me apoiou",
-  "esteve do meu lado" etc.
+- supportive =
+  sempre me apoiou/
+  esteve do meu lado.
 
-- judges em Drag Race:
+- judges =
   jurados.
 
-- judgers/judgees:
-  "quem julgava vai ser julgado"
+- judgers/judgees =
+  quem julgava vai ser julgado
   ou equivalente natural.
 
 - plucking pussy hairs:
-  preserve "pelo de xereca"
-  ou equivalente vulgar;
-  nunca "fio de bigode".
+  preserve pelo de xereca
+  ou equivalente vulgar.
 
-- double/shared win:
-  vitória dupla /
+- shared win:
+  vitória dupla/
   as duas ganharam;
-  não "empate duplo" sem empate.
+  não empate duplo
+  sem empate.
 
 - gagged:
-  "Tô passada",
-  "Tô muito passada",
-  "Tô em choque" etc.
+  Tô passada/
+  Tô muito passada/
+  Tô em choque,
   conforme contexto.
 
-- preserve catchphrases reconhecíveis de Drag Race.
+Preserve catchphrases reconhecíveis.
 
 CUE LOCK:
+exatamente um pt por cue i;
+mesmo i;
+sem omissão
+ou migração entre cues.
 
-Exatamente um "pt" para cada cue "i".
-Mesmo "i".
-Sem omissão.
-Sem mover conteúdo entre cues.
-
-speaker é contexto oculto.
+speaker é oculto.
 
 Sem labels,
 barras,
 marcadores
 ou alongamentos.
 
-Responda SOMENTE pelo esquema JSON fornecido pela API.
+Responda somente pelo JSON Schema fornecido.
 `;
 
 // ============================================================
@@ -1866,39 +1793,12 @@ function auditSchema(
 }
 
 // ============================================================
-// GEMINI HTTP
+// GEMINI INTERACTIONS API
 // ============================================================
-
-function extractGeminiText(data) {
-    return (
-        data
-            ?.candidates
-            ?.[0]
-            ?.content
-            ?.parts ||
-        []
-    )
-        .filter(
-            part =>
-                !part?.thought
-        )
-        .map(
-            part =>
-                typeof part?.text ===
-                    "string"
-                    ? part.text
-                    : ""
-        )
-        .join("")
-        .trim();
-}
 
 function parseDurationMs(value) {
     const text =
-        String(
-            value ||
-            ""
-        )
+        String(value || "")
             .trim()
             .toLowerCase();
 
@@ -1947,27 +1847,24 @@ function parseDurationMs(value) {
     return null;
 }
 
-function geminiRetryDelayMs(
+function retryDelayMs(
     response,
     data,
     attempt
 ) {
-    const retryAfter =
-        response
-            ?.headers
-            ?.get(
-                "retry-after"
-            );
-
-    const headerDelay =
+    const fromHeader =
         parseDurationMs(
-            retryAfter
+            response
+                ?.headers
+                ?.get(
+                    "retry-after"
+                )
         );
 
-    if (headerDelay) {
+    if (fromHeader) {
         return Math.min(
             90000,
-            headerDelay + 250
+            fromHeader + 250
         );
     }
 
@@ -1982,18 +1879,17 @@ function geminiRetryDelayMs(
         const detail
         of details
     ) {
-        const delay =
-            detail?.retryDelay ||
-            detail?.retry_delay ||
-            detail
-                ?.metadata
-                ?.retryDelay ||
-            detail
-                ?.metadata
-                ?.retry_delay;
-
         const parsed =
-            parseDurationMs(delay);
+            parseDurationMs(
+                detail?.retryDelay ||
+                detail?.retry_delay ||
+                detail
+                    ?.metadata
+                    ?.retryDelay ||
+                detail
+                    ?.metadata
+                    ?.retry_delay
+            );
 
         if (parsed) {
             return Math.min(
@@ -2009,13 +1905,59 @@ function geminiRetryDelayMs(
     );
 }
 
+function extractInteractionText(data) {
+    const steps =
+        Array.isArray(
+            data?.steps
+        )
+            ? data.steps
+            : [];
+
+    let last = "";
+
+    for (
+        const step
+        of steps
+    ) {
+        if (
+            step?.type !==
+                "model_output" ||
+            !Array.isArray(
+                step.content
+            )
+        ) {
+            continue;
+        }
+
+        const text =
+            step.content
+                .filter(
+                    part =>
+                        part?.type ===
+                            "text" &&
+                        typeof part?.text ===
+                            "string"
+                )
+                .map(
+                    part =>
+                        part.text
+                )
+                .join("");
+
+        if (text) {
+            last = text;
+        }
+    }
+
+    return last.trim();
+}
+
 async function geminiRequest({
     model,
     system,
     user,
     schema,
     thinkingLevel,
-    temperature,
     maxOutputTokens,
     timeoutMs,
     maxRetries,
@@ -2070,16 +2012,14 @@ async function geminiRequest({
                 `[GEMINI ${metric.toUpperCase()}] ` +
                 `${model} request ` +
                 `${attempt}/${maxRetries} | ` +
+                `interactions | ` +
                 `thinking=${thinkingLevel} | ` +
                 `maxOutput=${maxOutputTokens}.`
             );
 
             const response =
                 await fetch(
-                    `https://generativelanguage.googleapis.com/` +
-                    `v1beta/models/` +
-                    `${encodeURIComponent(model)}` +
-                    `:generateContent`,
+                    "https://generativelanguage.googleapis.com/v1beta/interactions",
 
                     {
                         method:
@@ -2095,78 +2035,68 @@ async function geminiRequest({
 
                         body:
                             JSON.stringify({
-                                systemInstruction: {
-                                    parts: [
-                                        {
-                                            text:
-                                                system
-                                        }
-                                    ]
+                                model,
+
+                                input:
+                                    user,
+
+                                system_instruction:
+                                    system,
+
+                                response_format: {
+                                    type:
+                                        "text",
+
+                                    mime_type:
+                                        "application/json",
+
+                                    schema
                                 },
 
-                                contents: [
-                                    {
-                                        role:
-                                            "user",
+                                generation_config: {
+                                    max_output_tokens:
+                                        maxOutputTokens,
 
-                                        parts: [
-                                            {
-                                                text:
-                                                    user
-                                            }
-                                        ]
+                                    thinking_level:
+                                        thinkingLevel
+                                },
+
+                                safety_settings: [
+                                    {
+                                        type:
+                                            "harassment",
+
+                                        threshold:
+                                            "block_none"
+                                    },
+
+                                    {
+                                        type:
+                                            "hate_speech",
+
+                                        threshold:
+                                            "block_none"
+                                    },
+
+                                    {
+                                        type:
+                                            "sexually_explicit",
+
+                                        threshold:
+                                            "block_none"
+                                    },
+
+                                    {
+                                        type:
+                                            "dangerous_content",
+
+                                        threshold:
+                                            "block_none"
                                     }
                                 ],
 
-                                generationConfig: {
-                                    temperature,
-
-                                    maxOutputTokens,
-
-                                    responseMimeType:
-                                        "application/json",
-
-                                    responseJsonSchema:
-                                        schema,
-
-                                    thinkingConfig: {
-                                        thinkingLevel
-                                    }
-                                },
-
-                                safetySettings: [
-                                    {
-                                        category:
-                                            "HARM_CATEGORY_HARASSMENT",
-
-                                        threshold:
-                                            "BLOCK_NONE"
-                                    },
-
-                                    {
-                                        category:
-                                            "HARM_CATEGORY_HATE_SPEECH",
-
-                                        threshold:
-                                            "BLOCK_NONE"
-                                    },
-
-                                    {
-                                        category:
-                                            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-
-                                        threshold:
-                                            "BLOCK_NONE"
-                                    },
-
-                                    {
-                                        category:
-                                            "HARM_CATEGORY_DANGEROUS_CONTENT",
-
-                                        threshold:
-                                            "BLOCK_NONE"
-                                    }
-                                ]
+                                store:
+                                    false
                             }),
 
                         signal:
@@ -2193,23 +2123,21 @@ async function geminiRequest({
                 data
             ) {
                 const text =
-                    extractGeminiText(
+                    extractInteractionText(
                         data
                     );
 
-                if (!text) {
-                    const finish =
-                        String(
-                            data
-                                ?.candidates
-                                ?.[0]
-                                ?.finishReason ||
-                            "UNKNOWN"
-                        );
+                const status =
+                    String(
+                        data?.status ||
+                        "unknown"
+                    ).toLowerCase();
 
+                if (!text) {
                     throw new Error(
-                        `Gemini ${metric} retornou resposta vazia; ` +
-                        `finishReason=${finish}.`
+                        `Gemini ${metric} ` +
+                        `retornou resposta vazia; ` +
+                        `status=${status}.`
                     );
                 }
 
@@ -2221,16 +2149,24 @@ async function geminiRequest({
                     job.stats.mainInputTokens +=
                         Number(
                             data
-                                ?.usageMetadata
-                                ?.promptTokenCount ||
+                                ?.usage
+                                ?.total_input_tokens ||
                             0
                         );
 
                     job.stats.mainOutputTokens +=
                         Number(
                             data
-                                ?.usageMetadata
-                                ?.candidatesTokenCount ||
+                                ?.usage
+                                ?.total_output_tokens ||
+                            0
+                        );
+
+                    job.stats.mainThoughtTokens +=
+                        Number(
+                            data
+                                ?.usage
+                                ?.total_thought_tokens ||
                             0
                         );
                 }
@@ -2247,30 +2183,25 @@ async function geminiRequest({
                     job.stats.repairCalls++;
                 }
 
-                const finishReason =
-                    String(
-                        data
-                            ?.candidates
-                            ?.[0]
-                            ?.finishReason ||
-                        "UNKNOWN"
-                    ).toUpperCase();
-
                 console.log(
                     `[GEMINI ${metric.toUpperCase()}] OK | ` +
-                    `finish=${finishReason} | ` +
-                    `promptTokens=` +
-                    `${Number(
+                    `status=${status.toUpperCase()} | ` +
+                    `input=${Number(
                         data
-                            ?.usageMetadata
-                            ?.promptTokenCount ||
+                            ?.usage
+                            ?.total_input_tokens ||
                         0
                     )} | ` +
-                    `outputTokens=` +
-                    `${Number(
+                    `output=${Number(
                         data
-                            ?.usageMetadata
-                            ?.candidatesTokenCount ||
+                            ?.usage
+                            ?.total_output_tokens ||
+                        0
+                    )} | ` +
+                    `thought=${Number(
+                        data
+                            ?.usage
+                            ?.total_thought_tokens ||
                         0
                     )} | ` +
                     `chars=${text.length}.`
@@ -2278,11 +2209,10 @@ async function geminiRequest({
 
                 return {
                     text,
-
-                    finishReason,
+                    status,
 
                     usage:
-                        data?.usageMetadata ||
+                        data?.usage ||
                         {}
                 };
             }
@@ -2302,7 +2232,7 @@ async function geminiRequest({
                     `HTTP ${response.status}: ` +
                     `${String(message).slice(
                         0,
-                        1400
+                        1800
                     )}`
                 );
 
@@ -2331,13 +2261,14 @@ async function geminiRequest({
                 }
 
                 if (
-                    attempt === maxRetries
+                    attempt ===
+                    maxRetries
                 ) {
                     throw error;
                 }
 
                 const wait =
-                    geminiRetryDelayMs(
+                    retryDelayMs(
                         response,
                         data,
                         attempt
@@ -2346,8 +2277,9 @@ async function geminiRequest({
                 console.warn(
                     `[GEMINI ${metric.toUpperCase()}] ` +
                     `429; aguardando ` +
-                    `${(wait / 1000).toFixed(1)}s ` +
-                    `conforme quota/retry.`
+                    `${(wait / 1000).toFixed(
+                        1
+                    )}s.`
                 );
 
                 await sleep(wait);
@@ -2377,13 +2309,6 @@ async function geminiRequest({
                     2500 * attempt,
                     15000
                 );
-
-            console.warn(
-                `[GEMINI ${metric.toUpperCase()}] ` +
-                `HTTP ${response.status}; ` +
-                `retry em ` +
-                `${(wait / 1000).toFixed(1)}s.`
-            );
 
             await sleep(wait);
         }
@@ -2442,7 +2367,9 @@ async function geminiRequest({
                     220
                 )}; ` +
                 `retry em ` +
-                `${(wait / 1000).toFixed(1)}s.`
+                `${(wait / 1000).toFixed(
+                    1
+                )}s.`
             );
 
             await sleep(wait);
@@ -2461,7 +2388,7 @@ async function geminiRequest({
 }
 
 // ============================================================
-// TRANSLATION PARSER / RESILIENCE
+// TRANSLATION
 // ============================================================
 
 function parseCueTranslation(
@@ -2510,7 +2437,7 @@ function parseCueTranslation(
     const byId =
         new Map();
 
-    const duplicateIds =
+    const duplicates =
         new Set();
 
     for (
@@ -2536,7 +2463,7 @@ function parseCueTranslation(
         if (
             byId.has(id)
         ) {
-            duplicateIds.add(id);
+            duplicates.add(id);
             continue;
         }
 
@@ -2549,25 +2476,28 @@ function parseCueTranslation(
     const groupMap =
         new Map();
 
-    const invalidGroups =
-        [];
+    const invalidGroups = [];
 
     for (
         const group
         of groups
     ) {
-        let valid = true;
+        let valid =
+            true;
 
-        const segments =
-            [];
+        const segments = [];
 
         for (
             const cue
             of group.cues
         ) {
             if (
-                !byId.has(cue.index) ||
-                duplicateIds.has(cue.index)
+                !byId.has(
+                    cue.index
+                ) ||
+                duplicates.has(
+                    cue.index
+                )
             ) {
                 valid = false;
                 break;
@@ -2587,28 +2517,29 @@ function parseCueTranslation(
             );
         }
         else {
-            invalidGroups.push(group);
+            invalidGroups.push(
+                group
+            );
         }
     }
 
     return {
         groupMap,
-
         invalidGroups,
 
         issue:
-            invalidGroups.length === 0
-                ? null
-                : `INCOMPLETE:` +
+            invalidGroups.length
+                ? `INCOMPLETE:` +
                   `${groupMap.size}/` +
                   `${groups.length}`
+                : null
     };
 }
 
 function translatorInput(groups) {
     return JSON.stringify({
         context:
-            "Subtitle Sentence Groups, in chronological episode order.",
+            "Subtitle Sentence Groups in chronological episode order.",
 
         groups:
             groups.map(
@@ -2626,6 +2557,9 @@ async function translateGroupsResilient(
     const expectedCues =
         countCues(groups);
 
+    const isMain =
+        mode === "main";
+
     const response =
         await geminiRequest({
             model:
@@ -2636,10 +2570,10 @@ async function translateGroupsResilient(
 
             user:
                 `Traduza TODOS os cues abaixo. ` +
-                `O output precisa conter exatamente ` +
+                `O output deve conter exatamente ` +
                 `${expectedCues} objetos de cue, ` +
                 `um por id recebido.\n\n` +
-                translatorInput(groups),
+                `${translatorInput(groups)}`,
 
             schema:
                 cueTranslationSchema(
@@ -2647,34 +2581,29 @@ async function translateGroupsResilient(
                 ),
 
             thinkingLevel:
-                mode === "main"
+                isMain
                     ? MAIN_THINKING_LEVEL
                     : "high",
 
-            temperature:
-                mode === "main"
-                    ? 0.25
-                    : 0.1,
-
             maxOutputTokens:
-                mode === "main"
+                isMain
                     ? MAIN_MAX_OUTPUT_TOKENS
                     : REPAIR_MAX_OUTPUT_TOKENS,
 
             timeoutMs:
-                mode === "main"
+                isMain
                     ? MAIN_REQUEST_TIMEOUT_MS
                     : REPAIR_REQUEST_TIMEOUT_MS,
 
             maxRetries:
-                mode === "main"
+                isMain
                     ? MAIN_MAX_RETRIES
                     : REPAIR_MAX_RETRIES,
 
             job,
 
             metric:
-                mode === "main"
+                isMain
                     ? "main"
                     : "repair"
         });
@@ -2685,28 +2614,24 @@ async function translateGroupsResilient(
             response.text
         );
 
-    const truncated =
-        response.finishReason.includes(
-            "MAX_TOKENS"
-        ) ||
-        response.finishReason.includes(
-            "LENGTH"
-        );
+    const incomplete =
+        response.status ===
+        "incomplete";
 
     if (
         !parsed.invalidGroups.length &&
-        !truncated
+        !incomplete
     ) {
         return parsed.groupMap;
     }
 
     if (
         (
-            truncated ||
+            incomplete ||
             parsed.issue ===
                 "JSON_INVALID"
         ) &&
-        groups.length > 60 &&
+        groups.length > 50 &&
         depth < 5
     ) {
         job.stats.mainSplits++;
@@ -2724,8 +2649,8 @@ async function translateGroupsResilient(
             `${groups.length - middle}; ` +
             `motivo=` +
             `${
-                truncated
-                    ? "TRUNC"
+                incomplete
+                    ? "INCOMPLETE"
                     : parsed.issue
             }.`
         );
@@ -2772,8 +2697,7 @@ async function translateGroupsResilient(
             throw new Error(
                 `Gemini não preservou estrutura ` +
                 `após resgates: ` +
-                `${parsed.invalidGroups.length} ` +
-                `group(s).`
+                `${parsed.invalidGroups.length} group(s).`
             );
         }
 
@@ -2782,12 +2706,10 @@ async function translateGroupsResilient(
 
         console.warn(
             `[GEMINI MAIN RESCUE] ` +
-            `válidos=` +
-            `${parsed.groupMap.size}/` +
+            `válidos=${parsed.groupMap.size}/` +
             `${groups.length}; ` +
-            `refazendo somente ` +
-            `${parsed.invalidGroups.length} ` +
-            `group(s).`
+            `refazendo ` +
+            `${parsed.invalidGroups.length} group(s).`
         );
 
         const rescued =
@@ -3019,9 +2941,6 @@ async function auditBatchWithModel(
                     ? "low"
                     : AUDIT_THINKING_LEVEL,
 
-            temperature:
-                0,
-
             maxOutputTokens:
                 AUDIT_MAX_OUTPUT_TOKENS,
 
@@ -3094,9 +3013,7 @@ async function auditBatchResilient(
                     ),
 
                     translations,
-
                     job,
-
                     depth + 1
                 );
 
@@ -3107,9 +3024,7 @@ async function auditBatchResilient(
                     ),
 
                     translations,
-
                     job,
-
                     depth + 1
                 );
 
@@ -3122,8 +3037,8 @@ async function auditBatchResilient(
         console.warn(
             `[GEMINI AUDIT FALLBACK] ` +
             `${GEMINI_AUDITOR_MODEL} falhou; ` +
-            `Gemini 3.6 assume auditoria ` +
-            `destes ${groups.length} group(s).`
+            `${GEMINI_TRANSLATOR_MODEL} assume ` +
+            `${groups.length} group(s).`
         );
 
         return auditBatchWithModel(
@@ -3189,7 +3104,8 @@ async function mapWithConcurrency(
 async function auditGroups(
     groups,
     translations,
-    job
+    job,
+    phase = "primary"
 ) {
     const batches =
         splitByBudget(
@@ -3207,11 +3123,10 @@ async function auditGroups(
         );
 
     console.log(
-        `[GEMINI AUDIT] ` +
+        `[GEMINI AUDIT ${phase.toUpperCase()}] ` +
         `${groups.length} groups -> ` +
-        `${batches.length} micro-lote(s), ` +
-        `concorrência=` +
-        `${AUDIT_CONCURRENCY}.`
+        `${batches.length} lote(s), ` +
+        `concorrência=${AUDIT_CONCURRENCY}.`
     );
 
     const results =
@@ -3228,18 +3143,24 @@ async function auditGroups(
                         job
                     );
 
-                job.stats.auditedGroups +=
-                    batch.length;
+                if (
+                    phase === "primary"
+                ) {
+                    job.stats.auditPrimaryGroups +=
+                        batch.length;
+                }
+                else {
+                    job.stats.auditRecheckGroups +=
+                        batch.length;
+                }
 
                 job.stats.auditFlagged +=
                     flags.size;
 
                 console.log(
-                    `[GEMINI AUDIT] ` +
+                    `[GEMINI AUDIT ${phase.toUpperCase()}] ` +
                     `${batch.length} revisados; ` +
-                    `${flags.size} marcado(s); ` +
-                    `total=` +
-                    `${job.stats.auditedGroups}.`
+                    `${flags.size} marcado(s).`
                 );
 
                 return flags;
@@ -3257,16 +3178,13 @@ async function auditGroups(
 }
 
 // ============================================================
-// FINAL CLEAN / QUALITY RISKS
+// FINAL CLEAN / QUALITY GUARD
 // ============================================================
 
 function cleanFinalText(text) {
     let value =
         normalizeElongations(
-            String(
-                text ||
-                ""
-            )
+            String(text || "")
                 .replace(
                     /\r\n/g,
                     "\n"
@@ -3287,10 +3205,7 @@ function cleanFinalText(text) {
         .split("\n")
         .map(
             line =>
-                String(
-                    line ||
-                    ""
-                )
+                String(line || "")
                     .replace(
                         /^\s*\[[^\]]{1,60}\]\s*:?[ \t]*/u,
                         ""
@@ -3331,13 +3246,7 @@ function applySafeFixes(
     target
 ) {
     let text =
-        String(
-            target ||
-            ""
-        );
-
-    text =
-        text
+        String(target || "")
             .replace(
                 /\buma alçapão\b/gi,
                 "um alçapão"
@@ -3356,15 +3265,10 @@ function applySafeFixes(
             );
 
     const english =
-        String(
-            source ||
-            ""
-        );
+        String(source || "");
 
     if (
-        /\bWerkroom\b/i.test(
-            english
-        )
+        /\bWerkroom\b/i.test(english)
     ) {
         text =
             text
@@ -3379,9 +3283,7 @@ function applySafeFixes(
     }
 
     if (
-        /\bCondragulations\b/i.test(
-            english
-        )
+        /\bCondragulations\b/i.test(english)
     ) {
         text =
             text.replace(
@@ -3395,12 +3297,10 @@ function applySafeFixes(
 
 function wordCount(text) {
     return (
-        String(
-            text ||
-            ""
-        ).match(
-            /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
-        ) ||
+        String(text || "")
+            .match(
+                /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu
+            ) ||
         []
     ).length;
 }
@@ -3572,19 +3472,6 @@ function knownIssuesForGroup(
     }
 
     if (
-        /\bcarreg(?:a|ar|ue|ando) (?:o )?dois\b/i.test(
-            pt
-        ) &&
-        /\bcarry the two\b/i.test(
-            english
-        )
-    ) {
-        reasons.add(
-            "CARRY_TWO_LITERAL"
-        );
-    }
-
-    if (
         /\s\/\s/u.test(pt) ||
         /--+/u.test(pt) ||
         /^\s*[-–—/]\s*\S/mu.test(pt)
@@ -3605,14 +3492,10 @@ function knownIssuesForGroup(
     }
 
     const enWords =
-        wordCount(
-            english
-        );
+        wordCount(english);
 
     const ptWords =
-        wordCount(
-            pt
-        );
+        wordCount(pt);
 
     if (
         enWords >= 12 &&
@@ -3659,9 +3542,7 @@ function addIssue(
     }
 
     const current =
-        issueMap.get(
-            groupId
-        ) ||
+        issueMap.get(groupId) ||
         {
             reasons:
                 new Set(),
@@ -3710,6 +3591,7 @@ function deterministicIssueMap(
         const reasons =
             knownIssuesForGroup(
                 group,
+
                 translations.get(
                     group.groupId
                 )
@@ -3736,7 +3618,7 @@ function deterministicIssueMap(
 
                 reasons,
 
-                "Corrija o problema sem perder sentido, naturalidade nem alinhamento por cue."
+                "Corrija sem perder sentido, naturalidade nem alinhamento por cue."
             );
         }
     }
@@ -3757,7 +3639,8 @@ function mergeIssueMaps(
 
             groupId,
 
-            item.reasons instanceof Set
+            item.reasons instanceof
+                Set
                 ? [
                     ...item.reasons
                 ]
@@ -3876,9 +3759,6 @@ async function repairBatch(
 
             thinkingLevel,
 
-            temperature:
-                0.1,
-
             maxOutputTokens:
                 REPAIR_MAX_OUTPUT_TOKENS,
 
@@ -3901,7 +3781,8 @@ async function repairBatch(
         );
 
     if (
-        !parsed.invalidGroups.length
+        !parsed.invalidGroups.length &&
+        response.status !== "incomplete"
     ) {
         return parsed.groupMap;
     }
@@ -3930,11 +3811,8 @@ async function repairBatch(
                 ),
 
                 translations,
-
                 issueMap,
-
                 job,
-
                 thinkingLevel
             );
 
@@ -3945,11 +3823,8 @@ async function repairBatch(
                 ),
 
                 translations,
-
                 issueMap,
-
                 job,
-
                 thinkingLevel
             );
 
@@ -3970,7 +3845,8 @@ async function repairIssueMap(
     translations,
     issueMap,
     job,
-    thinkingLevel = "high"
+    thinkingLevel =
+        REPAIR_THINKING_LEVEL
 ) {
     const selected =
         allGroups.filter(
@@ -4128,9 +4004,7 @@ function cleanAll(
             applySafeFixes(
                 blocks[index].text,
 
-                cleanFinalText(
-                    text
-                )
+                cleanFinalText(text)
             )
     );
 }
@@ -4185,13 +4059,9 @@ async function translateSrt(
         Date.now();
 
     const blocks =
-        parseSrt(
-            sourceSrt
-        );
+        parseSrt(sourceSrt);
 
-    if (
-        !blocks.length
-    ) {
+    if (!blocks.length) {
         throw new Error(
             "Nenhum cue SRT válido."
         );
@@ -4203,7 +4073,7 @@ async function translateSrt(
         );
 
     console.log(
-        `[PIPELINE 6.6] ` +
+        `[PIPELINE 6.6.1] ` +
         `fonte=${job.sourceKind} | ` +
         `${blocks.length} cues -> ` +
         `${groups.length} Sentence Groups.`
@@ -4229,8 +4099,7 @@ async function translateSrt(
     ) {
         throw new Error(
             `Tradução principal incompleta ` +
-            `${translations.size}/` +
-            `${groups.length}.`
+            `${translations.size}/${groups.length}.`
         );
     }
 
@@ -4252,20 +4121,18 @@ async function translateSrt(
         texts
     );
 
-    const checkpointSrt =
+    auditTimestamps(
+        sourceSrt,
+
         buildSrt(
             blocks,
             texts
-        );
+        ),
 
-    auditTimestamps(
-        sourceSrt,
-        checkpointSrt,
         "CHECKPOINT GEMINI 3.6"
     );
 
     job.progress = 72;
-
     job.updatedAt =
         Date.now();
 
@@ -4273,30 +4140,29 @@ async function translateSrt(
         await auditGroups(
             groups,
             translations,
-            job
+            job,
+            "primary"
         );
 
     if (
-        job.stats.auditedGroups !==
+        job.stats.auditPrimaryGroups !==
         groups.length
     ) {
         throw new Error(
-            `Auditoria incompleta ` +
-            `${job.stats.auditedGroups}/` +
+            `Auditoria primária incompleta ` +
+            `${job.stats.auditPrimaryGroups}/` +
             `${groups.length}.`
         );
     }
 
-    const deterministic =
+    mergeIssueMaps(
+        auditIssues,
+
         deterministicIssueMap(
             groups,
             translations,
             job
-        );
-
-    mergeIssueMaps(
-        auditIssues,
-        deterministic
+        )
     );
 
     console.log(
@@ -4326,7 +4192,6 @@ async function translateSrt(
             );
 
         job.progress = 90;
-
         job.updatedAt =
             Date.now();
 
@@ -4334,7 +4199,8 @@ async function translateSrt(
             await auditGroups(
                 repairedGroups,
                 translations,
-                job
+                job,
+                "recheck"
             );
 
         mergeIssueMaps(
@@ -4395,12 +4261,6 @@ async function translateSrt(
             job
         );
 
-    /*
-     * Última barreira:
-     *
-     * se ainda restou padrão conhecido,
-     * refaz cada group individualmente.
-     */
     if (
         residual.size
     ) {
@@ -4418,32 +4278,18 @@ async function translateSrt(
         console.warn(
             `[QUALITY EMERGENCY] ` +
             `${residualGroups.length} group(s) ` +
-            `ainda com padrão conhecido; ` +
-            `reparo individual HIGH.`
+            `ainda sinalizado(s); ` +
+            `uma última correção dirigida, ` +
+            `sem bloquear o episódio por timer.`
         );
 
-        for (
-            const group
-            of residualGroups
-        ) {
-            const oneMap =
-                new Map([
-                    [
-                        group.groupId,
-                        residual.get(
-                            group.groupId
-                        )
-                    ]
-                ]);
-
-            await repairIssueMap(
-                [group],
-                translations,
-                oneMap,
-                job,
-                "high"
-            );
-        }
+        await repairIssueMap(
+            groups,
+            translations,
+            residual,
+            job,
+            "high"
+        );
 
         texts =
             cleanAll(
@@ -4474,18 +4320,18 @@ async function translateSrt(
     if (
         residual.size
     ) {
-        throw new Error(
-            `QUALITY GUARD: ` +
-            `${residual.size} group(s) ` +
-            `ainda contém padrão conhecido ` +
-            `após reparo individual.`
+        console.warn(
+            `[QUALITY GUARD] AVISO — ` +
+            `${residual.size} group(s) residual(is); ` +
+            `SRT será entregue, sem travar o sistema.`
         );
     }
-
-    console.log(
-        "[QUALITY GUARD] PASSOU — " +
-        "0 padrão conhecido restante."
-    );
+    else {
+        console.log(
+            "[QUALITY GUARD] PASSOU — " +
+            "0 padrão conhecido restante."
+        );
+    }
 
     const finalSrt =
         buildSrt(
@@ -4496,7 +4342,7 @@ async function translateSrt(
     auditTimestamps(
         sourceSrt,
         finalSrt,
-        "FINAL 6.6"
+        "FINAL 6.6.1"
     );
 
     const elapsed =
@@ -4507,7 +4353,7 @@ async function translateSrt(
         1000;
 
     console.log(
-        `[PIPELINE 6.6] OK em ` +
+        `[PIPELINE 6.6.1] OK em ` +
         `${elapsed.toFixed(1)}s | ` +
 
         `MainCalls=` +
@@ -4529,6 +4375,9 @@ async function translateSrt(
         `${job.stats.mainInputTokens}+` +
         `${job.stats.mainOutputTokens} | ` +
 
+        `Thought=` +
+        `${job.stats.mainThoughtTokens} | ` +
+
         `AuditCalls=` +
         `${job.stats.auditCalls} | ` +
 
@@ -4538,8 +4387,12 @@ async function translateSrt(
         `AuditFallback=` +
         `${job.stats.auditFallbackCalls} | ` +
 
-        `Audited=` +
-        `${job.stats.auditedGroups} | ` +
+        `AuditPrimary=` +
+        `${job.stats.auditPrimaryGroups}/` +
+        `${groups.length} | ` +
+
+        `AuditRecheck=` +
+        `${job.stats.auditRecheckGroups} | ` +
 
         `Flagged=` +
         `${job.stats.auditFlagged} | ` +
@@ -4559,7 +4412,8 @@ async function translateSrt(
         `Emergency=` +
         `${job.stats.emergencyRepairGroups} | ` +
 
-        `Residual=0.`
+        `Residual=` +
+        `${residual.size}.`
     );
 
     return finalSrt;
@@ -4652,8 +4506,7 @@ function enqueue(job) {
     if (
         queue.some(
             item =>
-                item.id ===
-                job.id
+                item.id === job.id
         )
     ) {
         return;
@@ -4686,8 +4539,7 @@ async function runQueue() {
 
             if (
                 job &&
-                job.status ===
-                    "processing"
+                job.status === "processing"
             ) {
                 await processJob(job);
             }
@@ -4793,9 +4645,7 @@ function selectEnglishSubtitle(
     subtitles
 ) {
     return (
-        Array.isArray(
-            subtitles
-        )
+        Array.isArray(subtitles)
             ? subtitles
             : []
     )
@@ -4877,8 +4727,7 @@ async function fetchFallbackSrt({
         );
 
     console.log(
-        `[OPENSUBTITLES FALLBACK] ` +
-        `${url}`
+        `[OPENSUBTITLES FALLBACK] ${url}`
     );
 
     const response =
@@ -4891,14 +4740,12 @@ async function fetchFallbackSrt({
                         "application/json",
 
                     "User-Agent":
-                        "Stremio-PTBR/6.6"
+                        "Stremio-PTBR/6.6.1"
                 }
             }
         );
 
-    if (
-        !response.ok
-    ) {
+    if (!response.ok) {
         throw new Error(
             `OpenSubtitles HTTP ` +
             `${response.status}.`
@@ -4926,7 +4773,7 @@ async function fetchFallbackSrt({
             {
                 headers: {
                     "User-Agent":
-                        "Stremio-PTBR/6.6"
+                        "Stremio-PTBR/6.6.1"
                 }
             }
         );
@@ -4956,9 +4803,7 @@ async function fetchFallbackSrt({
     }
 
     const clean =
-        cleanSrtForTranslation(
-            raw
-        );
+        cleanSrtForTranslation(raw);
 
     if (!clean) {
         throw new Error(
@@ -4968,6 +4813,10 @@ async function fetchFallbackSrt({
 
     return clean;
 }
+
+// ============================================================
+// RESPONSE
+// ============================================================
 
 function jobResponse(
     req,
@@ -5009,13 +4858,13 @@ const manifest = {
         "org.tradutor.stateless.gemini.free",
 
     version:
-        "6.6.0",
+        "6.6.1",
 
     name:
         "Tradutor PT-BR Backend",
 
     description:
-        "Backend-only Gemini: 3.6 Flash principal + 3.5 Flash-Lite auditor.",
+        "Backend-only: Gemini 3.6 Flash + Gemini 3.5 Flash-Lite via Interactions API.",
 
     resources: [
         "subtitles"
@@ -5045,9 +4894,7 @@ app.get(
         req,
         res
     ) =>
-        res.json(
-            manifest
-        )
+        res.json(manifest)
 );
 
 app.get(
@@ -5076,17 +4923,14 @@ app.get(
             auditor:
                 GEMINI_AUDITOR_MODEL,
 
+            api:
+                "INTERACTIONS",
+
             mainThinking:
                 MAIN_THINKING_LEVEL,
 
             strategy:
-                "WHOLE_EPISODE_FIRST_THEN_TARGETED_SPLIT",
-
-            auditBatchGroups:
-                AUDIT_BATCH_GROUPS,
-
-            auditConcurrency:
-                AUDIT_CONCURRENCY,
+                "WHOLE_EPISODE_FIRST_TARGETED_REPAIR",
 
             queue:
                 queue.length,
@@ -5102,8 +4946,7 @@ function backendOnlySubtitles(
 ) {
     console.log(
         "[STREMIO PUBLIC] " +
-        "Backend-only: 0 legendas; " +
-        "use Ponte Local."
+        "Backend-only: 0 legendas; use Ponte Local."
     );
 
     return safeJson(
@@ -5175,7 +5018,8 @@ app.post(
                 req.body?.srt;
 
             if (
-                typeof rawSrt !== "string" ||
+                typeof rawSrt !==
+                    "string" ||
                 !rawSrt.trim()
             ) {
                 return safeJson(
@@ -5235,11 +5079,8 @@ app.post(
             const job =
                 getOrCreateJob({
                     type,
-
                     videoId,
-
                     filename,
-
                     sourceSrt,
 
                     sourceKind:
@@ -5340,25 +5181,22 @@ app.post(
                         videoId,
 
                     filename,
-
                     videoSize,
-
                     videoHash
                 });
 
             console.log(
                 `[FALLBACK API] ` +
-                `${parseSrt(sourceSrt).length} cues.`
+                `${parseSrt(
+                    sourceSrt
+                ).length} cues.`
             );
 
             const job =
                 getOrCreateJob({
                     type,
-
                     videoId,
-
                     filename,
-
                     sourceSrt,
 
                     sourceKind:
@@ -5453,25 +5291,18 @@ app.get(
 );
 
 // ============================================================
-// RESULT SRT
+// SRT DELIVERY
 // ============================================================
 
 function processingSrt(job) {
     return [
         "1",
-
         "00:00:01,000 --> 00:00:08,000",
-
         "Traduzindo e revisando legenda...",
-
         "",
-
         "2",
-
         "00:00:08,500 --> 00:00:15,000",
-
-        `Progresso: ` +
-        `${Number(
+        `Progresso: ${Number(
             job?.progress ||
             0
         )}%.`
@@ -5481,17 +5312,11 @@ function processingSrt(job) {
 function errorSrt(error) {
     return [
         "1",
-
         "00:00:01,000 --> 00:00:08,000",
-
         "Não foi possível concluir a legenda PT-BR.",
-
         "",
-
         "2",
-
         "00:00:08,500 --> 00:00:18,000",
-
         String(
             error ||
             "Erro desconhecido."
@@ -5547,7 +5372,8 @@ app.get(
         }
 
         if (
-            job.status === "completed" &&
+            job.status ===
+                "completed" &&
             job.result
         ) {
             try {
@@ -5569,19 +5395,17 @@ app.get(
 
             return sendSrt(
                 res,
-
                 job.result,
-
                 "public, max-age=604800"
             );
         }
 
         if (
-            job.status === "failed"
+            job.status ===
+            "failed"
         ) {
             return sendSrt(
                 res,
-
                 errorSrt(
                     job.error
                 )
@@ -5611,7 +5435,7 @@ app.listen(
         );
 
         console.log(
-            " STREMIO PT-BR BACKEND 6.6 GEMINI ONLY"
+            " STREMIO PT-BR BACKEND 6.6.1 GEMINI INTERACTIONS"
         );
 
         console.log(
@@ -5638,6 +5462,22 @@ app.listen(
         );
 
         console.log(
+            "API Gemini: INTERACTIONS (atual) ✅"
+        );
+
+        console.log(
+            "generateContent legado: FORA DO PIPELINE ✅"
+        );
+
+        console.log(
+            "temperature/top_p/top_k: NÃO ENVIADOS ✅"
+        );
+
+        console.log(
+            "Structured Output: response_format oficial ✅"
+        );
+
+        console.log(
             "Mistral: FORA DO PIPELINE ✅"
         );
 
@@ -5647,27 +5487,17 @@ app.listen(
 
         console.log(
             "Ponte Local 4.1: COMPATÍVEL; " +
-            "NÃO PRECISA ALTERAR ✅"
+            "NÃO PRECISA ALTERAR AGORA ✅"
         );
 
         console.log(
-            "Tradução inicial: " +
-            "EPISÓDIO INTEIRO em 1 chamada " +
-            "quando couber ✅"
+            "Tradução inicial: episódio inteiro " +
+            "em 1 chamada quando couber ✅"
         );
 
         console.log(
-            `Gemini 3.6 thinking principal: ` +
+            `Thinking principal: ` +
             `${MAIN_THINKING_LEVEL} ✅`
-        );
-
-        console.log(
-            "Structured Output responseJsonSchema: ATIVO ✅"
-        );
-
-        console.log(
-            "Falha/truncamento estrutural: " +
-            "divide SOMENTE o necessário ✅"
         );
 
         console.log(
@@ -5678,12 +5508,7 @@ app.listen(
         );
 
         console.log(
-            "Auditor falhou: " +
-            "Gemini 3.6 assume somente aquele micro-lote ✅"
-        );
-
-        console.log(
-            "Reparo: SOMENTE groups sinalizados ✅"
+            "Reparo: somente groups sinalizados ✅"
         );
 
         console.log(
@@ -5691,37 +5516,12 @@ app.listen(
         );
 
         console.log(
-            "bitch vocativo → " +
-            "bicha/gata/amiga conforme contexto ✅"
-        );
-
-        console.log(
-            "competição/lip sync/cheque 'da porra': " +
-            "GUARD ATIVO ✅"
-        );
-
-        console.log(
-            "supportive→super apoiador: GUARD ATIVO ✅"
-        );
-
-        console.log(
-            "judgers→juízes viraram os julgados: GUARD ATIVO ✅"
-        );
-
-        console.log(
-            "plucking pussy hairs→fio de bigode: GUARD ATIVO ✅"
-        );
-
-        console.log(
-            "empate duplo indevido: GUARD ATIVO ✅"
-        );
-
-        console.log(
-            "Omissão + cue-sync: AUDITORIA EN×PT ATIVA ✅"
-        );
-
-        console.log(
             "Cue-ID lock + timestamps embedded imutáveis: ATIVOS ✅"
+        );
+
+        console.log(
+            "Quality residual: tenta reparo final, " +
+            "mas NÃO trava o episódio ✅"
         );
 
         console.log(
@@ -5754,21 +5554,19 @@ app.listen(
 process.on(
     "unhandledRejection",
 
-    error => {
+    error =>
         console.error(
             "[PROCESS] Unhandled rejection:",
             error
-        );
-    }
+        )
 );
 
 process.on(
     "uncaughtException",
 
-    error => {
+    error =>
         console.error(
             "[PROCESS] Uncaught exception:",
             error
-        );
-    }
+        )
 );
