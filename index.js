@@ -3589,7 +3589,7 @@ function localReasonsForCue(block, pt, filename) {
     // WHO THE FUCK KNOWS
     // --------------------------------------------------------
 
-    if (
+        if (
       /\bwho\s+the\s+fuck\s+knows\b/i.test(
         en
       ) &&
@@ -3605,13 +3605,6 @@ function localReasonsForCue(block, pt, filename) {
 
   return [
     ...new Set(reasons)
-  ];
-}
-
-  return [
-    ...new Set(
-      reasons
-    )
   ];
 }
 
