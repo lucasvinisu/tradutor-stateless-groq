@@ -3386,119 +3386,50 @@ function hasExtendedVocalization(text) {
   );
 }
 
-function localReasonsForCue(
-  block,
-  pt,
-  filename
-) {
-  const en =
-    String(
-      block.text ||
-      ""
-    );
+function localReasonsForCue(block, pt, filename) {
+  const en = String(block.text || "");
+  const translated = String(pt || "");
+  const reasons = [];
 
-  const translated =
-    String(
-      pt ||
-      ""
-    );
+  const enCount = words(en).length;
+  const ptCount = words(translated).length;
 
-  const reasons =
-    [];
+  const drag = isDragContext(filename, en);
 
-  const enCount =
-    words(
-      en
-    ).length;
-
-  const ptCount =
-    words(
-      translated
-    ).length;
-
-  const drag =
-    isDragContext(
-      filename,
-      en
-    );
-
-  if (
-    !translated.trim()
-  ) {
-    reasons.push(
-      "EMPTY"
-    );
+  if (!translated.trim()) {
+    reasons.push("EMPTY");
   }
 
   if (
-    enCount >=
-    5 &&
-    copiedEnglishRatio(
-      en,
-      translated
-    ) >=
-    0.60
+    enCount >= 5 &&
+    copiedEnglishRatio(en, translated) >= 0.60
   ) {
-    reasons.push(
-      "POSSIBLE_UNTRANSLATED"
-    );
+    reasons.push("POSSIBLE_UNTRANSLATED");
   }
 
   if (
-    enCount >=
-    10 &&
-    ptCount <=
-    Math.max(
-      2,
-
-      Math.floor(
-        enCount *
-        0.32
-      )
-    )
+    enCount >= 10 &&
+    ptCount <= Math.max(2, Math.floor(enCount * 0.32))
   ) {
-    reasons.push(
-      "POSSIBLE_OMISSION"
-    );
+    reasons.push("POSSIBLE_OMISSION");
   }
 
   if (
-    enCount >=
-    3 &&
-    ptCount >=
-    enCount *
-    2.8 +
-    6
+    enCount >= 3 &&
+    ptCount >= enCount * 2.8 + 6
   ) {
-    reasons.push(
-      "POSSIBLE_OVERFLOW"
-    );
+    reasons.push("POSSIBLE_OVERFLOW");
   }
 
   if (
-    sourceDialogueDashCount(
-      block
-    ) >=
-    2 &&
-    translated
-      .split("\n")
-      .filter(Boolean)
-      .length <
-    2
+    sourceDialogueDashCount(block) >= 2 &&
+    translated.split("\n").filter(Boolean).length < 2
   ) {
-    reasons.push(
-      "MISSING_DIALOGUE_BREAK"
-    );
+    reasons.push("MISSING_DIALOGUE_BREAK");
   }
 
-  if (
-    hasExtendedVocalization(
-      translated
-    )
-  ) {
-    reasons.push(
-      "EXTENDED_SUNG_NOTE"
-    );
+  if (hasExtendedVocalization(translated)) {
+    reasons.push("EXTENDED_SUNG_NOTE");
   }
 
   if (
@@ -3506,49 +3437,17 @@ function localReasonsForCue(
       translated
     )
   ) {
-    reasons.push(
-      "FORMAT_NOISE"
-    );
+    reasons.push("FORMAT_NOISE");
   }
 
   if (drag) {
     const gagSlang =
-      /\bgag(?:ged|ging|s)?\b/i.test(
-        en
-      ) &&
-      !isPhysicalGagContext(
-        en
-          // "bottom" de competição traduzido literalmente.
-    const competitionBottom =
-      /\b(?:in|into|landed|landing|placed|placing|put|puts|ended|ending)\s+(?:up\s+)?(?:in\s+)?the\s+bottom\b/i.test(en) ||
-      /\bbottom\s+(?:two|three|2|3|queens?|girls?|contestants?|performers?)\b/i.test(en) ||
-      /\b(?:the\s+)?bottom\s+(?:this\s+week|tonight|again)\b/i.test(en);
-
-    if (
-      competitionBottom &&
-      /\b(?:fundo|quintal|parte\s+de\s+baixo|inferior(?:es)?)\b/i.test(translated)
-    ) {
-      reasons.push(
-        "COMPETITION_BOTTOM_LITERAL"
-      );
-    }
-
-    // Construções inglesas em que "the fuck" foi encaixado
-    // literalmente numa sintaxe impossível em português.
-    if (
-      /\bwho\s+the\s+fuck\s+knows\b/i.test(en) &&
-      /quem\s+sabe\s+(?:o\s+)?caralho/i.test(translated)
-    ) {
-      reasons.push(
-        "WHO_THE_FUCK_KNOWS_LITERAL"
-      );
-    
+      /\bgag(?:ged|ging|s)?\b/i.test(en) &&
+      !isPhysicalGagContext(en);
 
     if (
       gagSlang &&
-      !hasGoodGagReaction(
-        translated
-      )
+      !hasGoodGagReaction(translated)
     ) {
       reasons.push(
         "GAG_SLANG_NOT_NATURAL_PTBR"
@@ -3659,7 +3558,55 @@ function localReasonsForCue(
         "DOUBLE_WIN"
       );
     }
+
+    // --------------------------------------------------------
+    // BOTTOM — colocação ruim em Drag Race/reality competition
+    // --------------------------------------------------------
+
+    const competitionBottom =
+      /\b(?:in|into|landed|landing|placed|placing|put|puts|ended|ending)\s+(?:up\s+)?(?:in\s+)?the\s+bottom\b/i.test(
+        en
+      ) ||
+      /\bbottom\s+(?:two|three|2|3|queens?|girls?|contestants?|performers?)\b/i.test(
+        en
+      ) ||
+      /\b(?:the\s+)?bottom\s+(?:this\s+week|tonight|again)\b/i.test(
+        en
+      );
+
+    if (
+      competitionBottom &&
+      /\b(?:fundo|quintal|parte\s+de\s+baixo|inferior(?:es)?)\b/i.test(
+        translated
+      )
+    ) {
+      reasons.push(
+        "COMPETITION_BOTTOM_LITERAL"
+      );
+    }
+
+    // --------------------------------------------------------
+    // WHO THE FUCK KNOWS
+    // --------------------------------------------------------
+
+    if (
+      /\bwho\s+the\s+fuck\s+knows\b/i.test(
+        en
+      ) &&
+      /\bquem\s+sabe\s+(?:o\s+)?caralho\b/i.test(
+        translated
+      )
+    ) {
+      reasons.push(
+        "WHO_THE_FUCK_KNOWS_LITERAL"
+      );
+    }
   }
+
+  return [
+    ...new Set(reasons)
+  ];
+}
 
   return [
     ...new Set(
@@ -4331,36 +4278,22 @@ async function translateSrt(
   // Só chama Gemini novamente se ainda houver
   // defeitos objetivos após o primeiro repair.
   const remaining =
-    detectLocalIssues(
-      blocks,
-      finalTranslations,
-      job.filename
-    );
+  detectLocalIssues(
+    blocks,
+    finalTranslations,
+    job.filename
+  );
 
-  if (
-    remaining.length
-  ) {
-    console.log(
-      `[POST-REPAIR GUARD] ` +
-      `ainda há ${remaining.length} cue(s) suspeito(s); ` +
-      `segunda passada cirúrgica.`
-    );
-
-    finalTranslations =
-      await tryFocusedRepair(
-        blocks,
-        finalTranslations,
-        plan,
-        job
-      );
-
-    finalTranslations =
-      sanitizeTranslationMap(
-        blocks,
-        finalTranslations,
-        job
-      );
-  }
+if (
+  remaining.length
+) {
+  console.log(
+    `[POST-REPAIR GUARD] ` +
+    `${remaining.length} cue(s) ainda sinalizado(s) ` +
+    `após o repair; mantendo o primeiro repair ` +
+    `para evitar retradução repetitiva e perda de velocidade.`
+  );
+}
 
   const finalSrt =
     buildSrt(
