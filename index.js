@@ -18,7 +18,7 @@ const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim()
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
-const CACHE_VERSION = "8.2.0-quality-ownership";
+const CACHE_VERSION = "8.2.1-quality-ownership";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1568,12 +1568,28 @@ OUTRAS GÍRIAS IMPORTANTES
 - judges em competição/reality: jurados.
 - supportive: "me apoiou muito", "esteve do meu lado". Evite "super apoiador".
 - double/shared win: vitória dupla / as duas ganharam. Não "empate duplo" sem empate.
+- bottom em Drag Race/reality competition, quando indica colocação ruim: mantenha "bottom" quando soar natural para o fandom, ou use "entre as piores", "na berlinda", "entre as últimas" conforme a frase.
+- "in the bottom" em contexto de competição: "no bottom", "entre as piores" ou "na berlinda".
+- "bottom queens": "queens do bottom" ou "as piores da semana".
+- "bottom two": "bottom 2", "as duas piores" ou equivalente natural.
+- NUNCA traduza bottom competitivo como "fundo", "quintal", "parte de baixo", "inferior" ou sentido físico.
+- Não confunda bottom competitivo com bottom em contexto sexual; use o contexto da cena.
 
 GEN Z / GEN ALPHA / INTERNET
 - Entenda memes, fandom, stan culture, cringe, delulu, iconic, mother, serve, clocked, gag, ate, shade e linguagem de internet pelo SENTIDO.
 - Use equivalentes brasileiros atuais quando naturais.
 - Não transforme toda fala jovem em caricatura de TikTok.
 - Preserve idade, personalidade, classe, formalidade e situação social do falante.
+
+PALAVRÕES E INTENSIFICADORES
+- "fuck/fucking/the fuck" muitas vezes intensificam a frase e NÃO devem ocupar literalmente a mesma posição em português.
+- Preserve a atitude e a intensidade, não a sintaxe inglesa.
+- "Who the fuck knows?" -> "Quem caralhos sabe?", "Quem é que sabe, porra?" ou "Sei lá, porra.", conforme a personalidade e a cena.
+- NUNCA "Quem sabe o caralho?".
+- "What the fuck is that?" -> "Que porra é essa?".
+- "Where the fuck is she?" -> "Onde caralhos ela tá?" / "Onde é que ela tá, porra?".
+- "Why the fuck would I do that?" -> "Por que caralhos eu faria isso?".
+- Não transforme automaticamente todo "fucking" em "do caralho".
 
 NATURALIDADE
 - Em fala casual: "tô", "tá", "pra", "né" podem ser usados quando combinarem com a pessoa.
@@ -3502,7 +3518,31 @@ function localReasonsForCue(
       ) &&
       !isPhysicalGagContext(
         en
+          // "bottom" de competição traduzido literalmente.
+    const competitionBottom =
+      /\b(?:in|into|landed|landing|placed|placing|put|puts|ended|ending)\s+(?:up\s+)?(?:in\s+)?the\s+bottom\b/i.test(en) ||
+      /\bbottom\s+(?:two|three|2|3|queens?|girls?|contestants?|performers?)\b/i.test(en) ||
+      /\b(?:the\s+)?bottom\s+(?:this\s+week|tonight|again)\b/i.test(en);
+
+    if (
+      competitionBottom &&
+      /\b(?:fundo|quintal|parte\s+de\s+baixo|inferior(?:es)?)\b/i.test(translated)
+    ) {
+      reasons.push(
+        "COMPETITION_BOTTOM_LITERAL"
       );
+    }
+
+    // Construções inglesas em que "the fuck" foi encaixado
+    // literalmente numa sintaxe impossível em português.
+    if (
+      /\bwho\s+the\s+fuck\s+knows\b/i.test(en) &&
+      /quem\s+sabe\s+(?:o\s+)?caralho/i.test(translated)
+    ) {
+      reasons.push(
+        "WHO_THE_FUCK_KNOWS_LITERAL"
+      );
+    
 
     if (
       gagSlang &&
@@ -4958,7 +4998,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.2.0",
+  "8.2.1",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
