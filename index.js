@@ -8,8 +8,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.2 QUALITY + CUE OWNERSHIP
-// Gemini 3.5 Flash-Lite
+// STREMIO PT-BR 8.2.2 — QUALITY + CUE OWNERSHIP + SELF-HEAL
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -18,23 +17,20 @@ const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim()
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
-const CACHE_VERSION = "8.2.1-quality-ownership";
+const CACHE_VERSION = "8.2.2-quality-ownership-bleep-selfheal";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
 const FETCH_TIMEOUT_MS = 25000;
 
-// Velocidade: até ~14 inícios/minuto. O mutex impede colisão entre workers.
 const GEMINI_MIN_START_INTERVAL_MS = 4300;
 
-// Planner curto
 const PLAN_THINKING = "minimal";
 const PLAN_MAX_OUTPUT_TOKENS = 2200;
 const PLAN_TIMEOUT_MS = 60000;
 const PLAN_RETRIES = 2;
 const PLAN_SAMPLE_MAX_CUES = 900;
 
-// Tradução principal
 const MAIN_BATCH_MAX_CUES = 60;
 const MAIN_BATCH_MAX_CHARS = 15000;
 const MAIN_CONCURRENCY = 2;
@@ -46,7 +42,6 @@ const MAIN_TIMEOUT_MS = 120000;
 const MAIN_HTTP_RETRIES = 4;
 const MAIN_PARSE_ATTEMPTS = 2;
 
-// Reparo cirúrgico
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 80;
 const REPAIR_BATCH_MAX_CUES = 20;
@@ -56,88 +51,244 @@ const REPAIR_TIMEOUT_MS = 90000;
 const REPAIR_HTTP_RETRIES = 3;
 const REPAIR_PARSE_ATTEMPTS = 2;
 
+const BLEEP_TOKEN = "__CENSORED_BLEEP__";
+const RECOVERY_SIGNING_KEY =
+  LOCAL_BRIDGE_SECRET ||
+  GEMINI_API_KEY ||
+  "stremio-ptbr-8.2.2";
+
 const translationCache = new Map();
 const jobs = new Map();
+
 let lastGeminiRequestStart = 0;
 let geminiGate = Promise.resolve();
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sleep =
+  ms =>
+    new Promise(
+      resolve =>
+        setTimeout(
+          resolve,
+          ms
+        )
+    );
+
+// ============================================================
+// BASIC
+// ============================================================
 
 function sha256(value) {
-  return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
+  return crypto
+    .createHash("sha256")
+    .update(
+      String(value),
+      "utf8"
+    )
+    .digest("hex");
 }
 
 function randomId(bytes = 6) {
-  return crypto.randomBytes(bytes).toString("hex");
+  return crypto
+    .randomBytes(bytes)
+    .toString("hex");
 }
 
 function errorMessage(error) {
-  return String(error?.message || error || "Erro desconhecido.");
+  return String(
+    error?.message ||
+    error ||
+    "Erro desconhecido."
+  );
 }
 
 function normalizeSrt(value) {
-  return String(value || "")
-    .replace(/^\uFEFF/, "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
+  return String(
+    value ||
+    ""
+  )
+    .replace(
+      /^\uFEFF/,
+      ""
+    )
+    .replace(
+      /\r\n/g,
+      "\n"
+    )
+    .replace(
+      /\r/g,
+      "\n"
+    )
     .trim();
 }
 
 function stripCodeFences(value) {
-  return String(value || "")
-    .replace(/^\s*```(?:json|text|plaintext|srt)?\s*/i, "")
-    .replace(/\s*```\s*$/i, "")
+  return String(
+    value ||
+    ""
+  )
+    .replace(
+      /^\s*```(?:json|text|plaintext|srt)?\s*/i,
+      ""
+    )
+    .replace(
+      /\s*```\s*$/i,
+      ""
+    )
     .trim();
 }
 
 function baseUrl(req) {
-  if (PUBLIC_URL) return PUBLIC_URL;
-  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
-  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
-  return `${proto}://${host}`.replace(/\/+$/, "");
+  if (PUBLIC_URL) {
+    return PUBLIC_URL;
+  }
+
+  const proto =
+    String(
+      req.headers["x-forwarded-proto"] ||
+      req.protocol ||
+      "https"
+    )
+      .split(",")[0]
+      .trim();
+
+  const host =
+    String(
+      req.headers["x-forwarded-host"] ||
+      req.headers.host ||
+      ""
+    )
+      .split(",")[0]
+      .trim();
+
+  return `${proto}://${host}`
+    .replace(
+      /\/+$/,
+      ""
+    );
 }
 
-function safeJson(res, payload, status = 200) {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
-  return res.status(status).json(payload);
+function safeJson(
+  res,
+  payload,
+  status = 200
+) {
+  res.set(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
+
+  return res
+    .status(status)
+    .json(payload);
 }
 
-function sendSrt(res, srt, cacheControl = "no-store") {
+function sendSrt(
+  res,
+  srt,
+  cacheControl = "no-store"
+) {
   res.status(200);
-  res.set("Content-Type", "application/x-subrip; charset=utf-8");
-  res.set("Cache-Control", cacheControl);
-  res.send(String(srt || ""));
+
+  res.set(
+    "Content-Type",
+    "application/x-subrip; charset=utf-8"
+  );
+
+  res.set(
+    "Cache-Control",
+    cacheControl
+  );
+
+  res.send(
+    String(
+      srt ||
+      ""
+    )
+  );
 }
 
 function authorized(req) {
-  if (!LOCAL_BRIDGE_SECRET) return false;
-  const provided = Buffer.from(String(req.headers.authorization || "").trim());
-  const expected = Buffer.from(`Bearer ${LOCAL_BRIDGE_SECRET}`);
-  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+  if (!LOCAL_BRIDGE_SECRET) {
+    return false;
+  }
+
+  const provided =
+    Buffer.from(
+      String(
+        req.headers.authorization ||
+        ""
+      ).trim()
+    );
+
+  const expected =
+    Buffer.from(
+      `Bearer ${LOCAL_BRIDGE_SECRET}`
+    );
+
+  return (
+    provided.length ===
+      expected.length &&
+    crypto.timingSafeEqual(
+      provided,
+      expected
+    )
+  );
 }
 
-function makeCacheKey(type, videoId, sourceSrt) {
-  return `${CACHE_VERSION}:${type}:${videoId}:${sha256(sourceSrt)}`;
+// ============================================================
+// MEMORY CACHE / JOBS
+// ============================================================
+
+function makeCacheKey(
+  type,
+  videoId,
+  sourceSrt
+) {
+  return (
+    `${CACHE_VERSION}:` +
+    `${type}:` +
+    `${videoId}:` +
+    `${sha256(sourceSrt)}`
+  );
 }
 
 function getCache(key) {
-  const item = translationCache.get(key);
-  if (!item) return null;
+  const item =
+    translationCache.get(
+      key
+    );
 
-  if (item.expiresAt <= Date.now()) {
-    translationCache.delete(key);
+  if (!item) {
+    return null;
+  }
+
+  if (
+    item.expiresAt <=
+    Date.now()
+  ) {
+    translationCache.delete(
+      key
+    );
+
     return null;
   }
 
   return item.srt;
 }
 
-function setCache(key, srt) {
+function setCache(
+  key,
+  srt
+) {
   translationCache.set(
     key,
+
     {
       srt,
-      expiresAt: Date.now() + CACHE_TTL_MS
+
+      expiresAt:
+        Date.now() +
+        CACHE_TTL_MS
     }
   );
 }
@@ -148,75 +299,142 @@ function createJob({
   filename,
   sourceSrt,
   sourceKind,
-  lazy = false
+  lazy = false,
+  recovery = null
 }) {
-  const sourceHash = sha256(sourceSrt);
-  const now = Date.now();
+  const sourceHash =
+    sha256(
+      sourceSrt
+    );
+
+  const now =
+    Date.now();
 
   const job = {
-    id: `job-${sourceHash.slice(0, 24)}-${randomId()}`,
+    id:
+      `job-` +
+      `${sourceHash.slice(0, 24)}-` +
+      `${randomId()}`,
 
     type,
+
     videoId,
+
     filename,
+
     sourceSrt,
+
     sourceKind,
+
     sourceHash,
 
-    cacheKey: makeCacheKey(
-      type,
-      videoId,
-      sourceSrt
-    ),
+    recovery,
 
-    status: lazy
-      ? "pending"
-      : "processing",
+    cacheKey:
+      makeCacheKey(
+        type,
+        videoId,
+        sourceSrt
+      ),
 
-    progress: lazy
-      ? 0
-      : 1,
+    status:
+      lazy
+        ? "pending"
+        : "processing",
 
-    result: null,
-    safeDraft: null,
-    error: null,
-    started: false,
-    promise: null,
+    progress:
+      lazy
+        ? 0
+        : 1,
 
-    createdAt: now,
-    updatedAt: now,
-    expiresAt: now + JOB_TTL_MS,
+    result:
+      null,
+
+    safeDraft:
+      null,
+
+    error:
+      null,
+
+    started:
+      false,
+
+    promise:
+      null,
+
+    createdAt:
+      now,
+
+    updatedAt:
+      now,
+
+    expiresAt:
+      now +
+      JOB_TTL_MS,
 
     stats: {
-      sourceCues: 0,
+      sourceCues:
+        0,
 
-      planCalls: 0,
-      planFailures: 0,
+      planCalls:
+        0,
 
-      mainBatches: 0,
-      mainCalls: 0,
-      mainAttempts: 0,
-      main429: 0,
-      mainParseRetries: 0,
+      planFailures:
+        0,
 
-      localFlags: 0,
+      mainBatches:
+        0,
 
-      repairSelected: 0,
-      repairCalls: 0,
-      repairAttempts: 0,
-      repair429: 0,
-      repairParseRetries: 0,
-      repairFailures: 0,
+      mainCalls:
+        0,
 
-      pacerWaitMs: 0,
+      mainAttempts:
+        0,
 
-      inputTokens: 0,
-      outputTokens: 0,
-      thoughtTokens: 0,
+      main429:
+        0,
 
-      formatFixes: 0,
+      mainParseRetries:
+        0,
 
-      usedSafeDraftFallback: false
+      localFlags:
+        0,
+
+      repairSelected:
+        0,
+
+      repairCalls:
+        0,
+
+      repairAttempts:
+        0,
+
+      repair429:
+        0,
+
+      repairParseRetries:
+        0,
+
+      repairFailures:
+        0,
+
+      pacerWaitMs:
+        0,
+
+      inputTokens:
+        0,
+
+      outputTokens:
+        0,
+
+      thoughtTokens:
+        0,
+
+      formatFixes:
+        0,
+
+      usedSafeDraftFallback:
+        false
     }
   };
 
@@ -228,15 +446,23 @@ function createJob({
   return job;
 }
 
-function findReusableJob(cacheKey) {
-  for (const job of jobs.values()) {
+function findReusableJob(
+  cacheKey
+) {
+  for (
+    const job
+    of jobs.values()
+  ) {
     if (
-      job.cacheKey === cacheKey &&
+      job.cacheKey ===
+        cacheKey &&
       [
         "pending",
         "processing",
         "completed"
-      ].includes(job.status)
+      ].includes(
+        job.status
+      )
     ) {
       return job;
     }
@@ -259,11 +485,15 @@ function getOrCreateJob(
     );
 
   const cached =
-    getCache(cacheKey);
+    getCache(
+      cacheKey
+    );
 
   if (cached) {
     let job =
-      findReusableJob(cacheKey);
+      findReusableJob(
+        cacheKey
+      );
 
     if (!job) {
       job =
@@ -273,15 +503,22 @@ function getOrCreateJob(
         });
     }
 
-    job.status = "completed";
-    job.progress = 100;
-    job.result = cached;
+    job.status =
+      "completed";
+
+    job.progress =
+      100;
+
+    job.result =
+      cached;
 
     return job;
   }
 
   const existing =
-    findReusableJob(cacheKey);
+    findReusableJob(
+      cacheKey
+    );
 
   if (existing) {
     return existing;
@@ -294,7 +531,9 @@ function getOrCreateJob(
     });
 
   if (!lazy) {
-    startJob(job);
+    startJob(
+      job
+    );
   }
 
   return job;
@@ -331,9 +570,9 @@ setInterval(
     ) {
       if (
         job.expiresAt <=
-        now &&
+          now &&
         job.status !==
-        "processing"
+          "processing"
       ) {
         jobs.delete(
           id
@@ -342,8 +581,168 @@ setInterval(
     }
   },
 
-  10 * 60 * 1000
+  10 *
+  60 *
+  1000
 ).unref();
+
+// ============================================================
+// CLOUD SELF-HEAL TOKEN
+// ============================================================
+
+function encodeRecovery(
+  payload
+) {
+  const body =
+    Buffer.from(
+      JSON.stringify(
+        payload
+      ),
+      "utf8"
+    ).toString(
+      "base64url"
+    );
+
+  const sig =
+    crypto
+      .createHmac(
+        "sha256",
+        RECOVERY_SIGNING_KEY
+      )
+      .update(
+        body
+      )
+      .digest(
+        "base64url"
+      )
+      .slice(
+        0,
+        32
+      );
+
+  return (
+    `${body}.${sig}`
+  );
+}
+
+function decodeRecovery(
+  token
+) {
+  const [
+    body,
+    sig
+  ] =
+    String(
+      token ||
+      ""
+    ).split(".");
+
+  if (
+    !body ||
+    !sig
+  ) {
+    throw new Error(
+      "Token de recuperação inválido."
+    );
+  }
+
+  const expected =
+    crypto
+      .createHmac(
+        "sha256",
+        RECOVERY_SIGNING_KEY
+      )
+      .update(
+        body
+      )
+      .digest(
+        "base64url"
+      )
+      .slice(
+        0,
+        32
+      );
+
+  const a =
+    Buffer.from(
+      sig
+    );
+
+  const b =
+    Buffer.from(
+      expected
+    );
+
+  if (
+    a.length !==
+      b.length ||
+    !crypto.timingSafeEqual(
+      a,
+      b
+    )
+  ) {
+    throw new Error(
+      "Assinatura de recuperação inválida."
+    );
+  }
+
+  const payload =
+    JSON.parse(
+      Buffer.from(
+        body,
+        "base64url"
+      ).toString(
+        "utf8"
+      )
+    );
+
+  if (
+    !payload ||
+    !payload.t ||
+    !payload.i
+  ) {
+    throw new Error(
+      "Dados de recuperação incompletos."
+    );
+  }
+
+  return payload;
+}
+
+function buildCloudSubtitleUrl(
+  req,
+  job,
+  recovery
+) {
+  const token =
+    encodeRecovery({
+      t:
+        recovery.type,
+
+      i:
+        recovery.id,
+
+      f:
+        recovery.filename ||
+        "",
+
+      s:
+        recovery.videoSize ||
+        "",
+
+      h:
+        recovery.videoHash ||
+        ""
+    });
+
+  return (
+    `${baseUrl(req)}/` +
+    `subtitle/` +
+    `${encodeURIComponent(job.id)}` +
+    `.srt?r=` +
+    `${encodeURIComponent(token)}`
+  );
+}
 
 // ============================================================
 // SRT
@@ -358,9 +757,17 @@ const SPEAKER_RE =
 const SDH_WORDS =
   /laugh|laughing|chuckle|giggle|sigh|gasp|inhale|exhale|whimper|cry|sobb|music|song playing|applause|cheer|clap|door|phone|ring|buzz|beep|groan|grunt|scream|yell|shout|whisper|murmur|inaudible|indistinct|foreign language|clears? throat|sniff|cough|speaking indistinctly|speaks? indistinctly/i;
 
-function normalizeSpeaker(value) {
+const CENSOR_CLUSTER_RE =
+  /[!@#$%^&*()_+=~`¤£€¥¢]{3,}/gu;
+
+function normalizeSpeaker(
+  value
+) {
   const speaker =
-    String(value || "")
+    String(
+      value ||
+      ""
+    )
       .replace(
         /<[^>]+>/g,
         " "
@@ -373,9 +780,14 @@ function normalizeSpeaker(value) {
 
   if (
     !speaker ||
-    speaker.length > 60 ||
-    SDH_WORDS.test(speaker) ||
-    /[!?;]/u.test(speaker)
+    speaker.length >
+      60 ||
+    SDH_WORDS.test(
+      speaker
+    ) ||
+    /[!?;]/u.test(
+      speaker
+    )
   ) {
     return "";
   }
@@ -383,9 +795,13 @@ function normalizeSpeaker(value) {
   return speaker;
 }
 
-function looksLikeSpeakerLabel(value) {
+function looksLikeSpeakerLabel(
+  value
+) {
   const speaker =
-    normalizeSpeaker(value);
+    normalizeSpeaker(
+      value
+    );
 
   if (!speaker) {
     return false;
@@ -393,12 +809,17 @@ function looksLikeSpeakerLabel(value) {
 
   const parts =
     speaker
-      .split(/\s+/)
-      .filter(Boolean);
+      .split(
+        /\s+/
+      )
+      .filter(
+        Boolean
+      );
 
   if (
     !parts.length ||
-    parts.length > 4
+    parts.length >
+      4
   ) {
     return false;
   }
@@ -418,9 +839,11 @@ function looksLikeSpeakerLabel(value) {
     );
 
   const allUpper =
-    Boolean(letters) &&
+    Boolean(
+      letters
+    ) &&
     letters ===
-    letters.toUpperCase();
+      letters.toUpperCase();
 
   const titleLike =
     parts.every(
@@ -436,7 +859,9 @@ function looksLikeSpeakerLabel(value) {
   );
 }
 
-function extractSpeaker(line) {
+function extractSpeaker(
+  line
+) {
   const original =
     String(
       line ||
@@ -561,7 +986,9 @@ function extractSpeaker(line) {
   };
 }
 
-function isEmptyVocalization(text) {
+function isEmptyVocalization(
+  text
+) {
   const value =
     String(
       text ||
@@ -583,7 +1010,9 @@ function isEmptyVocalization(text) {
   );
 }
 
-function removeSdhSegments(text) {
+function removeSdhSegments(
+  text
+) {
   return String(
     text ||
     ""
@@ -622,58 +1051,64 @@ function removeSdhSegments(text) {
     );
 }
 
-function collapseExtendedVocalization(value) {
-  let text =
-    String(
-      value ||
-      ""
-    );
-
-  // "você-e-e-e-e", "love-e-e-e", etc. -> forma normal.
-  text =
-    text.replace(
-      /(\p{L}{2,})(?:-[aeiouáéíóúàâêôãõü]){2,}/giu,
-      "$1"
-    );
-
-  // Sílabas curtas repetidas como nota prolongada: "amor-or-or-or".
-  text =
-    text.replace(
-      /(\p{L}{2,})(?:-[\p{L}]{1,3}){3,}/gu,
-      "$1"
-    );
-
-  // Vogal escrita excessivamente longa: "noooooossa" -> "noossa".
-  text =
-    text.replace(
-      /([aeiouáéíóúàâêôãõü])\1{3,}/giu,
-      "$1$1"
-    );
-
-  return text;
-}
-
-function normalizeNoiseSymbols(value) {
+function collapseExtendedVocalization(
+  value
+) {
   return String(
     value ||
     ""
   )
-    // Barra ou pipes no começo da linha são ruído de legenda.
+    .replace(
+      /(\p{L}{2,})(?:-[aeiouáéíóúàâêôãõü]){2,}/giu,
+      "$1"
+    )
+    .replace(
+      /(\p{L}{2,})(?:-[\p{L}]{1,3}){3,}/gu,
+      "$1"
+    )
+    .replace(
+      /([aeiouáéíóúàâêôãõü])\1{3,}/giu,
+      "$1$1"
+    );
+}
+
+function replaceCensoredBleps(
+  value
+) {
+  return String(
+    value ||
+    ""
+  )
+    .replace(
+      CENSOR_CLUSTER_RE,
+      ` ${BLEEP_TOKEN} `
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function normalizeNoiseSymbols(
+  value
+) {
+  return String(
+    value ||
+    ""
+  )
     .replace(
       /^\s*[\/\\|]{1,4}\s*/u,
       ""
     )
-    // Três ou mais travessões no começo viram um único marcador.
     .replace(
       /^\s*[-–—]{2,}\s*/u,
       "- "
     )
-    // Separadores visuais soltos no meio não pertencem à fala.
     .replace(
       /\s+[\/\\|]{1,3}\s+/gu,
       " "
     )
-    // Sequências de --/--- dentro de fala viram pausa, não lixo visual.
     .replace(
       /\s*[-–—]{2,}\s*/gu,
       "… "
@@ -685,7 +1120,9 @@ function normalizeNoiseSymbols(value) {
     .trim();
 }
 
-function cleanSourceLine(line) {
+function cleanSourceLine(
+  line
+) {
   let text =
     String(
       line ||
@@ -719,6 +1156,11 @@ function cleanSourceLine(line) {
     );
 
   text =
+    replaceCensoredBleps(
+      text
+    );
+
+  text =
     normalizeNoiseSymbols(
       text
     );
@@ -738,7 +1180,9 @@ function cleanSourceLine(line) {
   return text;
 }
 
-function cleanSrtForTranslation(srt) {
+function cleanSrtForTranslation(
+  srt
+) {
   const normalized =
     normalizeSrt(
       srt
@@ -753,7 +1197,9 @@ function cleanSrtForTranslation(srt) {
       .split(
         /\n{2,}/
       )
-      .filter(Boolean);
+      .filter(
+        Boolean
+      );
 
   const out =
     [];
@@ -762,6 +1208,9 @@ function cleanSrtForTranslation(srt) {
     0;
 
   let speakerHints =
+    0;
+
+  let bleepCues =
     0;
 
   for (
@@ -807,6 +1256,9 @@ function cleanSrtForTranslation(srt) {
     const speakers =
       new Set();
 
+    let hasBleep =
+      false;
+
     for (
       const sourceLine
       of lines.slice(
@@ -834,6 +1286,15 @@ function cleanSrtForTranslation(srt) {
 
       if (!cleaned) {
         continue;
+      }
+
+      if (
+        cleaned.includes(
+          BLEEP_TOKEN
+        )
+      ) {
+        hasBleep =
+          true;
       }
 
       if (
@@ -867,6 +1328,12 @@ function cleanSrtForTranslation(srt) {
     }
 
     if (
+      hasBleep
+    ) {
+      bleepCues++;
+    }
+
+    if (
       speakers.size ===
       1
     ) {
@@ -893,7 +1360,8 @@ function cleanSrtForTranslation(srt) {
     `[CLEAN] ` +
     `${rawBlocks.length} -> ${out.length}; ` +
     `removidos=${removed}; ` +
-    `speakerHints=${speakerHints}.`
+    `speakerHints=${speakerHints}; ` +
+    `bleepCues=${bleepCues}.`
   );
 
   if (
@@ -921,7 +1389,9 @@ function cleanSrtForTranslation(srt) {
   );
 }
 
-function parseSrt(srt) {
+function parseSrt(
+  srt
+) {
   const normalized =
     normalizeSrt(
       srt
@@ -947,7 +1417,7 @@ function parseSrt(srt) {
 
     if (
       lines.length <
-      3 ||
+        3 ||
       !/^\d+$/.test(
         lines[0].trim()
       ) ||
@@ -1149,6 +1619,7 @@ function protectCulturalLocks(
 
           locks.push({
             token,
+
             value:
               rule.value
           });
@@ -1210,7 +1681,9 @@ function restoreCulturalLocks(
 // FINAL FORMAT LOCK
 // ============================================================
 
-function sourceDialogueDashCount(block) {
+function sourceDialogueDashCount(
+  block
+) {
   return String(
     block?.text ||
     ""
@@ -1257,6 +1730,21 @@ function sanitizeFinalCue(
       text
     );
 
+  text =
+    text.replace(
+      CENSOR_CLUSTER_RE,
+      " "
+    );
+
+  text =
+    text.replace(
+      new RegExp(
+        BLEEP_TOKEN,
+        "g"
+      ),
+      "[censurado]"
+    );
+
   const preserveDialogueDashes =
     sourceDialogueDashCount(
       block
@@ -1274,7 +1762,9 @@ function sanitizeFinalCue(
         line =>
           line.trim()
       )
-      .filter(Boolean)
+      .filter(
+        Boolean
+      )
       .map(
         line => {
           let cleaned =
@@ -1289,7 +1779,6 @@ function sanitizeFinalCue(
               )
               .trim();
 
-          // Resolve primeiro o marcador no início.
           if (
             !preserveDialogueDashes
           ) {
@@ -1307,7 +1796,6 @@ function sanitizeFinalCue(
               );
           }
 
-          // Depois trata -- internos.
           cleaned =
             cleaned
               .replace(
@@ -1317,6 +1805,14 @@ function sanitizeFinalCue(
               .replace(
                 /\s+[-–—]{2,}\s+/gu,
                 " "
+              )
+              .replace(
+                /\s+([,.;:!?])/g,
+                "$1"
+              )
+              .replace(
+                /\[censurado\]\s*([,.;:!?])/gi,
+                "[censurado]$1"
               )
               .replace(
                 /[ \t]{2,}/g,
@@ -1332,10 +1828,12 @@ function sanitizeFinalCue(
             return "";
           }
 
-          return cleaned.trim();
+          return cleaned;
         }
       )
-      .filter(Boolean);
+      .filter(
+        Boolean
+      );
 
   if (
     !lines.length
@@ -1343,7 +1841,6 @@ function sanitizeFinalCue(
     return "";
   }
 
-  // Só mantém hífen de diálogo quando a fonte realmente tinha duas falas.
   if (
     preserveDialogueDashes &&
     lines.length >=
@@ -1423,7 +1920,8 @@ function sanitizeTranslationMap(
   }
 
   console.log(
-    `[FORMAT LOCK] ${changes} cue(s) normalizado(s); ` +
+    `[FORMAT LOCK] ` +
+    `${changes} cue(s) normalizado(s); ` +
     `ruído visual/alongamentos controlados.`
   );
 
@@ -1490,9 +1988,9 @@ function auditTimestamps(
   ) {
     if (
       source[i].index !==
-      final[i].index ||
+        final[i].index ||
       source[i].timing !==
-      final[i].timing
+        final[i].timing
     ) {
       throw new Error(
         `TIMING LOCK ${label}: ` +
@@ -1513,7 +2011,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.2
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.2.2
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -1522,10 +2020,12 @@ PRIORIDADE ABSOLUTA
 4. cultura/registro corretos;
 5. velocidade.
 
-OBJETIVO
-Traduza como legenda profissional brasileira contemporânea: natural, oral, concisa, contextual e fiel.
-Nunca faça inglês vestido de português.
-Nunca invente uma tradução engraçadinha para bordão estabelecido.
+PRINCÍPIO CENTRAL: PRESERVAR IDENTIDADE, LOCALIZAR INTENÇÃO
+- Preserve nomes, marcas, bordões consagrados e termos cuja identidade cultural importa.
+- Localize para o Brasil humor, insulto, gíria, metáfora, intenção social e expressão idiomática quando uma tradução literal esconderia o sentido.
+- Não "abrasileire" nomes/bordões que soariam falsos traduzidos.
+- Não deixe inglês estrutural dentro de português só porque as palavras foram traduzidas.
+- A legenda deve fazer um brasileiro entender o que a fala QUER DIZER e como ela SOA socialmente.
 
 CUE OWNERSHIP — REGRA INVIOLÁVEL
 - Cada cápsula é independente.
@@ -1541,7 +2041,14 @@ HARD LOCKS
 - Tokens no formato __LOCK_C...__ são texto protegido.
 - Copie cada token EXATAMENTE, caractere por caractere, no ponto correspondente da tradução.
 - Nunca traduza, reformule, remova, pluralize ou pontue dentro do token.
-- O JavaScript restaurará o bordão original depois.
+
+CENSURA / BLEEP
+- O token ${BLEEP_TOKEN} representa uma palavra ou expressão censurada por bleep/símbolos na fonte.
+- NUNCA devolva ${BLEEP_TOKEN} nem sequências como @#$%&*() na legenda final.
+- Use a gramática, o sentimento, a cena e os cues vizinhos para reconstruir a INTENÇÃO em PT-BR natural.
+- Se o sentido geral estiver claro, escolha uma formulação brasileira coerente com o tom, sem fingir certeza sobre a palavra inglesa exata.
+- Se a palavra exata for impossível de inferir com segurança, reescreva a frase para continuar completa e natural; [censurado] é último recurso.
+- NUNCA deixe buracos como "é um vestido bem .".
 
 LGBTQIAPN+ / DRAG / BALLROOM / REALITY / FANDOM
 - Tenha letramento real de cultura LGBTQIAPN+, drag, ballroom, camp, shade, stan culture e reality competition.
@@ -1552,28 +2059,41 @@ LGBTQIAPN+ / DRAG / BALLROOM / REALITY / FANDOM
 GAG / GAGGED / GAGGING EM SENTIDO DE REAÇÃO
 - Em reação, surpresa, impacto ou admiração, prefira: "passada", "tô passada", "fiquei passada", "em choque", "sem reação".
 - Em Drag Race/reality queer, "I'm gagged" normalmente deve soar como "tô passada".
-- NUNCA use "amordaçada" nesse sentido.
-- NUNCA use "engasgada" nesse sentido.
+- NUNCA use "amordaçada" ou "engasgada" nesse sentido.
 - Só use sentido físico quando a cena realmente falar de boca, engasgo, reflexo de vômito, sufocamento etc.
+
+BOTTOM EM COMPETIÇÕES / REALITY
+- Em Drag Race/reality, bottom frequentemente significa colocação ruim ou risco de eliminação.
+- "in the bottom" -> "no bottom", "entre as piores" ou "na berlinda".
+- "bottom queens" -> "queens do bottom" ou "as piores da semana".
+- "bottom two" -> "bottom 2" ou "as duas piores".
+- "bottom three" -> "bottom 3" ou "as três piores".
+- NUNCA traduza bottom competitivo como "fundo", "quintal", "parte de baixo" ou "inferior".
+- Diferencie bottom competitivo de bottom sexual pelo contexto.
+
+PALAVRÕES E INTENSIFICADORES
+- "fuck", "fucking" e "the fuck" muitas vezes funcionam como intensidade, não como substantivos literais.
+- Preserve agressividade, humor e personalidade, mas reconstrua a frase em PT-BR natural.
+- "Who the fuck knows?" -> "Quem caralhos sabe?", "Quem é que sabe, porra?" ou "Sei lá, porra.".
+- NUNCA "Quem sabe o caralho?".
+- "What the fuck is that?" -> "Que porra é essa?".
+- "Where the fuck is she?" -> "Onde caralhos ela tá?" ou equivalente natural.
+- "Why the fuck would I do that?" -> "Por que caralhos eu faria isso?".
+- Não preserve mecanicamente a posição sintática de "fuck" do inglês.
+- Não transforme automaticamente todo "fucking" em "do caralho".
 
 OUTRAS GÍRIAS IMPORTANTES
 - she ate / you ate / they ate, quando elogio: "arrasou", "entregou tudo", "serviu". Nunca "comeu".
 - no crumbs: "não deixou nada pra ninguém" ou equivalente natural.
 - slay/slayed/slaying como elogio: arrasar, entregar, servir. Não "matar".
-- shade em sentido social: shade, alfinetada, indireta, veneno, conforme contexto. Não "sombra".
-- tea em fofoca/fandom: babado, chá/tea apenas se culturalmente intencional; nunca "chá" literal por reflexo.
+- shade social: shade, alfinetada, indireta, veneno, conforme contexto. Não "sombra".
+- tea em fofoca/fandom: babado ou equivalente; nunca "chá" literal por reflexo.
 - read/reading em drag: dar um read, acabar com alguém, ler alguém, conforme contexto; não tradução escolar automática.
 - serving em fashion/drag: servindo/entregando um look, entregando conceito etc., conforme a fala.
 - bitch como vocativo amigável: bicha, gata, amiga, menina ou omitir. Nunca "puta" automaticamente.
 - judges em competição/reality: jurados.
 - supportive: "me apoiou muito", "esteve do meu lado". Evite "super apoiador".
 - double/shared win: vitória dupla / as duas ganharam. Não "empate duplo" sem empate.
-- bottom em Drag Race/reality competition, quando indica colocação ruim: mantenha "bottom" quando soar natural para o fandom, ou use "entre as piores", "na berlinda", "entre as últimas" conforme a frase.
-- "in the bottom" em contexto de competição: "no bottom", "entre as piores" ou "na berlinda".
-- "bottom queens": "queens do bottom" ou "as piores da semana".
-- "bottom two": "bottom 2", "as duas piores" ou equivalente natural.
-- NUNCA traduza bottom competitivo como "fundo", "quintal", "parte de baixo", "inferior" ou sentido físico.
-- Não confunda bottom competitivo com bottom em contexto sexual; use o contexto da cena.
 
 GEN Z / GEN ALPHA / INTERNET
 - Entenda memes, fandom, stan culture, cringe, delulu, iconic, mother, serve, clocked, gag, ate, shade e linguagem de internet pelo SENTIDO.
@@ -1581,41 +2101,32 @@ GEN Z / GEN ALPHA / INTERNET
 - Não transforme toda fala jovem em caricatura de TikTok.
 - Preserve idade, personalidade, classe, formalidade e situação social do falante.
 
-PALAVRÕES E INTENSIFICADORES
-- "fuck/fucking/the fuck" muitas vezes intensificam a frase e NÃO devem ocupar literalmente a mesma posição em português.
-- Preserve a atitude e a intensidade, não a sintaxe inglesa.
-- "Who the fuck knows?" -> "Quem caralhos sabe?", "Quem é que sabe, porra?" ou "Sei lá, porra.", conforme a personalidade e a cena.
-- NUNCA "Quem sabe o caralho?".
-- "What the fuck is that?" -> "Que porra é essa?".
-- "Where the fuck is she?" -> "Onde caralhos ela tá?" / "Onde é que ela tá, porra?".
-- "Why the fuck would I do that?" -> "Por que caralhos eu faria isso?".
-- Não transforme automaticamente todo "fucking" em "do caralho".
-
-NATURALIDADE
+METÁFORAS E NATURALIDADE
+- Traduza metáforas pela imagem/intenção que um brasileiro entenderia naturalmente.
+- Evite calques estranhos e diminutivos artificiais que ninguém diria em PT-BR.
+- Se o inglês usa fire/spark/heat para dizer que algo despertou uma emoção, prefira uma expressão natural como "acendeu uma chama em mim", "despertou algo em mim" etc., conforme contexto; não invente objetos literais como "forneuzinha" sem motivo real.
+- Referências com tradução brasileira consolidada podem ser localizadas: Death Star -> Estrela da Morte, por exemplo.
 - Em fala casual: "tô", "tá", "pra", "né" podem ser usados quando combinarem com a pessoa.
-- Não use lusitanismos.
-- Não use linguagem burocrática.
+- Não use lusitanismos ou linguagem burocrática.
 - Não traduza expressão idiomática palavra por palavra.
 - Não censure palavrões; preserve intensidade de forma brasileira natural.
-- Não transforme automaticamente todo "fucking" em "da porra"/"do caralho".
 
 CANTO / NOTAS ESTENDIDAS
 - Traduza o conteúdo verbal, NÃO a duração vocal da nota.
-- "I love you-u-u-u-u" deve virar algo como "Eu te amo", nunca "Eu te amo-o-o-o-o".
+- "I love you-u-u-u-u" -> "Eu te amo", nunca "Eu te amo-o-o-o-o".
 - Não reproduza vogais ou sílabas repetidas apenas porque a pessoa sustentou uma nota.
-- Interjeições realmente repetidas como palavras separadas podem ser mantidas quando fizerem sentido, mas não alongamentos gráficos.
 
 FORMATAÇÃO
 - Não adicione símbolos decorativos.
 - Não devolva linhas com "/", "//", "---", "--", pipes ou sequências de traços como decoração.
 - Não invente bullets, asteriscos ou notas musicais.
 - Não adicione nomes de speaker, [NOME], NOME:, SDH ou comentários.
-- Use travessão/hífen de diálogo apenas quando o próprio cue tiver duas falas separadas.
+- Use hífen de diálogo apenas quando o próprio cue tiver duas falas separadas.
 - Preserve quebra de linha quando ela separar duas falas no mesmo cue.
 
 FIDELIDADE E SINCRONIZAÇÃO
 - Não resuma.
-- Não invente.
+- Não invente fatos.
 - Não omita finais de frase.
 - Não mova conteúdo de um cue para outro.
 - Não antecipe fala do cue seguinte.
@@ -1628,7 +2139,7 @@ const PLAN_PROMPT = `
 Você é editor de continuidade EN→PT-BR.
 Leia uma amostra do episódio e produza uma bíblia editorial CURTA.
 Extraia somente: tom, pessoas/relações quando claras, gênero apenas quando seguro, terminologia recorrente, referências culturais/fandom, gírias contextuais e escolhas de consistência.
-Reconheça especialmente reality, drag, LGBTQIAPN+, Gen Z/Alpha, música e competições.
+Reconheça especialmente reality, drag, LGBTQIAPN+, Gen Z/Alpha, música, competições e linguagem censurada por bleep.
 Não traduza o episódio. Não invente fatos. Não proponha tradução para tokens HARD LOCK.
 `;
 
@@ -1651,7 +2162,7 @@ Você é editor final EN→PT-BR.
 ${STYLE_PACK}
 
 Você receberá somente cues sinalizados por detectores locais.
-Corrija defeitos reais de cultura, literalidade, omissão, overflow, formatação ou ownership.
+Corrija defeitos reais de cultura, literalidade, censura/bleep, omissão, overflow, formatação ou ownership.
 Preserve o que já estiver bom.
 Não redistribua conteúdo entre ids.
 `;
@@ -1775,7 +2286,9 @@ function cueTranslationSchema(
 // GEMINI
 // ============================================================
 
-function parseDurationMs(value) {
+function parseDurationMs(
+  value
+) {
   const text =
     String(
       value ||
@@ -1810,6 +2323,7 @@ function parseDurationMs(value) {
   if (sec) {
     return Math.max(
       1000,
+
       Number(
         sec[1]
       ) *
@@ -1831,6 +2345,7 @@ function parseDurationMs(value) {
   )
     ? Math.max(
         1000,
+
         num *
         1000
       )
@@ -1854,6 +2369,7 @@ function retryDelayMs(
   if (header) {
     return Math.min(
       120000,
+
       header +
       500
     );
@@ -1861,7 +2377,9 @@ function retryDelayMs(
 
   const details =
     Array.isArray(
-      data?.error?.details
+      data
+        ?.error
+        ?.details
     )
       ? data.error.details
       : [];
@@ -1881,6 +2399,7 @@ function retryDelayMs(
     if (parsed) {
       return Math.min(
         120000,
+
         parsed +
         500
       );
@@ -1890,17 +2409,22 @@ function retryDelayMs(
   return Math.min(
     10000 *
     attempt,
+
     60000
   );
 }
 
-function extractInteractionText(data) {
+function extractInteractionText(
+  data
+) {
   if (
     typeof data?.output_text ===
-    "string" &&
+      "string" &&
     data.output_text.trim()
   ) {
-    return data.output_text.trim();
+    return data
+      .output_text
+      .trim();
   }
 
   const steps =
@@ -1919,7 +2443,7 @@ function extractInteractionText(data) {
   ) {
     if (
       step?.type !==
-      "model_output" ||
+        "model_output" ||
       !Array.isArray(
         step.content
       )
@@ -1932,9 +2456,9 @@ function extractInteractionText(data) {
         .filter(
           part =>
             part?.type ===
-            "text" &&
+              "text" &&
             typeof part?.text ===
-            "string"
+              "string"
         )
         .map(
           part =>
@@ -1946,7 +2470,9 @@ function extractInteractionText(data) {
   return out.trim();
 }
 
-async function acquireGeminiSlot(job) {
+async function acquireGeminiSlot(
+  job
+) {
   let release;
 
   const previous =
@@ -2010,14 +2536,18 @@ function markAttempt(
     metric ===
     "main"
   ) {
-    job.stats.mainAttempts++;
+    job
+      .stats
+      .mainAttempts++;
   }
 
   if (
     metric ===
     "repair"
   ) {
-    job.stats.repairAttempts++;
+    job
+      .stats
+      .repairAttempts++;
   }
 }
 
@@ -2033,14 +2563,18 @@ function mark429(
     metric ===
     "main"
   ) {
-    job.stats.main429++;
+    job
+      .stats
+      .main429++;
   }
 
   if (
     metric ===
     "repair"
   ) {
-    job.stats.repair429++;
+    job
+      .stats
+      .repair429++;
   }
 }
 
@@ -2057,21 +2591,27 @@ function markSuccess(
     metric ===
     "plan"
   ) {
-    job.stats.planCalls++;
+    job
+      .stats
+      .planCalls++;
   }
 
   if (
     metric ===
     "main"
   ) {
-    job.stats.mainCalls++;
+    job
+      .stats
+      .mainCalls++;
   }
 
   if (
     metric ===
     "repair"
   ) {
-    job.stats.repairCalls++;
+    job
+      .stats
+      .repairCalls++;
   }
 
   job.stats.inputTokens +=
@@ -2275,12 +2815,12 @@ async function geminiRequest({
 
         if (
           status ===
-          "incomplete" ||
+            "incomplete" ||
           !text
         ) {
           throw new Error(
             status ===
-            "incomplete"
+              "incomplete"
               ? `Gemini ${metric} retornou INCOMPLETE.`
               : `Gemini ${metric} retornou vazio.`
           );
@@ -2316,6 +2856,7 @@ async function geminiRequest({
 
         return {
           text,
+
           status,
 
           usage:
@@ -2439,7 +2980,7 @@ async function geminiRequest({
       if (
         lastError?.status &&
         lastError.status <
-        500 &&
+          500 &&
         ![
           408,
           409,
@@ -2483,10 +3024,12 @@ async function geminiRequest({
 }
 
 // ============================================================
-// PLANNER / BATCHES
+// PLANNER
 // ============================================================
 
-function compactCue(block) {
+function compactCue(
+  block
+) {
   return {
     i:
       block.index,
@@ -2505,7 +3048,9 @@ function compactCue(block) {
   };
 }
 
-function plannerSample(blocks) {
+function plannerSample(
+  blocks
+) {
   if (
     blocks.length <=
     PLAN_SAMPLE_MAX_CUES
@@ -2637,7 +3182,9 @@ async function buildEpisodePlan(
     return plan;
   }
   catch (error) {
-    job.stats.planFailures++;
+    job
+      .stats
+      .planFailures++;
 
     console.warn(
       `[EPISODE PLAN] ` +
@@ -2649,7 +3196,13 @@ async function buildEpisodePlan(
   }
 }
 
-function buildMainBatches(blocks) {
+// ============================================================
+// MAIN BATCHES / CUE OWNERSHIP
+// ============================================================
+
+function buildMainBatches(
+  blocks
+) {
   const batches =
     [];
 
@@ -2671,10 +3224,10 @@ function buildMainBatches(blocks) {
       current.length &&
       (
         current.length >=
-        MAIN_BATCH_MAX_CUES ||
+          MAIN_BATCH_MAX_CUES ||
         chars +
-        size >
-        MAIN_BATCH_MAX_CHARS
+          size >
+          MAIN_BATCH_MAX_CHARS
       )
     ) {
       batches.push(
@@ -2707,7 +3260,9 @@ function buildMainBatches(blocks) {
   return batches;
 }
 
-function positionMap(blocks) {
+function positionMap(
+  blocks
+) {
   const map =
     new Map();
 
@@ -2725,7 +3280,9 @@ function positionMap(blocks) {
   return map;
 }
 
-function interleaveBatch(batch) {
+function interleaveBatch(
+  batch
+) {
   const ordered =
     [];
 
@@ -2737,7 +3294,8 @@ function interleaveBatch(batch) {
 
   for (
     let i = 0;
-    i < half;
+    i <
+    half;
     i++
   ) {
     if (
@@ -2766,7 +3324,9 @@ function interleaveBatch(batch) {
   return ordered;
 }
 
-function contextCue(block) {
+function contextCue(
+  block
+) {
   return {
     i:
       block.index,
@@ -2984,10 +3544,12 @@ function parseCueTranslation(
     pt =
       restoreCulturalLocks(
         pt,
+
         locksById.get(
           id
         ) ||
         [],
+
         id
       );
 
@@ -3049,7 +3611,8 @@ async function translateMainBatch({
             `Traduza somente cada target. ` +
             `Output exatamente ${batch.length} cues. ` +
             `Todos os tokens __LOCK_C...__ recebidos no target ` +
-            `devem voltar idênticos em pt.`,
+            `devem voltar idênticos em pt. ` +
+            `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
 
           schema:
             cueTranslationSchema(
@@ -3091,7 +3654,9 @@ async function translateMainBatch({
         throw error;
       }
 
-      job.stats.mainParseRetries++;
+      job
+        .stats
+        .mainParseRetries++;
 
       console.warn(
         `[MAIN CUE-LOCK] ` +
@@ -3246,10 +3811,12 @@ async function translateAllMain(
 }
 
 // ============================================================
-// DETECTOR / REPAIR
+// LOCAL GUARD / REPAIR
 // ============================================================
 
-function words(text) {
+function words(
+  text
+) {
   return (
     String(
       text ||
@@ -3263,7 +3830,9 @@ function words(text) {
   );
 }
 
-function normalizedWordSet(text) {
+function normalizedWordSet(
+  text
+) {
   return new Set(
     words(
       text
@@ -3350,7 +3919,9 @@ function isDragContext(
   );
 }
 
-function isPhysicalGagContext(en) {
+function isPhysicalGagContext(
+  en
+) {
   return /\bgag reflex\b|\bgag(?:ged|ging)?\s+(?:on|from)\s+(?:food|water|something|it)\b|\bchok(?:e|ed|ing)\b|\bvomit|throw up|nausea|throat|mouth|tape|bound|restrain/i.test(
     String(
       en ||
@@ -3359,7 +3930,9 @@ function isPhysicalGagContext(en) {
   );
 }
 
-function hasGoodGagReaction(pt) {
+function hasGoodGagReaction(
+  pt
+) {
   return /\bpassad[ao]s?\b|\bt[oô]\s+passad[ao]\b|\bem\s+choque\b|\bsem\s+rea[cç][aã]o\b|\bboquiabert[ao]s?\b|\bchocad[ao]s?\b/i.test(
     String(
       pt ||
@@ -3368,7 +3941,9 @@ function hasGoodGagReaction(pt) {
   );
 }
 
-function hasExtendedVocalization(text) {
+function hasExtendedVocalization(
+  text
+) {
   const value =
     String(
       text ||
@@ -3386,50 +3961,121 @@ function hasExtendedVocalization(text) {
   );
 }
 
-function localReasonsForCue(block, pt, filename) {
-  const en = String(block.text || "");
-  const translated = String(pt || "");
-  const reasons = [];
+function localReasonsForCue(
+  block,
+  pt,
+  filename
+) {
+  const en =
+    String(
+      block.text ||
+      ""
+    );
 
-  const enCount = words(en).length;
-  const ptCount = words(translated).length;
+  const translated =
+    String(
+      pt ||
+      ""
+    );
 
-  const drag = isDragContext(filename, en);
+  const reasons =
+    [];
 
-  if (!translated.trim()) {
-    reasons.push("EMPTY");
+  const enCount =
+    words(
+      en
+    ).length;
+
+  const ptCount =
+    words(
+      translated
+    ).length;
+
+  const drag =
+    isDragContext(
+      filename,
+      en
+    );
+
+  if (
+    !translated.trim()
+  ) {
+    reasons.push(
+      "EMPTY"
+    );
   }
 
   if (
-    enCount >= 5 &&
-    copiedEnglishRatio(en, translated) >= 0.60
+    enCount >=
+      5 &&
+    copiedEnglishRatio(
+      en,
+      translated
+    ) >=
+      0.60
   ) {
-    reasons.push("POSSIBLE_UNTRANSLATED");
+    reasons.push(
+      "POSSIBLE_UNTRANSLATED"
+    );
   }
 
   if (
-    enCount >= 10 &&
-    ptCount <= Math.max(2, Math.floor(enCount * 0.32))
+    enCount >=
+      10 &&
+    ptCount <=
+      Math.max(
+        2,
+
+        Math.floor(
+          enCount *
+          0.32
+        )
+      )
   ) {
-    reasons.push("POSSIBLE_OMISSION");
+    reasons.push(
+      "POSSIBLE_OMISSION"
+    );
   }
 
   if (
-    enCount >= 3 &&
-    ptCount >= enCount * 2.8 + 6
+    enCount >=
+      3 &&
+    ptCount >=
+      enCount *
+      2.8 +
+      6
   ) {
-    reasons.push("POSSIBLE_OVERFLOW");
+    reasons.push(
+      "POSSIBLE_OVERFLOW"
+    );
   }
 
   if (
-    sourceDialogueDashCount(block) >= 2 &&
-    translated.split("\n").filter(Boolean).length < 2
+    sourceDialogueDashCount(
+      block
+    ) >=
+      2 &&
+    translated
+      .split("\n")
+      .filter(
+        Boolean
+      )
+      .length <
+      2
   ) {
-    reasons.push("MISSING_DIALOGUE_BREAK");
+    reasons.push(
+      "MISSING_DIALOGUE_BREAK"
+    );
   }
 
-  if (hasExtendedVocalization(translated)) {
-    reasons.push("EXTENDED_SUNG_NOTE");
+  if (
+    hasExtendedVocalization(
+      translated
+    )
+  ) {
+    reasons.push(
+      "EXTENDED_SUNG_NOTE"
+    );
   }
 
   if (
@@ -3437,17 +4083,61 @@ function localReasonsForCue(block, pt, filename) {
       translated
     )
   ) {
-    reasons.push("FORMAT_NOISE");
+    reasons.push(
+      "FORMAT_NOISE"
+    );
+  }
+
+  if (
+    CENSOR_CLUSTER_RE.test(
+      translated
+    )
+  ) {
+    reasons.push(
+      "CENSOR_SYMBOL_NOISE"
+    );
+  }
+
+  CENSOR_CLUSTER_RE.lastIndex =
+    0;
+
+  if (
+    translated.includes(
+      BLEEP_TOKEN
+    )
+  ) {
+    reasons.push(
+      "UNRESOLVED_BLEEP_TOKEN"
+    );
+  }
+
+  if (
+    en.includes(
+      BLEEP_TOKEN
+    ) &&
+    /\b(?:bem|muito|super)\s*[.!?,;:]?\s*$/i.test(
+      translated.trim()
+    )
+  ) {
+    reasons.push(
+      "BLEEP_CREATED_DANGLING_SENTENCE"
+    );
   }
 
   if (drag) {
     const gagSlang =
-      /\bgag(?:ged|ging|s)?\b/i.test(en) &&
-      !isPhysicalGagContext(en);
+      /\bgag(?:ged|ging|s)?\b/i.test(
+        en
+      ) &&
+      !isPhysicalGagContext(
+        en
+      );
 
     if (
       gagSlang &&
-      !hasGoodGagReaction(translated)
+      !hasGoodGagReaction(
+        translated
+      )
     ) {
       reasons.push(
         "GAG_SLANG_NOT_NATURAL_PTBR"
@@ -3559,17 +4249,15 @@ function localReasonsForCue(block, pt, filename) {
       );
     }
 
-    // --------------------------------------------------------
-    // BOTTOM — colocação ruim em Drag Race/reality competition
-    // --------------------------------------------------------
-
     const competitionBottom =
       /\b(?:in|into|landed|landing|placed|placing|put|puts|ended|ending)\s+(?:up\s+)?(?:in\s+)?the\s+bottom\b/i.test(
         en
       ) ||
+
       /\bbottom\s+(?:two|three|2|3|queens?|girls?|contestants?|performers?)\b/i.test(
         en
       ) ||
+
       /\b(?:the\s+)?bottom\s+(?:this\s+week|tonight|again)\b/i.test(
         en
       );
@@ -3585,11 +4273,7 @@ function localReasonsForCue(block, pt, filename) {
       );
     }
 
-    // --------------------------------------------------------
-    // WHO THE FUCK KNOWS
-    // --------------------------------------------------------
-
-        if (
+    if (
       /\bwho\s+the\s+fuck\s+knows\b/i.test(
         en
       ) &&
@@ -3601,10 +4285,22 @@ function localReasonsForCue(block, pt, filename) {
         "WHO_THE_FUCK_KNOWS_LITERAL"
       );
     }
+
+    if (
+      /\bforneuzinh|\bforninho\b/i.test(
+        translated
+      )
+    ) {
+      reasons.push(
+        "UNNATURAL_LITERAL_METAPHOR"
+      );
+    }
   }
 
   return [
-    ...new Set(reasons)
+    ...new Set(
+      reasons
+    )
   ];
 }
 
@@ -3663,14 +4359,11 @@ function detectLocalIssues(
     }
   }
 
-  // Ownership heurístico:
-  // cue muito curto seguido de vizinho anormalmente longo
-  // é o padrão típico de conteúdo que "escorreu" entre IDs.
   for (
     let i = 0;
     i <
     blocks.length -
-    1;
+      1;
     i++
   ) {
     const first =
@@ -3708,45 +4401,45 @@ function detectLocalIssues(
 
     const firstTooShort =
       firstEn >=
-      7 &&
+        7 &&
       firstPt <=
-      Math.max(
-        2,
+        Math.max(
+          2,
 
-        Math.floor(
-          firstEn *
-          0.30
-        )
-      );
+          Math.floor(
+            firstEn *
+            0.30
+          )
+        );
 
     const secondTooShort =
       secondEn >=
-      7 &&
+        7 &&
       secondPt <=
-      Math.max(
-        2,
+        Math.max(
+          2,
 
-        Math.floor(
-          secondEn *
-          0.30
-        )
-      );
+          Math.floor(
+            secondEn *
+            0.30
+          )
+        );
 
     const firstTooLong =
       firstEn >=
-      2 &&
+        2 &&
       firstPt >=
-      firstEn *
-      2.8 +
-      6;
+        firstEn *
+        2.8 +
+        6;
 
     const secondTooLong =
       secondEn >=
-      2 &&
+        2 &&
       secondPt >=
-      secondEn *
-      2.8 +
-      6;
+        secondEn *
+        2.8 +
+        6;
 
     if (
       firstTooShort &&
@@ -3897,7 +4590,7 @@ function buildRepairPayload(
             blocks
               .slice(
                 pos +
-                1,
+                  1,
 
                 Math.min(
                   blocks.length,
@@ -3973,7 +4666,8 @@ async function repairBatch(
             `CUES PARA REPARO:\n` +
             `${JSON.stringify(payload)}\n\n` +
             `Todos os tokens __LOCK_C...__ ` +
-            `devem voltar idênticos.`,
+            `devem voltar idênticos. ` +
+            `O token ${BLEEP_TOKEN} deve ser resolvido naturalmente e nunca copiado.`,
 
           schema:
             cueTranslationSchema(
@@ -4024,7 +4718,9 @@ async function repairBatch(
         throw error;
       }
 
-      job.stats.repairParseRetries++;
+      job
+        .stats
+        .repairParseRetries++;
 
       console.warn(
         `[REPAIR CUE-LOCK] ` +
@@ -4084,17 +4780,16 @@ async function tryFocusedRepair(
 
   issues.sort(
     (
-      first,
-      second
+      a,
+      b
     ) =>
-      second.reasons.length -
-      first.reasons.length
+      b.reasons.length -
+      a.reasons.length
   );
 
   const selected =
     issues.slice(
       0,
-
       REPAIR_MAX_CUES_TOTAL
     );
 
@@ -4160,7 +4855,9 @@ async function tryFocusedRepair(
     return updated;
   }
   catch (error) {
-    job.stats.repairFailures++;
+    job
+      .stats
+      .repairFailures++;
 
     console.warn(
       `[REPAIR] ` +
@@ -4173,7 +4870,7 @@ async function tryFocusedRepair(
 }
 
 // ============================================================
-// PIPELINE / JOB
+// PIPELINE
 // ============================================================
 
 async function translateSrt(
@@ -4200,7 +4897,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.2] ` +
+    `[PIPELINE 8.2.2] ` +
     `fonte=${job.sourceKind} | ` +
     `${blocks.length} cues.`
   );
@@ -4267,26 +4964,23 @@ async function translateSrt(
       job
     );
 
-  // Segunda checagem é local e barata.
-  // Só chama Gemini novamente se ainda houver
-  // defeitos objetivos após o primeiro repair.
   const remaining =
-  detectLocalIssues(
-    blocks,
-    finalTranslations,
-    job.filename
-  );
+    detectLocalIssues(
+      blocks,
+      finalTranslations,
+      job.filename
+    );
 
-if (
-  remaining.length
-) {
-  console.log(
-    `[POST-REPAIR GUARD] ` +
-    `${remaining.length} cue(s) ainda sinalizado(s) ` +
-    `após o repair; mantendo o primeiro repair ` +
-    `para evitar retradução repetitiva e perda de velocidade.`
-  );
-}
+  if (
+    remaining.length
+  ) {
+    console.log(
+      `[POST-REPAIR GUARD] ` +
+      `${remaining.length} cue(s) ainda sinalizado(s) ` +
+      `após o repair; mantendo o primeiro repair ` +
+      `para evitar retradução repetitiva e perda de velocidade.`
+    );
+  }
 
   const finalSrt =
     buildSrt(
@@ -4301,7 +4995,7 @@ if (
   );
 
   console.log(
-    `[PIPELINE 8.2] FINAL OK | ` +
+    `[PIPELINE 8.2.2] FINAL OK | ` +
     `${blocks.length} cues | ` +
     `${(
       (
@@ -4315,7 +5009,9 @@ if (
   return finalSrt;
 }
 
-async function processJob(job) {
+async function processJob(
+  job
+) {
   job.status =
     "processing";
 
@@ -4400,7 +5096,9 @@ async function processJob(job) {
         job.progress =
           100;
 
-        job.stats.usedSafeDraftFallback =
+        job
+          .stats
+          .usedSafeDraftFallback =
           true;
 
         console.warn(
@@ -4433,7 +5131,9 @@ async function processJob(job) {
   }
 }
 
-function startJob(job) {
+function startJob(
+  job
+) {
   if (
     job.promise
   ) {
@@ -4531,7 +5231,9 @@ async function fetchWithTimeout(
   }
 }
 
-function parseExtra(extra) {
+function parseExtra(
+  extra
+) {
   const params =
     new URLSearchParams(
       extra ||
@@ -4609,7 +5311,9 @@ function buildOpenSubtitlesUrl(
     : `${base}.json`;
 }
 
-function selectEnglishSubtitle(subtitles) {
+function selectEnglishSubtitle(
+  subtitles
+) {
   return (
     Array.isArray(
       subtitles
@@ -4637,8 +5341,8 @@ function selectEnglishSubtitle(subtitles) {
     )
     .sort(
       (
-        first,
-        second
+        a,
+        b
       ) => {
         const score =
           subtitle =>
@@ -4669,10 +5373,10 @@ function selectEnglishSubtitle(subtitles) {
 
         return (
           score(
-            second
+            b
           ) -
           score(
-            first
+            a
           )
         );
       }
@@ -4712,7 +5416,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.2"
+            "Stremio-PTBR/8.2.2"
         }
       }
     );
@@ -4744,7 +5448,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.2"
+            "Stremio-PTBR/8.2.2"
         }
       }
     );
@@ -4766,7 +5470,7 @@ async function fetchOpenSubtitlesSource({
   if (
     !raw ||
     raw.length >
-    MAX_SOURCE_CHARS
+      MAX_SOURCE_CHARS
   ) {
     throw new Error(
       "Legenda OpenSubtitles vazia/grande demais."
@@ -4844,6 +5548,14 @@ async function publicSubtitlesHandler(
       );
     }
 
+    const recovery = {
+      type,
+      id,
+      filename,
+      videoSize,
+      videoHash
+    };
+
     const job =
       getOrCreateJob(
         {
@@ -4857,7 +5569,9 @@ async function publicSubtitlesHandler(
           sourceSrt,
 
           sourceKind:
-            "opensubtitles-cloud"
+            "opensubtitles-cloud",
+
+          recovery
         },
 
         {
@@ -4867,10 +5581,11 @@ async function publicSubtitlesHandler(
       );
 
     const subtitleUrl =
-      `${baseUrl(req)}/` +
-      `subtitle/` +
-      `${encodeURIComponent(job.id)}` +
-      `.srt`;
+      buildCloudSubtitleUrl(
+        req,
+        job,
+        recovery
+      );
 
     console.log(
       `[CLOUD LAZY] ` +
@@ -4915,8 +5630,95 @@ async function publicSubtitlesHandler(
   }
 }
 
+async function recoverCloudJob(
+  token
+) {
+  const payload =
+    decodeRecovery(
+      token
+    );
+
+  const recovery = {
+    type:
+      String(
+        payload.t ||
+        ""
+      ),
+
+    id:
+      String(
+        payload.i ||
+        ""
+      ),
+
+    filename:
+      String(
+        payload.f ||
+        ""
+      ),
+
+    videoSize:
+      String(
+        payload.s ||
+        ""
+      ),
+
+    videoHash:
+      String(
+        payload.h ||
+        ""
+      )
+  };
+
+  console.log(
+    `[CLOUD SELF-HEAL] ` +
+    `recuperando ` +
+    `${recovery.type}/${recovery.id} ` +
+    `após restart/expiração de memória.`
+  );
+
+  const sourceSrt =
+    await fetchOpenSubtitlesSource(
+      recovery
+    );
+
+  if (!sourceSrt) {
+    throw new Error(
+      "OpenSubtitles não retornou fonte para autorrecuperação."
+    );
+  }
+
+  const job =
+    getOrCreateJob(
+      {
+        type:
+          recovery.type,
+
+        videoId:
+          recovery.id,
+
+        filename:
+          recovery.filename,
+
+        sourceSrt,
+
+        sourceKind:
+          "opensubtitles-cloud",
+
+        recovery
+      },
+
+      {
+        lazy:
+          false
+      }
+    );
+
+  return job;
+}
+
 // ============================================================
-// ROUTES
+// MANIFEST / ROUTES
 // ============================================================
 
 const manifest = {
@@ -4924,13 +5726,13 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-  "8.2.1",
+    "8.2.2",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
 
   description:
-    "OpenSubtitles inglês → Gemini 3.5 Flash-Lite → PT-BR contextual com hard locks culturais, Cue Ownership e formatação limpa.",
+    "OpenSubtitles inglês → Gemini 3.5 Flash-Lite → PT-BR contextual com hard locks, Cue Ownership, censura inteligente e job self-healing.",
 
   resources: [
     "subtitles"
@@ -5066,7 +5868,7 @@ app.post(
 
       if (
         typeof rawSrt !==
-        "string" ||
+          "string" ||
         !rawSrt.trim()
       ) {
         return safeJson(
@@ -5227,7 +6029,9 @@ app.get(
 // SUBTITLE DELIVERY
 // ============================================================
 
-function processingSrt(job) {
+function processingSrt(
+  job
+) {
   return [
     "1",
 
@@ -5248,7 +6052,9 @@ function processingSrt(job) {
   ].join("\n");
 }
 
-function errorSrt(error) {
+function errorSrt(
+  error
+) {
   return [
     "1",
 
@@ -5280,7 +6086,7 @@ function errorSrt(error) {
 app.get(
   "/subtitle/:jobId.srt",
 
-  (
+  async (
     req,
     res
   ) => {
@@ -5303,26 +6109,76 @@ app.get(
         );
     }
 
-    const job =
+    let job =
       jobs.get(
         jobId
       );
+
+    const recoveryToken =
+      String(
+        req.query.r ||
+        ""
+      ).trim();
+
+    if (
+      (
+        !job ||
+        job.status ===
+          "failed"
+      ) &&
+      recoveryToken
+    ) {
+      try {
+        job =
+          await recoverCloudJob(
+            recoveryToken
+          );
+
+        // Alias do ID antigo em memória.
+        // Assim, novos fetches da mesma URL
+        // não precisam baixar a fonte outra vez.
+        jobs.set(
+          jobId,
+          job
+        );
+
+        console.log(
+          `[CLOUD SELF-HEAL] ` +
+          `job ativo novamente: ` +
+          `${job.id} ` +
+          `(alias=${jobId}).`
+        );
+      }
+      catch (error) {
+        console.error(
+          `[CLOUD SELF-HEAL] falhou: ` +
+          `${errorMessage(error)}`
+        );
+
+        return sendSrt(
+          res,
+
+          errorSrt(
+            `Não foi possível recuperar a legenda: ` +
+            `${errorMessage(error)}`
+          )
+        );
+      }
+    }
 
     if (!job) {
       return sendSrt(
         res,
 
         errorSrt(
-          "Job expirado."
+          "Job expirado e sem dados de recuperação."
         )
       );
     }
 
-    // Cloud é LAZY:
-    // só começa quando a URL é realmente escolhida/acessada.
     if (
       job.status ===
-      "pending" &&
+        "pending" &&
       !job.started
     ) {
       console.log(
@@ -5338,7 +6194,7 @@ app.get(
 
     if (
       job.status ===
-      "completed" &&
+        "completed" &&
       job.result
     ) {
       try {
@@ -5407,7 +6263,7 @@ app.listen(
     );
 
     console.log(
-      " STREMIO PT-BR 8.2 QUALITY + CUE OWNERSHIP"
+      " STREMIO PT-BR 8.2.2 QUALITY + CUE OWNERSHIP + SELF-HEAL"
     );
 
     console.log(
@@ -5428,7 +6284,7 @@ app.listen(
     );
 
     console.log(
-      "Cloud OpenSubtitles: ATIVO + LAZY ✅"
+      "Cloud OpenSubtitles: ATIVO + LAZY + SELF-HEAL ✅"
     );
 
     console.log(
@@ -5459,10 +6315,6 @@ app.listen(
     );
 
     console.log(
-      "Gen Z/Alpha + LGBTQIAPN+ + drag/reality/fandom: STYLE PACK 8.2 ✅"
-    );
-
-    console.log(
       "Culture Hard Locks: ATIVOS ✅"
     );
 
@@ -5479,7 +6331,15 @@ app.listen(
     );
 
     console.log(
-      "ATE / SLAY / SHADE / TEA guards: ATIVOS ✅"
+      "BOTTOM + palavrões/intensificadores: GUARDS ATIVOS ✅"
+    );
+
+    console.log(
+      "Censored Bleep Reconstruction: ATIVO ✅"
+    );
+
+    console.log(
+      "Localização brasileira por intenção: ATIVA ✅"
     );
 
     console.log(
@@ -5491,11 +6351,7 @@ app.listen(
     );
 
     console.log(
-      "Auditoria ampla/Deep Audit: REMOVIDAS ✅"
-    );
-
-    console.log(
-      "Repair: cirúrgico + segunda checagem local ✅"
+      "Repair: UMA passada cirúrgica; sem segunda retradução ✅"
     );
 
     console.log(
