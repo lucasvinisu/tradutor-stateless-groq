@@ -5,10 +5,10 @@ const crypto = require("crypto");
 const app = express();
 app.use(cors());
 app.disable("x-powered-by");
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.2.4 — SDH CLEAN + PROFANITY INTEGRITY + PT-BR QA
+// STREMIO PT-BR 8.3.0 — HIGH QUALITY + HARD SDH + LOCAL AUDIO SYNC SUPPORT
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -16,8 +16,9 @@ const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
+const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
-const CACHE_VERSION = "8.2.4-sdh-profanity-ptbr-qa";
+const CACHE_VERSION = "8.3.0-high-qa-hard-sdh-audio-sync";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -25,7 +26,7 @@ const FETCH_TIMEOUT_MS = 25000;
 
 const GEMINI_MIN_START_INTERVAL_MS = 4300;
 
-const PLAN_THINKING = "minimal";
+const PLAN_THINKING = "high";
 const PLAN_MAX_OUTPUT_TOKENS = 2200;
 const PLAN_TIMEOUT_MS = 60000;
 const PLAN_RETRIES = 2;
@@ -36,7 +37,7 @@ const MAIN_BATCH_MAX_CHARS = 15000;
 const MAIN_CONCURRENCY = 2;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
-const MAIN_THINKING = "medium";
+const MAIN_THINKING = "high";
 const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 120000;
 const MAIN_HTTP_RETRIES = 4;
@@ -45,27 +46,26 @@ const MAIN_PARSE_ATTEMPTS = 2;
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 80;
 const REPAIR_BATCH_MAX_CUES = 20;
-const REPAIR_THINKING = "medium";
+const REPAIR_THINKING = "high";
 const REPAIR_MAX_OUTPUT_TOKENS = 10000;
 const REPAIR_TIMEOUT_MS = 90000;
 const REPAIR_HTTP_RETRIES = 3;
 const REPAIR_PARSE_ATTEMPTS = 2;
 
-// QA leve: somente Embedded. Não reescreve a legenda; apenas aponta cues
-// claramente problemáticos para a mesma passada cirúrgica de repair.
+// QA semântico EN×PT para TODAS as fontes. Não reescreve diretamente;
+// apenas aponta cues problemáticos para a única passada cirúrgica de repair.
 const QA_ENABLED = true;
-const QA_EMBEDDED_ONLY = true;
-const QA_BATCH_MAX_CUES = 240;
+const QA_BATCH_MAX_CUES = 120;
 const QA_BATCH_MAX_CHARS = 18000;
-const QA_THINKING = "minimal";
-const QA_MAX_OUTPUT_TOKENS = 6000;
-const QA_TIMEOUT_MS = 60000;
-const QA_HTTP_RETRIES = 2;
+const QA_THINKING = "high";
+const QA_MAX_OUTPUT_TOKENS = 9000;
+const QA_TIMEOUT_MS = 120000;
+const QA_HTTP_RETRIES = 3;
 const QA_PARSE_ATTEMPTS = 2;
 const QA_MAX_FLAGS_TOTAL = 80;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
-const RECOVERY_SIGNING_KEY = LOCAL_BRIDGE_SECRET || GEMINI_API_KEY || "stremio-ptbr-8.2.2";
+const RECOVERY_SIGNING_KEY = LOCAL_BRIDGE_SECRET || GEMINI_API_KEY || "stremio-ptbr-8.3.0";
 
 const translationCache = new Map();
 const jobs = new Map();
@@ -279,7 +279,7 @@ const SPEAKER_RE = /^@@SPK:([^@]+)@@\s*/u;
 
 // Descrições de acessibilidade / SDH em EN e PT-BR. A lista é propositalmente
 // ampla para detectar descrições dentro de []/() sem apagar fala normal.
-const SDH_WORDS = /(?:laugh|laughing|laughter|chuckle|chuckling|giggle|giggling|sigh|sighing|gasp|gasping|pant|panting|breath|breathing|breathes|inhale|inhaling|exhale|exhaling|whimper|whimpering|cry|crying|sob|sobbing|music|musical|song|singing|sings|chant|chanting|humming|hums|applause|cheer|cheering|clap|clapping|door|knock|knocking|bang|banging|slam|slamming|phone|ring|ringing|buzz|buzzing|beep|beeping|static|groan|groaning|grunt|grunting|scream|screaming|yell|yelling|shout|shouting|whisper|whispering|murmur|murmuring|inaudible|indistinct|foreign language|clears? throat|sniff|sniffing|cough|coughing|footstep|footsteps|steps|walking|running|rustle|rustling|leaves|branch|twig|floorboard|creak|creaking|crack|cracking|snap|snapping|glass|shatter|shattering|smash|horn|honking|tire|tires|engine|car|vehicle|wind|thunder|rain|storm|fire|crackle|crackling|growl|growling|roar|roaring|howl|howling|cricket|crickets|bird|birds|dog|dogs|cat|cats|moan|moaning|distorted|echo|echoing|voice|voices|distant|offscreen|off-screen|background|continues|speaking|calling|calls|narrating|voice-over|muffled|thud|impact|scrape|scraping|metal|click|clicking|lock|unlock|faint|softly|loudly|tv|radio|siren|alarm|gunshot|gunshots|explosion|heartbeat|wheez|wheezing|whistl|whistling|snoring|screech|squeal|squealing|approaching|receding|door closes|door opens|footsteps approaching|breathing heavily|song playing|music playing|risos?|rindo|risadinhas?|gargalhada|gargalhando|suspira|suspiro|ofegante|ofegando|respira(?:ção|ndo)?|respiração|chora|chorando|soluça|soluçando|música|canção|cantando|canto|tarareando|aplausos?|palmas|gritos?|gritando|sussurra|sussurrando|murmura|murmurando|chamando|narração|narrando|falando baixo|continua falando|inaudível|indistinto|estática|passos?|pisada|pisadas|correndo|folhas?|farfalhando|galhos?|quebrando|assoalho|rangendo|rangido|vidro|estilhaça|estilhaçando|buzina|pneus?|motor|marcha lenta|vento|trovão|chuva|tempestade|fogo|estalando|uivo|grilos?|rosnado|rosnando|grunhido|grunhidos|guincho|guinchos|distorcido|distorcida|eco|voz ao longe|ao longe|ao fundo|em voz baixa|voz baixa|voz de|baque|impacto|raspando|metal|clique|clicando|tranca a porta|porta fechando|porta abrindo|sirene|alarme|tiro|tiros|explosão|menina rindo|som abafado)/i;
+const SDH_WORDS = /(?:laugh|laughing|laughter|chuckle|chuckling|giggle|giggling|sigh|sighing|gasp|gasping|pant|panting|breath|breathing|breathes|inhale|inhaling|exhale|exhaling|whimper|whimpering|cry|crying|sob|sobbing|music|musical|song|singing|sings|chant|chanting|humming|hums|applause|cheer|cheering|clap|clapping|door|knock|knocking|bang|banging|slam|slamming|phone|ring|ringing|buzz|buzzing|beep|beeping|static|groan|groaning|grunt|grunting|scream|screaming|yell|yelling|shout|shouting|whisper|whispering|murmur|murmuring|talk|talking|quietly|inaudible|indistinct|foreign language|clears? throat|sniff|sniffing|cough|coughing|footstep|footsteps|steps|walking|running|rustle|rustling|leaves|branch|twig|floorboard|creak|creaking|crack|cracking|snap|snapping|glass|shatter|shattering|smash|horn|honking|tire|tires|engine|car|vehicle|wind|thunder|rain|storm|fire|crackle|crackling|growl|growling|roar|roaring|howl|howling|cricket|crickets|bird|birds|dog|dogs|cat|cats|moan|moaning|distorted|echo|echoing|voice|voices|distant|offscreen|off-screen|background|continues|speaking|calling|calls|narrating|voice-over|muffled|thud|impact|squish|squishing|squelch|squelching|scrape|scraping|metal|click|clicking|lock|unlock|faint|softly|loudly|tv|radio|siren|alarm|gunshot|gunshots|explosion|heartbeat|wheez|wheezing|whistl|whistling|snoring|screech|squeal|squealing|approaching|receding|door closes|door opens|footsteps approaching|breathing heavily|song playing|music playing|risos?|rindo|risadinhas?|gargalhada|gargalhando|suspira|suspiro|ofegante|ofegando|respira(?:ção|ndo)?|respiração|chora|chorando|soluça|soluçando|música|canção|cantando|canto|tarareando|aplausos?|palmas|gritos?|gritando|sussurra|sussurrando|murmura|murmurando|chamando|narração|narrando|falando baixo|continua falando|inaudível|indistinto|estática|passos?|pisada|pisadas|correndo|folhas?|farfalhando|galhos?|quebrando|assoalho|rangendo|rangido|vidro|estilhaça|estilhaçando|buzina|pneus?|motor|marcha lenta|vento|trovão|chuva|tempestade|fogo|estalando|uivo|grilos?|rosnado|rosnando|grunhido|grunhidos|guincho|guinchos|distorcido|distorcida|eco|voz ao longe|ao longe|ao fundo|em voz baixa|voz baixa|voz de|baque|impacto|raspando|metal|clique|clicando|tranca a porta|porta fechando|porta abrindo|sirene|alarme|tiro|tiros|explosão|menina rindo|som abafado)/i;
 
 const CENSOR_CLUSTER_RE = /[!@#$%^&*()_+=~`¤£€¥¢]{3,}/gu;
 const STANDALONE_SYMBOL_CLUSTER_RE = /(^|\s)[!@#$%^&*()_+=~`¤£€¥¢]{3,}(?=\s|$)/gu;
@@ -382,7 +382,7 @@ function looksLikeSdhDescriptor(value) {
 function looksLikeBareSdhLine(value) {
   const text = stripMarkup(value).replace(/[.:;!?]+$/g, "").replace(/\s+/g, " ").trim();
   if (!text || text.length > 100 || looksLikeSpeakerLabel(text)) return false;
-  return /^(?:sound of |sounds of )?(?:static|laughter|applause|music(?: playing)?|song(?: playing)?|footsteps?(?: approaching| receding)?|door (?:opens|closes|slams|creaks)|phone (?:rings|buzzes)|wind (?:blows|howls)|thunder|rain(?: falling)?|fire crackling|glass (?:breaks|shatters)|engine (?:starts|idles)|car horn|tires? screeching|branch (?:breaks|snaps)|leaves rustling|heavy breathing|panting|gasping|sobbing|crying|humming|whistling|growling|roaring|howling|muffled voices?|distant voices?|estática|risos?|aplausos?|música|passos?(?: se aproximando| ao longe)?|porta (?:abrindo|fechando|batendo|rangendo)|telefone (?:tocando|vibrando)|vento (?:soprando|uivando)|trovão|chuva|fogo estalando|vidro (?:quebrando|estilhaçando)|motor (?:ligando|em marcha lenta)|buzina|pneus? cantando|galho (?:quebrando|estalando)|folhas farfalhando|respiração (?:forte|ofegante)|ofegante|ofegando|chorando|soluçando|tarareando|assobiando|rosnado|uivo|vozes? abafadas?|vozes? ao longe)$/i.test(text);
+  return /^(?:sound of |sounds of )?(?:static|laughter|applause|music(?: playing)?|song(?: playing)?|footsteps?(?: approaching| receding)?|door (?:opens|closes|slams|creaks)|phone (?:rings|buzzes)|wind (?:blows|howls)|thunder|rain(?: falling)?|fire crackling|glass (?:breaks|shatters)|engine (?:starts|idles)|car horn|tires? screeching|branch (?:breaks|snaps)|leaves rustling|heavy breathing|panting|gasping|sobbing|crying|humming|whistling|growling|roaring|howling|muffled voices?|distant voices?|estática|risos?|aplausos?|música|passos?(?: se aproximando| ao longe)?|porta (?:abrindo|fechando|batendo|rangendo)|telefone (?:tocando|vibrando)|vento (?:soprando|uivando)|trovão|chuva|fogo estalando|vidro (?:quebrando|estilhaçando)|motor (?:ligando|em marcha lenta)|buzina|pneus? cantando|galho (?:quebrando|estalando)|folhas farfalhando|respiração (?:forte|ofegante)|ofegante|ofegando|chorando|soluçando|tarareando|assobiando|rosnado|uivo|vozes? abafadas?|vozes? ao longe|som (?:abafado )?(?:de )?(?:passos|pisadas|esmagamento|algo sendo esmagado)|esmagando|som pastoso)$/i.test(text);
 }
 
 function removeSdhSegments(text) {
@@ -411,20 +411,51 @@ function collapseExtendedVocalization(value) {
 function looksLikeMaskedProfanityToken(token) {
   const raw = String(token || "");
   if (!raw) return false;
-  const hasMask = CENSOR_CHAR_RE.test(raw) || /\.{2,}/.test(raw);
-  if (!hasMask) return false;
-  const plain = raw.toLowerCase().replace(/[^a-zà-ÿ]/g, "");
-  const maskCount = (raw.match(/[*#@%&$]/g) || []).length + (raw.match(/\./g) || []).length;
-  const stems = /^(?:f|fu|fuc|fuck|motherf|sh|shi|shit|bi|bit|bitch|cu|cun|cunt|ass|assh|dic|dick|pus|puss|pussy|put|puta|porr|caralh|fod|fud|merd)/i;
-  const obviousMasked = /^(?:f|p|c|b|m)[*#@%&$!.]{2,}/i.test(raw) || /^(?:c|sh|b|d|p)[*#@%&$!.]+[a-zà-ÿ]+/i.test(raw);
-  if (!stems.test(plain) && !obviousMasked) return false;
-  if (plain.length <= 1 && maskCount < 2) return false;
-  return true;
-}
 
+  const symbolMask = /[*#@%&$]/u.test(raw);
+  const dotMask = /(?:\.{2,}|…)/u.test(raw);
+  if (!symbolMask && !dotMask) return false;
+
+  const maskIndex = raw.search(/[*#@%&$]|\.{2,}|…/u);
+  if (maskIndex <= 0) return false;
+
+  const visiblePrefix = raw
+    .slice(0, maskIndex)
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]/g, "");
+
+  if (!visiblePrefix) return false;
+
+  // IMPORTANTE: reticência normal NÃO é censura. "Shel...", "felt...",
+  // "Flora..." etc. precisam continuar sendo reticências, não BLEEP.
+  // Só tratamos pontos como máscara quando as letras visíveis são um
+  // prefixo curto e plausível de palavrão conhecido.
+  const dotPrefixes = new Set([
+    "f", "fu", "fuc", "fuck", "motherf",
+    "sh", "shi",
+    "b", "bi", "bit",
+    "c", "cu", "cun", "car", "cara", "caral",
+    "p", "pu", "put", "por", "porr", "pus", "puss",
+    "ass", "assh", "d", "di", "dic", "dick",
+    "fo", "fod", "fud", "me", "mer", "merd"
+  ]);
+
+  if (dotMask && !symbolMask) return dotPrefixes.has(visiblePrefix);
+
+  // Com *, #, &, @, %, $ a evidência de máscara é muito mais forte.
+  // Ainda exigimos um prefixo plausível para não converter símbolos comuns
+  // grudados a palavras normais em palavrão.
+  const symbolPrefixes = new Set([
+    ...dotPrefixes,
+    "s", "m"
+  ]);
+  return symbolPrefixes.has(visiblePrefix);
+}
 function replaceMaskedProfanity(value) {
   const decoded = decodeBasicEntities(value);
-  return decoded.replace(/[\p{L}][\p{L}0-9*#@%&$!._~’'-]{1,28}/gu, token => {
+  return decoded.replace(/[\p{L}][\p{L}0-9*#@%&$!._~…’'-]{1,28}/gu, token => {
     return looksLikeMaskedProfanityToken(token) ? BLEEP_TOKEN : token;
   });
 }
@@ -432,7 +463,7 @@ function replaceMaskedProfanity(value) {
 function hasArtificialCensorship(value) {
   const text = decodeBasicEntities(value);
   if (text.includes(BLEEP_TOKEN)) return true;
-  const tokens = text.match(/[\p{L}][\p{L}0-9*#@%&$!._~’'-]{1,28}/gu) || [];
+  const tokens = text.match(/[\p{L}][\p{L}0-9*#@%&$!._~…’'-]{1,28}/gu) || [];
   if (tokens.some(looksLikeMaskedProfanityToken)) return true;
   CENSOR_CLUSTER_RE.lastIndex = 0;
   const cluster = CENSOR_CLUSTER_RE.test(text);
@@ -459,17 +490,27 @@ function normalizeNoiseSymbols(value) {
     .trim();
 }
 
+function looksLikeCaptionCredit(value) {
+  const text = stripMarkup(value).replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  return /^(?:caption(?:ed|ing)|closed captions?|subtitles?|subtitling)\s+(?:by|provided by|courtesy of)\b/i.test(text) ||
+    /\bmedia access group\b.*\bwgbh\b/i.test(text);
+}
+
 function cleanSourceLine(line) {
   let text = stripMarkup(String(line || "")).trim();
-  if (!text) return "";
+  if (!text || looksLikeCaptionCredit(text)) return "";
   text = stripTrailingSpeakerLabel(text);
   text = removeSdhSegments(text)
-    .replace(/[♪♫♬]/gu, " ");
+    .replace(/[♪♫♬★☆✦✧]/gu, " ");
   text = collapseExtendedVocalization(text);
   text = replaceCensoredBleps(text);
   text = normalizeNoiseSymbols(text);
   text = text.replace(/^\s*[:;]+\s*/u, "").trim();
-  if (looksLikeBareSdhLine(text)) return "";
+  if (looksLikeBareSdhLine(text) || looksLikeCaptionCredit(text)) return "";
+  // Single *, ★, … and other non-verbal placeholders are metadata/noise,
+  // never dialogue. A real censored cluster has already become BLEEP_TOKEN.
+  if (!text.includes(BLEEP_TOKEN) && !/[\p{L}\p{N}]/u.test(text)) return "";
   if (!text || /^[-–—/\\|:;\s]*$/u.test(text) || isEmptyVocalization(text)) return "";
   return text;
 }
@@ -603,7 +644,9 @@ function sourceDialogueDashCount(block) {
 
 function stripOutputAccessibilityLine(line) {
   let text = stripMarkup(String(line || "")).trim();
-  if (!text) return "";
+  if (!text || looksLikeCaptionCredit(text)) return "";
+  text = text.replace(/[♪♫♬★☆✦✧]/gu, " ").trim();
+  if (!text || (!/[\p{L}\p{N}]/u.test(text) && !hasArtificialCensorship(text))) return "";
 
   // Remove speaker prefix que o modelo eventualmente tenha recriado.
   const info = extractSpeaker(text);
@@ -741,7 +784,7 @@ function auditTimestamps(sourceSrt, finalSrt, label) {
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.2.4
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.0
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -829,13 +872,16 @@ GEN Z / GEN ALPHA / INTERNET
 - Entenda memes, fandom, stan culture, cringe, delulu, iconic, mother, serve, clocked, gag, ate, shade e linguagem de internet pelo SENTIDO.
 - Use equivalentes brasileiros atuais quando naturais.
 - Não transforme toda fala jovem em caricatura de TikTok.
-- Preserve idade, personalidade, classe, formalidade e situação social do falante.
+- Não injete gíria só para modernizar. "Qualé", "pistola" e equivalentes não são atalhos automáticos para informalidade.
+- Uma queen jovem no Werkroom pode pedir linguagem de fandom/Gen Z; uma personagem adulta em drama/horror pode pedir fala simples contemporânea sem gíria de internet.
+- Preserve idade, personalidade, classe, formalidade, época da obra e situação social do falante.
 
 METÁFORAS E NATURALIDADE
 - Traduza metáforas pela imagem/intenção que um brasileiro entenderia naturalmente.
 - Evite calques estranhos e diminutivos artificiais que ninguém diria em PT-BR.
 - Se o inglês usa fire/spark/heat para dizer que algo despertou uma emoção, prefira uma expressão natural como "acendeu uma chama em mim", "despertou algo em mim" etc., conforme contexto; não invente objetos literais como "forneuzinha" sem motivo real.
 - Referências com tradução brasileira consolidada podem ser localizadas: Death Star -> Estrela da Morte, por exemplo.
+- CONTINUIDADE AUDIOVISUAL: se uma palavra inglesa estiver sendo soletrada, formada por iniciais, escrita na tela ou usada como pista visual, preserve a relação com as letras/imagem. Não traduza de modo que a pista deixe de fazer sentido. Quando necessário, mantenha a palavra visual em inglês e deixe o sentido claro sem quebrar o cue.
 - Em fala casual: "tô", "tá", "pra", "né" podem ser usados quando combinarem com a pessoa.
 - Não use lusitanismos ou linguagem burocrática.
 - Não traduza expressão idiomática palavra por palavra.
@@ -920,26 +966,39 @@ Não redistribua conteúdo entre ids.
 `;
 
 const QA_PROMPT = `
-Você é um revisor de QUALIDADE de legendas brasileiras.
-NÃO traduza e NÃO reescreva a legenda. Sua única tarefa é apontar IDs que têm defeito CLARO.
+Você é o revisor semântico e linguístico FINAL de legendas EN→PT-BR.
+Você recebe EN e PT do MESMO cue. NÃO reescreva aqui: apenas sinalize IDs com defeito REAL para a única passada de repair.
 
-Sinalize somente quando houver pelo menos um destes problemas:
-- erro ortográfico real, palavra corrompida/inexistente ou erro de digitação;
-- português quebrado, calque evidente ou frase claramente não natural em PT-BR;
-- gíria artificial/datada que destoa e parece escolha mecânica;
-- autocensura gráfica de palavrão (f..., fu&#, p***, símbolos etc.);
-- nome de personagem/speaker label que vazou para a legenda;
-- descrição SDH/acessibilidade de som, ação, voz ou ambiente;
-- símbolos aleatórios, pontuação quebrada ou artefato de formatação;
-- gagueira gráfica/alongamento escrito sem necessidade (e-eu, é-é-é, amo-o-o-o).
+Faça revisão profunda, não superficial. Verifique:
+- sentido: pessoa verbal, sujeito, objeto, negação, tempo, intensidade e relação entre pronomes;
+- omissão, invenção ou conteúdo que pertence a outro cue;
+- gênero/contexto quando o EN e a bíblia deixarem claro;
+- expressão idiomática/calque: preserve intenção, não palavras;
+- ortografia, digitação, concordância e português quebrado;
+- naturalidade PT-BR contemporânea apropriada à idade/personagem/obra;
+- gíria artificial, datada ou inserida apenas para "parecer jovem";
+- palavrão: não censurar, não suavizar por pudor e não aumentar a força sem base;
+- speaker labels, SDH/CC, descrição sonora, créditos de caption, símbolos e placeholders;
+- gagueira gráfica/alongamento que não deve aparecer na legenda final;
+- continuidade audiovisual, inclusive palavras/letras exibidas na tela.
 
-NÃO sinalize:
-- informalidade brasileira natural (tô, tá, pra, né);
-- palavrões escritos normalmente por extenso;
-- nomes próprios, marcas ou termos culturais protegidos;
-- escolhas estilísticas aceitáveis apenas porque você faria diferente.
+Considere defeitos claros como estes padrões observados:
+- "Why do you let them hurt me?" não pode virar algo com "te machucarem";
+- "They alerted..." não pode virar "Alertei...";
+- "for once" não é "por um dia";
+- "Shh, shh" não é "Xis, xis";
+- "have you even been to sleep yet?" não é pergunta habitual "você sequer dorme?";
+- "totally crazy" não pode virar "totalmente loucura";
+- erros como "ossas opções" são inaceitáveis;
+- "my child" deve respeitar o gênero conhecido da criança no contexto;
+- "subjects" não deve virar automaticamente "sujeitos" se significar pessoas pesquisadas/entrevistadas;
+- "cry wolf" e "give them a holler" exigem sentido idiomático;
+- "malevolent force" não deve virar português infantil/artificial como "força maldosa";
+- não use "qualé", "pistola" ou construções como "bêbada que só a porra" por automatismo estilístico.
 
-Seja conservador: marque defeito claro, não preferência pessoal.
+NÃO marque escolha apenas diferente, mas perfeitamente correta e natural.
+Tô/tá/pra/né e palavrões por extenso podem ser ótimos quando combinarem com a personagem.
+Se houver dúvida real entre duas boas traduções, NÃO marque. Se houver erro objetivo ou português claramente ruim, MARQUE.
 `;
 
 const QA_SCHEMA = {
@@ -1155,6 +1214,99 @@ async function geminiRequest({ system, user, schema, thinkingLevel, maxOutputTok
   throw lastError || new Error(`Gemini ${metric} falhou.`);
 }
 
+function parseGeminiOffsetMs(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(-?\d+(?:\.\d+)?)s$/i);
+  if (match) return Math.round(Number(match[1]) * 1000);
+  const n = Number(text);
+  return Number.isFinite(n) ? Math.round(n * 1000) : null;
+}
+
+function extractTranscribedWords(data) {
+  const words = [];
+  for (const step of Array.isArray(data?.steps) ? data.steps : []) {
+    for (const content of Array.isArray(step?.content) ? step.content : []) {
+      for (const annotation of Array.isArray(content?.annotations) ? content.annotations : []) {
+        if (annotation?.type !== "word_info") continue;
+        const startMs = parseGeminiOffsetMs(annotation.start_offset);
+        const endMs = parseGeminiOffsetMs(annotation.end_offset);
+        const text = String(annotation.text || "").trim();
+        if (!text || startMs == null || endMs == null) continue;
+        words.push({ text, startMs, endMs, speaker: String(annotation.speaker || "") });
+      }
+    }
+  }
+  return words;
+}
+
+async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY não configurada.");
+  const cleanBase64 = String(audioBase64 || "").trim();
+  if (!cleanBase64) throw new Error("Áudio vazio.");
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await acquireGeminiSlot(null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120000);
+    try {
+      console.log(`[GEMINI TRANSCRIBE] ${GEMINI_TRANSCRIBE_MODEL} request ${attempt}/3 | word timestamps.`);
+      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+          "Api-Revision": "2026-05-20"
+        },
+        body: JSON.stringify({
+          model: GEMINI_TRANSCRIBE_MODEL,
+          input: [{ type: "audio", data: cleanBase64, mime_type: mimeType }],
+          generation_config: {
+            transcription_config: {
+              language_codes: [],
+              mode: { type: "verbatim", timestamp_granularities: ["word"] }
+            }
+          },
+          store: false
+        }),
+        signal: controller.signal
+      });
+
+      const raw = await response.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : {}; } catch {}
+      if (response.ok && data) {
+        const words = extractTranscribedWords(data);
+        const text = extractInteractionText(data);
+        if (!words.length) throw new Error("Gemini Transcribe não retornou timestamps de palavras.");
+        console.log(`[GEMINI TRANSCRIBE] OK | words=${words.length}.`);
+        return { text, words };
+      }
+
+      const error = new Error(`GEMINI ${GEMINI_TRANSCRIBE_MODEL} HTTP ${response.status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1200)}`);
+      error.status = response.status;
+      if (response.status === 429 && attempt < 3) {
+        const wait = retryDelayMs(response, data, attempt);
+        console.warn(`[GEMINI TRANSCRIBE] 429; retry em ${(wait / 1000).toFixed(1)}s.`);
+        await sleep(wait);
+        continue;
+      }
+      if ((response.status >= 500 || [408, 409, 425].includes(response.status)) && attempt < 3) {
+        await sleep(Math.min(4000 * attempt, 12000));
+        continue;
+      }
+      throw error;
+    } catch (error) {
+      lastError = error?.name === "AbortError" ? new Error("Gemini Transcribe: timeout.") : error;
+      if (attempt >= 3 || (lastError?.status && lastError.status < 500 && lastError.status !== 429 && ![408, 409, 425].includes(lastError.status))) throw lastError;
+      await sleep(Math.min(3000 * attempt, 9000));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError || new Error("Gemini Transcribe falhou.");
+}
+
 // ============================================================
 // PLANNER / BATCHES
 // ============================================================
@@ -1344,7 +1496,7 @@ async function translateAllMain(blocks, plan, job) {
 }
 
 // ============================================================
-// PT-BR QA SCANNER — EMBEDDED
+// PT-BR QA SCANNER — EN×PT / TODAS AS FONTES
 // ============================================================
 
 function buildQaBatches(blocks, translations) {
@@ -1352,7 +1504,12 @@ function buildQaBatches(blocks, translations) {
   let current = [];
   let chars = 0;
   for (const block of blocks) {
-    const item = { i: block.index, pt: String(translations.get(block.index) || "") };
+    const item = {
+      i: block.index,
+      en: String(block.text || ""),
+      pt: String(translations.get(block.index) || ""),
+      ...(block.speakerHint ? { speaker: block.speakerHint } : {})
+    };
     const size = JSON.stringify(item).length;
     if (current.length && (current.length >= QA_BATCH_MAX_CUES || chars + size > QA_BATCH_MAX_CHARS)) {
       batches.push(current);
@@ -1381,9 +1538,8 @@ function parseQaIssues(text, allowedIds) {
   return out;
 }
 
-async function scanPtbrQuality(blocks, translations, job) {
+async function scanPtbrQuality(blocks, translations, plan, job) {
   if (!QA_ENABLED) return [];
-  if (QA_EMBEDDED_ONLY && job.sourceKind !== "embedded") return [];
 
   const batches = buildQaBatches(blocks, translations);
   job.stats.qaBatches = batches.length;
@@ -1401,7 +1557,7 @@ async function scanPtbrQuality(blocks, translations, job) {
       try {
         const response = await geminiRequest({
           system: QA_PROMPT,
-          user: `CUES PT-BR PARA AUDITORIA:\n${JSON.stringify(batch)}\n\nRetorne somente IDs com defeito CLARO. Não reescreva os cues.`,
+          user: `BÍBLIA EDITORIAL DO EPISÓDIO:\n${JSON.stringify(plan || {})}\n\nCUES EN×PT PARA AUDITORIA:\n${JSON.stringify(batch)}\n\nRetorne somente IDs com defeito CLARO. Não reescreva os cues.`,
           schema: QA_SCHEMA,
           thinkingLevel: QA_THINKING,
           maxOutputTokens: QA_MAX_OUTPUT_TOKENS,
@@ -1497,7 +1653,15 @@ function localReasonsForCue(block, pt, filename) {
   if (translated.includes(BLEEP_TOKEN)) reasons.push("UNRESOLVED_BLEEP_TOKEN");
   if (translated.split("\n").some(line => { const info = extractSpeaker(line); return Boolean(info.speaker); })) reasons.push("SPEAKER_LABEL_RESIDUE");
   if (/\[[^\]]{1,100}\]|\([^)]{1,100}\)/u.test(translated) && translated.match(/\[[^\]]{1,100}\]|\([^)]{1,100}\)/gu)?.some(part => looksLikeSdhDescriptor(part.slice(1, -1)))) reasons.push("SDH_RESIDUE");
-  if (/\b(?:nabeira|olurando|dem[oô]nico|podrindo|qualé)\b/i.test(translated) || /\btomar\s+consist[eê]ncia\b/i.test(translated)) reasons.push("KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS");
+  if (/\b(?:nabeira|olurando|dem[oô]nico|podrindo|qualé|ossas)\b/i.test(translated) || /\btomar\s+consist[eê]ncia\b/i.test(translated) || /\btotalmente\s+loucura\b/i.test(translated) || /\bxis\s*,?\s*xis\b/i.test(translated)) reasons.push("KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS");
+  if (/\bfor\s+once\b/i.test(en) && /\bpor\s+um\s+dia\b/i.test(translated)) reasons.push("IDIOM_FOR_ONCE_MISTRANSLATED");
+  if (/\bcry\s+wolf\b/i.test(en) && /\balarmar\b/i.test(translated)) reasons.push("IDIOM_CRY_WOLF_LITERAL");
+  if (/\bholler\b/i.test(en) && /\b(?:dar|desse|demos|deu|um)\s+(?:um\s+)?al[oô]\b/i.test(translated)) reasons.push("IDIOM_HOLLER_LITERAL");
+  if (/\bmalevolent\s+force\b/i.test(en) && /\bforça\s+maldosa\b/i.test(translated)) reasons.push("UNNATURAL_MALEVOLENT_FORCE");
+  if (/\bsubjects?\b/i.test(en) && /\bsujeitos?\b/i.test(translated)) reasons.push("POSSIBLE_LITERAL_SUBJECTS");
+  if (/\b(?:qualé|pistola)\b/i.test(translated)) reasons.push("POSSIBLE_FORCED_OR_DATED_SLANG");
+  if (/\bb[eê]bad[oa]\s+que\s+s[oó]\s+a\s+porra\b/i.test(translated)) reasons.push("FORCED_PROFANITY_REGISTER");
+  if (translated.split("\n").some(line => [...line].length > 52)) reasons.push("OVERLONG_SUBTITLE_LINE");
   if (en.includes(BLEEP_TOKEN) && /\b(?:bem|muito|super)\s*[.!?,;:]?\s*$/i.test(translated.trim())) reasons.push("BLEEP_CREATED_DANGLING_SENTENCE");
 
   if (drag) {
@@ -1664,7 +1828,7 @@ async function translateSrt(sourceSrt, job) {
   const blocks = parseSrt(sourceSrt);
   if (!blocks.length) throw new Error("Nenhum cue SRT válido.");
   job.stats.sourceCues = blocks.length;
-  console.log(`[PIPELINE 8.2.4] fonte=${job.sourceKind} | ${blocks.length} cues.`);
+  console.log(`[PIPELINE 8.3.0] fonte=${job.sourceKind} | ${blocks.length} cues.`);
 
   const plan = await buildEpisodePlan(blocks, job);
   job.progress = 5;
@@ -1680,7 +1844,7 @@ async function translateSrt(sourceSrt, job) {
 
   // Para Embedded fazemos uma auditoria PT-BR leve: ela só aponta IDs;
   // quem corrige continua sendo a única passada cirúrgica de repair.
-  const qaIssues = await scanPtbrQuality(blocks, mainTranslations, job);
+  const qaIssues = await scanPtbrQuality(blocks, mainTranslations, plan, job);
   let finalTranslations = await tryFocusedRepair(blocks, mainTranslations, plan, job, qaIssues);
   finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
@@ -1691,7 +1855,7 @@ async function translateSrt(sourceSrt, job) {
 
   const finalSrt = buildSrt(blocks, finalTranslations);
   auditTimestamps(sourceSrt, finalSrt, "FINAL");
-  console.log(`[PIPELINE 8.2.4] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
+  console.log(`[PIPELINE 8.3.0] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
   return finalSrt;
 }
 
@@ -1798,12 +1962,12 @@ function selectEnglishSubtitle(subtitles) {
 async function fetchOpenSubtitlesSource({ type, id, filename, videoSize, videoHash }) {
   const url = buildOpenSubtitlesUrl(type, id, { filename, videoSize, videoHash });
   console.log(`[OPENSUBTITLES CLOUD] ${url}`);
-  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.2.4" } });
+  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.0" } });
   if (!response.ok) throw new Error(`OpenSubtitles HTTP ${response.status}.`);
   const data = await response.json();
   const target = selectEnglishSubtitle(data?.subtitles);
   if (!target) return null;
-  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.2.4" } });
+  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.0" } });
   if (!subtitleResponse.ok) throw new Error(`Download OpenSubtitles HTTP ${subtitleResponse.status}.`);
   const raw = normalizeSrt(await subtitleResponse.text());
   if (!raw || raw.length > MAX_SOURCE_CHARS) throw new Error("Legenda OpenSubtitles vazia/grande demais.");
@@ -1876,9 +2040,9 @@ async function recoverCloudJob(token) {
 
 const manifest = {
   id: "org.tradutor.stateless.gemini.free",
-  version: "8.2.4",
+  version: "8.3.0",
   name: "PT-BR Cloud • OpenSubtitles",
-  description: "OpenSubtitles/Embedded inglês → PT-BR contextual com Cue Ownership, limpeza SDH, integridade de palavrões, QA PT-BR e self-heal.",
+  description: "OpenSubtitles inglês → PT-BR contextual com HIGH thinking, Cue Ownership, HARD SDH, integridade de palavrões, QA semântico EN×PT e self-heal. A Ponte Local usa também Audio Sync.",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
@@ -1892,7 +2056,7 @@ app.get("/", (req, res) => res.json({
   status: "online",
   version: manifest.version,
   model: GEMINI_MODEL,
-  mode: "CLOUD_OPEN_SUBTITLES_PLUS_EMBEDDED_API",
+  mode: "CLOUD_OPENSUB_PLUS_LOCAL_TRANSLATION_AND_AUDIO_TRANSCRIBE",
   mainBatchMaxCues: MAIN_BATCH_MAX_CUES,
   mainConcurrency: MAIN_CONCURRENCY,
   pacerMs: GEMINI_MIN_START_INTERVAL_MS,
@@ -1904,23 +2068,50 @@ app.get("/subtitles/:type/:id.json", publicSubtitlesHandler);
 app.get("/subtitles/:type/:id/:extra.json", publicSubtitlesHandler);
 
 // ============================================================
-// EMBEDDED API — PONTE LOCAL
+// LOCAL APIs — PONTE LOCAL
 // ============================================================
 
-app.post("/api/translate-embedded", async (req, res) => {
+async function localTranslateHandler(req, res, forcedSourceKind = "") {
   if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
   try {
     const type = String(req.body?.type || "unknown").trim();
     const videoId = String(req.body?.id || "unknown").trim();
-    const filename = String(req.body?.filename || req.body?.name || "embedded").trim();
+    const filename = String(req.body?.filename || req.body?.name || "local").trim();
+    const requestedKind = String(req.body?.sourceKind || forcedSourceKind || "embedded").trim().toLowerCase();
+    const sourceKind = forcedSourceKind || (requestedKind === "opensubtitles-local-sync" ? "opensubtitles-local-sync" : "embedded");
     const rawSrt = req.body?.srt;
     if (typeof rawSrt !== "string" || !rawSrt.trim()) return safeJson(res, { error: "Campo srt obrigatório." }, 400);
     if (rawSrt.length > MAX_SOURCE_CHARS) return safeJson(res, { error: "SRT grande demais." }, 413);
     const sourceSrt = cleanSrtForTranslation(rawSrt);
-    if (!sourceSrt || !parseSrt(sourceSrt).length) throw new Error("Embedded inválida após limpeza.");
-    const job = getOrCreateJob({ type, videoId, filename, sourceSrt, sourceKind: "embedded" }, { lazy: false });
+    if (!sourceSrt || !parseSrt(sourceSrt).length) throw new Error("Legenda local inválida após HARD SDH CLEAN.");
+    const job = getOrCreateJob({ type, videoId, filename, sourceSrt, sourceKind }, { lazy: false });
     return safeJson(res, jobResponse(req, job));
   } catch (error) {
+    return safeJson(res, { error: errorMessage(error) }, 500);
+  }
+}
+
+// Compatibilidade com a Ponte anterior.
+app.post("/api/translate-embedded", (req, res) => localTranslateHandler(req, res, "embedded"));
+app.post("/api/translate-local", (req, res) => localTranslateHandler(req, res));
+
+// O áudio é extraído LOCALMENTE da mídia real em reprodução e somente pequenos
+// trechos comprimidos são enviados para este endpoint. A chave Gemini continua
+// exclusivamente no Render.
+app.post("/api/audio-transcribe", async (req, res) => {
+  if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
+  try {
+    const audioBase64 = String(req.body?.audioBase64 || "").trim();
+    const mimeType = String(req.body?.mimeType || "audio/aac").trim().toLowerCase();
+    const label = String(req.body?.label || "anchor").replace(/\s+/g, " ").slice(0, 120);
+    if (!/^audio\//i.test(mimeType)) return safeJson(res, { error: "mimeType de áudio inválido." }, 400);
+    if (!audioBase64) return safeJson(res, { error: "audioBase64 obrigatório." }, 400);
+    if (audioBase64.length > 6 * 1024 * 1024) return safeJson(res, { error: "Trecho de áudio grande demais." }, 413);
+    console.log(`[AUDIO SYNC API] transcrevendo ${label} | base64=${audioBase64.length}.`);
+    const result = await geminiTranscribeInline(audioBase64, mimeType);
+    return safeJson(res, { ok: true, model: GEMINI_TRANSCRIBE_MODEL, text: result.text, words: result.words });
+  } catch (error) {
+    console.error(`[AUDIO SYNC API] ${errorMessage(error).slice(0, 300)}`);
     return safeJson(res, { error: errorMessage(error) }, 500);
   }
 });
@@ -2015,15 +2206,16 @@ app.get("/subtitle/:jobId.srt", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log("============================================================");
-  console.log(" STREMIO PT-BR 8.2.4 — SDH CLEAN + PROFANITY INTEGRITY + PT-BR QA");
+  console.log(" STREMIO PT-BR 8.3.0 — HIGH QUALITY + HARD SDH + AUDIO SYNC SUPPORT");
   console.log("============================================================");
   console.log(`Gemini: ${GEMINI_API_KEY ? "CONFIGURADA ✅" : "FALTANDO ❌"}`);
   console.log(`Modelo: ${GEMINI_MODEL} ✅`);
   console.log("Cloud OpenSubtitles: ATIVO + LAZY + SELF-HEAL ✅");
-  console.log("Embedded API para Ponte: ATIVA ✅");
+  console.log("APIs Local Embedded + OpenSub Sync: ATIVAS ✅");
+  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_MODEL} + word timestamps ✅`);
   console.log(`Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`);
   console.log(`Cue capsules: ${CAPSULE_CONTEXT_BEFORE} antes + target fechado + ${CAPSULE_CONTEXT_AFTER} depois ✅`);
-  console.log(`Main thinking: ${MAIN_THINKING} ✅`);
+  console.log(`Thinking: PLAN=${PLAN_THINKING} | MAIN=${MAIN_THINKING} | QA=${QA_THINKING} | REPAIR=${REPAIR_THINKING} ✅`);
   console.log(`Gate global: ${GEMINI_MIN_START_INTERVAL_MS}ms entre inícios ✅`);
   console.log("Culture Hard Locks: ATIVOS ✅");
   console.log("Condragulations / Sashay away / Shantay / Werkroom / Rusical: PROTEGIDOS ✅");
@@ -2031,9 +2223,9 @@ app.listen(PORT, () => {
   console.log("GAG/GAGGED reaction guard: ATIVO ✅");
   console.log("BOTTOM + palavrões/intensificadores: GUARDS ATIVOS ✅");
   console.log("Censored Bleep Reconstruction: ATIVO ✅");
-  console.log("SDH Sanitizer pré/pós Gemini: ATIVO ✅");
+  console.log("HARD SDH Sanitizer pré/pós Gemini + credits/placeholders: ATIVO ✅");
   console.log("Profanity Integrity Lock: ATIVO ✅");
-  console.log("PT-BR QA Scanner para Embedded: ATIVO ✅");
+  console.log("PT-BR QA semântico EN×PT para TODAS as fontes: ATIVO ✅");
   console.log("Format Lock Empty-Cue Rescue: ATIVO ✅");
   console.log("Localização brasileira por intenção: ATIVA ✅");
   console.log("Símbolos inúteis + notas estendidas: NORMALIZAÇÃO ATIVA ✅");
