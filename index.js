@@ -5,10 +5,10 @@ const crypto = require("crypto");
 const app = express();
 app.use(cors());
 app.disable("x-powered-by");
-app.use(express.json({ limit: "24mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.1 — HIGH QUALITY + HARD SDH + LIVE-FIRST AUDIO SYNC SUPPORT
+// STREMIO PT-BR 8.3.2 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -18,8 +18,10 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 const GEMINI_TRANSCRIBE_LIVE_MODEL = "gemini-3.5-transcribe-live";
+const GEMINI_LIVE_TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens";
+const GEMINI_LIVE_CONSTRAINED_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained";
 
-const CACHE_VERSION = "8.3.1-high-qa-hard-sdh-audio-sync-live";
+const CACHE_VERSION = "8.3.2-high-qa-hard-sdh-audio-sync-direct-live";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -66,7 +68,6 @@ const QA_PARSE_ATTEMPTS = 2;
 const QA_MAX_FLAGS_TOTAL = 80;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
-// Mantido em 8.3.0 para não invalidar recovery tokens já emitidos.
 const RECOVERY_SIGNING_KEY = LOCAL_BRIDGE_SECRET || GEMINI_API_KEY || "stremio-ptbr-8.3.0";
 
 const translationCache = new Map();
@@ -786,7 +787,7 @@ function auditTimestamps(sourceSrt, finalSrt, label) {
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.1
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.2
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -1312,450 +1313,104 @@ async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
   throw lastError || new Error("Gemini Transcribe falhou.");
 }
 
-function liveWsText(data) {
-  if (typeof data === "string") return data;
-  if (Buffer.isBuffer(data)) return data.toString("utf8");
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
-  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
-  return String(data || "");
-}
-
-async function geminiLiveTranscribeSegments(inputSegments) {
+async function createGeminiLiveEphemeralToken() {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY não configurada.");
-  if (typeof WebSocket !== "function") throw new Error("Runtime Node sem WebSocket nativo para Gemini Live.");
 
-  const segments = (Array.isArray(inputSegments) ? inputSegments : [])
-    .map((item, index) => ({
-      id: String(item?.id || `segment-${index + 1}`).slice(0, 120),
-      audioBase64: String(item?.audioBase64 || "").trim()
-    }))
-    .filter(item => item.audioBase64);
+  const now = Date.now();
+  const expireTime = new Date(now + 20 * 60 * 1000).toISOString();
+  const newSessionExpireTime = new Date(now + 2 * 60 * 1000).toISOString();
 
-  if (!segments.length) return [];
-
-  if (segments.length > 160) {
-    throw new Error("Muitos segmentos para uma sessão Live.");
-  }
-
-  let totalBytes = 0;
-
-  for (const segment of segments) {
-
-    const approx = Math.floor(
-      segment.audioBase64.length * 0.75
-    );
-
-    if (approx > 700000) {
-      throw new Error(
-        `Segmento Live grande demais: ${segment.id}.`
-      );
-    }
-
-    totalBytes += approx;
-  }
-
-  if (totalBytes > 12 * 1024 * 1024) {
-    throw new Error(
-      "Áudio Live total grande demais."
-    );
-  }
-
-  const wsUrl =
-    "wss://generativelanguage.googleapis.com/ws/" +
-    "google.ai.generativelanguage.v1beta." +
-    "GenerativeService.BidiGenerateContent" +
-    `?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
-  const ws = new WebSocket(wsUrl);
-
-  let closed = false;
-  let fatal = null;
-  let setupDone = false;
-
-  let setupResolve;
-  let setupReject;
-
-  const setupPromise = new Promise(
-    (resolve, reject) => {
-      setupResolve = resolve;
-      setupReject = reject;
-    }
-  );
-
-  const finals = [];
-  const finalWaiters = [];
-
-  function wakeFinal() {
-
-    while (
-      finals.length &&
-      finalWaiters.length
-    ) {
-
-      const waiter =
-        finalWaiters.shift();
-
-      waiter.resolve(
-        finals.shift()
-      );
-
-    }
-
-  }
-
-  function failAll(error) {
-
-    fatal =
-      error instanceof Error
-        ? error
-        : new Error(
-            String(
-              error ||
-              "Gemini Live falhou."
-            )
-          );
-
-    if (!setupDone) {
-      setupReject(fatal);
-    }
-
-    while (finalWaiters.length) {
-      finalWaiters.shift().reject(fatal);
-    }
-
-  }
-
-  ws.onopen = () => {
-
-    ws.send(
-      JSON.stringify({
-        setup: {
-          model:
-            `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
-
-          generationConfig: {
-            responseModalities: ["TEXT"]
-          },
-
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: true
-            }
-          },
-
-          inputAudioTranscription: {
-            languageCodes: ["en-US"],
-            mode: "VERBATIM"
-          }
+  const body = {
+    uses: 1,
+    expireTime,
+    newSessionExpireTime,
+    liveConnectConstraints: {
+      model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
+      config: {
+        responseModalities: ["TEXT"],
+        realtimeInputConfig: {
+          automaticActivityDetection: { disabled: true }
+        },
+        inputAudioTranscription: {
+          languageCodes: [],
+          mode: "VERBATIM"
         }
-      })
-    );
-
+      }
+    }
   };
 
-  ws.onmessage = event => {
+  let lastError = null;
 
-    let message;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
 
     try {
-      message =
-        JSON.parse(
-          liveWsText(event.data)
-        );
-    }
-    catch {
-      return;
-    }
-
-    if (
-      message?.setupComplete &&
-      !setupDone
-    ) {
-
-      setupDone = true;
-      setupResolve();
-      return;
-
-    }
-
-    const text =
-      String(
-        message
-          ?.serverContent
-          ?.inputTranscription
-          ?.text || ""
-      ).trim();
-
-    if (text) {
-
-      finals.push(text);
-      wakeFinal();
-
-    }
-
-  };
-
-  ws.onerror = event => {
-
-    const message =
-      String(
-        event?.message ||
-        "erro WebSocket Gemini Live"
-      );
-
-    failAll(
-      new Error(message)
-    );
-
-  };
-
-  ws.onclose = event => {
-
-    closed = true;
-
-    if (
-      !fatal &&
-      event?.code !== 1000
-    ) {
-
-      failAll(
-        new Error(
-          `Gemini Live fechou conexão: ` +
-          `code=${event?.code || 0} ` +
-          `reason=${String(
-            event?.reason || ""
-          ).slice(0, 300)}`
-        )
-      );
-
-    }
-
-  };
-
-  function waitFinal(
-    timeoutMs = 8000
-  ) {
-
-    if (fatal) {
-      return Promise.reject(fatal);
-    }
-
-    if (finals.length) {
-      return Promise.resolve(
-        finals.shift()
-      );
-    }
-
-    return new Promise(
-      (resolve, reject) => {
-
-        const waiter = {
-
-          resolve: value => {
-            clearTimeout(timer);
-            resolve(value);
-          },
-
-          reject: error => {
-            clearTimeout(timer);
-            reject(error);
-          }
-
-        };
-
-        const timer =
-          setTimeout(() => {
-
-            const index =
-              finalWaiters.indexOf(
-                waiter
-              );
-
-            if (index >= 0) {
-              finalWaiters.splice(
-                index,
-                1
-              );
-            }
-
-            resolve("");
-
-          }, timeoutMs);
-
-        finalWaiters.push(waiter);
-
-      }
-    );
-
-  }
-
-  async function sendPcm(buffer) {
-
-    const chunkBytes = 3200;
-
-    for (
-      let offset = 0;
-      offset < buffer.length;
-      offset += chunkBytes
-    ) {
-
-      if (fatal || closed) {
-
-        throw (
-          fatal ||
-          new Error(
-            "Gemini Live fechou durante o áudio."
-          )
-        );
-
-      }
-
-      while (
-        Number(
-          ws.bufferedAmount || 0
-        ) >
-        2 * 1024 * 1024
-      ) {
-        await sleep(10);
-      }
-
-      const chunk =
-        buffer.subarray(
-          offset,
-          Math.min(
-            buffer.length,
-            offset + chunkBytes
-          )
-        );
-
-      ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: {
-              data:
-                chunk.toString("base64"),
-
-              mimeType:
-                "audio/pcm;rate=16000"
-            }
-          }
-        })
-      );
-
-      await sleep(2);
-
-    }
-
-  }
-
-  const setupTimer =
-    setTimeout(() => {
-
-      if (!setupDone) {
-
-        setupReject(
-          new Error(
-            "Gemini Live: timeout no setup."
-          )
-        );
-
-      }
-
-    }, 15000);
-
-  try {
-
-    await setupPromise;
-    clearTimeout(setupTimer);
-
-    console.log(
-      `[GEMINI TRANSCRIBE LIVE] sessão aberta | ` +
-      `segments=${segments.length} | ` +
-      `pcm≈${Math.round(
-        totalBytes / 1024
-      )}KB.`
-    );
-
-    const results = [];
-
-    for (
-      let i = 0;
-      i < segments.length;
-      i++
-    ) {
-
-      const segment =
-        segments[i];
-
-      const pcm =
-        Buffer.from(
-          segment.audioBase64,
-          "base64"
-        );
-
-      finals.length = 0;
-
-      ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            activityStart: {}
-          }
-        })
-      );
-
-      await sendPcm(pcm);
-
-      ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            activityEnd: {}
-          }
-        })
-      );
-
-      const text =
-        await waitFinal(9000);
-
-      results.push({
-        id: segment.id,
-        text
+      const response = await fetch(GEMINI_LIVE_TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
       });
 
-      if (
-        (i + 1) % 10 === 0 ||
-        i + 1 === segments.length
-      ) {
+      const raw = await response.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : {}; } catch {}
 
-        console.log(
-          `[GEMINI TRANSCRIBE LIVE] ` +
-          `${i + 1}/${segments.length} segmentos.`
-        );
-
+      if (response.ok && data?.name) {
+        return {
+          token: String(data.name),
+          model: GEMINI_TRANSCRIBE_LIVE_MODEL,
+          wsUrl: GEMINI_LIVE_CONSTRAINED_WS_URL,
+          expireTime,
+          newSessionExpireTime,
+          setup: {
+            model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
+            generationConfig: { responseModalities: ["TEXT"] },
+            realtimeInputConfig: {
+              automaticActivityDetection: { disabled: true }
+            },
+            inputAudioTranscription: {
+              languageCodes: [],
+              mode: "VERBATIM"
+            }
+          }
+        };
       }
 
+      const error = new Error(`Gemini Live token HTTP ${response.status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1200)}`);
+      error.status = response.status;
+
+      if (response.status === 429 && attempt < 3) {
+        const wait = retryDelayMs(response, data, attempt);
+        console.warn(`[GEMINI LIVE TOKEN] 429; retry em ${(wait / 1000).toFixed(1)}s.`);
+        await sleep(wait);
+        continue;
+      }
+
+      if ((response.status >= 500 || [408, 409, 425].includes(response.status)) && attempt < 3) {
+        await sleep(Math.min(3000 * attempt, 10000));
+        continue;
+      }
+
+      throw error;
+    } catch (error) {
+      lastError = error?.name === "AbortError" ? new Error("Gemini Live token: timeout.") : error;
+      if (attempt >= 3 || (lastError?.status && lastError.status < 500 && lastError.status !== 429 && ![408, 409, 425].includes(lastError.status))) {
+        throw lastError;
+      }
+      await sleep(Math.min(2500 * attempt, 7500));
+    } finally {
+      clearTimeout(timer);
     }
-
-    try {
-      ws.close(1000, "done");
-    }
-    catch {}
-
-    return results;
-
   }
-  catch (error) {
 
-    clearTimeout(setupTimer);
-
-    try {
-      ws.close();
-    }
-    catch {}
-
-    throw error;
-
-  }
+  throw lastError || new Error("Não foi possível criar token efêmero Gemini Live.");
 }
+
 // ============================================================
 // PLANNER / BATCHES
 // ============================================================
@@ -2277,7 +1932,7 @@ async function translateSrt(sourceSrt, job) {
   const blocks = parseSrt(sourceSrt);
   if (!blocks.length) throw new Error("Nenhum cue SRT válido.");
   job.stats.sourceCues = blocks.length;
-  console.log(`[PIPELINE 8.3.1] fonte=${job.sourceKind} | ${blocks.length} cues.`);
+  console.log(`[PIPELINE 8.3.2] fonte=${job.sourceKind} | ${blocks.length} cues.`);
 
   const plan = await buildEpisodePlan(blocks, job);
   job.progress = 5;
@@ -2304,7 +1959,7 @@ async function translateSrt(sourceSrt, job) {
 
   const finalSrt = buildSrt(blocks, finalTranslations);
   auditTimestamps(sourceSrt, finalSrt, "FINAL");
-  console.log(`[PIPELINE 8.3.1] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
+  console.log(`[PIPELINE 8.3.2] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
   return finalSrt;
 }
 
@@ -2411,12 +2066,12 @@ function selectEnglishSubtitle(subtitles) {
 async function fetchOpenSubtitlesSource({ type, id, filename, videoSize, videoHash }) {
   const url = buildOpenSubtitlesUrl(type, id, { filename, videoSize, videoHash });
   console.log(`[OPENSUBTITLES CLOUD] ${url}`);
-  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.1" } });
+  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.2" } });
   if (!response.ok) throw new Error(`OpenSubtitles HTTP ${response.status}.`);
   const data = await response.json();
   const target = selectEnglishSubtitle(data?.subtitles);
   if (!target) return null;
-  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.1" } });
+  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.2" } });
   if (!subtitleResponse.ok) throw new Error(`Download OpenSubtitles HTTP ${subtitleResponse.status}.`);
   const raw = normalizeSrt(await subtitleResponse.text());
   if (!raw || raw.length > MAX_SOURCE_CHARS) throw new Error("Legenda OpenSubtitles vazia/grande demais.");
@@ -2489,7 +2144,7 @@ async function recoverCloudJob(token) {
 
 const manifest = {
   id: "org.tradutor.stateless.gemini.free",
-  version: "8.3.1",
+  version: "8.3.2",
   name: "PT-BR Cloud • OpenSubtitles",
   description: "OpenSubtitles inglês → PT-BR contextual com HIGH thinking, Cue Ownership, HARD SDH, integridade de palavrões, QA semântico EN×PT e self-heal. A Ponte Local usa também Audio Sync.",
   resources: ["subtitles"],
@@ -2505,7 +2160,7 @@ app.get("/", (req, res) => res.json({
   status: "online",
   version: manifest.version,
   model: GEMINI_MODEL,
-  mode: "CLOUD_OPENSUB_PLUS_LOCAL_TRANSLATION_AND_AUDIO_SYNC_V2",
+  mode: "CLOUD_OPENSUB_PLUS_LOCAL_TRANSLATION_AND_DIRECT_LIVE_TOKEN_AUDIO_SYNC",
   mainBatchMaxCues: MAIN_BATCH_MAX_CUES,
   mainConcurrency: MAIN_CONCURRENCY,
   pacerMs: GEMINI_MIN_START_INTERVAL_MS,
@@ -2544,95 +2199,38 @@ async function localTranslateHandler(req, res, forcedSourceKind = "") {
 app.post("/api/translate-embedded", (req, res) => localTranslateHandler(req, res, "embedded"));
 app.post("/api/translate-local", (req, res) => localTranslateHandler(req, res));
 
-// O áudio é extraído LOCALMENTE da mídia real. Para o Audio Sync v2, a Ponte
-// manda vários pequenos segmentos PCM e o Render usa UMA sessão Transcribe Live.
-app.post("/api/audio-transcribe-live", async (req, res) => {
-
-  if (!authorized(req)) {
-    return safeJson(
-      res,
-      { error: "Unauthorized" },
-      401
-    );
-  }
+// Audio Sync v3: o Render NÃO recebe o áudio Live. Ele cria um token efêmero,
+// one-use e restrito ao gemini-3.5-transcribe-live. A Ponte conecta diretamente
+// ao Gemini por WebSocket; a chave Gemini real continua exclusivamente no Render.
+app.post("/api/audio-live-token", async (req, res) => {
+  if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
 
   try {
+    const label = String(req.body?.label || "audio-sync-direct-live").replace(/\s+/g, " ").slice(0, 120);
+    const tokenInfo = await createGeminiLiveEphemeralToken();
 
-    const label =
-      String(
-        req.body?.label ||
-        "audio-sync-live"
-      )
-        .replace(/\s+/g, " ")
-        .slice(0, 120);
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
 
-    const segments =
-      Array.isArray(
-        req.body?.segments
-      )
-        ? req.body.segments
-        : [];
+    console.log(`[LIVE TOKEN API] ${label} | token efêmero one-use emitido para ${GEMINI_TRANSCRIBE_LIVE_MODEL}.`);
 
-    if (!segments.length) {
-
-      return safeJson(
-        res,
-        {
-          error:
-            "segments obrigatório."
-        },
-        400
-      );
-
-    }
-
-    console.log(
-      `[AUDIO SYNC LIVE API] ` +
-      `${label} | ` +
-      `segments=${segments.length}.`
-    );
-
-    const results =
-      await geminiLiveTranscribeSegments(
-        segments
-      );
-
-    return safeJson(
-      res,
-      {
-        ok: true,
-        model:
-          GEMINI_TRANSCRIBE_LIVE_MODEL,
-        results
-      }
-    );
-
+    return safeJson(res, {
+      ok: true,
+      model: tokenInfo.model,
+      token: tokenInfo.token,
+      wsUrl: tokenInfo.wsUrl,
+      expireTime: tokenInfo.expireTime,
+      newSessionExpireTime: tokenInfo.newSessionExpireTime,
+      setup: tokenInfo.setup
+    });
+  } catch (error) {
+    console.error(`[LIVE TOKEN API] ${errorMessage(error).slice(0, 500)}`);
+    return safeJson(res, { error: errorMessage(error) }, 500);
   }
-  catch (error) {
-
-    console.error(
-      `[AUDIO SYNC LIVE API] ` +
-      `${errorMessage(error).slice(
-        0,
-        500
-      )}`
-    );
-
-    return safeJson(
-      res,
-      {
-        error:
-          errorMessage(error)
-      },
-      500
-    );
-
-  }
-
 });
 
-// Unary fica como instrumento de precisão: word timestamps somente quando a
-// Ponte precisa refinar um pequeno número de âncoras.
+// Unary continua no Render como instrumento de precisão com word timestamps,
+// usado pela Ponte no máximo em poucos pontos críticos do episódio.
 app.post("/api/audio-transcribe", async (req, res) => {
   if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
   try {
@@ -2741,13 +2339,13 @@ app.get("/subtitle/:jobId.srt", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log("============================================================");
-  console.log(" STREMIO PT-BR 8.3.1 — HIGH QUALITY + HARD SDH + LIVE-FIRST AUDIO SYNC SUPPORT");
+  console.log(" STREMIO PT-BR 8.3.2 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT");
   console.log("============================================================");
   console.log(`Gemini: ${GEMINI_API_KEY ? "CONFIGURADA ✅" : "FALTANDO ❌"}`);
   console.log(`Modelo: ${GEMINI_MODEL} ✅`);
   console.log("Cloud OpenSubtitles: ATIVO + LAZY + SELF-HEAL ✅");
   console.log("APIs Local Embedded + OpenSub Sync: ATIVAS ✅");
-  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_LIVE_MODEL} principal + ${GEMINI_TRANSCRIBE_MODEL} precisão ✅`);
+  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_LIVE_MODEL} direto via token efêmero + ${GEMINI_TRANSCRIBE_MODEL} precisão ✅`);
   console.log(`Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`);
   console.log(`Cue capsules: ${CAPSULE_CONTEXT_BEFORE} antes + target fechado + ${CAPSULE_CONTEXT_AFTER} depois ✅`);
   console.log(`Thinking: PLAN=${PLAN_THINKING} | MAIN=${MAIN_THINKING} | QA=${QA_THINKING} | REPAIR=${REPAIR_THINKING} ✅`);
