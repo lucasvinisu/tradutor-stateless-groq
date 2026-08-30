@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.6 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.7 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -20,7 +20,7 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
-const CACHE_VERSION = "8.3.6-natural-identity-ledger-qa-transcribe-budget";
+const CACHE_VERSION = "8.3.7-plan-fast-priority-qa-transcribe-budget";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -40,17 +40,23 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.6.
+// já consumidas nas últimas 24h durante o deploy do 8.3.7.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
 );
 
-const PLAN_THINKING = "high";
-const PLAN_MAX_OUTPUT_TOKENS = 3600;
+const PLAN_THINKING = "medium";
+const PLAN_MAX_OUTPUT_TOKENS = 6500;
 const PLAN_TIMEOUT_MS = 60000;
-const PLAN_RETRIES = 2;
-const PLAN_SAMPLE_MAX_CUES = 900;
+const PLAN_RETRIES = 1;
+const PLAN_SAMPLE_MAX_CUES = 360;
+
+// Fallback do planner: propositalmente ainda mais simples e barato.
+// Se o SAFE-SCHEMA vier INCOMPLETE, não repetimos a mesma estratégia.
+const PLAN_FALLBACK_THINKING = "low";
+const PLAN_FALLBACK_MAX_OUTPUT_TOKENS = 5000;
+const PLAN_FALLBACK_RETRIES = 1;
 
 const MAIN_BATCH_MAX_CUES = 60;
 const MAIN_BATCH_MAX_CHARS = 15000;
@@ -75,8 +81,8 @@ const REPAIR_PARSE_ATTEMPTS = 2;
 // QA semântico EN×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 120;
-const QA_BATCH_MAX_CHARS = 24000;
+const QA_BATCH_MAX_CUES = 160;
+const QA_BATCH_MAX_CHARS = 36000;
 const QA_THINKING = "high";
 const QA_MAX_OUTPUT_TOKENS = 9000;
 const QA_TIMEOUT_MS = 120000;
@@ -2779,7 +2785,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.6
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.7
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3718,16 +3724,34 @@ async function geminiRequest({
         }
 
         if (
-          status === "incomplete" ||
-          !text
-        ) {
-          throw new Error(
-            status ===
-              "incomplete"
-              ? `Gemini ${metric} retornou INCOMPLETE.`
-              : `Gemini ${metric} retornou vazio.`
-          );
-        }
+  status === "incomplete" ||
+  !text
+) {
+  const incompleteDetail =
+    data?.incomplete_details ??
+    data?.incompleteDetails ??
+    data?.finish_reason ??
+    data?.finishReason ??
+    data?.response?.finish_reason ??
+    data?.response?.finishReason ??
+    null;
+
+  let detailText = "sem detalhe adicional da API";
+
+  if (incompleteDetail != null) {
+    try {
+      detailText = JSON.stringify(incompleteDetail).slice(0, 900);
+    } catch {
+      detailText = String(incompleteDetail).slice(0, 900);
+    }
+  }
+
+  throw new Error(
+    status === "incomplete"
+      ? `Gemini ${metric} retornou INCOMPLETE | detalhe=${detailText}`
+      : `Gemini ${metric} retornou vazio.`
+  );
+}
 
         markSuccess(
           job,
@@ -5102,19 +5126,16 @@ async function buildEpisodePlan(
           PLAN_FALLBACK_SCHEMA,
 
         thinkingLevel:
-          PLAN_THINKING,
+          PLAN_FALLBACK_THINKING,
 
         maxOutputTokens:
-          Math.min(
-            PLAN_MAX_OUTPUT_TOKENS,
-            3000
-          ),
+          PLAN_FALLBACK_MAX_OUTPUT_TOKENS,
 
         timeoutMs:
           PLAN_TIMEOUT_MS,
 
         maxRetries:
-          PLAN_RETRIES,
+          PLAN_FALLBACK_RETRIES,
 
         job,
 
@@ -7492,6 +7513,126 @@ function mergeIssueLists(
   );
 }
 
+function issueReasonBucket(reason) {
+  const text = String(reason || "").trim();
+
+  if (/^QA_PTBR:/i.test(text)) {
+    return "QA_PTBR";
+  }
+
+  if (/FALSE_COGNATE/i.test(text)) {
+    return "FALSE_COGNATE";
+  }
+
+  if (/^IDIOM_/i.test(text)) {
+    return "IDIOM_LITERAL";
+  }
+
+  if (/LITERAL/i.test(text)) {
+    return "LITERALITY";
+  }
+
+  return text || "UNKNOWN";
+}
+
+function issuePriority(issue) {
+  const reasons = Array.isArray(issue?.reasons)
+    ? issue.reasons.map(String)
+    : [];
+
+  const joined = reasons.join(" | ");
+
+  // ==========================================================
+  // PRIORIDADE 0 — CRÍTICO
+  // Sentido, identidade, gênero, speaker/referente, omissão,
+  // cue ownership e censura quebrada.
+  // ==========================================================
+
+  if (
+    /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
+    /POSSIBLE_OMISSION/i.test(joined) ||
+    /POSSIBLE_CUE_SHIFT_PAIR/i.test(joined) ||
+    /EMPTY/i.test(joined) ||
+    /UNRESOLVED_BLEEP_TOKEN/i.test(joined) ||
+    /BLEEP_CREATED_DANGLING_SENTENCE/i.test(joined) ||
+    /ARTIFICIAL_PROFANITY_CENSORSHIP/i.test(joined) ||
+    /MISSING_DIALOGUE_BREAK/i.test(joined) ||
+
+    // Motivos escritos pelo Gemini QA.
+    /\bg[eê]nero\b/i.test(joined) ||
+    /\bpronome\b/i.test(joined) ||
+    /\bidentity\b/i.test(joined) ||
+    /\bidentidade\b/i.test(joined) ||
+    /\bspeaker\b/i.test(joined) ||
+    /\breferente\b/i.test(joined) ||
+    /\bsentido\b/i.test(joined) ||
+    /\bsem[aâ]ntic/i.test(joined) ||
+    /\bnega[cç][aã]o\b/i.test(joined) ||
+    /\bomiss[aã]o\b/i.test(joined) ||
+    /\binven(?:ta|tou|ção)\b/i.test(joined) ||
+    /\bsujeito\b/i.test(joined) ||
+    /\bobjeto\b/i.test(joined)
+  ) {
+    return 0;
+  }
+
+  // ==========================================================
+  // PRIORIDADE 1 — QUALIDADE LINGUÍSTICA
+  // Literalidade, calque, idioma, registro, naturalidade etc.
+  // ==========================================================
+
+  if (
+    /QA_PTBR/i.test(joined) ||
+    /FALSE_COGNATE/i.test(joined) ||
+    /IDIOM_/i.test(joined) ||
+    /LITERAL/i.test(joined) ||
+    /UNNATURAL/i.test(joined) ||
+    /FORCED_/i.test(joined) ||
+    /GAG_/i.test(joined) ||
+    /JUDGES_/i.test(joined) ||
+    /DOUBLE_WIN/i.test(joined) ||
+    /COMPETITION_BOTTOM/i.test(joined) ||
+    /POSSIBLE_LITERAL/i.test(joined) ||
+    /POSSIBLE_FORCED/i.test(joined) ||
+    /KNOWN_PTBR/i.test(joined) ||
+    /POSSIBLE_UNTRANSLATED/i.test(joined) ||
+    /naturalidade/i.test(joined) ||
+    /literal/i.test(joined) ||
+    /calque/i.test(joined) ||
+    /registro/i.test(joined) ||
+    /g[ií]ria/i.test(joined) ||
+    /met[aá]fora/i.test(joined)
+  ) {
+    return 1;
+  }
+
+  // PRIORIDADE 2 — MECÂNICO
+  // Ex.: linha comprida, ruído leve, formatação etc.
+  return 2;
+}
+
+function logIssueSummary(label, issues) {
+  const counts = new Map();
+
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    for (const reason of Array.isArray(issue?.reasons) ? issue.reasons : []) {
+      const key = issueReasonBucket(reason);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+
+  const summary = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(" | ");
+
+  console.log(
+    `[ISSUE SUMMARY] ${label} | cues=${Array.isArray(issues) ? issues.length : 0}` +
+    (summary ? ` | ${summary}` : "")
+  );
+}
+
 function detectLocalIssues(
   blocks,
   translations,
@@ -7932,17 +8073,56 @@ async function tryFocusedRepair(
     return translations;
   }
 
-  issues.sort(
-    (a, b) =>
-      b.reasons.length -
-      a.reasons.length
+  logIssueSummary(
+  "PRÉ-REPAIR",
+  issues
+);
+
+issues.sort((a, b) => {
+  const priorityDiff =
+    issuePriority(a) -
+    issuePriority(b);
+
+  if (priorityDiff !== 0) {
+    return priorityDiff;
+  }
+
+  return (
+    b.reasons.length -
+    a.reasons.length
   );
+});
 
   const selected =
     issues.slice(
       0,
       REPAIR_MAX_CUES_TOTAL
     );
+
+  const selectedCritical =
+  selected.filter(
+    issue =>
+      issuePriority(issue) === 0
+  ).length;
+
+const selectedQuality =
+  selected.filter(
+    issue =>
+      issuePriority(issue) === 1
+  ).length;
+
+const selectedMechanical =
+  selected.filter(
+    issue =>
+      issuePriority(issue) === 2
+  ).length;
+
+console.log(
+  `[REPAIR PRIORITY] selecionados=${selected.length} | ` +
+  `críticos=${selectedCritical} | ` +
+  `qualidade=${selectedQuality} | ` +
+  `mecânicos=${selectedMechanical}.`
+);
 
   job.stats.repairSelected =
     selected.length;
@@ -8047,7 +8227,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.6] fonte=${
+    `[PIPELINE 8.3.7] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -8135,12 +8315,17 @@ async function translateSrt(
     );
 
   if (remaining.length) {
-    console.log(
-      `[POST-REPAIR GUARD] ${
-        remaining.length
-      } cue(s) ainda sinalizado(s) após o repair; mantendo o primeiro repair para evitar retradução repetitiva e perda de velocidade.`
-    );
-  }
+  logIssueSummary(
+    "PÓS-REPAIR",
+    remaining
+  );
+
+  console.log(
+    `[POST-REPAIR GUARD] ${
+      remaining.length
+    } cue(s) ainda sinalizado(s) após o repair; mantendo o primeiro repair para evitar retradução repetitiva e perda de velocidade.`
+  );
+}
 
   const finalSrt =
     buildSrt(
@@ -8155,7 +8340,7 @@ async function translateSrt(
   );
 
   console.log(
-    `[PIPELINE 8.3.6] FINAL OK | ${
+    `[PIPELINE 8.3.7] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -8556,7 +8741,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.6"
+            "Stremio-PTBR/8.3.7"
         }
       }
     );
@@ -8588,7 +8773,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.6"
+            "Stremio-PTBR/8.3.7"
         }
       }
     );
@@ -8754,7 +8939,7 @@ async function publicSubtitlesHandler(
               subtitleUrl,
 
             lang:
-              "por"
+             "PT-BR Cloud"
           }
         ]
       }
@@ -8874,7 +9059,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.6",
+    "8.3.7",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -9631,7 +9816,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.6 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.7 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
   );
 
   console.log(
