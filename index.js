@@ -1929,9 +1929,21 @@ function sanitizeFallbackCue(value) {
         Boolean
       );
 
-  return lines
+  const result =
+  lines
     .join("\n")
     .trim();
+
+if (
+  !result ||
+  !/[\p{L}\p{N}]/u.test(
+    result
+  )
+) {
+  return "";
+}
+
+return result;
 }
 
 function sanitizeTranslationMap(
