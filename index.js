@@ -8,7 +8,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.2 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT
+// STREMIO PT-BR 8.3.3 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -787,7 +787,7 @@ function auditTimestamps(sourceSrt, finalSrt, label) {
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.2
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.3
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -1320,23 +1320,26 @@ async function createGeminiLiveEphemeralToken() {
   const expireTime = new Date(now + 20 * 60 * 1000).toISOString();
   const newSessionExpireTime = new Date(now + 2 * 60 * 1000).toISOString();
 
+  // O endpoint REST /v1beta/auth_tokens usa o schema AuthToken bruto.
+  // No projeto atual, liveConnectConstraints e rejeitado pelo REST; a referencia
+  // de API aceita bidiGenerateContentSetup diretamente no AuthToken.
+  const liveSetup = {
+    model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
+    generationConfig: { responseModalities: ["TEXT"] },
+    realtimeInputConfig: {
+      automaticActivityDetection: { disabled: true }
+    },
+    inputAudioTranscription: {
+      languageCodes: [],
+      mode: "VERBATIM"
+    }
+  };
+
   const body = {
     uses: 1,
     expireTime,
     newSessionExpireTime,
-    liveConnectConstraints: {
-      model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
-      config: {
-        responseModalities: ["TEXT"],
-        realtimeInputConfig: {
-          automaticActivityDetection: { disabled: true }
-        },
-        inputAudioTranscription: {
-          languageCodes: [],
-          mode: "VERBATIM"
-        }
-      }
-    }
+    bidiGenerateContentSetup: liveSetup
   };
 
   let lastError = null;
@@ -1367,17 +1370,7 @@ async function createGeminiLiveEphemeralToken() {
           wsUrl: GEMINI_LIVE_CONSTRAINED_WS_URL,
           expireTime,
           newSessionExpireTime,
-          setup: {
-            model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
-            generationConfig: { responseModalities: ["TEXT"] },
-            realtimeInputConfig: {
-              automaticActivityDetection: { disabled: true }
-            },
-            inputAudioTranscription: {
-              languageCodes: [],
-              mode: "VERBATIM"
-            }
-          }
+          setup: liveSetup
         };
       }
 
@@ -1932,7 +1925,7 @@ async function translateSrt(sourceSrt, job) {
   const blocks = parseSrt(sourceSrt);
   if (!blocks.length) throw new Error("Nenhum cue SRT válido.");
   job.stats.sourceCues = blocks.length;
-  console.log(`[PIPELINE 8.3.2] fonte=${job.sourceKind} | ${blocks.length} cues.`);
+  console.log(`[PIPELINE 8.3.3] fonte=${job.sourceKind} | ${blocks.length} cues.`);
 
   const plan = await buildEpisodePlan(blocks, job);
   job.progress = 5;
@@ -1959,7 +1952,7 @@ async function translateSrt(sourceSrt, job) {
 
   const finalSrt = buildSrt(blocks, finalTranslations);
   auditTimestamps(sourceSrt, finalSrt, "FINAL");
-  console.log(`[PIPELINE 8.3.2] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
+  console.log(`[PIPELINE 8.3.3] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
   return finalSrt;
 }
 
@@ -2066,12 +2059,12 @@ function selectEnglishSubtitle(subtitles) {
 async function fetchOpenSubtitlesSource({ type, id, filename, videoSize, videoHash }) {
   const url = buildOpenSubtitlesUrl(type, id, { filename, videoSize, videoHash });
   console.log(`[OPENSUBTITLES CLOUD] ${url}`);
-  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.2" } });
+  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.3" } });
   if (!response.ok) throw new Error(`OpenSubtitles HTTP ${response.status}.`);
   const data = await response.json();
   const target = selectEnglishSubtitle(data?.subtitles);
   if (!target) return null;
-  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.2" } });
+  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.3" } });
   if (!subtitleResponse.ok) throw new Error(`Download OpenSubtitles HTTP ${subtitleResponse.status}.`);
   const raw = normalizeSrt(await subtitleResponse.text());
   if (!raw || raw.length > MAX_SOURCE_CHARS) throw new Error("Legenda OpenSubtitles vazia/grande demais.");
@@ -2144,7 +2137,7 @@ async function recoverCloudJob(token) {
 
 const manifest = {
   id: "org.tradutor.stateless.gemini.free",
-  version: "8.3.2",
+  version: "8.3.3",
   name: "PT-BR Cloud • OpenSubtitles",
   description: "OpenSubtitles inglês → PT-BR contextual com HIGH thinking, Cue Ownership, HARD SDH, integridade de palavrões, QA semântico EN×PT e self-heal. A Ponte Local usa também Audio Sync.",
   resources: ["subtitles"],
@@ -2212,7 +2205,7 @@ app.post("/api/audio-live-token", async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
     res.setHeader("Pragma", "no-cache");
 
-    console.log(`[LIVE TOKEN API] ${label} | token efêmero one-use emitido para ${GEMINI_TRANSCRIBE_LIVE_MODEL}.`);
+    console.log(`[LIVE TOKEN API] ${label} | token efêmero one-use emitido para ${GEMINI_TRANSCRIBE_LIVE_MODEL} | schema=bidiGenerateContentSetup.`);
 
     return safeJson(res, {
       ok: true,
@@ -2339,13 +2332,13 @@ app.get("/subtitle/:jobId.srt", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log("============================================================");
-  console.log(" STREMIO PT-BR 8.3.2 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT");
+  console.log(" STREMIO PT-BR 8.3.3 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT");
   console.log("============================================================");
   console.log(`Gemini: ${GEMINI_API_KEY ? "CONFIGURADA ✅" : "FALTANDO ❌"}`);
   console.log(`Modelo: ${GEMINI_MODEL} ✅`);
   console.log("Cloud OpenSubtitles: ATIVO + LAZY + SELF-HEAL ✅");
   console.log("APIs Local Embedded + OpenSub Sync: ATIVAS ✅");
-  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_LIVE_MODEL} direto via token efêmero + ${GEMINI_TRANSCRIBE_MODEL} precisão ✅`);
+  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_LIVE_MODEL} direto via token efêmero REST schema=bidiGenerateContentSetup + ${GEMINI_TRANSCRIBE_MODEL} precisão ✅`);
   console.log(`Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`);
   console.log(`Cue capsules: ${CAPSULE_CONTEXT_BEFORE} antes + target fechado + ${CAPSULE_CONTEXT_AFTER} depois ✅`);
   console.log(`Thinking: PLAN=${PLAN_THINKING} | MAIN=${MAIN_THINKING} | QA=${QA_THINKING} | REPAIR=${REPAIR_THINKING} ✅`);
