@@ -8,7 +8,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.2.2 — QUALITY + CUE OWNERSHIP + SELF-HEAL
+// STREMIO PT-BR 8.2.3 QUALITY + CUE OWNERSHIP + EMPTY RESCUE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -17,7 +17,7 @@ const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim()
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
-const CACHE_VERSION = "8.2.2-quality-ownership-bleep-selfheal";
+const CACHE_VERSION = "8.2.3-quality-ownership-empty-rescue";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1862,6 +1862,78 @@ function sanitizeFinalCue(
     .trim();
 }
 
+function sanitizeFallbackCue(value) {
+  let text =
+    String(
+      value ||
+      ""
+    )
+      .replace(
+        /<[^>]+>/g,
+        ""
+      )
+      .replace(
+        /\{\\[^}]+\}/g,
+        " "
+      )
+      .replace(
+        /[♪♫♬]/gu,
+        " "
+      )
+      .replace(
+        CENSOR_CLUSTER_RE,
+        " "
+      )
+      .replace(
+        new RegExp(
+          BLEEP_TOKEN,
+          "g"
+        ),
+        "[censurado]"
+      );
+
+  text =
+    collapseExtendedVocalization(
+      text
+    );
+
+  const lines =
+    text
+      .replace(
+        /\r/g,
+        ""
+      )
+      .split("\n")
+      .map(
+        line =>
+          line
+            .replace(
+              /^\s*[\/\\|]{1,4}\s*/u,
+              ""
+            )
+            .replace(
+              /\s+[\/\\|]{1,3}\s+/gu,
+              " "
+            )
+            .replace(
+              /\s+([,.;:!?])/g,
+              "$1"
+            )
+            .replace(
+              /[ \t]{2,}/g,
+              " "
+            )
+            .trim()
+      )
+      .filter(
+        Boolean
+      );
+
+  return lines
+    .join("\n")
+    .trim();
+}
+
 function sanitizeTranslationMap(
   blocks,
   translations,
@@ -1871,6 +1943,9 @@ function sanitizeTranslationMap(
     new Map();
 
   let changes =
+    0;
+
+  let rescuedEmpty =
     0;
 
   for (
@@ -1885,15 +1960,48 @@ function sanitizeTranslationMap(
         block.text
       ).trim();
 
-    const after =
+    let after =
       sanitizeFinalCue(
         block,
         before
       );
 
+    // --------------------------------------------------------
+    // EMPTY CUE RESCUE
+    // --------------------------------------------------------
+    // Nunca derrubar um episódio inteiro porque a limpeza
+    // removeu 100% do conteúdo de um único cue.
+    //
+    // O texto "before" já é a tradução PT-BR produzida pelo
+    // Gemini. Primeiro tentamos preservá-lo com uma limpeza
+    // muito mais conservadora.
+    //
+    // Se até isso ficar vazio, usamos uma reticência neutra
+    // apenas para manter o cue/timestamp estruturalmente válido.
+    // --------------------------------------------------------
+
     if (!after) {
-      throw new Error(
-        `FORMAT LOCK: cue ${block.index} ficou vazio.`
+      after =
+        sanitizeFallbackCue(
+          before
+        );
+
+      if (!after) {
+        after =
+          "…";
+      }
+
+      rescuedEmpty++;
+
+      console.warn(
+        `[FORMAT LOCK] cue ${block.index} ` +
+        `ficaria vazio; fallback conservador aplicado | ` +
+        `raw=${JSON.stringify(
+          before.slice(
+            0,
+            140
+          )
+        )}`
       );
     }
 
@@ -1922,6 +2030,7 @@ function sanitizeTranslationMap(
   console.log(
     `[FORMAT LOCK] ` +
     `${changes} cue(s) normalizado(s); ` +
+    `${rescuedEmpty} cue(s) resgatado(s) de vazio; ` +
     `ruído visual/alongamentos controlados.`
   );
 
@@ -5726,7 +5835,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.2.2",
+    "8.2.3",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -6121,13 +6230,9 @@ app.get(
       ).trim();
 
     if (
-      (
-        !job ||
-        job.status ===
-          "failed"
-      ) &&
-      recoveryToken
-    ) {
+  !job &&
+  recoveryToken
+) {
       try {
         job =
           await recoverCloudJob(
@@ -6263,7 +6368,7 @@ app.listen(
     );
 
     console.log(
-      " STREMIO PT-BR 8.2.2 QUALITY + CUE OWNERSHIP + SELF-HEAL"
+      " STREMIO PT-BR 8.2.3 QUALITY + CUE OWNERSHIP + EMPTY RESCUE"
     );
 
     console.log(
@@ -6335,7 +6440,7 @@ app.listen(
     );
 
     console.log(
-      "Censored Bleep Reconstruction: ATIVO ✅"
+      "Format Lock Empty-Cue Rescue: ATIVO ✅"
     );
 
     console.log(
