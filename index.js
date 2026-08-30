@@ -1,6 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -8,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.3 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT
+// STREMIO PT-BR 8.3.5 — CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -17,11 +19,8 @@ const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim()
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
-const GEMINI_TRANSCRIBE_LIVE_MODEL = "gemini-3.5-transcribe-live";
-const GEMINI_LIVE_TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens";
-const GEMINI_LIVE_CONSTRAINED_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained";
 
-const CACHE_VERSION = "8.3.2-high-qa-hard-sdh-audio-sync-direct-live";
+const CACHE_VERSION = "8.3.5-context-identity-lock-transcribe-budget";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -29,8 +28,19 @@ const FETCH_TIMEOUT_MS = 25000;
 
 const GEMINI_MIN_START_INTERVAL_MS = 4300;
 
+// Gemini Transcribe free-tier guard: 3 RPM / 10k TPM / 25 RPD.
+// O projeto usa 22s entre inícios, teto interno de 24 chamadas/24h e
+// uma margem de TPM para reduzir 429 antes que aconteçam.
+const TRANSCRIBE_MIN_START_INTERVAL_MS = 22000;
+const TRANSCRIBE_TPM_LIMIT = 10000;
+const TRANSCRIBE_TPM_SOFT_LIMIT = 9500;
+const TRANSCRIBE_RPD_INTERNAL_LIMIT = 24;
+const TRANSCRIBE_TOKEN_ESTIMATE_PER_SECOND = 32;
+const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
+const TRANSCRIBE_BUDGET_FILE = String(process.env.TRANSCRIBE_BUDGET_FILE || path.join(process.cwd(), "transcribe-budget-8.3.5.json"));
+
 const PLAN_THINKING = "high";
-const PLAN_MAX_OUTPUT_TOKENS = 2200;
+const PLAN_MAX_OUTPUT_TOKENS = 3600;
 const PLAN_TIMEOUT_MS = 60000;
 const PLAN_RETRIES = 2;
 const PLAN_SAMPLE_MAX_CUES = 900;
@@ -74,8 +84,137 @@ const translationCache = new Map();
 const jobs = new Map();
 let lastGeminiRequestStart = 0;
 let geminiGate = Promise.resolve();
+let transcribeGate = Promise.resolve();
+let lastTranscribeRequestStart = 0;
+let transcribeLedger = { calls: [] };
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function loadTranscribeLedger() {
+  try {
+    if (!fs.existsSync(TRANSCRIBE_BUDGET_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(TRANSCRIBE_BUDGET_FILE, "utf8"));
+    if (Array.isArray(parsed?.calls)) transcribeLedger = { calls: parsed.calls };
+  } catch (error) {
+    console.warn(`[TRANSCRIBE BUDGET] ledger não pôde ser lido: ${String(error?.message || error).slice(0, 220)}`);
+  }
+}
+
+function pruneTranscribeLedger(now = Date.now()) {
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  transcribeLedger.calls = (Array.isArray(transcribeLedger.calls) ? transcribeLedger.calls : [])
+    .filter(item => Number(item?.ts) >= dayAgo && Number.isFinite(Number(item?.ts)));
+}
+
+function persistTranscribeLedger() {
+  try {
+    pruneTranscribeLedger();
+    const tmp = `${TRANSCRIBE_BUDGET_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(transcribeLedger), "utf8");
+    if (fs.existsSync(TRANSCRIBE_BUDGET_FILE)) fs.unlinkSync(TRANSCRIBE_BUDGET_FILE);
+    fs.renameSync(tmp, TRANSCRIBE_BUDGET_FILE);
+  } catch (error) {
+    console.warn(`[TRANSCRIBE BUDGET] ledger não pôde ser salvo: ${String(error?.message || error).slice(0, 220)}`);
+  }
+}
+
+function transcribeTokenCost(item) {
+  const actual = Number(item?.inputTokens || 0) + Number(item?.outputTokens || 0);
+  return actual > 0 ? actual : Number(item?.estimatedTokens || 0);
+}
+
+function estimateTranscribeTokens(durationMs) {
+  const seconds = Math.max(1, Number(durationMs || 0) / 1000);
+  return Math.ceil(seconds * TRANSCRIBE_TOKEN_ESTIMATE_PER_SECOND) + TRANSCRIBE_OUTPUT_TOKEN_RESERVE;
+}
+
+function transcribeBudgetSnapshot(now = Date.now()) {
+  pruneTranscribeLedger(now);
+  const minuteAgo = now - 60 * 1000;
+  const minuteCalls = transcribeLedger.calls.filter(item => Number(item.ts) >= minuteAgo);
+  return {
+    calls24h: transcribeLedger.calls.length,
+    calls60s: minuteCalls.length,
+    tokens60s: minuteCalls.reduce((sum, item) => sum + transcribeTokenCost(item), 0),
+    remainingRpd: Math.max(0, TRANSCRIBE_RPD_INTERNAL_LIMIT - transcribeLedger.calls.length)
+  };
+}
+
+async function acquireTranscribeBudget(durationMs, label = "audio") {
+  const previous = transcribeGate;
+  let release;
+  transcribeGate = new Promise(resolve => { release = resolve; });
+  await previous;
+
+  try {
+    const estimate = estimateTranscribeTokens(durationMs);
+
+    while (true) {
+      const now = Date.now();
+      pruneTranscribeLedger(now);
+
+      if (transcribeLedger.calls.length >= TRANSCRIBE_RPD_INTERNAL_LIMIT) {
+        const oldest = Math.min(...transcribeLedger.calls.map(item => Number(item.ts)));
+        const unlockAt = oldest + 24 * 60 * 60 * 1000;
+        const waitMs = Math.max(1000, unlockAt - now);
+        const error = new Error(`TRANSCRIBE BUDGET: limite interno de ${TRANSCRIBE_RPD_INTERNAL_LIMIT}/24h atingido; próxima vaga em ~${Math.ceil(waitMs / 60000)} min.`);
+        error.nonRetryable = true;
+        error.code = "TRANSCRIBE_RPD_LOCK";
+        throw error;
+      }
+
+      const rpmWait = Math.max(0, lastTranscribeRequestStart + TRANSCRIBE_MIN_START_INTERVAL_MS - now);
+      const minuteAgo = now - 60 * 1000;
+      const minuteCalls = transcribeLedger.calls.filter(item => Number(item.ts) >= minuteAgo);
+      const minuteTokens = minuteCalls.reduce((sum, item) => sum + transcribeTokenCost(item), 0);
+      let tpmWait = 0;
+
+      if (minuteTokens + estimate > TRANSCRIBE_TPM_SOFT_LIMIT && minuteCalls.length) {
+        const ordered = [...minuteCalls].sort((a, b) => Number(a.ts) - Number(b.ts));
+        let rolling = minuteTokens;
+        for (const item of ordered) {
+          rolling -= transcribeTokenCost(item);
+          if (rolling + estimate <= TRANSCRIBE_TPM_SOFT_LIMIT) {
+            tpmWait = Math.max(0, Number(item.ts) + 60000 - now + 250);
+            break;
+          }
+        }
+        if (!tpmWait) tpmWait = Math.max(0, Number(ordered[ordered.length - 1].ts) + 60000 - now + 250);
+      }
+
+      const waitMs = Math.max(rpmWait, tpmWait);
+      if (waitMs > 0) {
+        const reason = tpmWait >= rpmWait && tpmWait > 0 ? "TPM" : "RPM";
+        console.log(`[TRANSCRIBE BUDGET] ${reason} aguardando ${(waitMs / 1000).toFixed(1)}s | ${label} | uso60s=${minuteTokens}/${TRANSCRIBE_TPM_LIMIT} est=${estimate}.`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      const id = `${now}-${crypto.randomBytes(4).toString("hex")}`;
+      lastTranscribeRequestStart = Date.now();
+      transcribeLedger.calls.push({ id, ts: lastTranscribeRequestStart, durationMs: Number(durationMs || 0), estimatedTokens: estimate, inputTokens: 0, outputTokens: 0 });
+      persistTranscribeLedger();
+      const snap = transcribeBudgetSnapshot();
+      console.log(`[TRANSCRIBE BUDGET] reserva ${snap.calls24h}/${TRANSCRIBE_RPD_INTERNAL_LIMIT} em 24h | ${snap.tokens60s}/${TRANSCRIBE_TPM_LIMIT} tokens estimados em 60s.`);
+      return id;
+    }
+  } finally {
+    release();
+  }
+}
+
+function commitTranscribeUsage(id, usage = {}) {
+  const item = transcribeLedger.calls.find(call => call.id === id);
+  if (!item) return;
+  item.inputTokens = Number(usage?.total_input_tokens || usage?.input_tokens || 0);
+  item.outputTokens = Number(usage?.total_output_tokens || usage?.output_tokens || 0);
+  item.thoughtTokens = Number(usage?.total_thought_tokens || usage?.thought_tokens || 0);
+  item.updatedAt = Date.now();
+  persistTranscribeLedger();
+}
+
+loadTranscribeLedger();
+pruneTranscribeLedger();
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
@@ -456,6 +595,7 @@ function looksLikeMaskedProfanityToken(token) {
   ]);
   return symbolPrefixes.has(visiblePrefix);
 }
+
 function replaceMaskedProfanity(value) {
   const decoded = decodeBasicEntities(value);
   return decoded.replace(/[\p{L}][\p{L}0-9*#@%&$!._~…’'-]{1,28}/gu, token => {
@@ -787,7 +927,7 @@ function auditTimestamps(sourceSrt, finalSrt, label) {
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.3
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.5
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -802,6 +942,15 @@ PRINCÍPIO CENTRAL: PRESERVAR IDENTIDADE, LOCALIZAR INTENÇÃO
 - Não "abrasileire" nomes/bordões que soariam falsos traduzidos.
 - Não deixe inglês estrutural dentro de português só porque as palavras foram traduzidas.
 - A legenda deve fazer um brasileiro entender o que a fala QUER DIZER e como ela SOA socialmente.
+
+CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
+- A BÍBLIA EDITORIAL contém um Character Ledger. Trate identidades confirmadas como estado de continuidade do episódio.
+- Quando gênero/pronomes estiverem marcados como conhecidos/seguros, respeite-os na concordância e nos referentes em PT-BR.
+- Quando gênero for unknown/incerto, NÃO adivinhe. Reformule naturalmente para evitar marcar gênero sem necessidade.
+- Speaker é QUEM ESTÁ FALANDO; pessoa citada/mentioned é DE QUEM SE FALA. speaker ≠ pessoa mencionada.
+- Nunca transfira gênero, pronome, relação ou identidade do speaker para a pessoa mencionada, nem o contrário.
+- Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
+- Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
 CUE OWNERSHIP — REGRA INVIOLÁVEL
 - Cada cápsula é independente.
@@ -936,9 +1085,20 @@ FIDELIDADE E SINCRONIZAÇÃO
 `;
 
 const PLAN_PROMPT = `
-Você é editor de continuidade EN→PT-BR.
-Leia uma amostra do episódio e produza uma bíblia editorial CURTA.
-Extraia somente: tom, pessoas/relações quando claras, gênero apenas quando seguro, terminologia recorrente, referências culturais/fandom, gírias contextuais e escolhas de consistência.
+Você é editor de continuidade EN→PT-BR e responsável pelo CONTEXT + IDENTITY LOCK.
+Leia a amostra do episódio e produza uma bíblia editorial CURTA, mas um Character Ledger confiável.
+
+CHARACTER LEDGER:
+- Registre apenas pessoas realmente sustentadas pela amostra.
+- canonical: nome/identificador mais estável; aliases: variações realmente vistas.
+- gender só pode ser female, male, nonbinary ou unknown. Use unknown quando não houver evidência segura.
+- pronouns devem refletir somente evidência clara; se não houver, deixe [] e gender=unknown.
+- relation/context descreve relações apenas quando claras.
+- confidence deve ser high, medium ou low; gênero só deve deixar unknown quando confidence sobre isso for realmente suficiente.
+- evidence_cues: até 8 IDs que sustentam a identidade/relação.
+- speaker e pessoa mencionada são entidades distintas; não transfira gênero entre elas.
+
+Também extraia tom, terminologia recorrente, referências culturais/fandom, gírias contextuais e escolhas de consistência.
 Reconheça especialmente reality, drag, LGBTQIAPN+, Gen Z/Alpha, música, competições e linguagem censurada por bleep.
 Não traduza o episódio. Não invente fatos. Não proponha tradução para tokens HARD LOCK.
 `;
@@ -975,7 +1135,7 @@ Você recebe EN e PT do MESMO cue. NÃO reescreva aqui: apenas sinalize IDs com 
 Faça revisão profunda, não superficial. Verifique:
 - sentido: pessoa verbal, sujeito, objeto, negação, tempo, intensidade e relação entre pronomes;
 - omissão, invenção ou conteúdo que pertence a outro cue;
-- gênero/contexto quando o EN e a bíblia deixarem claro;
+- gênero/contexto quando o EN e o Character Ledger deixarem claro; speaker e pessoa mencionada nunca devem ser confundidos;
 - expressão idiomática/calque: preserve intenção, não palavras;
 - ortografia, digitação, concordância e português quebrado;
 - naturalidade PT-BR contemporânea apropriada à idade/personagem/obra;
@@ -1030,7 +1190,24 @@ const PLAN_SCHEMA = {
   additionalProperties: false,
   properties: {
     tone: { type: "string" },
-    people: { type: "array", items: { type: "string" }, maxItems: 25 },
+    people: {
+      type: "array",
+      maxItems: 30,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          canonical: { type: "string" },
+          aliases: { type: "array", items: { type: "string" }, maxItems: 8 },
+          gender: { type: "string", enum: ["female", "male", "nonbinary", "unknown"] },
+          pronouns: { type: "array", items: { type: "string" }, maxItems: 6 },
+          relation: { type: "string" },
+          confidence: { type: "string", enum: ["high", "medium", "low"] },
+          evidence_cues: { type: "array", items: { type: "integer" }, maxItems: 8 }
+        },
+        required: ["canonical", "aliases", "gender", "pronouns", "relation", "confidence", "evidence_cues"]
+      }
+    },
     glossary: { type: "array", items: { type: "string" }, maxItems: 40 },
     continuity: { type: "array", items: { type: "string" }, maxItems: 30 }
   },
@@ -1242,21 +1419,21 @@ function extractTranscribedWords(data) {
       }
     }
   }
-  return words;
+  return words.sort((a, b) => a.startMs - b.startMs);
 }
 
-async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
+async function geminiTranscribeInline(audioBase64, mimeType = "audio/wav", durationMs = 0, label = "audio-sync") {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY não configurada.");
   const cleanBase64 = String(audioBase64 || "").trim();
   if (!cleanBase64) throw new Error("Áudio vazio.");
   let lastError = null;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    await acquireGeminiSlot(null);
+    const budgetId = await acquireTranscribeBudget(durationMs, `${label} tentativa ${attempt}`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120000);
     try {
-      console.log(`[GEMINI TRANSCRIBE] ${GEMINI_TRANSCRIBE_MODEL} request ${attempt}/3 | word timestamps.`);
+      console.log(`[GEMINI TRANSCRIBE] ${GEMINI_TRANSCRIBE_MODEL} request ${attempt}/3 | montage=${label} | duração≈${(Number(durationMs || 0) / 1000).toFixed(1)}s | word timestamps.`);
       const response = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
         method: "POST",
         headers: {
@@ -1269,7 +1446,7 @@ async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
           input: [{ type: "audio", data: cleanBase64, mime_type: mimeType }],
           generation_config: {
             transcription_config: {
-              language_codes: [],
+              language_codes: ["en"],
               mode: { type: "verbatim", timestamp_granularities: ["word"] }
             }
           },
@@ -1281,19 +1458,22 @@ async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
       const raw = await response.text();
       let data = null;
       try { data = raw ? JSON.parse(raw) : {}; } catch {}
+      commitTranscribeUsage(budgetId, data?.usage || {});
+
       if (response.ok && data) {
         const words = extractTranscribedWords(data);
         const text = extractInteractionText(data);
         if (!words.length) throw new Error("Gemini Transcribe não retornou timestamps de palavras.");
-        console.log(`[GEMINI TRANSCRIBE] OK | words=${words.length}.`);
-        return { text, words };
+        const snapshot = transcribeBudgetSnapshot();
+        console.log(`[GEMINI TRANSCRIBE] OK | words=${words.length} | input=${Number(data?.usage?.total_input_tokens || 0)} | output=${Number(data?.usage?.total_output_tokens || 0)} | RPD=${snapshot.calls24h}/${TRANSCRIBE_RPD_INTERNAL_LIMIT}.`);
+        return { text, words, usage: data?.usage || {}, budget: snapshot };
       }
 
       const error = new Error(`GEMINI ${GEMINI_TRANSCRIBE_MODEL} HTTP ${response.status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1200)}`);
       error.status = response.status;
       if (response.status === 429 && attempt < 3) {
         const wait = retryDelayMs(response, data, attempt);
-        console.warn(`[GEMINI TRANSCRIBE] 429; retry em ${(wait / 1000).toFixed(1)}s.`);
+        console.warn(`[GEMINI TRANSCRIBE] 429; budget manager preserva o próximo início e retry em ${(wait / 1000).toFixed(1)}s.`);
         await sleep(wait);
         continue;
       }
@@ -1304,6 +1484,7 @@ async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
       throw error;
     } catch (error) {
       lastError = error?.name === "AbortError" ? new Error("Gemini Transcribe: timeout.") : error;
+      if (lastError?.nonRetryable) throw lastError;
       if (attempt >= 3 || (lastError?.status && lastError.status < 500 && lastError.status !== 429 && ![408, 409, 425].includes(lastError.status))) throw lastError;
       await sleep(Math.min(3000 * attempt, 9000));
     } finally {
@@ -1311,97 +1492,6 @@ async function geminiTranscribeInline(audioBase64, mimeType = "audio/aac") {
     }
   }
   throw lastError || new Error("Gemini Transcribe falhou.");
-}
-
-async function createGeminiLiveEphemeralToken() {
-  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY não configurada.");
-
-  const now = Date.now();
-  const expireTime = new Date(now + 20 * 60 * 1000).toISOString();
-  const newSessionExpireTime = new Date(now + 2 * 60 * 1000).toISOString();
-
-  // O endpoint REST /v1beta/auth_tokens usa o schema AuthToken bruto.
-  // No projeto atual, liveConnectConstraints e rejeitado pelo REST; a referencia
-  // de API aceita bidiGenerateContentSetup diretamente no AuthToken.
-  const liveSetup = {
-    model: `models/${GEMINI_TRANSCRIBE_LIVE_MODEL}`,
-    generationConfig: { responseModalities: ["TEXT"] },
-    realtimeInputConfig: {
-      automaticActivityDetection: { disabled: true }
-    },
-    inputAudioTranscription: {
-      languageCodes: [],
-      mode: "VERBATIM"
-    }
-  };
-
-  const body = {
-    uses: 1,
-    expireTime,
-    newSessionExpireTime,
-    bidiGenerateContentSetup: liveSetup
-  };
-
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30000);
-
-    try {
-      const response = await fetch(GEMINI_LIVE_TOKEN_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-
-      const raw = await response.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : {}; } catch {}
-
-      if (response.ok && data?.name) {
-        return {
-          token: String(data.name),
-          model: GEMINI_TRANSCRIBE_LIVE_MODEL,
-          wsUrl: GEMINI_LIVE_CONSTRAINED_WS_URL,
-          expireTime,
-          newSessionExpireTime,
-          setup: liveSetup
-        };
-      }
-
-      const error = new Error(`Gemini Live token HTTP ${response.status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1200)}`);
-      error.status = response.status;
-
-      if (response.status === 429 && attempt < 3) {
-        const wait = retryDelayMs(response, data, attempt);
-        console.warn(`[GEMINI LIVE TOKEN] 429; retry em ${(wait / 1000).toFixed(1)}s.`);
-        await sleep(wait);
-        continue;
-      }
-
-      if ((response.status >= 500 || [408, 409, 425].includes(response.status)) && attempt < 3) {
-        await sleep(Math.min(3000 * attempt, 10000));
-        continue;
-      }
-
-      throw error;
-    } catch (error) {
-      lastError = error?.name === "AbortError" ? new Error("Gemini Live token: timeout.") : error;
-      if (attempt >= 3 || (lastError?.status && lastError.status < 500 && lastError.status !== 429 && ![408, 409, 425].includes(lastError.status))) {
-        throw lastError;
-      }
-      await sleep(Math.min(2500 * attempt, 7500));
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  throw lastError || new Error("Não foi possível criar token efêmero Gemini Live.");
 }
 
 // ============================================================
@@ -1445,7 +1535,7 @@ async function buildEpisodePlan(blocks, job) {
       metric: "plan"
     });
     const plan = JSON.parse(stripCodeFences(response.text));
-    console.log(`[EPISODE PLAN] OK | people=${plan.people?.length || 0} | glossary=${plan.glossary?.length || 0}.`);
+    console.log(`[EPISODE PLAN] OK | Character Ledger=${plan.people?.length || 0} pessoa(s) | glossary=${plan.glossary?.length || 0}.`);
     return plan;
   } catch (error) {
     job.stats.planFailures++;
@@ -1492,7 +1582,59 @@ function contextCue(block) {
   return { i: block.index, en: block.text, ...(block.speakerHint ? { speaker: block.speakerHint } : {}) };
 }
 
-function buildOwnershipPayload(allBlocks, posMap, batch) {
+function normalizedIdentityKey(value) {
+  return String(value || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function personAliases(person) {
+  return [person?.canonical, ...(Array.isArray(person?.aliases) ? person.aliases : [])]
+    .map(normalizedIdentityKey)
+    .filter(Boolean);
+}
+
+function findPersonForSpeaker(plan, speakerHint) {
+  const wanted = normalizedIdentityKey(speakerHint);
+  if (!wanted) return null;
+  for (const person of Array.isArray(plan?.people) ? plan.people : []) {
+    if (personAliases(person).some(alias => alias === wanted || alias.includes(wanted) || wanted.includes(alias))) return person;
+  }
+  return null;
+}
+
+function mentionedPeople(plan, text, excludeCanonical = "") {
+  const haystack = ` ${normalizedIdentityKey(text)} `;
+  if (!haystack.trim()) return [];
+  const out = [];
+  for (const person of Array.isArray(plan?.people) ? plan.people : []) {
+    if (excludeCanonical && normalizedIdentityKey(person?.canonical) === normalizedIdentityKey(excludeCanonical)) continue;
+    const found = personAliases(person).some(alias => alias.length >= 2 && haystack.includes(` ${alias} `));
+    if (found) out.push(person);
+  }
+  return out.slice(0, 8);
+}
+
+function compactPersonIdentity(person) {
+  if (!person) return null;
+  return {
+    canonical: String(person.canonical || ""),
+    gender: String(person.gender || "unknown"),
+    pronouns: Array.isArray(person.pronouns) ? person.pronouns : [],
+    relation: String(person.relation || ""),
+    confidence: String(person.confidence || "low")
+  };
+}
+
+function identityLockForCapsule(block, plan) {
+  const speaker = findPersonForSpeaker(plan, block.speakerHint);
+  const mentions = mentionedPeople(plan, block.text, speaker?.canonical || "").map(compactPersonIdentity);
+  return {
+    rule: "speaker é quem fala; mentions são pessoas citadas. Nunca transfira gênero/pronomes entre eles. unknown = não adivinhar; reformular se necessário.",
+    speaker: compactPersonIdentity(speaker),
+    mentions
+  };
+}
+
+function buildOwnershipPayload(allBlocks, posMap, batch, plan) {
   const locksById = new Map();
   const capsules = [];
   for (const block of interleaveBatch(batch)) {
@@ -1504,6 +1646,7 @@ function buildOwnershipPayload(allBlocks, posMap, batch) {
       before: allBlocks.slice(Math.max(0, pos - CAPSULE_CONTEXT_BEFORE), pos).map(contextCue),
       target: { i: block.index, en: protectedTarget.text, ...(block.speakerHint ? { speaker: block.speakerHint } : {}) },
       after: allBlocks.slice(pos + 1, Math.min(allBlocks.length, pos + 1 + CAPSULE_CONTEXT_AFTER)).map(contextCue),
+      identity_lock: identityLockForCapsule(block, plan),
       hard_locks: protectedTarget.locks.map(lock => lock.token)
     });
   }
@@ -1540,7 +1683,7 @@ async function translateMainBatch({ blocks, posMap, batch, plan, job }) {
   let lastError;
   for (let parseAttempt = 1; parseAttempt <= MAIN_PARSE_ATTEMPTS; parseAttempt++) {
     try {
-      const { payload, locksById } = buildOwnershipPayload(blocks, posMap, batch);
+      const { payload, locksById } = buildOwnershipPayload(blocks, posMap, batch, plan);
       const response = await geminiRequest({
         system: TRANSLATOR_PROMPT,
         user: `BÍBLIA EDITORIAL:\n${JSON.stringify(plan)}\n\nCÁPSULAS CUE-LOCK:\n${JSON.stringify(payload)}\n\nTraduza somente cada target. Output exatamente ${batch.length} cues. Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
@@ -1925,7 +2068,7 @@ async function translateSrt(sourceSrt, job) {
   const blocks = parseSrt(sourceSrt);
   if (!blocks.length) throw new Error("Nenhum cue SRT válido.");
   job.stats.sourceCues = blocks.length;
-  console.log(`[PIPELINE 8.3.3] fonte=${job.sourceKind} | ${blocks.length} cues.`);
+  console.log(`[PIPELINE 8.3.5] fonte=${job.sourceKind} | ${blocks.length} cues.`);
 
   const plan = await buildEpisodePlan(blocks, job);
   job.progress = 5;
@@ -1952,7 +2095,7 @@ async function translateSrt(sourceSrt, job) {
 
   const finalSrt = buildSrt(blocks, finalTranslations);
   auditTimestamps(sourceSrt, finalSrt, "FINAL");
-  console.log(`[PIPELINE 8.3.3] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
+  console.log(`[PIPELINE 8.3.5] FINAL OK | ${blocks.length} cues | ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`);
   return finalSrt;
 }
 
@@ -2059,12 +2202,12 @@ function selectEnglishSubtitle(subtitles) {
 async function fetchOpenSubtitlesSource({ type, id, filename, videoSize, videoHash }) {
   const url = buildOpenSubtitlesUrl(type, id, { filename, videoSize, videoHash });
   console.log(`[OPENSUBTITLES CLOUD] ${url}`);
-  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.3" } });
+  const response = await fetchWithTimeout(url, { headers: { Accept: "application/json", "User-Agent": "Stremio-PTBR/8.3.5" } });
   if (!response.ok) throw new Error(`OpenSubtitles HTTP ${response.status}.`);
   const data = await response.json();
   const target = selectEnglishSubtitle(data?.subtitles);
   if (!target) return null;
-  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.3" } });
+  const subtitleResponse = await fetchWithTimeout(target.url, { headers: { "User-Agent": "Stremio-PTBR/8.3.5" } });
   if (!subtitleResponse.ok) throw new Error(`Download OpenSubtitles HTTP ${subtitleResponse.status}.`);
   const raw = normalizeSrt(await subtitleResponse.text());
   if (!raw || raw.length > MAX_SOURCE_CHARS) throw new Error("Legenda OpenSubtitles vazia/grande demais.");
@@ -2137,9 +2280,9 @@ async function recoverCloudJob(token) {
 
 const manifest = {
   id: "org.tradutor.stateless.gemini.free",
-  version: "8.3.3",
+  version: "8.3.5",
   name: "PT-BR Cloud • OpenSubtitles",
-  description: "OpenSubtitles inglês → PT-BR contextual com HIGH thinking, Cue Ownership, HARD SDH, integridade de palavrões, QA semântico EN×PT e self-heal. A Ponte Local usa também Audio Sync.",
+  description: "OpenSubtitles inglês → PT-BR com Context + Identity Lock, Character Ledger, Cue Ownership, HARD SDH, QA EN×PT e suporte ao OpenSub Sync V5 por Gemini Transcribe.",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
@@ -2153,10 +2296,11 @@ app.get("/", (req, res) => res.json({
   status: "online",
   version: manifest.version,
   model: GEMINI_MODEL,
-  mode: "CLOUD_OPENSUB_PLUS_LOCAL_TRANSLATION_AND_DIRECT_LIVE_TOKEN_AUDIO_SYNC",
+  mode: "CLOUD_OPENSUB_PLUS_LOCAL_TRANSLATION_AND_GEMINI_TRANSCRIBE_MONTAGE_BUDGET",
   mainBatchMaxCues: MAIN_BATCH_MAX_CUES,
   mainConcurrency: MAIN_CONCURRENCY,
   pacerMs: GEMINI_MIN_START_INTERVAL_MS,
+  transcribeBudget: transcribeBudgetSnapshot(),
   cache: translationCache.size,
   jobs: jobs.size
 }));
@@ -2192,54 +2336,50 @@ async function localTranslateHandler(req, res, forcedSourceKind = "") {
 app.post("/api/translate-embedded", (req, res) => localTranslateHandler(req, res, "embedded"));
 app.post("/api/translate-local", (req, res) => localTranslateHandler(req, res));
 
-// Audio Sync v3: o Render NÃO recebe o áudio Live. Ele cria um token efêmero,
-// one-use e restrito ao gemini-3.5-transcribe-live. A Ponte conecta diretamente
-// ao Gemini por WebSocket; a chave Gemini real continua exclusivamente no Render.
-app.post("/api/audio-live-token", async (req, res) => {
-  if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
-
-  try {
-    const label = String(req.body?.label || "audio-sync-direct-live").replace(/\s+/g, " ").slice(0, 120);
-    const tokenInfo = await createGeminiLiveEphemeralToken();
-
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-    res.setHeader("Pragma", "no-cache");
-
-    console.log(`[LIVE TOKEN API] ${label} | token efêmero one-use emitido para ${GEMINI_TRANSCRIBE_LIVE_MODEL} | schema=bidiGenerateContentSetup.`);
-
-    return safeJson(res, {
-      ok: true,
-      model: tokenInfo.model,
-      token: tokenInfo.token,
-      wsUrl: tokenInfo.wsUrl,
-      expireTime: tokenInfo.expireTime,
-      newSessionExpireTime: tokenInfo.newSessionExpireTime,
-      setup: tokenInfo.setup
-    });
-  } catch (error) {
-    console.error(`[LIVE TOKEN API] ${errorMessage(error).slice(0, 500)}`);
-    return safeJson(res, { error: errorMessage(error) }, 500);
-  }
-});
-
-// Unary continua no Render como instrumento de precisão com word timestamps,
-// usado pela Ponte no máximo em poucos pontos críticos do episódio.
+// Audio Sync V5: a Ponte monta várias janelas em UM WAV. O Render mantém a
+// chave Gemini privada, aplica Budget Manager e devolve word timestamps.
 app.post("/api/audio-transcribe", async (req, res) => {
   if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
   try {
     const audioBase64 = String(req.body?.audioBase64 || "").trim();
-    const mimeType = String(req.body?.mimeType || "audio/aac").trim().toLowerCase();
-    const label = String(req.body?.label || "anchor").replace(/\s+/g, " ").slice(0, 120);
+    const mimeType = String(req.body?.mimeType || "audio/wav").trim().toLowerCase();
+    const label = String(req.body?.label || "montage").replace(/\s+/g, " ").slice(0, 120);
+    const durationMs = Math.max(0, Number(req.body?.durationMs || 0));
     if (!/^audio\//i.test(mimeType)) return safeJson(res, { error: "mimeType de áudio inválido." }, 400);
     if (!audioBase64) return safeJson(res, { error: "audioBase64 obrigatório." }, 400);
-    if (audioBase64.length > 6 * 1024 * 1024) return safeJson(res, { error: "Trecho de áudio grande demais." }, 413);
-    console.log(`[AUDIO SYNC API] transcrevendo ${label} | base64=${audioBase64.length}.`);
-    const result = await geminiTranscribeInline(audioBase64, mimeType);
-    return safeJson(res, { ok: true, model: GEMINI_TRANSCRIBE_MODEL, text: result.text, words: result.words });
+    if (audioBase64.length > 8 * 1024 * 1024) return safeJson(res, { error: "Montagem de áudio grande demais." }, 413);
+    if (durationMs > 4 * 60 * 1000) return safeJson(res, { error: "Montagem excede 4 minutos." }, 413);
+    console.log(`[AUDIO SYNC API] ${label} | base64=${audioBase64.length} | duração≈${(durationMs / 1000).toFixed(1)}s.`);
+    const result = await geminiTranscribeInline(audioBase64, mimeType, durationMs, label);
+    return safeJson(res, {
+      ok: true,
+      model: GEMINI_TRANSCRIBE_MODEL,
+      text: result.text,
+      words: result.words,
+      usage: result.usage,
+      budget: result.budget
+    });
   } catch (error) {
-    console.error(`[AUDIO SYNC API] ${errorMessage(error).slice(0, 300)}`);
-    return safeJson(res, { error: errorMessage(error) }, 500);
+    const status = error?.code === "TRANSCRIBE_RPD_LOCK" ? 429 : 500;
+    console.error(`[AUDIO SYNC API] ${errorMessage(error).slice(0, 500)}`);
+    return safeJson(res, { error: errorMessage(error), code: error?.code || "" }, status);
   }
+});
+
+app.get("/api/audio-budget", (req, res) => {
+  if (!authorized(req)) return safeJson(res, { error: "Unauthorized" }, 401);
+  return safeJson(res, {
+    ok: true,
+    model: GEMINI_TRANSCRIBE_MODEL,
+    limits: {
+      rpm: 3,
+      tpm: TRANSCRIBE_TPM_LIMIT,
+      rpdExternal: 25,
+      rpdInternal: TRANSCRIBE_RPD_INTERNAL_LIMIT,
+      minStartIntervalMs: TRANSCRIBE_MIN_START_INTERVAL_MS
+    },
+    state: transcribeBudgetSnapshot()
+  });
 });
 
 // ============================================================
@@ -2290,8 +2430,11 @@ function errorSrt(error) {
 
 app.get("/subtitle/:jobId.srt", async (req, res) => {
   let jobId;
-  try { jobId = decodeURIComponent(String(req.params.jobId || "")); }
-  catch { jobId = String(req.params.jobId || ""); }
+  try {
+    jobId = decodeURIComponent(String(req.params.jobId || ""));
+  } catch {
+    jobId = String(req.params.jobId || "");
+  }
 
   let job = jobs.get(jobId);
   const recoveryToken = String(req.query.r || "").trim();
@@ -2317,8 +2460,11 @@ app.get("/subtitle/:jobId.srt", async (req, res) => {
   }
 
   if (job.status === "completed" && job.result) {
-    try { auditTimestamps(job.sourceSrt, job.result, "SERVING"); }
-    catch (error) { return sendSrt(res, errorSrt(errorMessage(error))); }
+    try {
+      auditTimestamps(job.sourceSrt, job.result, "SERVING");
+    } catch (error) {
+      return sendSrt(res, errorSrt(errorMessage(error)));
+    }
     return sendSrt(res, job.result, "public, max-age=604800");
   }
 
@@ -2332,13 +2478,15 @@ app.get("/subtitle/:jobId.srt", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log("============================================================");
-  console.log(" STREMIO PT-BR 8.3.3 — HIGH QUALITY + HARD SDH + DIRECT LIVE TOKEN AUDIO SYNC SUPPORT");
+  console.log(" STREMIO PT-BR 8.3.5 — HIGH QUALITY + HARD SDH + CONTEXT + IDENTITY LOCK + TRANSCRIBE BUDGET/MONTAGE");
   console.log("============================================================");
   console.log(`Gemini: ${GEMINI_API_KEY ? "CONFIGURADA ✅" : "FALTANDO ❌"}`);
   console.log(`Modelo: ${GEMINI_MODEL} ✅`);
   console.log("Cloud OpenSubtitles: ATIVO + LAZY + SELF-HEAL ✅");
   console.log("APIs Local Embedded + OpenSub Sync: ATIVAS ✅");
-  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_LIVE_MODEL} direto via token efêmero REST schema=bidiGenerateContentSetup + ${GEMINI_TRANSCRIBE_MODEL} precisão ✅`);
+  console.log(`Audio Sync ASR: ${GEMINI_TRANSCRIBE_MODEL} | montage COARSE/PRECISION/RESCUE + word timestamps ✅`);
+  console.log(`Transcribe Budget: 22s entre inícios | TPM soft=${TRANSCRIBE_TPM_SOFT_LIMIT}/${TRANSCRIBE_TPM_LIMIT} | RPD interno=${TRANSCRIBE_RPD_INTERNAL_LIMIT}/25 ✅`);
+  console.log("Context + Identity Lock / Character Ledger: ATIVO ✅");
   console.log(`Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`);
   console.log(`Cue capsules: ${CAPSULE_CONTEXT_BEFORE} antes + target fechado + ${CAPSULE_CONTEXT_AFTER} depois ✅`);
   console.log(`Thinking: PLAN=${PLAN_THINKING} | MAIN=${MAIN_THINKING} | QA=${QA_THINKING} | REPAIR=${REPAIR_THINKING} ✅`);
