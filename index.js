@@ -7006,6 +7006,23 @@ function parseCueTranslation(
       );
     }
 
+    // ============================================================
+// PT-BR VOCAB HARD LOCK — "qualé"
+// ============================================================
+// Preferência editorial absoluta:
+// essa forma nunca deve chegar à legenda final.
+// Não substituímos deterministicamente porque o equivalente
+// correto depende do contexto; forçamos o Gemini a reformular.
+if (
+  /(?:^|[^\p{L}\p{N}_])qualé(?=$|[^\p{L}\p{N}_])/iu.test(
+    pt
+  )
+) {
+  throw new Error(
+    `PT-BR VOCAB HARD LOCK cue ${id}: termo proibido "qualé".`
+  );
+}
+
     const expectedOwnershipKey =
       ownershipById.get(
         id
