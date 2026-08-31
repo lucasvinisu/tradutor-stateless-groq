@@ -8795,11 +8795,10 @@ console.log(
     continue;
   }
 
-  updated.set(
-    id,
-    candidatePt
-  );
-}
+          updated.set(
+          id,
+          candidatePt
+        );
       }
     }
 
