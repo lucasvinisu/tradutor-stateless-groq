@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.8 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.9 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -20,7 +20,8 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
-const CACHE_VERSION = "8.3.8-naturalness-layout-lock-transcribe-budget";
+const CACHE_VERSION =
+  "8.3.9-meaning-integrity-hard-2x50-compact-rescue";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -40,7 +41,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.8.
+// já consumidas nas últimas 24h durante o deploy do 8.3.9.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -105,6 +106,26 @@ const LAYOUT_MAX_CHARS_PER_LINE = 50;
 
 // Quanto mais perto deste valor, mais equilibradas as duas linhas ficam.
 const LAYOUT_IDEAL_CHARS_PER_LINE = 44;
+
+// ============================================================
+// COMPACT RESCUE — HARD 2x50
+// ============================================================
+
+// Só entra aqui quem continuou grande DEMAIS mesmo após o Repair normal.
+// Em episódios como o teste do RuPaul, esperamos pouquíssimos cues.
+const COMPACT_RESCUE_ENABLED = true;
+const COMPACT_RESCUE_MAX_CUES_TOTAL = 120;
+const COMPACT_RESCUE_BATCH_MAX_CUES = 24;
+const COMPACT_RESCUE_MAX_ROUNDS = 2;
+
+const COMPACT_RESCUE_THINKING = "high";
+const COMPACT_RESCUE_MAX_OUTPUT_TOKENS = 7000;
+const COMPACT_RESCUE_TIMEOUT_MS = 90000;
+const COMPACT_RESCUE_HTTP_RETRIES = 3;
+
+// 96 dá folga para o JavaScript encontrar uma quebra <= 50/50.
+// Não é truncamento; é objetivo editorial para o Gemini.
+const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
 const RECOVERY_SIGNING_KEY =
@@ -3036,7 +3057,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.8
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.9
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3118,6 +3139,49 @@ CONCISÃO AUDIOVISUAL
 - Se duas formulações forem semanticamente equivalentes, prefira a mais curta, natural e rápida de ler.
 - Não acrescente sujeitos, pronomes, conectivos ou explicações que o português possa omitir naturalmente.
 - Não resuma informação; compacte a FORMA, não o conteúdo.
+
+MEANING INTEGRITY LOCK — REGRA INVIOLÁVEL
+- NATURALIZAR NÃO É RESUMIR.
+- ENCURTAR NÃO É APAGAR.
+- Uma tradução mais elegante que perde uma unidade real de significado é INCORRETA.
+- Antes de compactar, faça silenciosamente um inventário semântico do EN.
+
+Toda unidade independente deve sobreviver quando existir no original:
+* quem fez/sentiu/disse;
+* ação ou estado;
+* objeto/alvo da ação;
+* negação;
+* causa e consequência;
+* condição;
+* quantidade;
+* comparação;
+* relação familiar/social;
+* tempo relevante;
+* contraste;
+* intensidade;
+* palavrão ou força emocional relevante;
+* insulto e seu grau de agressividade;
+* piada, shade ou duplo sentido;
+* informação narrativa nova.
+
+- Se o EN trouxer duas informações ligadas por "and", não apague automaticamente a segunda só para encurtar.
+- Não transforme duas ideias diferentes em uma ideia genérica.
+- Não suavize insulto, vulgaridade, raiva ou intensidade apenas para economizar caracteres.
+- Não transforme FALA em descrição SDH, stage direction ou efeito sonoro.
+- Uma instrução falada continua sendo fala.
+- Preserve a função comunicativa do cue.
+
+CONCISÃO SEGURA
+- Economize caracteres mudando a ESTRUTURA do português:
+  * elimine sujeito redundante;
+  * use verbo mais direto;
+  * retire repetição sintática;
+  * prefira expressão idiomática curta;
+  * evite nominalizações e construções burocráticas;
+  * use elipse natural do português quando o sentido continuar completo.
+- NÃO economize caracteres removendo fatos ou relações.
+- O objetivo visual é caber em 2 linhas de até 50 caracteres.
+- Se não houver forma segura no MAIN, preserve o sentido completo. O sistema possui uma etapa especializada posterior para compactação.
 
 CUE OWNERSHIP — REGRA INVIOLÁVEL
 - Cada cápsula é independente.
@@ -3356,12 +3420,84 @@ SUBTITLE_TOO_DENSE
 - NÃO crie nem altere timestamps.
 - Se não houver forma segura de reduzir, preserve o conteúdo completo. Integridade vem antes do limite visual.
 
+MEANING INTEGRITY DURANTE O REPAIR
+- Antes de reescrever, identifique silenciosamente todas as unidades semânticas do EN.
+- Sua nova versão só é válida se TODAS continuarem representadas.
+- Compacte sintaxe, não significado.
+- NÃO transforme duas informações em uma só mais genérica.
+- NÃO apague relação familiar/social.
+- NÃO apague causa, contraste, condição ou consequência.
+- NÃO neutralize insulto ou intensidade apenas para diminuir caracteres.
+- NÃO converta fala em [descrição], (descrição), *descrição* ou SDH.
+- Se o PT atual estiver semanticamente mais completo que sua proposta, NÃO piore o cue.
+
 Corrija defeitos reais de cultura, literalidade/calque, censura/bleep, gênero/referente, ortografia, palavra corrompida, naturalidade, SDH residual, omissão, overflow, formatação ou ownership.
 - Se identity_lock disser que o speaker é desconhecido/incerto, neutralize concordância de 1ª pessoa quando não houver evidência segura.
 - "Gramaticalmente correto" não basta se soar traduzido, antiquado ou pouco espontâneo em PT-BR contemporâneo.
 - Se houver palavrão autocensurado graficamente, reconstrua a fala natural por extenso; nunca preserve f..., fu&#, *** ou equivalentes.
 Preserve o que já estiver bom.
 Não redistribua conteúdo entre ids.
+`;
+
+const COMPACT_RESCUE_PROMPT = `
+Você é o editor audiovisual FINAL de legendas EN→PT-BR.
+
+${STYLE_PACK}
+
+Sua tarefa é MUITO específica:
+
+Você receberá somente cues que, mesmo depois do MAIN + QA + REPAIR,
+ainda NÃO conseguem ser diagramados em no máximo:
+
+- ${LAYOUT_MAX_LINES} linhas;
+- ${LAYOUT_MAX_CHARS_PER_LINE} caracteres por linha.
+
+OBJETIVO
+Reescreva SOMENTE o PT do mesmo cue para que fique:
+1. semanticamente completo;
+2. natural em PT-BR;
+3. conciso;
+4. diagramável em 2x50.
+
+MEANING INTEGRITY LOCK
+- Faça silenciosamente um inventário de TODAS as unidades de significado do EN.
+- Nenhuma delas pode desaparecer apenas para atingir o limite.
+- Preserve fatos, referentes, relações, negação, causa, contraste,
+  condição, quantidade, intensidade, emoção, insulto, palavrão relevante,
+  humor, shade e informação narrativa.
+- Compacte a FORMA, nunca o CONTEÚDO.
+
+COMO ECONOMIZAR
+- reorganize completamente a sintaxe inglesa;
+- use português mais direto;
+- elimine sujeito/pronome redundante;
+- elimine repetição puramente estrutural;
+- prefira verbo curto a construção nominal longa;
+- prefira expressão brasileira idiomática e curta;
+- use contrações naturais quando combinarem com a personagem;
+- procure ficar preferencialmente em até ${COMPACT_RESCUE_TARGET_TOTAL_CHARS}
+  caracteres visíveis totais para dar margem ao reflow.
+
+PROIBIDO
+- cortar palavra;
+- truncar frase;
+- remover informação;
+- mover palavras para outro cue;
+- criar outro cue;
+- criar ou alterar timestamp;
+- transformar fala em SDH/stage direction;
+- criar [som...], (som...), *som...* ou equivalentes;
+- suavizar insulto/intensidade por conveniência;
+- inventar sinônimo que altere a força social da fala.
+
+DIÁLOGO
+Se o original contém duas falas no mesmo cue, preserve as duas falas
+e o formato de diálogo. Não una speakers diferentes.
+
+HARD LOCK
+Todos os tokens __LOCK_C...__ devem voltar IDÊNTICOS.
+
+A resposta deve conter exatamente um objeto por cue recebido.
 `;
 
 const QA_PROMPT = `
@@ -3428,6 +3564,34 @@ PADRÕES OBJETIVOS A EVITAR:
 - actually≠atualmente, eventually≠eventualmente por reflexo, realize≠realizar no sentido de perceber, pretend≠pretender no sentido de fingir;
 - "malevolent force" não deve virar português infantil/artificial como "força maldosa";
 - não use "qualé", "pistola" ou construções como "bêbada que só a porra" por automatismo estilístico.
+
+MEANING INTEGRITY AUDIT — OBRIGATÓRIO
+Antes de decidir que um cue está correto, compare EN×PT por UNIDADES DE SIGNIFICADO.
+
+Pergunte silenciosamente:
+1. Cada fato do EN ainda existe no PT?
+2. Toda relação relevante ainda existe?
+3. Alguma informação depois de "and", "but", "because", "if", "while" etc. desapareceu?
+4. A intensidade emocional foi preservada?
+5. Um insulto virou palavra neutra?
+6. Um palavrão/intensificador desapareceu de maneira que mudou o tom?
+7. Uma fala virou descrição de som/SDH?
+8. O tradutor compactou tanto que virou resumo?
+
+MARQUE para Repair quando houver perda real, mesmo que o PT final:
+- esteja gramaticalmente correto;
+- soe natural;
+- esteja curto;
+- caiba perfeitamente na tela.
+
+Naturalidade SEM fidelidade não passa.
+
+CASOS-TESTE DO TIPO DE ERRO:
+- "relationships and family connections": ambas as ideias precisam sobreviver; "relações" sozinho pode apagar os laços familiares.
+- "how in the hell": não precisa de tradução lexical, mas a ênfase/força da fala não pode simplesmente desaparecer.
+- "fire crotch": não pode ser domesticado automaticamente para algo neutro como "ruivinha"; preserve a função de insulto vulgar/cômico conforme o contexto.
+- "Insert rattlesnakes.": se for uma instrução falada, deve continuar sendo fala; NÃO transformar em "[som de cascavel]".
+Os exemplos definem o TIPO de falha. Não os copie mecanicamente.
 
 NÃO marque uma escolha apenas diferente se ela for realmente correta, espontânea e adequada ao registro.
 Tô/tá/pra/né e palavrões por extenso podem ser ótimos quando combinarem com a personagem.
@@ -8357,6 +8521,95 @@ async function repairBatch(
   throw lastError;
 }
 
+function repairCandidateRegressionReasons(
+  block,
+  beforePt,
+  candidatePt,
+  filename
+) {
+  const before = String(beforePt || "").trim();
+  const candidate = String(candidatePt || "").trim();
+
+  const beforeReasons = new Set(
+    localReasonsForCue(
+      block,
+      before,
+      filename
+    )
+  );
+
+  const afterReasons =
+    localReasonsForCue(
+      block,
+      candidate,
+      filename
+    );
+
+  const regressions = [];
+
+  for (const reason of afterReasons) {
+    const isCriticalRegression =
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK)/i.test(
+        reason
+      );
+
+    if (
+      isCriticalRegression &&
+      !beforeReasons.has(reason)
+    ) {
+      regressions.push(reason);
+    }
+  }
+
+  // Se o Repair inventar [descrição] onde não havia,
+  // especialmente em uma fala comum, rejeitamos.
+  const beforeBracketed =
+    /\[[^\]]{1,120}\]/u.test(before);
+
+  const newBracketParts =
+    candidate.match(/\[[^\]]{1,120}\]/gu) || [];
+
+  const suspiciousNewBrackets =
+    newBracketParts.filter(
+      part =>
+        !/^\[censurado\]$/iu.test(
+          part.trim()
+        )
+    );
+
+  if (
+    !beforeBracketed &&
+    suspiciousNewBrackets.length
+  ) {
+    regressions.push(
+      "NEW_BRACKETED_STAGE_DIRECTION"
+    );
+  }
+
+  // Também não permitimos criar uma linha inteira
+  // embrulhada em asteriscos como descrição.
+  const beforeStarDescriptor =
+    /(?:^|\n)\s*\*[^*\n]{1,120}\*\s*(?=$|\n)/u.test(
+      before
+    );
+
+  const candidateStarDescriptor =
+    /(?:^|\n)\s*\*[^*\n]{1,120}\*\s*(?=$|\n)/u.test(
+      candidate
+    );
+
+  if (
+    !beforeStarDescriptor &&
+    candidateStarDescriptor
+  ) {
+    regressions.push(
+      "NEW_STARRED_STAGE_DIRECTION"
+    );
+  }
+
+  return [...new Set(regressions)];
+}
+
 async function tryFocusedRepair(
   blocks,
   translations,
@@ -8504,16 +8757,49 @@ console.log(
           job
         );
 
-      for (
-        const [
-          id,
-          pt
-        ] of repaired
-      ) {
-        updated.set(
-          id,
-          pt
-        );
+      for (const [id, pt] of repaired) {
+  const pos =
+    posMap.get(id);
+
+  const block =
+    blocks[pos];
+
+  if (!block) {
+    continue;
+  }
+
+  const beforePt =
+    String(
+      updated.get(id) ??
+      translations.get(id) ??
+      ""
+    ).trim();
+
+  const candidatePt =
+    String(pt || "").trim();
+
+  const regressions =
+    repairCandidateRegressionReasons(
+      block,
+      beforePt,
+      candidatePt,
+      job.filename
+    );
+
+  if (regressions.length) {
+    console.warn(
+      `[REPAIR REGRESSION GUARD] cue ${id} rejeitado | ` +
+      `${regressions.join(", ")}.`
+    );
+
+    continue;
+  }
+
+  updated.set(
+    id,
+    candidatePt
+  );
+}
       }
     }
 
@@ -8540,6 +8826,486 @@ console.log(
 // PIPELINE / JOB
 // ============================================================
 
+function collectCompactRescueIssues(
+  blocks,
+  translations
+) {
+  const issues = [];
+
+  for (const block of blocks) {
+    const current =
+      String(
+        translations.get(block.index) ??
+        block.text
+      ).trim();
+
+    const layout =
+      layoutCueResult(
+        block,
+        current
+      );
+
+    if (
+      !layout.fits ||
+      layout.lines > LAYOUT_MAX_LINES
+    ) {
+      issues.push({
+        id: block.index,
+        reasons: [
+          "SUBTITLE_TOO_DENSE"
+        ]
+      });
+    }
+  }
+
+  return issues;
+}
+
+function buildCompactRescuePayload(
+  blocks,
+  posMap,
+  translations,
+  issues,
+  plan
+) {
+  const locksById =
+    new Map();
+
+  const cues =
+    issues.map(issue => {
+      const pos =
+        posMap.get(issue.id);
+
+      const block =
+        blocks[pos];
+
+      const protectedTarget =
+        protectCulturalLocks(
+          block.text,
+          block.index
+        );
+
+      locksById.set(
+        block.index,
+        protectedTarget.locks
+      );
+
+      const current =
+        String(
+          translations.get(block.index) ??
+          ""
+        ).trim();
+
+      const layout =
+        layoutCueResult(
+          block,
+          current
+        );
+
+      return {
+        i: block.index,
+
+        en:
+          protectedTarget.text,
+
+        pt:
+          current,
+
+        reasons:
+          issue.reasons,
+
+        hard_locks:
+          protectedTarget.locks.map(
+            lock => lock.token
+          ),
+
+        ...(block.speakerHint
+          ? {
+              speaker:
+                block.speakerHint
+            }
+          : {}),
+
+        identity_lock:
+          identityLockForCapsule(
+            block,
+            plan
+          ),
+
+        constraints: {
+          max_lines:
+            LAYOUT_MAX_LINES,
+
+          max_chars_per_line:
+            LAYOUT_MAX_CHARS_PER_LINE,
+
+          preferred_total_visible_chars:
+            COMPACT_RESCUE_TARGET_TOTAL_CHARS
+        },
+
+        current_layout: {
+          lines:
+            layout.lines,
+
+          max_line_length:
+            layout.maxLineLength,
+
+          visible_chars:
+            layoutVisibleLength(
+              normalizeLayoutWhitespace(
+                current
+              )
+            )
+        },
+
+        before:
+          blocks
+            .slice(
+              Math.max(
+                0,
+                pos - 2
+              ),
+              pos
+            )
+            .map(item => ({
+              i: item.index,
+              en: item.text,
+              pt:
+                translations.get(
+                  item.index
+                ) || ""
+            })),
+
+        after:
+          blocks
+            .slice(
+              pos + 1,
+              Math.min(
+                blocks.length,
+                pos + 3
+              )
+            )
+            .map(item => ({
+              i: item.index,
+              en: item.text,
+              pt:
+                translations.get(
+                  item.index
+                ) || ""
+            }))
+      };
+    });
+
+  return {
+    payload: {
+      cues
+    },
+    locksById
+  };
+}
+
+async function compactRescueBatch(
+  blocks,
+  posMap,
+  translations,
+  issues,
+  plan,
+  job,
+  round
+) {
+  let lastError;
+
+  for (
+    let parseAttempt = 1;
+    parseAttempt <= REPAIR_PARSE_ATTEMPTS;
+    parseAttempt++
+  ) {
+    try {
+      const {
+        payload,
+        locksById
+      } =
+        buildCompactRescuePayload(
+          blocks,
+          posMap,
+          translations,
+          issues,
+          plan
+        );
+
+      const response =
+        await geminiRequest({
+          system:
+            COMPACT_RESCUE_PROMPT,
+
+          user:
+            `BÍBLIA:\n${JSON.stringify(plan)}\n\n` +
+            `COMPACT RESCUE — RODADA ${round}/${COMPACT_RESCUE_MAX_ROUNDS}\n` +
+            `CUES:\n${JSON.stringify(payload)}\n\n` +
+            `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
+            `O objetivo é conteúdo COMPLETO + PT-BR natural + 2x50.`,
+
+          schema:
+            cueTranslationSchema(
+              issues.length
+            ),
+
+          thinkingLevel:
+            COMPACT_RESCUE_THINKING,
+
+          maxOutputTokens:
+            COMPACT_RESCUE_MAX_OUTPUT_TOKENS,
+
+          timeoutMs:
+            COMPACT_RESCUE_TIMEOUT_MS,
+
+          maxRetries:
+            COMPACT_RESCUE_HTTP_RETRIES,
+
+          job,
+
+          metric:
+            "compact"
+        });
+
+      return parseCueTranslation(
+        issues.map(
+          issue =>
+            blocks[
+              posMap.get(
+                issue.id
+              )
+            ]
+        ),
+        response.text,
+        locksById
+      );
+    } catch (error) {
+      lastError =
+        error;
+
+      if (
+        parseAttempt >=
+        REPAIR_PARSE_ATTEMPTS
+      ) {
+        throw error;
+      }
+
+      console.warn(
+        `[COMPACT CUE-LOCK] repetindo lote | ` +
+        `${errorMessage(error).slice(0, 260)}`
+      );
+    }
+  }
+
+  throw lastError;
+}
+
+async function runCompactRescue(
+  blocks,
+  translations,
+  plan,
+  job
+) {
+  if (!COMPACT_RESCUE_ENABLED) {
+    return translations;
+  }
+
+  const posMap =
+    positionMap(blocks);
+
+  const updated =
+    new Map(translations);
+
+  let totalAccepted = 0;
+  let totalRejected = 0;
+
+  for (
+    let round = 1;
+    round <= COMPACT_RESCUE_MAX_ROUNDS;
+    round++
+  ) {
+    const allIssues =
+      collectCompactRescueIssues(
+        blocks,
+        updated
+      );
+
+    if (!allIssues.length) {
+      console.log(
+        `[COMPACT RESCUE] rodada ${round}: ` +
+        `nenhum overflow restante ✅`
+      );
+
+      break;
+    }
+
+    const selected =
+      allIssues.slice(
+        0,
+        COMPACT_RESCUE_MAX_CUES_TOTAL
+      );
+
+    if (
+      allIssues.length >
+      selected.length
+    ) {
+      console.warn(
+        `[COMPACT RESCUE] ${allIssues.length} overflow(s); ` +
+        `limite desta rodada=${selected.length}.`
+      );
+    }
+
+    console.log(
+      `[COMPACT RESCUE] rodada ${round}/${COMPACT_RESCUE_MAX_ROUNDS} | ` +
+      `candidatos=${selected.length}.`
+    );
+
+    let acceptedThisRound = 0;
+    let rejectedThisRound = 0;
+
+    for (
+      let i = 0;
+      i < selected.length;
+      i += COMPACT_RESCUE_BATCH_MAX_CUES
+    ) {
+      const batch =
+        selected.slice(
+          i,
+          i +
+            COMPACT_RESCUE_BATCH_MAX_CUES
+        );
+
+      try {
+        const rescued =
+          await compactRescueBatch(
+            blocks,
+            posMap,
+            updated,
+            batch,
+            plan,
+            job,
+            round
+          );
+
+        for (
+          const [id, rawPt]
+          of rescued
+        ) {
+          const pos =
+            posMap.get(id);
+
+          const block =
+            blocks[pos];
+
+          if (!block) {
+            continue;
+          }
+
+          const beforePt =
+            String(
+              updated.get(id) ??
+              ""
+            ).trim();
+
+          const candidatePt =
+            sanitizeFinalCue(
+              block,
+              String(rawPt || "")
+            );
+
+          if (!candidatePt) {
+            rejectedThisRound++;
+            totalRejected++;
+
+            console.warn(
+              `[COMPACT RESCUE] cue ${id} rejeitado: vazio após sanitizer.`
+            );
+
+            continue;
+          }
+
+          const layout =
+            layoutCueResult(
+              block,
+              candidatePt
+            );
+
+          if (
+            !layout.fits ||
+            layout.lines >
+              LAYOUT_MAX_LINES
+          ) {
+            rejectedThisRound++;
+            totalRejected++;
+
+            console.warn(
+              `[COMPACT RESCUE] cue ${id} ainda não cabe em 2x${LAYOUT_MAX_CHARS_PER_LINE} | ` +
+              `maior linha=${layout.maxLineLength}.`
+            );
+
+            continue;
+          }
+
+          const regressions =
+            repairCandidateRegressionReasons(
+              block,
+              beforePt,
+              candidatePt,
+              job.filename
+            );
+
+          if (regressions.length) {
+            rejectedThisRound++;
+            totalRejected++;
+
+            console.warn(
+              `[COMPACT RESCUE REGRESSION] cue ${id} rejeitado | ` +
+              `${regressions.join(", ")}.`
+            );
+
+            continue;
+          }
+
+          updated.set(
+            id,
+            candidatePt
+          );
+
+          acceptedThisRound++;
+          totalAccepted++;
+        }
+      } catch (error) {
+        console.warn(
+          `[COMPACT RESCUE] lote falhou sem matar episódio | ` +
+          `${errorMessage(error).slice(0, 350)}`
+        );
+      }
+    }
+
+    console.log(
+      `[COMPACT RESCUE] rodada ${round} | ` +
+      `aprovados=${acceptedThisRound} | ` +
+      `rejeitados=${rejectedThisRound}.`
+    );
+  }
+
+  const remaining =
+    collectCompactRescueIssues(
+      blocks,
+      updated
+    );
+
+  console.log(
+    `[COMPACT RESCUE] FINAL | ` +
+    `aprovados=${totalAccepted} | ` +
+    `rejeitados=${totalRejected} | ` +
+    `overflow restante=${remaining.length}.`
+  );
+
+  return updated;
+}
+
 async function translateSrt(
   sourceSrt,
   job
@@ -8562,7 +9328,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.8] fonte=${
+    `[PIPELINE 8.3.9] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -8662,6 +9428,27 @@ finalTranslations =
   );
 
 // ============================================================
+// COMPACT RESCUE
+// ============================================================
+// Só os cues que AINDA não cabem em 2x50 entram aqui.
+// Não move conteúdo, não cria cue e não toca em timestamp.
+finalTranslations =
+  await runCompactRescue(
+    blocks,
+    finalTranslations,
+    plan,
+    job
+  );
+
+// Sanitizer final após o Rescue.
+finalTranslations =
+  sanitizeTranslationMap(
+    blocks,
+    finalTranslations,
+    job
+  );
+
+// ============================================================
 // LAYOUT LOCK — FINAL
 // ============================================================
 // A tradução final é diagramada deterministicamente.
@@ -8675,6 +9462,27 @@ const finalLayoutTranslations =
     "FINAL"
   );
 
+ const finalLayoutOverflow =
+  collectCompactRescueIssues(
+    blocks,
+    finalLayoutTranslations
+  );
+
+if (!finalLayoutOverflow.length) {
+  console.log(
+    `[LAYOUT HARD CAP] PASSOU ✅ | ` +
+    `${blocks.length}/${blocks.length} cues em no máximo ` +
+    `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}.`
+  );
+} else {
+  console.warn(
+    `[LAYOUT HARD CAP] ATENÇÃO ❌ | ` +
+    `${finalLayoutOverflow.length} cue(s) ainda excedem ` +
+    `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}. ` +
+    `Conteúdo NÃO foi truncado.`
+  );
+}
+  
 // O guard final analisa exatamente o texto que será servido.
 const remaining =
   detectLocalIssues(
@@ -8709,7 +9517,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.8] FINAL OK | ${
+    `[PIPELINE 8.3.9] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -9110,7 +9918,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.8"
+            "Stremio-PTBR/8.3.9"
         }
       }
     );
@@ -9142,7 +9950,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.8"
+            "Stremio-PTBR/8.3.9"
         }
       }
     );
@@ -9428,7 +10236,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.8",
+    "8.3.9",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -10185,7 +10993,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.8 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.9 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
   );
 
   console.log(
@@ -10250,6 +11058,22 @@ console.log(
 
 console.log(
   "SUBTITLE_TOO_DENSE: Repair busca concisão natural antes do reflow final ✅"
+);
+
+  console.log(
+  "Meaning Integrity Lock: naturalizar/compactar NÃO pode apagar unidades semânticas ✅"
+);
+
+console.log(
+  `Compact Rescue: até ${COMPACT_RESCUE_MAX_ROUNDS} rodada(s), somente overflow residual, thinking=${COMPACT_RESCUE_THINKING} ✅`
+);
+
+console.log(
+  `Final Layout Cap: objetivo estrito=${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}; zero truncamento / zero word-split ✅`
+);
+
+console.log(
+  "Repair Regression Guard: bloqueia nova omissão/SDH/censura/gênero/diálogo quebrado ✅"
 );
 
   console.log(
