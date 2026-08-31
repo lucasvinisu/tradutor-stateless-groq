@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.13 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.14 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.13-ownership-key-lock-semantic-compact-canonical-2x50";
+  "8.3.14-entity-integrity-post-semantic-ownership-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -41,7 +41,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.11.
+// já consumidas nas últimas 24h durante o deploy do 8.3.14.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -3145,7 +3145,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.11
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.14
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3161,6 +3161,26 @@ PRINCÍPIO CENTRAL: PRESERVAR IDENTIDADE, LOCALIZAR INTENÇÃO
 - Não "abrasileire" nomes/bordões que soariam falsos traduzidos.
 - Não deixe inglês estrutural dentro de português só porque as palavras foram traduzidas.
 - A legenda deve fazer um brasileiro entender o que a fala QUER DIZER e como ela SOA socialmente.
+
+NAMED / CULTURAL ENTITY INTEGRITY — REGRA ABSOLUTA
+- Nomes e identidades culturais NÃO são matéria de adaptação livre.
+- Preserve a identidade de pessoas reais, personagens, figuras mitológicas,
+  lendas/folclore, celebridades, marcas, empresas, programas, filmes, séries,
+  músicas, obras, instituições, eventos, lugares e demais entidades nomeadas.
+- NUNCA substitua uma entidade estrangeira por uma entidade brasileira
+  "equivalente", parecida ou culturalmente análoga.
+- Localizar a INTENÇÃO não autoriza trocar a IDENTIDADE.
+- Uma forma canônica consagrada em PT-BR para A MESMA entidade é permitida:
+  exônimos estabelecidos, títulos oficiais localizados e nomes oficialmente
+  usados em português continuam representando a mesma identidade.
+- Se houver dúvida entre preservar o nome original ou inventar/adaptar
+  culturalmente, PRESERVE O ORIGINAL.
+- Traduza a explicação em volta da entidade, não transforme a entidade em outra.
+- Se a mesma entidade reaparecer no episódio, mantenha sua identidade consistente.
+- Exemplo de erro de identidade:
+  "Bloody Mary" -> "Loira do Banheiro" é PROIBIDO.
+  São lendas culturalmente análogas, mas NÃO são a mesma entidade.
+- Isso é diferente de uma tradução canônica da MESMA entidade.
 
 CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - A BÍBLIA EDITORIAL contém um Character Ledger. Trate identidades confirmadas como estado de continuidade do episódio.
@@ -3730,6 +3750,28 @@ MARQUE quando houver:
 - speaker labels, SDH/CC, descrição sonora, créditos, símbolos, placeholders, gagueira gráfica/alongamento;
 - quebra de continuidade audiovisual, palavras/letras exibidas na tela.
 
+NAMED / CULTURAL ENTITY INTEGRITY — CRÍTICO
+
+Compare as entidades nomeadas do EN com o PT.
+
+SINALIZE se:
+- uma pessoa, personagem, lenda, figura cultural, marca, obra, programa,
+  música, instituição, lugar ou outra entidade foi trocada por OUTRA entidade;
+- o PT abrasileirou uma identidade usando um equivalente cultural local;
+- um nome desapareceu e foi substituído por uma explicação que muda sua identidade;
+- a mesma entidade recebe identidades diferentes em cues próximos.
+
+É permitido usar a forma canônica consagrada em PT-BR da MESMA entidade.
+Não sinalize "Nova York" por "New York", por exemplo.
+
+Na dúvida sobre existir uma forma canônica PT-BR,
+preservar a entidade original é a escolha segura.
+
+Quando houver substituição real de identidade,
+reason deve começar com:
+
+ENTITY_IDENTITY_SUBSTITUTION: identidade cultural alterada.
+
 CUE OWNERSHIP / SEMANTIC SYNC — CRÍTICO
 
 Para CADA cue, compare exclusivamente o EN daquele ID
@@ -3828,6 +3870,20 @@ Preserve a FALA/INTENÇÃO PROVÁVEL da cena.
 
 NÃO seja escravo de um erro evidente da legenda-fonte,
 mas também NÃO invente conteúdo apenas porque ele parece plausível.
+
+NAMED / CULTURAL ENTITY INTEGRITY
+
+Uma reescrita NÃO pode mudar a identidade de uma entidade nomeada.
+
+- Preserve pessoas, personagens, lendas, figuras culturais, marcas,
+  obras, programas, músicas, instituições, lugares e demais entidades.
+- Forma canônica PT-BR da MESMA entidade é válida.
+- Entidade brasileira/culturalmente análoga NÃO é a mesma entidade.
+- Nunca aceite adaptação cultural que substitua uma identidade por outra.
+- Se BEFORE_PT preservava corretamente a entidade e AFTER_PT a substituiu,
+  isso é REGRESSÃO SEMÂNTICA.
+- Se EN contém a entidade e AFTER_PT a trocou por outra, CORRIJA.
+- Na dúvida, preserve o nome original.
 
 ============================================================
 CULTURE & REGISTER INTEGRITY
@@ -8706,6 +8762,7 @@ function issuePriority(issue) {
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
     /POSSIBLE_OMISSION/i.test(joined) ||
     /POSSIBLE_CUE_SHIFT_PAIR/i.test(joined) ||
+    /POSSIBLE_FORCED_OR_DATED_SLANG/i.test(joined) ||
     /EMPTY/i.test(joined) ||
     /UNRESOLVED_BLEEP_TOKEN/i.test(joined) ||
     /BLEEP_CREATED_DANGLING_SENTENCE/i.test(joined) ||
@@ -10329,6 +10386,70 @@ async function trySemanticCompactCorrection({
   return candidate;
 }
 
+function semanticSourceLikelyContinuesNextCue(
+  blocks,
+  posMap,
+  id
+) {
+  const pos =
+    posMap.get(id);
+
+  if (
+    !Number.isInteger(pos) ||
+    pos < 0 ||
+    pos >= blocks.length - 1
+  ) {
+    return false;
+  }
+
+  const current =
+    String(
+      blocks[pos]?.text ||
+      ""
+    ).trim();
+
+  const next =
+    String(
+      blocks[pos + 1]?.text ||
+      ""
+    ).trim();
+
+  if (
+    !current ||
+    !next
+  ) {
+    return false;
+  }
+
+  // Se o cue atual já termina claramente uma frase,
+  // não tratamos como continuação.
+  if (
+    /[.!?]["'’”)\]]*$/u.test(
+      current
+    )
+  ) {
+    return false;
+  }
+
+  // Primeiro caractere alfabético do próximo cue.
+  const firstLetter =
+    next.match(
+      /\p{L}/u
+    )?.[0] || "";
+
+  if (!firstLetter) {
+    return false;
+  }
+
+  const startsLowercase =
+    firstLetter ===
+      firstLetter.toLocaleLowerCase() &&
+    firstLetter !==
+      firstLetter.toLocaleUpperCase();
+
+  return startsLowercase;
+}
+
 async function runPostRewriteSemanticAudit(
   blocks,
   beforeTranslations,
@@ -10643,6 +10764,44 @@ if (
             ""
           ).trim();
 
+        const sourceContinuesNextCue =
+  semanticSourceLikelyContinuesNextCue(
+    blocks,
+    posMap,
+    id
+  );
+
+const currentWordCount =
+  words(
+    currentPt
+  ).length;
+
+const candidateWordCount =
+  words(
+    candidatePt
+  ).length;
+
+if (
+  sourceContinuesNextCue &&
+  candidateWordCount >=
+    currentWordCount + 2
+) {
+  totalRejected++;
+
+  const nextCue =
+    blocks[
+      pos + 1
+    ];
+
+  console.warn(
+    `[SEMANTIC OWNERSHIP GUARD] cue ${id} correção rejeitada | ` +
+    `fonte continua no cue ${nextCue?.index ?? "seguinte"} e ` +
+    `a correção adicionaria conteúdo além do limite do target.`
+  );
+
+  continue;
+}
+
         const regressions =
           repairCandidateRegressionReasons(
             block,
@@ -10724,7 +10883,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.13] fonte=${
+    `[PIPELINE 8.3.14] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -10942,7 +11101,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.11] FINAL OK | ${
+    `[PIPELINE 8.3.14] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -11343,7 +11502,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.11"
+            "Stremio-PTBR/8.3.14"
         }
       }
     );
@@ -11375,7 +11534,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.11"
+            "Stremio-PTBR/8.3.14"
         }
       }
     );
@@ -11661,7 +11820,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.11",
+    "8.3.14",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -12418,7 +12577,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.13 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+    " STREMIO PT-BR 8.3.14 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
