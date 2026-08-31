@@ -8578,21 +8578,24 @@ async function translateSrt(
   job.progress = 5;
 
   let mainTranslations =
-    await translateAllMain(
-      blocks,
-      plan,
-      job
-    );
+  await translateAllMain(
+    blocks,
+    plan,
+    job
+  );
 
-  mainTranslations =
+mainTranslations =
   sanitizeTranslationMap(
     blocks,
     mainTranslations,
     job
   );
 
-// SAFE DRAFT também recebe layout profissional.
-// A versão sem reflow continua em mainTranslations para QA/Repair.
+// ============================================================
+// LAYOUT LOCK — SAFE DRAFT
+// ============================================================
+// O QA e o Repair continuam trabalhando com o texto sem reflow.
+// O SAFE DRAFT já é servido com layout profissional.
 const mainLayoutTranslations =
   applySubtitleLayout(
     blocks,
@@ -8606,58 +8609,65 @@ const mainSrt =
     mainLayoutTranslations
   );
 
-  const mainSrt =
-    buildSrt(
-      blocks,
-      mainTranslations
-    );
+auditTimestamps(
+  sourceSrt,
+  mainSrt,
+  "MAIN"
+);
 
-  auditTimestamps(
-    sourceSrt,
-    mainSrt,
-    "MAIN"
+job.safeDraft =
+  mainSrt;
+
+job.progress =
+  92;
+
+console.log(
+  `[SAFE DRAFT] ${
+    blocks.length
+  }/${
+    blocks.length
+  } protegido com CUE + FORMAT + LAYOUT LOCK.`
+);
+
+// ============================================================
+// QA
+// ============================================================
+
+const qaIssues =
+  await scanPtbrQuality(
+    blocks,
+    mainTranslations,
+    plan,
+    job
   );
 
-  job.safeDraft =
-    mainSrt;
+// ============================================================
+// REPAIR
+// ============================================================
 
-  job.progress =
-    92;
-
-  console.log(
-    `[SAFE DRAFT] ${
-      blocks.length
-    }/${
-      blocks.length
-    } protegido com CUE + FORMAT LOCK.`
+let finalTranslations =
+  await tryFocusedRepair(
+    blocks,
+    mainTranslations,
+    plan,
+    job,
+    qaIssues
   );
 
-  const qaIssues =
-    await scanPtbrQuality(
-      blocks,
-      mainTranslations,
-      plan,
-      job
-    );
-
-  let finalTranslations =
-    await tryFocusedRepair(
-      blocks,
-      mainTranslations,
-      plan,
-      job,
-      qaIssues
-    );
-
-  finalTranslations =
+finalTranslations =
   sanitizeTranslationMap(
     blocks,
     finalTranslations,
     job
   );
 
-// Layout final determinístico.
-// NÃO altera texto entre cues e NÃO altera timestamps.
+// ============================================================
+// LAYOUT LOCK — FINAL
+// ============================================================
+// A tradução final é diagramada deterministicamente.
+// Nenhuma palavra é cortada.
+// Nenhum conteúdo é movido para outro cue.
+// Nenhum timestamp é criado ou alterado.
 const finalLayoutTranslations =
   applySubtitleLayout(
     blocks,
@@ -8665,6 +8675,7 @@ const finalLayoutTranslations =
     "FINAL"
   );
 
+// O guard final analisa exatamente o texto que será servido.
 const remaining =
   detectLocalIssues(
     blocks,
@@ -8673,7 +8684,7 @@ const remaining =
     plan
   );
 
-  if (remaining.length) {
+if (remaining.length) {
   logIssueSummary(
     "PÓS-REPAIR",
     remaining
@@ -8686,18 +8697,17 @@ const remaining =
   );
 }
 
-  const finalSrt =
+const finalSrt =
   buildSrt(
     blocks,
     finalLayoutTranslations
   );
 
-  auditTimestamps(
-    sourceSrt,
-    finalSrt,
-    "FINAL"
-  );
-
+auditTimestamps(
+  sourceSrt,
+  finalSrt,
+  "FINAL"
+);
   console.log(
     `[PIPELINE 8.3.8] FINAL OK | ${
       blocks.length
