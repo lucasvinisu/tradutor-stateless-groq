@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.14 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.15 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.14-entity-integrity-post-semantic-ownership-2x50";
+  "8.3.15-repair-batch-isolation-context-safe-format-scrub-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -41,7 +41,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.14.
+// já consumidas nas últimas 24h durante o deploy do 8.3.15.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -1201,6 +1201,25 @@ function looksLikeSpeakerLabel(
   if (!speaker) {
     return false;
   }
+
+  const normalizedGroupSpeaker =
+  speaker
+    .toLocaleLowerCase("pt-BR")
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+if (
+  /^(?:all|both|all queens|both queens|all girls|both girls|todos|todas|ambos|ambas)$/u.test(
+    normalizedGroupSpeaker
+  )
+) {
+  return true;
+}
 
   const parts =
     speaker
@@ -2506,19 +2525,23 @@ function sanitizeFinalCue(
   value
 ) {
   let text =
-    String(value || "")
-      .replace(
-        /<[^>]+>/g,
-        ""
-      )
-      .replace(
-        /\{\\[^}]+\}/g,
-        " "
-      )
-      .replace(
-        /[♪♫♬]/gu,
-        " "
-      );
+  String(value || "")
+    .replace(
+      /<[^>]+>/g,
+      ""
+    )
+    .replace(
+      /\{\\[^}]+\}/g,
+      " "
+    )
+    .replace(
+      /[♪♫♬]/gu,
+      " "
+    )
+    .replace(
+      /\\+/gu,
+      " "
+    );
 
   text =
     collapseExtendedVocalization(
@@ -3145,7 +3168,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.14
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.15
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -9072,9 +9095,8 @@ function buildRepairPayload(
             )
             .map(
               item => ({
-                i:
+                context_i:
                   item.index,
-
                 en:
                   item.text,
 
@@ -9097,7 +9119,7 @@ function buildRepairPayload(
             )
             .map(
               item => ({
-                i:
+                context_i:
                   item.index,
 
                 en:
@@ -9375,24 +9397,24 @@ async function tryFocusedRepair(
   }
 
   logIssueSummary(
-  "PRÉ-REPAIR",
-  issues
-);
-
-issues.sort((a, b) => {
-  const priorityDiff =
-    issuePriority(a) -
-    issuePriority(b);
-
-  if (priorityDiff !== 0) {
-    return priorityDiff;
-  }
-
-  return (
-    b.reasons.length -
-    a.reasons.length
+    "PRÉ-REPAIR",
+    issues
   );
-});
+
+  issues.sort((a, b) => {
+    const priorityDiff =
+      issuePriority(a) -
+      issuePriority(b);
+
+    if (priorityDiff !== 0) {
+      return priorityDiff;
+    }
+
+    return (
+      b.reasons.length -
+      a.reasons.length
+    );
+  });
 
   const selected =
     issues.slice(
@@ -9401,29 +9423,29 @@ issues.sort((a, b) => {
     );
 
   const selectedCritical =
-  selected.filter(
-    issue =>
-      issuePriority(issue) === 0
-  ).length;
+    selected.filter(
+      issue =>
+        issuePriority(issue) === 0
+    ).length;
 
-const selectedQuality =
-  selected.filter(
-    issue =>
-      issuePriority(issue) === 1
-  ).length;
+  const selectedQuality =
+    selected.filter(
+      issue =>
+        issuePriority(issue) === 1
+    ).length;
 
-const selectedMechanical =
-  selected.filter(
-    issue =>
-      issuePriority(issue) === 2
-  ).length;
+  const selectedMechanical =
+    selected.filter(
+      issue =>
+        issuePriority(issue) === 2
+    ).length;
 
-console.log(
-  `[REPAIR PRIORITY] selecionados=${selected.length} | ` +
-  `críticos=${selectedCritical} | ` +
-  `qualidade=${selectedQuality} | ` +
-  `mecânicos=${selectedMechanical}.`
-);
+  console.log(
+    `[REPAIR PRIORITY] selecionados=${selected.length} | ` +
+    `críticos=${selectedCritical} | ` +
+    `qualidade=${selectedQuality} | ` +
+    `mecânicos=${selectedMechanical}.`
+  );
 
   job.stats.repairSelected =
     selected.length;
@@ -9446,20 +9468,36 @@ console.log(
       translations
     );
 
-  try {
-    for (
-      let i = 0;
-      i < selected.length;
-      i +=
-        REPAIR_BATCH_MAX_CUES
-    ) {
-      const batch =
-        selected.slice(
-          i,
-          i +
-          REPAIR_BATCH_MAX_CUES
-        );
+  const totalBatches =
+    Math.ceil(
+      selected.length /
+      REPAIR_BATCH_MAX_CUES
+    );
 
+  let successfulBatches = 0;
+  let failedBatches = 0;
+  let acceptedCues = 0;
+
+  for (
+    let i = 0;
+    i < selected.length;
+    i +=
+      REPAIR_BATCH_MAX_CUES
+  ) {
+    const batch =
+      selected.slice(
+        i,
+        i +
+        REPAIR_BATCH_MAX_CUES
+      );
+
+    const batchNumber =
+      Math.floor(
+        i /
+        REPAIR_BATCH_MAX_CUES
+      ) + 1;
+
+    try {
       const repaired =
         await repairBatch(
           blocks,
@@ -9470,68 +9508,99 @@ console.log(
           job
         );
 
-      for (const [id, pt] of repaired) {
-  const pos =
-    posMap.get(id);
+      let acceptedThisBatch = 0;
 
-  const block =
-    blocks[pos];
+      for (
+        const [id, pt]
+        of repaired
+      ) {
+        const pos =
+          posMap.get(id);
 
-  if (!block) {
-    continue;
-  }
+        const block =
+          blocks[pos];
 
-  const beforePt =
-    String(
-      updated.get(id) ??
-      translations.get(id) ??
-      ""
-    ).trim();
+        if (!block) {
+          continue;
+        }
 
-  const candidatePt =
-    String(pt || "").trim();
+        const beforePt =
+          String(
+            updated.get(id) ??
+            translations.get(id) ??
+            ""
+          ).trim();
 
-  const regressions =
-    repairCandidateRegressionReasons(
-      block,
-      beforePt,
-      candidatePt,
-      job.filename
-    );
+        const candidatePt =
+          String(
+            pt || ""
+          ).trim();
 
-  if (regressions.length) {
-    console.warn(
-      `[REPAIR REGRESSION GUARD] cue ${id} rejeitado | ` +
-      `${regressions.join(", ")}.`
-    );
+        const regressions =
+          repairCandidateRegressionReasons(
+            block,
+            beforePt,
+            candidatePt,
+            job.filename
+          );
 
-    continue;
-  }
+        if (regressions.length) {
+          console.warn(
+            `[REPAIR REGRESSION GUARD] cue ${id} rejeitado | ` +
+            `${regressions.join(", ")}.`
+          );
 
-          updated.set(
+          continue;
+        }
+
+        updated.set(
           id,
           candidatePt
         );
+
+        acceptedThisBatch++;
+        acceptedCues++;
       }
+
+      successfulBatches++;
+
+      console.log(
+        `[REPAIR] lote ${batchNumber}/${totalBatches} OK | ` +
+        `aceitos=${acceptedThisBatch}.`
+      );
+    } catch (error) {
+      failedBatches++;
+
+      job.stats.repairFailures++;
+
+      console.warn(
+        `[REPAIR] lote ${batchNumber}/${totalBatches} falhou sem matar Repair | ` +
+        `mantendo lotes anteriores e continuando | ${
+          errorMessage(
+            error
+          ).slice(
+            0,
+            350
+          )
+        }`
+      );
+
+      // MUITO IMPORTANTE:
+      // não retorna translations;
+      // não apaga os lotes já reparados;
+      // simplesmente segue para o próximo lote.
+      continue;
     }
-
-    return updated;
-  } catch (error) {
-    job.stats.repairFailures++;
-
-    console.warn(
-      `[REPAIR] falhou sem matar episódio: ${
-        errorMessage(
-          error
-        ).slice(
-          0,
-          350
-        )
-      }`
-    );
-
-    return translations;
   }
+
+  console.log(
+    `[REPAIR] FINAL | ` +
+    `lotes OK=${successfulBatches}/${totalBatches} | ` +
+    `lotes falhos=${failedBatches} | ` +
+    `cues aceitos=${acceptedCues}.`
+  );
+
+  return updated;
 }
 
 // ============================================================
@@ -10883,7 +10952,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.14] fonte=${
+    `[PIPELINE 8.3.15] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -11101,7 +11170,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.14] FINAL OK | ${
+    `[PIPELINE 8.3.15] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -11502,7 +11571,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.14"
+            "Stremio-PTBR/8.3.15"
         }
       }
     );
@@ -11534,7 +11603,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.14"
+            "Stremio-PTBR/8.3.15"
         }
       }
     );
@@ -11820,7 +11889,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.14",
+    "8.3.15",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -12577,7 +12646,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.14 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+    " STREMIO PT-BR 8.3.15 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
