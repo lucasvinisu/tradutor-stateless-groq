@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.12 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.13 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.12-ownership-hard-lock-semantic-compact-canonical-2x50";
+  "8.3.13-ownership-key-lock-semantic-compact-canonical-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -68,7 +68,7 @@ const MAIN_THINKING = "high";
 const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 120000;
 const MAIN_HTTP_RETRIES = 4;
-const MAIN_PARSE_ATTEMPTS = 2;
+const MAIN_PARSE_ATTEMPTS = 3;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
@@ -3557,7 +3557,7 @@ ${STYLE_PACK}
 Você receberá uma lista de CÁPSULAS.
 Cada cápsula contém before, target, after e identity_lock.
 Traduza SOMENTE target.
-As cápsulas podem estar propositalmente fora de ordem para impedir redistribuição de conteúdo. Isso é intencional.
+As cápsulas estão SEMPRE em ordem cronológica. Preserve rigorosamente essa ordem e nunca redistribua conteúdo entre IDs.
 
 CHECKLIST SILENCIOSO OBRIGATÓRIO ANTES DE CADA pt:
 1. Quem fala está realmente provado? Se não, não marque gênero de 1ª pessoa sem necessidade.
@@ -4230,6 +4230,52 @@ function cueTranslationSchema(
 
           required: [
             "i",
+            "pt"
+          ]
+        }
+      }
+    },
+
+    required: [
+      "cues"
+    ]
+  };
+}
+
+function mainCueTranslationSchema(
+  expectedCount
+) {
+  return {
+    type: "object",
+    additionalProperties: false,
+
+    properties: {
+      cues: {
+        type: "array",
+        minItems: expectedCount,
+        maxItems: expectedCount,
+
+        items: {
+          type: "object",
+          additionalProperties: false,
+
+          properties: {
+            i: {
+              type: "integer"
+            },
+
+            k: {
+              type: "string"
+            },
+
+            pt: {
+              type: "string"
+            }
+          },
+
+          required: [
+            "i",
+            "k",
             "pt"
           ]
         }
@@ -6646,9 +6692,6 @@ function buildOwnershipPayload(
 
   const capsules = [];
 
-  // 8.3.12:
-  // ordem cronológica absoluta.
-  // Não usamos interleaveBatch aqui.
   for (const block of batch) {
     const pos =
       posMap.get(
@@ -6661,12 +6704,8 @@ function buildOwnershipPayload(
         block.index
       );
 
-    // Marcadores exclusivos deste ID.
-    const startToken =
-      `__OWN_C${block.index}_START__`;
-
-    const endToken =
-      `__OWN_C${block.index}_END__`;
+    const ownershipKey =
+      `OWN_C${block.index}`;
 
     locksById.set(
       block.index,
@@ -6675,15 +6714,15 @@ function buildOwnershipPayload(
 
     ownershipById.set(
       block.index,
-      {
-        startToken,
-        endToken
-      }
+      ownershipKey
     );
 
     capsules.push({
       i:
         block.index,
+
+      ownership_key:
+        ownershipKey,
 
       before:
         allBlocks
@@ -6704,7 +6743,7 @@ function buildOwnershipPayload(
           block.index,
 
         en:
-          `${startToken} ${protectedTarget.text} ${endToken}`,
+          protectedTarget.text,
 
         ...(
           block.speakerHint
@@ -6733,32 +6772,19 @@ function buildOwnershipPayload(
             contextCue
           ),
 
-      // IMPORTANTE:
-      // preservamos o Identity Lock que seu código atual já possui.
       identity_lock:
         identityLockForCapsule(
           block,
           plan
         ),
 
-      hard_locks: [
-        startToken,
-
-        ...protectedTarget
+      hard_locks:
+        protectedTarget
           .locks
           .map(
             lock =>
               lock.token
-          ),
-
-        endToken
-      ],
-
-      ownership_start:
-        startToken,
-
-      ownership_end:
-        endToken
+          )
     });
   }
 
@@ -6766,13 +6792,11 @@ function buildOwnershipPayload(
     payload: {
       ownership_rule:
         "As cápsulas estão em ordem cronológica. " +
-        "Cada target é uma caixa fechada. " +
-        "Traduza EXCLUSIVAMENTE o conteúdo entre " +
-        "__OWN_C<ID>_START__ e __OWN_C<ID>_END__ do MESMO ID. " +
-        "before/after servem somente para compreender contexto. " +
-        "Nunca copie, antecipe, atrase, duplique ou mova conteúdo entre IDs. " +
-        "Se speaker for unknown, não adivinhe gênero. " +
-        "Correto mas literal demais deve ser reescrito em PT-BR espontâneo.",
+        "Cada ownership_key pertence exclusivamente ao target do mesmo ID. " +
+        "Na saída, copie ownership_key exatamente para o campo k. " +
+        "Traduza somente target para pt. " +
+        "before/after servem exclusivamente para contexto. " +
+        "Nunca copie, antecipe, atrase, duplique ou mova conteúdo entre IDs.",
 
       capsules
     },
@@ -6903,122 +6927,26 @@ function parseCueTranslation(
       );
     }
 
-    const ownership =
+    const expectedOwnershipKey =
       ownershipById.get(
         id
       );
 
-    if (ownership) {
-      const {
-        startToken,
-        endToken
-      } =
-        ownership;
-
-      const startPos =
-        pt.indexOf(
-          startToken
-        );
-
-      const endPos =
-        pt.indexOf(
-          endToken
-        );
-
-      const duplicatedStart =
-        startPos >= 0 &&
-        startPos !==
-          pt.lastIndexOf(
-            startToken
-          );
-
-      const duplicatedEnd =
-        endPos >= 0 &&
-        endPos !==
-          pt.lastIndexOf(
-            endToken
-          );
+    if (expectedOwnershipKey) {
+      const returnedOwnershipKey =
+        String(
+          item?.k ||
+          ""
+        ).trim();
 
       if (
-        startPos < 0 ||
-        endPos < 0
+        returnedOwnershipKey !==
+        expectedOwnershipKey
       ) {
         throw new Error(
           `CUE OWNERSHIP cue ${id}: ` +
-          `marcador START/END não voltou.`
-        );
-      }
-
-      if (
-        duplicatedStart ||
-        duplicatedEnd
-      ) {
-        throw new Error(
-          `CUE OWNERSHIP cue ${id}: ` +
-          `marcador START/END duplicado.`
-        );
-      }
-
-      if (
-        endPos <=
-        startPos
-      ) {
-        throw new Error(
-          `CUE OWNERSHIP cue ${id}: ` +
-          `marcadores invertidos.`
-        );
-      }
-
-      const outsideBefore =
-        pt
-          .slice(
-            0,
-            startPos
-          )
-          .trim();
-
-      const outsideAfter =
-        pt
-          .slice(
-            endPos +
-              endToken.length
-          )
-          .trim();
-
-      if (
-        outsideBefore ||
-        outsideAfter
-      ) {
-        throw new Error(
-          `CUE OWNERSHIP cue ${id}: ` +
-          `texto apareceu fora dos limites do target.`
-        );
-      }
-
-      pt =
-        pt
-          .slice(
-            startPos +
-              startToken.length,
-            endPos
-          )
-          .trim();
-
-      if (
-        /__OWN_C\d+_(?:START|END)__/u.test(
-          pt
-        )
-      ) {
-        throw new Error(
-          `CUE OWNERSHIP cue ${id}: ` +
-          `marcador de outro cue contaminou o target.`
-        );
-      }
-
-      if (!pt) {
-        throw new Error(
-          `CUE OWNERSHIP cue ${id}: ` +
-          `conteúdo entre marcadores ficou vazio.`
+          `esperava key ${expectedOwnershipKey}, ` +
+          `recebeu ${returnedOwnershipKey || "(vazia)"}.`
         );
       }
     }
@@ -7084,33 +7012,31 @@ async function translateMainBatch({
             TRANSLATOR_PROMPT,
 
           user:
-            `BÍBLIA EDITORIAL:\n${
-              JSON.stringify(
-                plan
-              )
-            }\n\n` +
-            `CÁPSULAS CUE-LOCK:\n${
-              JSON.stringify(
-                payload
-              )
-            }\n\n` +
-            `Os cues estão em ORDEM CRONOLÓGICA. ` +
-            `Retorne os IDs EXATAMENTE na mesma ordem recebida. ` +
-            `Traduza somente cada target. ` +
-            `Output exatamente ${
-              batch.length
-} cues. ` +
-`Cada target começa com __OWN_C<ID>_START__ e termina com __OWN_C<ID>_END__. ` +
-`Os dois marcadores do MESMO ID devem voltar IDÊNTICOS dentro de pt. ` +
-`Não escreva absolutamente nada antes do START nem depois do END. ` +
-`Nunca use no pt de um ID conteúdo pertencente ao target, before ou after de outro ID. ` +
-`Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
-`O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
+  `BÍBLIA EDITORIAL:\n${
+    JSON.stringify(
+      plan
+    )
+  }\n\n` +
+  `CÁPSULAS CUE-LOCK:\n${
+    JSON.stringify(
+      payload
+    )
+  }\n\n` +
+  `Os cues estão em ORDEM CRONOLÓGICA. ` +
+  `Retorne os IDs EXATAMENTE na mesma ordem recebida. ` +
+  `Output exatamente ${
+    batch.length
+  } cues. ` +
+  `Para cada cápsula, copie ownership_key EXATAMENTE para o campo k do mesmo ID. ` +
+  `Traduza SOMENTE target para pt. ` +
+  `Nunca use em pt conteúdo pertencente ao target, before ou after de outro ID. ` +
+  `Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
+  `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
 
           schema:
-            cueTranslationSchema(
-              batch.length
-            ),
+  mainCueTranslationSchema(
+    batch.length
+  ),
 
           thinkingLevel:
             MAIN_THINKING,
@@ -7142,12 +7068,24 @@ async function translateMainBatch({
         error;
 
       if (
-        parseAttempt >=
-        MAIN_PARSE_ATTEMPTS
-      ) {
-        throw error;
-      }
+  parseAttempt >=
+  MAIN_PARSE_ATTEMPTS
+) {
+  console.error(
+    `[MAIN CUE-LOCK] lote rejeitado definitivamente após ${
+      MAIN_PARSE_ATTEMPTS
+    } tentativa(s): ${
+      errorMessage(
+        error
+      ).slice(
+        0,
+        320
+      )
+    }`
+  );
 
+  throw error;
+}
       job.stats.mainParseRetries++;
 
       console.warn(
@@ -10786,7 +10724,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.12] fonte=${
+    `[PIPELINE 8.3.13] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -12480,7 +12418,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.12 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+    " STREMIO PT-BR 8.3.13 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
@@ -12616,7 +12554,7 @@ console.log(
   );
 
   console.log(
-  "Cue Ownership Hard Lock: ordem cronológica + START/END por ID + resposta na mesma ordem ✅"
+  "Cue Ownership Key Lock: ordem cronológica + ownership_key por ID + resposta na mesma ordem ✅"
 );
 
 console.log(
