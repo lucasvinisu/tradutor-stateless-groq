@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.9 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.10 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.9-meaning-integrity-hard-2x50-compact-rescue";
+  "8.3.10-post-rewrite-semantic-guard-source-recovery-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -41,7 +41,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.9.
+// já consumidas nas últimas 24h durante o deploy do 8.3.10.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -126,6 +126,23 @@ const COMPACT_RESCUE_HTTP_RETRIES = 3;
 // 96 dá folga para o JavaScript encontrar uma quebra <= 50/50.
 // Não é truncamento; é objetivo editorial para o Gemini.
 const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
+
+// ============================================================
+// POST-REWRITE SEMANTIC GUARD
+// ============================================================
+
+// Audita somente cues cujo TEXTO foi realmente reescrito
+// depois do MAIN. Mudança apenas de quebra de linha não conta.
+const SEMANTIC_REWRITE_AUDIT_ENABLED = true;
+
+const SEMANTIC_REWRITE_AUDIT_MAX_CUES_PER_BATCH = 80;
+const SEMANTIC_REWRITE_AUDIT_MAX_CHARS_PER_BATCH = 32000;
+const SEMANTIC_REWRITE_AUDIT_MAX_ISSUES = 80;
+
+const SEMANTIC_REWRITE_AUDIT_THINKING = "high";
+const SEMANTIC_REWRITE_AUDIT_MAX_OUTPUT_TOKENS = 7000;
+const SEMANTIC_REWRITE_AUDIT_TIMEOUT_MS = 90000;
+const SEMANTIC_REWRITE_AUDIT_HTTP_RETRIES = 3;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
 const RECOVERY_SIGNING_KEY =
@@ -3057,7 +3074,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.9
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.10
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3598,6 +3615,207 @@ Tô/tá/pra/né e palavrões por extenso podem ser ótimos quando combinarem com
 Se houver duas boas traduções naturais, NÃO marque.
 Se a opção atual soar como tradução mesmo estando entendível, MARQUE.
 `;
+
+const SEMANTIC_REWRITE_AUDIT_PROMPT = `
+Você é o AUDITOR SEMÂNTICO PÓS-REESCRITA de legendas EN→PT-BR.
+
+Sua função NÃO é melhorar estilo por preferência.
+Sua função NÃO é retraduzir tudo.
+Sua função NÃO é deixar a legenda mais longa.
+
+Você receberá somente cues que sofreram REESCRITA
+depois da tradução principal.
+
+Para cada cue, compare rigorosamente:
+
+1. EN = legenda-fonte;
+2. BEFORE_PT = tradução antes do Repair/Compact Rescue;
+3. AFTER_PT = resultado candidato a final;
+4. BEFORE_CONTEXT / AFTER_CONTEXT = contexto para entender a cena,
+   nunca autorização automática para mover conteúdo entre cues.
+
+============================================================
+PRINCÍPIO CENTRAL
+============================================================
+
+Preserve a FALA/INTENÇÃO PROVÁVEL da cena.
+
+NÃO seja escravo de um erro evidente da legenda-fonte,
+mas também NÃO invente conteúdo apenas porque ele parece plausível.
+
+============================================================
+REGRESSÃO SEMÂNTICA
+============================================================
+
+Marque quando AFTER_PT perder, distorcer ou trocar informação
+que está claramente presente no EN.
+
+Audite especialmente:
+
+- ação/verbo principal;
+- sujeito;
+- objeto/alvo;
+- negação;
+- fato ou estado;
+- causa e consequência;
+- condição;
+- contraste;
+- relação familiar/social;
+- quantidade;
+- números;
+- unidades de medida ou tempo;
+- duração;
+- enumerações;
+- intensidade;
+- palavrão/intensificador semanticamente relevante;
+- insulto e força social;
+- humor/shade;
+- referente;
+- informação depois de "and", "but", "because", "if" etc.;
+- informação narrativa nova.
+
+Exemplos do TIPO de regressão:
+- uma fala sobre pessoas se beijando não pode perder a ação de beijar;
+- "eight minutes and three seconds" não pode perder "seconds";
+- "relationships and family connections" não pode apagar os laços familiares;
+- um insulto forte não pode virar termo neutro só para economizar espaço.
+
+============================================================
+SOURCE DEFECT RECOVERY — REPARO CONSERVADOR DA FONTE
+============================================================
+
+Uma frase EN aparentemente incompleta NÃO deve ser tratada
+automaticamente como conteúdo proibido de completar.
+
+Primeiro classifique silenciosamente o caso:
+
+A) CONTINUA NO PRÓXIMO CUE
+- A estrutura, gramática ou sentido mostram claramente que a frase
+  continua no AFTER_CONTEXT.
+- Nesse caso, NÃO antecipe nem puxe a continuação.
+- CUE OWNERSHIP é absoluto.
+
+B) INTERRUPÇÃO REAL DA FALA
+Sinais possíveis:
+- reticências expressivas;
+- travessão/corte;
+- outra pessoa interrompe;
+- mudança abrupta de speaker;
+- a interrupção faz sentido dramático;
+- a frase foi propositalmente abandonada.
+Nesse caso, PRESERVE a interrupção.
+
+C) PROVÁVEL DEFEITO/TRUNCAMENTO DA LEGENDA-FONTE
+Pode completar SOMENTE quando houver evidência forte de que:
+- o EN termina de forma gramatical ou semanticamente quebrada;
+- não há sinal razoável de interrupção real;
+- o próximo cue começa outra fala ou outra ideia;
+- o contexto torna a intenção praticamente inequívoca;
+- existe uma conclusão mínima e genérica que recupera a intenção
+  sem inventar fato específico.
+
+Exemplo permitido em princípio:
+"If I can get through Snatch Game, I can get through..."
+→ algo equivalente a
+"Se passo pelo Snatch Game, passo por qualquer coisa."
+SE o contexto sustentar claramente essa conclusão.
+
+Exemplo NÃO permitido:
+→ "Se passo pelo Snatch Game, vou ganhar a competição."
+Isso inventa informação específica não sustentada pela fonte.
+
+D) AMBÍGUO
+Se houver duas ou mais continuações plausíveis,
+ou dúvida real entre truncamento da legenda e interrupção da fala:
+NÃO COMPLETE.
+Preserve a ambiguidade/incompletude.
+
+============================================================
+COMO JULGAR AFTER_PT
+============================================================
+
+Se AFTER_PT fez um SOURCE DEFECT RECOVERY conservador e bem sustentado:
+- NÃO marque como regressão;
+- não exija que volte a ficar incompleto.
+
+Se AFTER_PT inventou uma conclusão específica sem evidência:
+- marque.
+
+Se AFTER_PT perdeu informação claramente presente no EN:
+- marque.
+
+Se AFTER_PT apenas reformulou livremente,
+mas todo o sentido e efeito social sobreviveram:
+- NÃO marque.
+
+Não exija correspondência palavra por palavra.
+Equivalência idiomática e pragmática é correta.
+
+============================================================
+CORREÇÃO
+============================================================
+
+Se AFTER_PT estiver semanticamente correto:
+NÃO devolva o cue em issues.
+
+Se houver regressão real:
+- devolva o id;
+- explique resumidamente em reason;
+- forneça em pt uma correção natural, completa e concisa.
+
+A correção DEVE:
+- permanecer no MESMO cue;
+- preservar todos os HARD LOCKS;
+- preservar Meaning Integrity;
+- respeitar SOURCE DEFECT RECOVERY;
+- não criar SDH;
+- não inventar informação;
+- não mover conteúdo entre cues;
+- não alterar timestamp;
+- ser diagramável em no máximo ${LAYOUT_MAX_LINES} linhas
+  de ${LAYOUT_MAX_CHARS_PER_LINE} caracteres;
+- preferencialmente ficar em até ${COMPACT_RESCUE_TARGET_TOTAL_CHARS}
+  caracteres visíveis totais.
+
+Meta final:
+SIGNIFICADO / INTENÇÃO COMPLETOS
++ PT-BR NATURAL
++ 2x50.
+`;
+
+const SEMANTIC_REWRITE_AUDIT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    issues: {
+      type: "array",
+      maxItems: SEMANTIC_REWRITE_AUDIT_MAX_ISSUES,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: {
+            type: "integer"
+          },
+          reason: {
+            type: "string"
+          },
+          pt: {
+            type: "string"
+          }
+        },
+        required: [
+          "i",
+          "reason",
+          "pt"
+        ]
+      }
+    }
+  },
+  required: [
+    "issues"
+  ]
+};
 
 const QA_SCHEMA = {
   type: "object",
@@ -9305,6 +9523,504 @@ async function runCompactRescue(
   return updated;
 }
 
+function semanticComparableText(value) {
+  return normalizeLayoutWhitespace(
+    String(value || "")
+  )
+    .toLocaleLowerCase("pt-BR")
+    .trim();
+}
+
+function collectPostRewriteSemanticCandidates(
+  blocks,
+  beforeTranslations,
+  afterTranslations
+) {
+  const candidates = [];
+
+  for (const block of blocks) {
+    const beforePt =
+      String(
+        beforeTranslations.get(block.index) ??
+        ""
+      ).trim();
+
+    const afterPt =
+      String(
+        afterTranslations.get(block.index) ??
+        ""
+      ).trim();
+
+    // Apenas mudança de quebra de linha NÃO conta como rewrite.
+    if (
+      semanticComparableText(beforePt) ===
+      semanticComparableText(afterPt)
+    ) {
+      continue;
+    }
+
+    candidates.push({
+      id: block.index
+    });
+  }
+
+  return candidates;
+}
+
+function buildSemanticRewriteAuditBatches(
+  blocks,
+  posMap,
+  beforeTranslations,
+  afterTranslations,
+  candidates,
+  plan
+) {
+  const batches = [];
+
+  let current = [];
+  let currentChars = 0;
+
+  for (const candidate of candidates) {
+    const pos =
+      posMap.get(candidate.id);
+
+    const block =
+      blocks[pos];
+
+    if (!block) {
+      continue;
+    }
+
+    const protectedTarget =
+      protectCulturalLocks(
+        block.text,
+        block.index
+      );
+
+    const beforePt =
+      String(
+        beforeTranslations.get(block.index) ??
+        ""
+      ).trim();
+
+    const afterPt =
+      String(
+        afterTranslations.get(block.index) ??
+        ""
+      ).trim();
+
+    const item = {
+      i: block.index,
+
+      en:
+        protectedTarget.text,
+
+      before_pt:
+        beforePt,
+
+      after_pt:
+        afterPt,
+
+      hard_locks:
+        protectedTarget.locks.map(
+          lock => lock.token
+        ),
+
+      ...(block.speakerHint
+        ? {
+            speaker:
+              block.speakerHint
+          }
+        : {}),
+
+      identity_lock:
+        identityLockForCapsule(
+          block,
+          plan
+        ),
+
+      before_context:
+        blocks
+          .slice(
+            Math.max(
+              0,
+              pos - 1
+            ),
+            pos
+          )
+          .map(item => ({
+            i: item.index,
+            en: item.text,
+            ...(item.speakerHint
+              ? {
+                  speaker:
+                    item.speakerHint
+                }
+              : {})
+          })),
+
+      after_context:
+        blocks
+          .slice(
+            pos + 1,
+            Math.min(
+              blocks.length,
+              pos + 2
+            )
+          )
+          .map(item => ({
+            i: item.index,
+            en: item.text,
+            ...(item.speakerHint
+              ? {
+                  speaker:
+                    item.speakerHint
+                }
+              : {})
+          }))
+    };
+
+    const estimatedChars =
+      JSON.stringify(item).length;
+
+    if (
+      current.length &&
+      (
+        current.length >=
+          SEMANTIC_REWRITE_AUDIT_MAX_CUES_PER_BATCH ||
+        currentChars +
+          estimatedChars >
+          SEMANTIC_REWRITE_AUDIT_MAX_CHARS_PER_BATCH
+      )
+    ) {
+      batches.push(
+        current
+      );
+
+      current = [];
+      currentChars = 0;
+    }
+
+    current.push({
+      item,
+      locks:
+        protectedTarget.locks
+    });
+
+    currentChars +=
+      estimatedChars;
+  }
+
+  if (current.length) {
+    batches.push(
+      current
+    );
+  }
+
+  return batches;
+}
+
+async function runPostRewriteSemanticAudit(
+  blocks,
+  beforeTranslations,
+  afterTranslations,
+  plan,
+  job
+) {
+  if (!SEMANTIC_REWRITE_AUDIT_ENABLED) {
+    return afterTranslations;
+  }
+
+  const candidates =
+    collectPostRewriteSemanticCandidates(
+      blocks,
+      beforeTranslations,
+      afterTranslations
+    );
+
+  if (!candidates.length) {
+    console.log(
+      "[SEMANTIC REWRITE GUARD] 0 cues realmente reescritos; auditoria dispensada."
+    );
+
+    return afterTranslations;
+  }
+
+  const posMap =
+    positionMap(
+      blocks
+    );
+
+  const batches =
+    buildSemanticRewriteAuditBatches(
+      blocks,
+      posMap,
+      beforeTranslations,
+      afterTranslations,
+      candidates,
+      plan
+    );
+
+  console.log(
+    `[SEMANTIC REWRITE GUARD] ` +
+    `${candidates.length} cue(s) realmente reescrito(s) | ` +
+    `${batches.length} lote(s) EN×BEFORE×AFTER.`
+  );
+
+  const updated =
+    new Map(
+      afterTranslations
+    );
+
+  let totalFlagged = 0;
+  let totalAccepted = 0;
+  let totalRejected = 0;
+
+  for (
+    let batchIndex = 0;
+    batchIndex < batches.length;
+    batchIndex++
+  ) {
+    const batch =
+      batches[batchIndex];
+
+    const payload = {
+      cues:
+        batch.map(
+          entry =>
+            entry.item
+        )
+    };
+
+    try {
+      const response =
+        await geminiRequest({
+          system:
+            SEMANTIC_REWRITE_AUDIT_PROMPT,
+
+          user:
+            `BÍBLIA:\n${JSON.stringify(plan)}\n\n` +
+            `AUDITORIA PÓS-REESCRITA ${batchIndex + 1}/${batches.length}\n` +
+            `CUES:\n${JSON.stringify(payload)}\n\n` +
+            `Marque SOMENTE regressões semânticas reais. ` +
+            `Reparo conservador de fonte claramente truncada é permitido. ` +
+            `Paráfrase natural e fiel NÃO é erro.`,
+
+          schema:
+            SEMANTIC_REWRITE_AUDIT_SCHEMA,
+
+          thinkingLevel:
+            SEMANTIC_REWRITE_AUDIT_THINKING,
+
+          maxOutputTokens:
+            SEMANTIC_REWRITE_AUDIT_MAX_OUTPUT_TOKENS,
+
+          timeoutMs:
+            SEMANTIC_REWRITE_AUDIT_TIMEOUT_MS,
+
+          maxRetries:
+            SEMANTIC_REWRITE_AUDIT_HTTP_RETRIES,
+
+          job,
+
+          metric:
+            "semantic"
+        });
+
+      const parsed =
+        JSON.parse(
+          stripCodeFences(
+            response.text
+          )
+        );
+
+      const rawIssues =
+        Array.isArray(parsed?.issues)
+          ? parsed.issues
+          : [];
+
+      const allowedIds =
+        new Set(
+          batch.map(
+            entry =>
+              entry.item.i
+          )
+        );
+
+      const locksById =
+        new Map(
+          batch.map(
+            entry => [
+              entry.item.i,
+              entry.locks
+            ]
+          )
+        );
+
+      for (const issue of rawIssues) {
+        const id =
+          Number(
+            issue?.i
+          );
+
+        if (
+          !Number.isInteger(id) ||
+          !allowedIds.has(id)
+        ) {
+          continue;
+        }
+
+        totalFlagged++;
+
+        const pos =
+          posMap.get(id);
+
+        const block =
+          blocks[pos];
+
+        if (!block) {
+          totalRejected++;
+          continue;
+        }
+
+        let candidatePt =
+          String(
+            issue?.pt ||
+            ""
+          ).trim();
+
+        if (!candidatePt) {
+          totalRejected++;
+
+          console.warn(
+            `[SEMANTIC REWRITE GUARD] cue ${id} sinalizado sem correção utilizável.`
+          );
+
+          continue;
+        }
+
+        try {
+          candidatePt =
+            restoreCulturalLocks(
+              candidatePt,
+              locksById.get(id) || [],
+              id
+            );
+        } catch (error) {
+          totalRejected++;
+
+          console.warn(
+            `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado por HARD LOCK | ` +
+            `${errorMessage(error).slice(0, 220)}`
+          );
+
+          continue;
+        }
+
+        candidatePt =
+          sanitizeFinalCue(
+            block,
+            candidatePt
+          );
+
+        if (!candidatePt) {
+          totalRejected++;
+
+          console.warn(
+            `[SEMANTIC REWRITE GUARD] cue ${id} ficou vazio após sanitizer.`
+          );
+
+          continue;
+        }
+
+        // A correção semântica jamais pode relaxar o teto visual.
+        const layout =
+          layoutCueResult(
+            block,
+            candidatePt
+          );
+
+        if (
+          !layout.fits ||
+          layout.lines >
+            LAYOUT_MAX_LINES
+        ) {
+          totalRejected++;
+
+          console.warn(
+            `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado: ` +
+            `não cabe em ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} | ` +
+            `maior linha=${layout.maxLineLength}.`
+          );
+
+          continue;
+        }
+
+        const currentPt =
+          String(
+            updated.get(id) ??
+            ""
+          ).trim();
+
+        const regressions =
+          repairCandidateRegressionReasons(
+            block,
+            currentPt,
+            candidatePt,
+            job.filename
+          );
+
+        if (regressions.length) {
+          totalRejected++;
+
+          console.warn(
+            `[SEMANTIC REWRITE GUARD] cue ${id} correção rejeitada pelo guard local | ` +
+            `${regressions.join(", ")}.`
+          );
+
+          continue;
+        }
+
+        updated.set(
+          id,
+          candidatePt
+        );
+
+        totalAccepted++;
+
+        console.log(
+          `[SEMANTIC REWRITE GUARD] cue ${id} corrigido ✅ | ` +
+          `${String(
+            issue?.reason ||
+            "regressão semântica"
+          ).slice(0, 180)}`
+        );
+      }
+
+      console.log(
+        `[SEMANTIC REWRITE GUARD] lote ${batchIndex + 1}/${batches.length} | ` +
+        `flags=${rawIssues.length}.`
+      );
+    } catch (error) {
+      console.warn(
+        `[SEMANTIC REWRITE GUARD] lote ${batchIndex + 1}/${batches.length} falhou; ` +
+        `mantendo resultado anterior sem matar episódio | ` +
+        `${errorMessage(error).slice(0, 350)}`
+      );
+    }
+  }
+
+  console.log(
+    `[SEMANTIC REWRITE GUARD] FINAL | ` +
+    `auditados=${candidates.length} | ` +
+    `sinalizados=${totalFlagged} | ` +
+    `correções aceitas=${totalAccepted} | ` +
+    `correções rejeitadas=${totalRejected}.`
+  );
+
+  return updated;
+}
+
 async function translateSrt(
   sourceSrt,
   job
@@ -9327,7 +10043,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.9] fonte=${
+    `[PIPELINE 8.3.10] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -9410,7 +10126,15 @@ const qaIssues =
 // REPAIR
 // ============================================================
 
-let finalTranslations =
+// Snapshot semântico ANTES de Repair + Compact Rescue.
+// Serve para descobrir se uma reescrita posterior
+// perdeu ou inventou informação.
+const preRewriteTranslations =
+  new Map(
+    mainTranslations
+  );
+  
+  let finalTranslations =
   await tryFocusedRepair(
     blocks,
     mainTranslations,
@@ -9439,7 +10163,28 @@ finalTranslations =
     job
   );
 
-// Sanitizer final após o Rescue.
+finalTranslations =
+  sanitizeTranslationMap(
+    blocks,
+    finalTranslations,
+    job
+  );
+
+// ============================================================
+// POST-REWRITE SEMANTIC GUARD
+// ============================================================
+// Compara EN × tradução pré-rewrite × resultado pós-rewrite.
+// Permite reparo conservador de fonte claramente truncada.
+// Toda correção ainda precisa obedecer 2x50.
+finalTranslations =
+  await runPostRewriteSemanticAudit(
+    blocks,
+    preRewriteTranslations,
+    finalTranslations,
+    plan,
+    job
+  );
+
 finalTranslations =
   sanitizeTranslationMap(
     blocks,
@@ -9516,7 +10261,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.9] FINAL OK | ${
+    `[PIPELINE 8.3.10] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -9917,7 +10662,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.9"
+            "Stremio-PTBR/8.3.10"
         }
       }
     );
@@ -9949,7 +10694,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.9"
+            "Stremio-PTBR/8.3.10"
         }
       }
     );
@@ -10235,7 +10980,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.9",
+    "8.3.10",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -10992,7 +11737,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.9 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.10 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
   );
 
   console.log(
@@ -11073,6 +11818,18 @@ console.log(
 
 console.log(
   "Repair Regression Guard: bloqueia nova omissão/SDH/censura/gênero/diálogo quebrado ✅"
+);
+
+  console.log(
+  "Post-Rewrite Semantic Guard: EN × BEFORE × AFTER somente em cues realmente reescritos ✅"
+);
+
+console.log(
+  "Source Defect Recovery: truncamento evidente pode ser completado de forma mínima; interrupção/ambiguidade são preservadas ✅"
+);
+
+console.log(
+  `Semantic Guard Safety: qualquer correção ainda exige HARD LOCKS + sentido + ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} ✅`
 );
 
   console.log(
