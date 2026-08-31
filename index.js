@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.11 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.12 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.11-culture-register-integrity-canonical-locks-2x50";
+  "8.3.12-ownership-hard-lock-semantic-compact-canonical-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -145,6 +145,12 @@ const SEMANTIC_REWRITE_AUDIT_TIMEOUT_MS = 90000;
 const SEMANTIC_REWRITE_AUDIT_HTTP_RETRIES = 3;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
+const SEMANTIC_COMPACT_RETRY_ENABLED = true;
+const SEMANTIC_COMPACT_RETRY_MAX_PER_EPISODE = 8;
+const SEMANTIC_COMPACT_RETRY_THINKING = "high";
+const SEMANTIC_COMPACT_RETRY_MAX_OUTPUT_TOKENS = 2200;
+const SEMANTIC_COMPACT_RETRY_TIMEOUT_MS = 90000;
+const SEMANTIC_COMPACT_RETRY_HTTP_RETRIES = 3;
 const RECOVERY_SIGNING_KEY =
   LOCAL_BRIDGE_SECRET ||
   GEMINI_API_KEY ||
@@ -2190,7 +2196,7 @@ const CULTURE_HARD_LOCKS = [
   },
   {
     regex:
-      /\bSashay\s+away\b/giu,
+      /\bSashay\s*,?\s+away\b/giu,
     value:
       "Sashay away"
   },
@@ -2343,6 +2349,52 @@ function restoreCulturalLocks(
   }
 
   return out;
+}
+
+function canonicalizeCulturalText(
+  value
+) {
+  let out =
+    String(
+      value || ""
+    );
+
+  for (
+    const rule of
+    CULTURE_HARD_LOCKS
+  ) {
+    rule.regex.lastIndex = 0;
+
+    out =
+      out.replace(
+        rule.regex,
+        () =>
+          rule.value
+      );
+  }
+
+  return out;
+}
+
+function missingCanonicalCultureLocks(
+  value,
+  locks
+) {
+  const canonical =
+    canonicalizeCulturalText(
+      value
+    );
+
+  return (
+    Array.isArray(locks)
+      ? locks
+      : []
+  ).filter(
+    lock =>
+      !canonical.includes(
+        lock.value
+      )
+  );
 }
 
 // ============================================================
@@ -3300,6 +3352,17 @@ PALAVRÕES / PROFANITY — PRESERVAR FORÇA, NÃO CONTAGEM
 - Se acrescentar "porra", "caralho", "puta", "merda" etc. tornar a fala artificialmente mais agressiva que o original, NÃO acrescente.
 - Profanidade deve soar como algo que aquela pessoa realmente diria em português naquela situação.
 
+PHRASAL PROFANITY / EXPRESSÕES FIXAS
+- Não traduza palavrão dentro de expressão idiomática palavra por palavra.
+- "don't fuck it up" pede preservação da intenção: "não estrague tudo",
+  "não faça merda", "não cague tudo" etc. conforme personagem e intensidade.
+- Evite calques artificiais como "não fode tudo".
+- Expressões como "shake shit up" significam causar impacto,
+  virar o jogo, bagunçar estruturas ou causar; não exigem automaticamente
+  inserir "foder" em PT-BR.
+- Preserve a força pragmática, mas NÃO aumente a vulgaridade só para
+  demonstrar que percebeu o palavrão inglês.
+
 GAG / GAGGED — DISTINGUIR SENTIDOS
 - Em drag/fandom/reaction slang, "I'm gagged", "she gagged me", "I was gagged" normalmente expressam choque, impacto ou ficar sem reação.
 - Nesses casos, prefira conforme o registro: "tô passada", "fiquei passada", "tô em choque", "fiquei sem reação", "me deixou passada" etc.
@@ -3667,6 +3730,30 @@ MARQUE quando houver:
 - speaker labels, SDH/CC, descrição sonora, créditos, símbolos, placeholders, gagueira gráfica/alongamento;
 - quebra de continuidade audiovisual, palavras/letras exibidas na tela.
 
+CUE OWNERSHIP / SEMANTIC SYNC — CRÍTICO
+
+Para CADA cue, compare exclusivamente o EN daquele ID
+com o PT daquele MESMO ID.
+
+É ERRO CRÍTICO se:
+- o PT traduz claramente o EN do cue anterior;
+- o PT traduz claramente o EN do cue seguinte;
+- o PT repete a tradução do cue anterior enquanto o EN mudou;
+- uma sequência de PT parece deslocada em +1 ou -1 cue;
+- informação do target desapareceu e reapareceu no ID vizinho;
+- o PT contém conteúdo principal pertencente a before/after;
+- um cue ficou com a fala pertencente a outro timestamp.
+
+Quando detectar isso, reason DEVE começar exatamente com:
+
+CUE_OWNERSHIP_SHIFT:
+
+Depois explique brevemente.
+
+Não confunda continuação legítima de uma frase entre cues
+com deslocamento. Cada ID só pode conter a parte que pertence
+ao EN desse mesmo ID.
+
 PADRÕES OBJETIVOS A EVITAR:
 - "Why do you let them hurt me?" não pode virar algo com "te machucarem";
 - "They alerted..." não pode virar "Alertei...";
@@ -3778,7 +3865,10 @@ GAG / DRAG / INTERNET SLANG
 - Não permita calque literal que destrua o sentido social.
 
 BORDÕES / FRASES CONHECIDAS
-- HARD LOCKS devem permanecer exatamente canônicos.
+- O campo canonical_locks contém formas canônicas literais.
+- Cada canonical_lock deve sobreviver EXATAMENTE.
+- Nesta auditoria NÃO devolva tokens __LOCK_C...__.
+- Trabalhe diretamente com a forma canônica real.
 - Uma frase conhecida não protegida por token ainda deve preservar
   seus elementos distintivos, intensidade, humor e estrutura retórica.
 - Não aceite simplificação que transforme um bordão reconhecível
@@ -3909,7 +3999,7 @@ Se houver regressão real:
 
 A correção DEVE:
 - permanecer no MESMO cue;
-- preservar todos os HARD LOCKS;
+- preservar exatamente todos os canonical_locks;
 - preservar Meaning Integrity;
 - respeitar SOURCE DEFECT RECOVERY;
 - não criar SDH;
@@ -3925,6 +4015,56 @@ Meta final:
 SIGNIFICADO / INTENÇÃO COMPLETOS
 + PT-BR NATURAL
 + 2x50.
+`;
+
+const SEMANTIC_COMPACT_RETRY_PROMPT = `
+Você é o COMPACTADOR SEMÂNTICO FINAL de um único cue EN→PT-BR.
+
+A tradução recebida já foi identificada como semanticamente necessária.
+
+Sua única tarefa é reescrever a FORMA para caber em:
+
+- no máximo ${LAYOUT_MAX_LINES} linhas;
+- no máximo ${LAYOUT_MAX_CHARS_PER_LINE} caracteres por linha.
+
+REGRA ABSOLUTA:
+NÃO remova nenhuma unidade de significado da correção recebida.
+
+Preserve:
+- ação;
+- sujeito;
+- objeto;
+- números;
+- unidades;
+- relações;
+- negação;
+- intensidade;
+- insulto;
+- humor;
+- palavrão relevante;
+- informação narrativa.
+
+Pode:
+- mudar completamente a sintaxe;
+- usar contrações naturais;
+- eliminar sujeito redundante;
+- escolher formulação PT-BR mais curta;
+- usar números em algarismos quando natural.
+
+Não pode:
+- resumir conteúdo;
+- apagar informação;
+- inventar;
+- mover conteúdo;
+- alterar timestamp;
+- criar SDH;
+- suavizar registro;
+- deformar canonical_locks.
+
+canonical_locks devem aparecer exatamente.
+
+Resultado:
+PT-BR natural + significado completo + 2x50.
 `;
 
 const SEMANTIC_REWRITE_AUDIT_SCHEMA = {
@@ -6501,14 +6641,15 @@ function buildOwnershipPayload(
   const locksById =
     new Map();
 
+  const ownershipById =
+    new Map();
+
   const capsules = [];
 
-  for (
-    const block of
-    interleaveBatch(
-      batch
-    )
-  ) {
+  // 8.3.12:
+  // ordem cronológica absoluta.
+  // Não usamos interleaveBatch aqui.
+  for (const block of batch) {
     const pos =
       posMap.get(
         block.index
@@ -6520,9 +6661,24 @@ function buildOwnershipPayload(
         block.index
       );
 
+    // Marcadores exclusivos deste ID.
+    const startToken =
+      `__OWN_C${block.index}_START__`;
+
+    const endToken =
+      `__OWN_C${block.index}_END__`;
+
     locksById.set(
       block.index,
       protectedTarget.locks
+    );
+
+    ownershipById.set(
+      block.index,
+      {
+        startToken,
+        endToken
+      }
     );
 
     capsules.push({
@@ -6535,7 +6691,7 @@ function buildOwnershipPayload(
             Math.max(
               0,
               pos -
-              CAPSULE_CONTEXT_BEFORE
+                CAPSULE_CONTEXT_BEFORE
             ),
             pos
           )
@@ -6548,7 +6704,7 @@ function buildOwnershipPayload(
           block.index,
 
         en:
-          protectedTarget.text,
+          `${startToken} ${protectedTarget.text} ${endToken}`,
 
         ...(
           block.speakerHint
@@ -6569,46 +6725,68 @@ function buildOwnershipPayload(
               allBlocks.length,
 
               pos +
-              1 +
-              CAPSULE_CONTEXT_AFTER
+                1 +
+                CAPSULE_CONTEXT_AFTER
             )
           )
           .map(
             contextCue
           ),
 
+      // IMPORTANTE:
+      // preservamos o Identity Lock que seu código atual já possui.
       identity_lock:
         identityLockForCapsule(
           block,
           plan
         ),
 
-      hard_locks:
-        protectedTarget
+      hard_locks: [
+        startToken,
+
+        ...protectedTarget
           .locks
           .map(
             lock =>
               lock.token
-          )
+          ),
+
+        endToken
+      ],
+
+      ownership_start:
+        startToken,
+
+      ownership_end:
+        endToken
     });
   }
 
   return {
     payload: {
       ownership_rule:
-        "Cada cápsula é independente. Traduza somente target; before/after são leitura contextual e nunca fornecem conteúdo ao output. Se speaker for unknown, não adivinhe gênero. Correto mas literal demais deve ser reescrito em PT-BR espontâneo.",
+        "As cápsulas estão em ordem cronológica. " +
+        "Cada target é uma caixa fechada. " +
+        "Traduza EXCLUSIVAMENTE o conteúdo entre " +
+        "__OWN_C<ID>_START__ e __OWN_C<ID>_END__ do MESMO ID. " +
+        "before/after servem somente para compreender contexto. " +
+        "Nunca copie, antecipe, atrase, duplique ou mova conteúdo entre IDs. " +
+        "Se speaker for unknown, não adivinhe gênero. " +
+        "Correto mas literal demais deve ser reescrito em PT-BR espontâneo.",
 
       capsules
     },
 
-    locksById
+    locksById,
+    ownershipById
   };
 }
-
 function parseCueTranslation(
   batch,
   raw,
-  locksById = new Map()
+  locksById = new Map(),
+  ownershipById = new Map(),
+  enforceOrder = false
 ) {
   let parsed;
 
@@ -6642,7 +6820,48 @@ function parseCueTranslation(
     );
 
   const expected =
-    new Set(ids);
+    new Set(
+      ids
+    );
+
+  if (
+    parsed.cues.length !==
+    ids.length
+  ) {
+    throw new Error(
+      `Quantidade de cues inválida: ` +
+      `${parsed.cues.length}/${ids.length}.`
+    );
+  }
+
+  // Somente o MAIN ativa isto.
+  // Repair/Compact continuam compatíveis com o parser.
+  if (enforceOrder) {
+    const returnedIds =
+      parsed.cues.map(
+        item =>
+          Number(
+            item?.i
+          )
+      );
+
+    for (
+      let i = 0;
+      i < ids.length;
+      i++
+    ) {
+      if (
+        returnedIds[i] !==
+        ids[i]
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP ORDER: ` +
+          `posição ${i} esperava ID ${ids[i]}, ` +
+          `recebeu ${returnedIds[i]}.`
+        );
+      }
+    }
+  }
 
   const byId =
     new Map();
@@ -6684,11 +6903,131 @@ function parseCueTranslation(
       );
     }
 
+    const ownership =
+      ownershipById.get(
+        id
+      );
+
+    if (ownership) {
+      const {
+        startToken,
+        endToken
+      } =
+        ownership;
+
+      const startPos =
+        pt.indexOf(
+          startToken
+        );
+
+      const endPos =
+        pt.indexOf(
+          endToken
+        );
+
+      const duplicatedStart =
+        startPos >= 0 &&
+        startPos !==
+          pt.lastIndexOf(
+            startToken
+          );
+
+      const duplicatedEnd =
+        endPos >= 0 &&
+        endPos !==
+          pt.lastIndexOf(
+            endToken
+          );
+
+      if (
+        startPos < 0 ||
+        endPos < 0
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `marcador START/END não voltou.`
+        );
+      }
+
+      if (
+        duplicatedStart ||
+        duplicatedEnd
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `marcador START/END duplicado.`
+        );
+      }
+
+      if (
+        endPos <=
+        startPos
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `marcadores invertidos.`
+        );
+      }
+
+      const outsideBefore =
+        pt
+          .slice(
+            0,
+            startPos
+          )
+          .trim();
+
+      const outsideAfter =
+        pt
+          .slice(
+            endPos +
+              endToken.length
+          )
+          .trim();
+
+      if (
+        outsideBefore ||
+        outsideAfter
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `texto apareceu fora dos limites do target.`
+        );
+      }
+
+      pt =
+        pt
+          .slice(
+            startPos +
+              startToken.length,
+            endPos
+          )
+          .trim();
+
+      if (
+        /__OWN_C\d+_(?:START|END)__/u.test(
+          pt
+        )
+      ) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `marcador de outro cue contaminou o target.`
+        );
+      }
+
+      if (!pt) {
+        throw new Error(
+          `CUE OWNERSHIP cue ${id}: ` +
+          `conteúdo entre marcadores ficou vazio.`
+        );
+      }
+    }
+
     pt =
       restoreCulturalLocks(
         pt,
         locksById.get(id) ||
-        [],
+          [],
         id
       );
 
@@ -6703,11 +7042,8 @@ function parseCueTranslation(
     ids.length
   ) {
     throw new Error(
-      `Tradução incompleta ${
-        byId.size
-      }/${
-        ids.length
-      }.`
+      `Tradução incompleta ` +
+      `${byId.size}/${ids.length}.`
     );
   }
 
@@ -6731,10 +7067,11 @@ async function translateMainBatch({
   ) {
     try {
       const {
-        payload,
-        locksById
-      } =
-        buildOwnershipPayload(
+  payload,
+  locksById,
+  ownershipById
+} =
+  buildOwnershipPayload(
           blocks,
           posMap,
           batch,
@@ -6757,12 +7094,18 @@ async function translateMainBatch({
                 payload
               )
             }\n\n` +
+            `Os cues estão em ORDEM CRONOLÓGICA. ` +
+            `Retorne os IDs EXATAMENTE na mesma ordem recebida. ` +
             `Traduza somente cada target. ` +
             `Output exatamente ${
               batch.length
-            } cues. ` +
-            `Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
-            `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
+} cues. ` +
+`Cada target começa com __OWN_C<ID>_START__ e termina com __OWN_C<ID>_END__. ` +
+`Os dois marcadores do MESMO ID devem voltar IDÊNTICOS dentro de pt. ` +
+`Não escreva absolutamente nada antes do START nem depois do END. ` +
+`Nunca use no pt de um ID conteúdo pertencente ao target, before ou after de outro ID. ` +
+`Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
+`O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
 
           schema:
             cueTranslationSchema(
@@ -6788,10 +7131,12 @@ async function translateMainBatch({
         });
 
       return parseCueTranslation(
-        batch,
-        response.text,
-        locksById
-      );
+  batch,
+  response.text,
+  locksById,
+  ownershipById,
+  true
+);
     } catch (error) {
       lastError =
         error;
@@ -7150,16 +7495,27 @@ function parseQaIssues(
 
     seen.add(id);
 
-    out.push({
-      id,
+    const reasons = [
+  `QA_PTBR: ${
+    reason ||
+    "defeito claro"
+  }`
+];
 
-      reasons: [
-        `QA_PTBR: ${
-          reason ||
-          "defeito claro"
-        }`
-      ]
-    });
+if (
+  /^CUE_OWNERSHIP_SHIFT\s*:/iu.test(
+    reason
+  )
+) {
+  reasons.unshift(
+    "POSSIBLE_CUE_SHIFT_PAIR"
+  );
+}
+
+out.push({
+  id,
+  reasons
+});
   }
 
   return out;
@@ -9757,7 +10113,10 @@ function buildSemanticRewriteAuditBatches(
       i: block.index,
 
       en:
-        protectedTarget.text,
+  String(
+    block.text ||
+    ""
+  ),
 
       before_pt:
         beforePt,
@@ -9765,10 +10124,10 @@ function buildSemanticRewriteAuditBatches(
       after_pt:
         afterPt,
 
-      hard_locks:
-        protectedTarget.locks.map(
-          lock => lock.token
-        ),
+      canonical_locks:
+  protectedTarget.locks.map(
+    lock => lock.value
+  ),
 
       ...(block.speakerHint
         ? {
@@ -9864,6 +10223,174 @@ function buildSemanticRewriteAuditBatches(
   return batches;
 }
 
+async function trySemanticCompactCorrection({
+  block,
+  semanticCandidate,
+  reason,
+  locks,
+  plan,
+  job
+}) {
+  console.log(
+    `[SEMANTIC COMPACT RETRY] cue ${block.index} | tentando preservar correção dentro de 2x50.`
+  );
+
+  const response =
+    await geminiRequest({
+      system:
+        SEMANTIC_COMPACT_RETRY_PROMPT,
+
+      user:
+        `BÍBLIA:\n${
+          JSON.stringify(
+            plan || {}
+          )
+        }\n\n` +
+        `CUE:\n${
+          JSON.stringify({
+            i:
+              block.index,
+
+            en:
+              block.text,
+
+            semantic_pt:
+              semanticCandidate,
+
+            reason:
+              String(
+                reason ||
+                ""
+              ),
+
+            canonical_locks:
+              (locks || [])
+                .map(
+                  lock =>
+                    lock.value
+                )
+          })
+        }\n\n` +
+        `Retorne exatamente 1 cue com o mesmo ID.`,
+
+      schema:
+        cueTranslationSchema(
+          1
+        ),
+
+      thinkingLevel:
+        SEMANTIC_COMPACT_RETRY_THINKING,
+
+      maxOutputTokens:
+        SEMANTIC_COMPACT_RETRY_MAX_OUTPUT_TOKENS,
+
+      timeoutMs:
+        SEMANTIC_COMPACT_RETRY_TIMEOUT_MS,
+
+      maxRetries:
+        SEMANTIC_COMPACT_RETRY_HTTP_RETRIES,
+
+      job,
+
+      metric:
+        "compact"
+    });
+
+  const parsed =
+    parseCueTranslation(
+      [block],
+      response.text
+    );
+
+  let candidate =
+    String(
+      parsed.get(
+        block.index
+      ) ||
+      ""
+    ).trim();
+
+  candidate =
+    canonicalizeCulturalText(
+      candidate
+    );
+
+  candidate =
+    sanitizeFinalCue(
+      block,
+      candidate
+    );
+
+  candidate =
+    canonicalizeCulturalText(
+      candidate
+    );
+
+  if (!candidate) {
+    throw new Error(
+      "Semantic Compact Retry retornou vazio."
+    );
+  }
+
+  const missingLocks =
+    missingCanonicalCultureLocks(
+      candidate,
+      locks
+    );
+
+  if (
+    missingLocks.length
+  ) {
+    throw new Error(
+      `Semantic Compact Retry perdeu canonical lock: ${
+        missingLocks
+          .map(
+            lock =>
+              lock.value
+          )
+          .join(", ")
+      }`
+    );
+  }
+
+  const layout =
+    layoutCueResult(
+      block,
+      candidate
+    );
+
+  if (
+    !layout.fits ||
+    layout.lines >
+      LAYOUT_MAX_LINES
+  ) {
+    throw new Error(
+      `Semantic Compact Retry ainda não cabe em ` +
+      `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}; ` +
+      `maior linha=${layout.maxLineLength}.`
+    );
+  }
+
+  const regressions =
+    repairCandidateRegressionReasons(
+      block,
+      semanticCandidate,
+      candidate,
+      job.filename
+    );
+
+  if (
+    regressions.length
+  ) {
+    throw new Error(
+      `Semantic Compact Retry criou regressão: ` +
+      `${regressions.join(", ")}`
+    );
+  }
+
+  return candidate;
+}
+
 async function runPostRewriteSemanticAudit(
   blocks,
   beforeTranslations,
@@ -9919,6 +10446,7 @@ async function runPostRewriteSemanticAudit(
   let totalFlagged = 0;
   let totalAccepted = 0;
   let totalRejected = 0;
+  let semanticCompactRetries = 0;
 
   for (
     let batchIndex = 0;
@@ -10043,23 +10571,10 @@ async function runPostRewriteSemanticAudit(
           continue;
         }
 
-        try {
-          candidatePt =
-            restoreCulturalLocks(
-              candidatePt,
-              locksById.get(id) || [],
-              id
-            );
-        } catch (error) {
-          totalRejected++;
-
-          console.warn(
-            `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado por HARD LOCK | ` +
-            `${errorMessage(error).slice(0, 220)}`
-          );
-
-          continue;
-        }
+        candidatePt =
+  canonicalizeCulturalText(
+    candidatePt
+  );
 
         candidatePt =
           sanitizeFinalCue(
@@ -10077,6 +10592,41 @@ async function runPostRewriteSemanticAudit(
           continue;
         }
 
+        candidatePt =
+  canonicalizeCulturalText(
+    candidatePt
+  );
+
+const requiredLocks =
+  locksById.get(id) ||
+  [];
+
+const missingLocks =
+  missingCanonicalCultureLocks(
+    candidatePt,
+    requiredLocks
+  );
+
+if (
+  missingLocks.length
+) {
+  totalRejected++;
+
+  console.warn(
+    `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado por CANONICAL LOCK | ` +
+    `faltando=${
+      missingLocks
+        .map(
+          lock =>
+            lock.value
+        )
+        .join(", ")
+    }`
+  );
+
+  continue;
+}
+
         // A correção semântica jamais pode relaxar o teto visual.
         const layout =
           layoutCueResult(
@@ -10085,20 +10635,69 @@ async function runPostRewriteSemanticAudit(
           );
 
         if (
-          !layout.fits ||
-          layout.lines >
-            LAYOUT_MAX_LINES
-        ) {
-          totalRejected++;
+  !layout.fits ||
+  layout.lines >
+    LAYOUT_MAX_LINES
+) {
+  const canRetryCompact =
+    SEMANTIC_COMPACT_RETRY_ENABLED &&
+    semanticCompactRetries <
+      SEMANTIC_COMPACT_RETRY_MAX_PER_EPISODE;
 
-          console.warn(
-            `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado: ` +
-            `não cabe em ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} | ` +
-            `maior linha=${layout.maxLineLength}.`
-          );
+  if (canRetryCompact) {
+    semanticCompactRetries++;
 
-          continue;
-        }
+    try {
+      const compacted =
+        await trySemanticCompactCorrection({
+          block,
+
+          semanticCandidate:
+            candidatePt,
+
+          reason:
+            issue?.reason,
+
+          locks:
+            locksById.get(id) ||
+              [],
+
+          plan,
+          job
+        });
+
+      updated.set(
+        id,
+        compacted
+      );
+
+      totalAccepted++;
+
+      console.log(
+        `[SEMANTIC COMPACT RETRY] cue ${id} corrigido ✅ | ` +
+        `correção semântica preservada dentro de ` +
+        `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}.`
+      );
+
+      continue;
+    } catch (error) {
+      console.warn(
+        `[SEMANTIC COMPACT RETRY] cue ${id} falhou | ` +
+        `${errorMessage(error).slice(0, 300)}`
+      );
+    }
+  }
+
+  totalRejected++;
+
+  console.warn(
+    `[SEMANTIC REWRITE GUARD] cue ${id} rejeitado: ` +
+    `não cabe em ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} | ` +
+    `maior linha=${layout.maxLineLength}.`
+  );
+
+  continue;
+}
 
         const currentPt =
           String(
@@ -10187,7 +10786,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.11] fonte=${
+    `[PIPELINE 8.3.12] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -11881,7 +12480,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.11 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.12 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
@@ -11973,7 +12572,7 @@ console.log(
 );
 
 console.log(
-  `Semantic Guard Safety: qualquer correção ainda exige HARD LOCKS + sentido + ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} ✅`
+  `Semantic Guard Safety: qualquer correção ainda exige CANONICAL LOCKS + sentido + ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} ✅`
 );
 
   console.log(
@@ -12015,6 +12614,18 @@ console.log(
   console.log(
     "Cue Ownership capsules: ATIVAS ✅"
   );
+
+  console.log(
+  "Cue Ownership Hard Lock: ordem cronológica + START/END por ID + resposta na mesma ordem ✅"
+);
+
+console.log(
+  "Semantic Compact Retry: correção semântica >2x50 é compactada antes de ser rejeitada ✅"
+);
+
+console.log(
+  "Semantic Canonical Locks: auditor pós-rewrite usa bordões reais, não tokens opacos ✅"
+);
 
   console.log(
     "GAG/GAGGED reaction guard: ATIVO ✅"
