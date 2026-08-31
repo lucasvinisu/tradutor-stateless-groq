@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.10 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.11 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.10-post-rewrite-semantic-guard-source-recovery-2x50";
+  "8.3.11-culture-register-integrity-canonical-locks-2x50";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -41,7 +41,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.10.
+// já consumidas nas últimas 24h durante o deploy do 8.3.11.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -2172,13 +2172,13 @@ function parseSrt(srt) {
 const CULTURE_HARD_LOCKS = [
   {
     regex:
-      /\bLip\s+Sync\s+for\s+Your\s+Life\b/giu,
+      /\bLip[\s-]+Sync\s+for\s+Your\s+Life\b/giu,
     value:
       "Lip Sync for Your Life"
   },
   {
     regex:
-      /\bLip\s+Sync\s+for\s+the\s+Crown\b/giu,
+      /\bLip[\s-]+Sync\s+for\s+the\s+Crown\b/giu,
     value:
       "Lip Sync for the Crown"
   },
@@ -2200,12 +2200,21 @@ const CULTURE_HARD_LOCKS = [
     value:
       "You betta werk"
   },
+
+  // ==========================================================
+  // CONDRAGULATIONS — CANONICALIZAÇÃO DETERMINÍSTICA
+  // ==========================================================
+  // Algumas legendas-fonte trazem typos como:
+  // Condragtulations / Condraglulations.
+  // Todas representam o mesmo bordão e devem voltar
+  // deterministicamente como "Condragulations".
   {
     regex:
-      /\bCondragulations\b/giu,
+      /\b(?:Condragulations|Condragtulations|Condraglulations)\b/giu,
     value:
       "Condragulations"
   },
+
   {
     regex:
       /\bSnatch\s+Game\b/giu,
@@ -2236,14 +2245,24 @@ const CULTURE_HARD_LOCKS = [
     value:
       "Untucked"
   },
+
+  // Nome da franquia — aceita inclusive fonte sem apóstrofo.
   {
     regex:
-      /\blip\s+sync\b/giu,
+      /\bRuPaul(?:'|’)?s\s+Drag\s+Race\b/giu,
+    value:
+      "RuPaul's Drag Race"
+  },
+
+  // Deve ficar por último para não capturar antes
+  // os dois bordões completos "Lip Sync for..."
+  {
+    regex:
+      /\blip[\s-]+sync\b/giu,
     value:
       "lip sync"
   }
 ];
-
 function protectCulturalLocks(
   text,
   cueId
@@ -3074,7 +3093,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.10
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.11
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3223,11 +3242,91 @@ CENSURA / BLEEP
 - Se a palavra exata for impossível de inferir com segurança, reescreva a frase para continuar completa e natural; [censurado] é último recurso.
 - NUNCA deixe buracos como "é um vestido bem .".
 
-LGBTQIAPN+ / DRAG / BALLROOM / REALITY / FANDOM
-- Tenha letramento real de cultura LGBTQIAPN+, drag, ballroom, camp, shade, stan culture e reality competition.
-- Preserve humor, sexualidade, irreverência, shade, camp, afeto e agressividade conforme a cena.
-- Não suavize a personalidade de queens, jurados ou participantes.
+LGBTQIAPN+ / DRAG / BALLROOM / REALITY / FANDOM — CULTURE & REGISTER INTEGRITY LOCK
+- Tenha letramento real de cultura LGBTQIAPN+, drag, ballroom, camp, shade, stan culture, internet culture e reality competition.
+- Preserve humor, sexualidade, irreverência, shade, camp, afeto, orgulho, deboche e agressividade conforme a cena.
+- Não suavize a personalidade de queens, jurados, participantes ou personagens.
 - Não force gíria em pessoas cujo registro não pede isso.
+- NÃO trate vocabulário cultural como tabela fixa EN→PT.
+- Antes de traduzir gíria, palavrão, insulto ou vocativo, determine silenciosamente sua FUNÇÃO SOCIAL na fala.
+- A tradução correta é a que preserva intenção, relação entre as pessoas, intensidade, humor e efeito social — não necessariamente a palavra de dicionário.
+
+BORDÕES / FRASES CANÔNICAS / IDENTIDADE DE PROGRAMA
+- Bordões, nomes de desafios, nomes de segmentos, marcas e expressões reconhecidamente canônicas exigem cuidado máximo.
+- Tokens __LOCK_C...__ são autoridade absoluta e devem voltar IDÊNTICOS.
+- Nunca "corrija criativamente", traduza ou abrasileire um HARD LOCK.
+- Se a legenda-fonte contiver um typo reconhecível de um bordão que o HARD LOCK canonicalizou, use a forma CANÔNICA restaurada.
+- Para frases conhecidas que NÃO são HARD LOCK, preserve a estrutura retórica, a piada, a intensidade e as unidades importantes do bordão.
+- Não transforme uma frase icônica em uma paráfrase genérica só para ficar curta.
+- Familiaridade com o programa/personagem é contexto editorial, não licença para inventar.
+
+BITCH — PROIBIDA TRADUÇÃO AUTOMÁTICA
+- "bitch" NÃO possui equivalente PT-BR fixo.
+- NUNCA converta mecanicamente toda ocorrência para "puta".
+- NUNCA converta mecanicamente toda ocorrência para "vadia", "bicha", "gata" ou qualquer outra palavra.
+- Primeiro identifique a função da ocorrência.
+
+Possíveis funções de "bitch":
+* insulto hostil;
+* provocação/briga;
+* vocativo afetuoso entre amigas/queens;
+* cumplicidade camp;
+* exclamação;
+* admiração;
+* autoelogio;
+* orgulho/empoderamento;
+* descrição de personalidade;
+* termo sexual, quando o contexto realmente for sexual.
+
+- Em uso amigável/camp, possibilidades naturais incluem "bicha", "gata", "amiga", "menina" ou até omissão do vocativo.
+- Em insulto real, possibilidades incluem "vadia", "escrota", "desgraçada" ou outra formulação compatível com a intensidade e a personagem.
+- "puta" só é apropriado quando o sentido/contexto realmente justificar; não é tradução-padrão de "bitch".
+- Em autoafirmação como "I'm a bad bitch", preserve orgulho, poder e atitude.
+- "I'm a bad bitch" NÃO significa "sou uma puta ruim".
+- Dependendo da personagem/cena, pode equivaler pragmaticamente a algo como "eu sou foda", "sou poderosa", "sou aquela gata" ou outra formulação brasileira natural.
+- Não transforme autoelogio em autodepreciação nem afeto em agressão.
+
+PALAVRÕES / PROFANITY — PRESERVAR FORÇA, NÃO CONTAGEM
+- Preserve a força pragmática dos palavrões e intensificadores relevantes.
+- NÃO censure artificialmente.
+- NÃO suavize palavrão apenas para economizar caracteres.
+- NÃO insira palavrão aleatoriamente só porque existe um palavrão no EN.
+- NÃO tente manter uma correspondência de 1 palavrão EN = 1 palavrão PT.
+- "fuck", "fucking", "shit", "damn", "hell", "ass", "motherfucker" etc. dependem da função na frase.
+- Um palavrão pode funcionar como insulto, raiva, surpresa, intensidade, humor, admiração, sexualidade ou ritmo de fala.
+- Escolha a solução PT-BR que preserve ESSA função.
+- Se uma construção brasileira natural expressa a mesma intensidade sem tradução lexical do palavrão, isso pode ser correto.
+- Se retirar o palavrão destruir a força, personalidade ou piada da fala, preserve essa força em PT-BR.
+- Se acrescentar "porra", "caralho", "puta", "merda" etc. tornar a fala artificialmente mais agressiva que o original, NÃO acrescente.
+- Profanidade deve soar como algo que aquela pessoa realmente diria em português naquela situação.
+
+GAG / GAGGED — DISTINGUIR SENTIDOS
+- Em drag/fandom/reaction slang, "I'm gagged", "she gagged me", "I was gagged" normalmente expressam choque, impacto ou ficar sem reação.
+- Nesses casos, prefira conforme o registro: "tô passada", "fiquei passada", "tô em choque", "fiquei sem reação", "me deixou passada" etc.
+- NÃO traduza reaction "gag/gagged" como engasgar, amordaçar ou ter ânsia.
+- Uso físico de gag/engasgar só vale quando o contexto realmente envolve garganta, comida, vômito, sufocamento, mordaça ou ação física semelhante.
+- "the gag is..." pode significar "o babado é...", "a questão é...", "o detalhe é..." ou outra construção conforme a intenção.
+- "gag" também pode significar piada/bit/recurso cômico; determine pelo contexto.
+
+DRAG / INTERNET / REALITY — TRADUZIR POR SENTIDO
+- "ate / ate that" em elogio = arrasou, entregou tudo, serviu etc.; NUNCA "comeu isso" nesse sentido.
+- "no crumbs" = não deixou nada pra ninguém / entregou tudo; não traduza literalmente migalhas quando for elogio.
+- "slay" = arrasar, entregar, servir etc. quando for elogio; não "matar" salvo sentido literal.
+- "shade" = shade, alfinetada, indireta, veneno etc. conforme contexto; não "sombra".
+- "tea" como fofoca/informação = babado, fofoca, novidade etc.; não "chá".
+- "read / reading" em contexto drag = ler/alfinetar/desmontar/colocar no lugar conforme a fala; não aplicar tradução lexical cegamente.
+- "serve / serving" pode significar entregar visual, atitude, energia ou performance; traduza a intenção.
+- "bottom" em competição = bottom, piores, berlinda/zona de risco conforme o formato; não "fundo".
+- Diferencie completamente "bottom" competitivo de uso sexual.
+- "mother" como título/elogio cultural não significa automaticamente "mãe" literal.
+- "girl" pode ser vocativo social ("amiga", "gata", "mulher", "menina", omissão etc.) e não descrição literal de gênero.
+- Preserve duplo sentido sexual quando ele fizer parte da piada.
+- Não explique a piada dentro da legenda.
+
+REGRA DE OURO DE REGISTRO
+- Duas frases podem ter o mesmo significado factual e ainda assim NÃO serem equivalentes socialmente.
+- Preserve também: afeto, hostilidade, intimidade, poder, sarcasmo, vulgaridade, camp, orgulho, ironia e intensidade.
+- Uma tradução semanticamente correta mas socialmente errada deve ser tratada como ERRO.
 
 GAG / GAGGED / GAGGING EM SENTIDO DE REAÇÃO
 - Em reação, surpresa, impacto ou admiração, prefira: "passada", "tô passada", "fiquei passada", "em choque", "sem reação".
@@ -3642,6 +3741,51 @@ Preserve a FALA/INTENÇÃO PROVÁVEL da cena.
 
 NÃO seja escravo de um erro evidente da legenda-fonte,
 mas também NÃO invente conteúdo apenas porque ele parece plausível.
+
+============================================================
+CULTURE & REGISTER INTEGRITY
+============================================================
+
+Mudança de FUNÇÃO SOCIAL também é regressão semântica.
+
+Audite cuidadosamente gírias, palavrões, insultos, vocativos,
+bordões, referências culturais e linguagem de fandom.
+
+NÃO use equivalências lexicais automáticas.
+
+BITCH
+- "bitch" é altamente contextual.
+- NÃO exija "puta", "vadia", "bicha" ou qualquer tradução fixa.
+- Determine se é ataque, afeto, camp, cumplicidade, admiração,
+  autoelogio, orgulho, provocação ou outro uso.
+- Se BEFORE/AFTER transformar afeto em insulto, insulto em carinho,
+  autoafirmação em ofensa ou vice-versa, marque como regressão.
+- "I'm a bad bitch" é tipicamente autoafirmação/empoderamento,
+  não "sou uma puta ruim".
+
+PALAVRÕES
+- Compare a FORÇA pragmática, não a contagem de palavrões.
+- Marque se AFTER_PT suavizar injustificadamente raiva, vulgaridade,
+  insulto, humor ou intensidade importante.
+- Marque também se AFTER_PT acrescentar palavrão/agressividade
+  que o EN não sustenta.
+- O palavrão PT deve parecer organicamente pertencente àquela fala.
+
+GAG / DRAG / INTERNET SLANG
+- Diferencie reaction "gag/gagged" de sentido físico.
+- Verifique ate, slay, shade, tea, read, serving, bottom e termos
+  semelhantes pelo sentido cultural/contextual, nunca pelo dicionário.
+- Não permita calque literal que destrua o sentido social.
+
+BORDÕES / FRASES CONHECIDAS
+- HARD LOCKS devem permanecer exatamente canônicos.
+- Uma frase conhecida não protegida por token ainda deve preservar
+  seus elementos distintivos, intensidade, humor e estrutura retórica.
+- Não aceite simplificação que transforme um bordão reconhecível
+  em frase genérica.
+
+Uma tradução pode preservar os fatos e ainda assim estar ERRADA
+se destruir a personalidade, o registro ou o efeito social da fala.
 
 ============================================================
 REGRESSÃO SEMÂNTICA
@@ -10043,7 +10187,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.10] fonte=${
+    `[PIPELINE 8.3.11] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -10261,7 +10405,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.10] FINAL OK | ${
+    `[PIPELINE 8.3.11] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -10662,7 +10806,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.10"
+            "Stremio-PTBR/8.3.11"
         }
       }
     );
@@ -10694,7 +10838,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.10"
+            "Stremio-PTBR/8.3.11"
         }
       }
     );
@@ -10980,7 +11124,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.10",
+    "8.3.11",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -11737,7 +11881,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.10 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.11 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
   );
 
   console.log(
@@ -11851,6 +11995,18 @@ console.log(
   console.log(
     "Culture Hard Locks: ATIVOS ✅"
   );
+
+  console.log(
+  "Canonical Catchphrase Lock: typos conhecidos da fonte são restaurados para a forma canônica ✅"
+);
+
+console.log(
+  "Culture & Register Integrity: bitch/gag/profanity/slang por função social, nunca tabela lexical ✅"
+);
+
+console.log(
+  "Profanity Pragmatic Lock: preserva força sem inserir palavrão mecanicamente ✅"
+);
 
   console.log(
     "Condragulations / Sashay away / Shantay / Werkroom / Rusical: PROTEGIDOS ✅"
