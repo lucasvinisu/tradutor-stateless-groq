@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.7 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
+// STREMIO PT-BR 8.3.8 — TRANSLATION QUALITY + CONTEXT + IDENTITY LOCK + GEMINI TRANSCRIBE BUDGET/MONTAGE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -20,7 +20,7 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
-const CACHE_VERSION = "8.3.7-plan-fast-priority-qa-transcribe-budget";
+const CACHE_VERSION = "8.3.8-naturalness-layout-lock-transcribe-budget";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -40,7 +40,7 @@ const TRANSCRIBE_OUTPUT_TOKEN_RESERVE = 320;
 
 // INTENCIONALMENTE continua 8.3.5:
 // não podemos trocar o nome do ledger e esquecer chamadas Transcribe
-// já consumidas nas últimas 24h durante o deploy do 8.3.7.
+// já consumidas nas últimas 24h durante o deploy do 8.3.8.
 const TRANSCRIBE_BUDGET_FILE = String(
   process.env.TRANSCRIBE_BUDGET_FILE ||
   path.join(process.cwd(), "transcribe-budget-8.3.5.json")
@@ -92,6 +92,19 @@ const QA_MAX_FLAGS_TOTAL = 120;
 const QA_CONCURRENCY = 2;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
+
+// ============================================================
+// SUBTITLE LAYOUT LOCK
+// ============================================================
+
+// Alvo audiovisual: no máximo 2 linhas, até 50 caracteres por linha.
+// IMPORTANTE: estes limites NUNCA autorizam cortar palavras, truncar
+// conteúdo, criar cues ou alterar timestamps.
+const LAYOUT_MAX_LINES = 2;
+const LAYOUT_MAX_CHARS_PER_LINE = 50;
+
+// Quanto mais perto deste valor, mais equilibradas as duas linhas ficam.
+const LAYOUT_IDEAL_CHARS_PER_LINE = 44;
 
 const BLEEP_TOKEN = "__CENSORED_BLEEP__";
 const RECOVERY_SIGNING_KEY =
@@ -2696,6 +2709,244 @@ function sanitizeTranslationMap(
   return out;
 }
 
+function layoutVisibleLength(value) {
+  return [...String(value || "")].length;
+}
+
+function normalizeLayoutWhitespace(value) {
+  return String(value || "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function bestTwoLineSplit(value, maxChars = LAYOUT_MAX_CHARS_PER_LINE) {
+  const text = normalizeLayoutWhitespace(value);
+
+  if (!text) {
+    return {
+      lines: [],
+      fits: true,
+      maxLineLength: 0
+    };
+  }
+
+  const fullLength = layoutVisibleLength(text);
+
+  if (fullLength <= maxChars) {
+    return {
+      lines: [text],
+      fits: true,
+      maxLineLength: fullLength
+    };
+  }
+
+  const words = text.split(/\s+/).filter(Boolean);
+
+  // Uma única palavra enorme jamais será cortada.
+  if (words.length <= 1) {
+    return {
+      lines: [text],
+      fits: fullLength <= maxChars,
+      maxLineLength: fullLength
+    };
+  }
+
+  let best = null;
+
+  for (let split = 1; split < words.length; split++) {
+    const first = words.slice(0, split).join(" ");
+    const second = words.slice(split).join(" ");
+
+    const firstLength = layoutVisibleLength(first);
+    const secondLength = layoutVisibleLength(second);
+    const maxLength = Math.max(firstLength, secondLength);
+    const difference = Math.abs(firstLength - secondLength);
+
+    // Pequena preferência por uma quebra linguisticamente agradável.
+    const punctuationBonus =
+      /[,.;:!?…]$/.test(first)
+        ? 10
+        : 0;
+
+    // Preferimos:
+    // 1. caber em 50;
+    // 2. ficar equilibrado;
+    // 3. aproximar-se visualmente de ~44;
+    // 4. quebrar perto de pontuação quando possível.
+    const overflow =
+      Math.max(0, firstLength - maxChars) +
+      Math.max(0, secondLength - maxChars);
+
+    const idealDistance =
+      Math.abs(firstLength - LAYOUT_IDEAL_CHARS_PER_LINE) +
+      Math.abs(secondLength - LAYOUT_IDEAL_CHARS_PER_LINE);
+
+    const score =
+      overflow * 10000 +
+      difference * 30 +
+      idealDistance * 3 -
+      punctuationBonus;
+
+    if (!best || score < best.score) {
+      best = {
+        score,
+        lines: [first, second],
+        fits:
+          firstLength <= maxChars &&
+          secondLength <= maxChars,
+        maxLineLength: maxLength
+      };
+    }
+  }
+
+  return best || {
+    lines: [text],
+    fits: false,
+    maxLineLength: fullLength
+  };
+}
+
+function layoutCueResult(block, value) {
+  const raw = String(value || "")
+    .replace(/\r/g, "")
+    .trim();
+
+  if (!raw) {
+    return {
+      text: "",
+      fits: true,
+      lines: 0,
+      maxLineLength: 0
+    };
+  }
+
+  const sourceHasTwoDialogueTurns =
+    sourceDialogueDashCount(block) >= 2;
+
+  const existingLines = raw
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  // Cues com duas falas são uma exceção semântica importante.
+  // Não juntamos speakers diferentes só para obedecer ao layout.
+  if (
+    sourceHasTwoDialogueTurns &&
+    existingLines.length === 2
+  ) {
+    const lengths = existingLines.map(layoutVisibleLength);
+
+    return {
+      text: existingLines.join("\n"),
+      fits: lengths.every(
+        length => length <= LAYOUT_MAX_CHARS_PER_LINE
+      ),
+      lines: 2,
+      maxLineLength: Math.max(...lengths)
+    };
+  }
+
+  // Para fala normal, as quebras vindas da fonte deixam de ser autoridade.
+  // Transformamos o cue em texto contínuo e recalculamos a melhor quebra.
+  const flattened = normalizeLayoutWhitespace(raw);
+
+  const result = bestTwoLineSplit(
+    flattened,
+    LAYOUT_MAX_CHARS_PER_LINE
+  );
+
+  return {
+    text: result.lines.join("\n"),
+    fits: result.fits,
+    lines: result.lines.length,
+    maxLineLength: result.maxLineLength
+  };
+}
+
+function cueNeedsConciseRepair(block, value) {
+  const result = layoutCueResult(block, value);
+
+  // Se JavaScript consegue diagramar em <= 2x50, NÃO desperdiçamos Gemini.
+  if (
+    result.fits &&
+    result.lines <= LAYOUT_MAX_LINES
+  ) {
+    return false;
+  }
+
+  // Não significa que o texto será cortado.
+  // Significa apenas: peça ao Repair para tentar uma versão
+  // semanticamente equivalente, porém mais concisa e natural.
+  return true;
+}
+
+function applySubtitleLayout(
+  blocks,
+  translations,
+  label = "FINAL"
+) {
+  const out = new Map();
+
+  let changed = 0;
+  let perfectFits = 0;
+  let overflow = 0;
+  let maxObserved = 0;
+
+  for (const block of blocks) {
+    const original = String(
+      translations.get(block.index) ??
+      block.text
+    ).trim();
+
+    const result = layoutCueResult(
+      block,
+      original
+    );
+
+    // Segurança absoluta:
+    // layout nunca pode apagar conteúdo.
+    const finalText =
+      result.text.trim() ||
+      original;
+
+    if (finalText !== original) {
+      changed++;
+    }
+
+    if (
+      result.fits &&
+      result.lines <= LAYOUT_MAX_LINES
+    ) {
+      perfectFits++;
+    } else {
+      overflow++;
+    }
+
+    maxObserved = Math.max(
+      maxObserved,
+      result.maxLineLength || 0
+    );
+
+    out.set(
+      block.index,
+      finalText
+    );
+  }
+
+  console.log(
+    `[LAYOUT LOCK] ${label} | ` +
+    `reflow=${changed} | ` +
+    `<=2x${LAYOUT_MAX_CHARS_PER_LINE}=${perfectFits}/${blocks.length} | ` +
+    `overflow seguro=${overflow} | ` +
+    `maior linha=${maxObserved}.`
+  );
+
+  return out;
+}
+
 function buildSrt(
   blocks,
   translations
@@ -2785,7 +3036,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.7
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.8
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -2827,6 +3078,46 @@ NATURALIDADE PT-BR 2026 — REGRA DE ACEITAÇÃO
 - Use PT-BR contemporâneo SEMPRE; use Gen Z/Alpha/fandom SOMENTE quando idade, personalidade, comunidade e situação pedirem.
 - Uma fala adulta em drama/horror deve soar atual e humana, não necessariamente como internet/TikTok.
 - Não use "sequer", "de fato", "eu suponho", "eu aprecio isso", "isso sendo dito" ou outras formas engessadas por reflexo do inglês quando uma forma brasileira simples for mais natural no registro da cena.
+
+NATURALNESS LOCK — REGRA INVIOLÁVEL
+- TRADUÇÃO LITERAL QUE SOA TRADUZIDA É TRADUÇÃO ERRADA, mesmo quando a gramática e o significado básico estiverem corretos.
+- Fidelidade NÃO significa preservar sintaxe, ordem de palavras, verbo, substantivo ou metáfora do inglês.
+- Fidelidade significa preservar o que a pessoa QUER DIZER, o efeito social da fala, a emoção e a personalidade.
+- Antes de devolver o pt, imagine que a pessoa da cena é brasileira e está dizendo espontaneamente a mesma coisa. Escreva essa fala.
+- Depois de entender o EN, pare de usá-lo como molde sintático.
+- Prefira equivalência pragmática e idiomática a equivalência palavra por palavra.
+- Se a tradução permitir enxergar facilmente a frase inglesa por baixo dela, revise em busca de calque.
+- Frase compreensível mas artificial NÃO está pronta.
+- Frase gramaticalmente correta mas que ninguém diria naturalmente NÃO está pronta.
+- Frase que parece Google Translate, legenda estudantil ou português de dublagem antiga NÃO está pronta.
+- Use contrações brasileiras naturais como "tô", "tá", "pra", "né" quando o personagem e a cena pedirem.
+- Não use informalidade artificial apenas para parecer moderno.
+
+TESTE DO BRASILEIRO NATIVO
+Antes de cada cue, pergunte silenciosamente:
+1. Eu ouviria um brasileiro real dizer isso?
+2. Essa pessoa específica diria isso?
+3. A ordem da frase nasceu em português ou foi copiada do inglês?
+4. Existe uma forma igualmente fiel, porém mais curta e natural?
+Se qualquer resposta indicar artificialidade, REESCREVA antes de responder.
+
+EXEMPLOS DE DEFEITO DE NATURALIDADE
+- RUIM: "Eu estava esperando mais picos e vales."
+  MELHOR: "Eu esperava mais altos e baixos." / "Eu esperava mais variação.", conforme contexto.
+- RUIM: "Eu aprecio isso."
+  MELHOR: "Valeu.", "Agradeço.", "Fico feliz." etc., conforme personagem e situação.
+- RUIM: "Isso sendo dito..."
+  MELHOR: reconstrua a transição naturalmente: "Dito isso...", "Mas...", "Só que..." etc.
+- RUIM: "O Maxi Desafio desta semana é uma reviravolta no Snatch Game chamada..."
+  MELHOR: prefira uma formulação enxuta e brasileira como "O Maxi Desafio desta semana é uma versão do Snatch Game..." quando esse for o sentido.
+- Os exemplos ensinam o TIPO de correção; não os copie mecanicamente em contextos diferentes.
+
+CONCISÃO AUDIOVISUAL
+- Legenda não é transcrição palavra por palavra.
+- Preserve TODA a informação relevante, mas elimine redundância sintática que o português não precisa.
+- Se duas formulações forem semanticamente equivalentes, prefira a mais curta, natural e rápida de ler.
+- Não acrescente sujeitos, pronomes, conectivos ou explicações que o português possa omitir naturalmente.
+- Não resuma informação; compacte a FORMA, não o conteúdo.
 
 CUE OWNERSHIP — REGRA INVIOLÁVEL
 - Cada cápsula é independente.
@@ -3032,6 +3323,11 @@ CHECKLIST SILENCIOSO OBRIGATÓRIO ANTES DE CADA pt:
 4. Um brasileiro falaria isso espontaneamente em 2026, nesse registro?
 5. A gíria é apropriada à pessoa/contexto, e não uma tentativa artificial de parecer jovem?
 6. Todo conteúdo pertence somente a este target?
+7. Se eu escondesse o inglês e lesse somente o PT, isso pareceria escrito originalmente em português brasileiro?
+8. Existe alguma expressão, verbo ou ordem sintática que estou preservando apenas porque aparece assim em inglês?
+9. Consigo dizer exatamente a mesma coisa de forma mais espontânea e/ou mais curta sem perder informação?
+10. A frase cabe naturalmente como LEGENDA, e não como tradução acadêmica da sentença?
+11. Se o resultado estiver correto porém literal, NÃO devolva ainda: reescreva.
 
 Devolva exatamente um objeto por target, mantendo o mesmo id em i.
 `;
@@ -3042,6 +3338,24 @@ Você é editor final EN→PT-BR.
 ${STYLE_PACK}
 
 Você receberá somente cues sinalizados por detectores locais e/ou pelo QA PT-BR.
+
+NATURALNESS REPAIR
+- Se o motivo incluir QA_PTBR, LITERAL, FALSE_COGNATE, IDIOM, UNNATURAL ou SUBTITLE_TOO_DENSE, não faça uma correção superficial.
+- Releia EN + contexto + Character Ledger e reconstrua a fala em PT-BR espontâneo.
+- NÃO preserve a sintaxe inglesa só porque a primeira tradução estava compreensível.
+- O resultado reparado deve soar melhor que o MAIN, não apenas diferente.
+
+SUBTITLE_TOO_DENSE
+- Significa que a tradução atual não consegue ser diagramada confortavelmente em no máximo 2 linhas de 50 caracteres.
+- Torne a frase MAIS CONCISA e MAIS NATURAL sem remover fatos, intenção, piada, shade, emoção, negação, referente ou informação importante.
+- Remova redundância causada pela tradução, não conteúdo da fala.
+- NÃO corte palavra.
+- NÃO trunque a frase.
+- NÃO mova conteúdo para outro cue.
+- NÃO invente outro cue.
+- NÃO crie nem altere timestamps.
+- Se não houver forma segura de reduzir, preserve o conteúdo completo. Integridade vem antes do limite visual.
+
 Corrija defeitos reais de cultura, literalidade/calque, censura/bleep, gênero/referente, ortografia, palavra corrompida, naturalidade, SDH residual, omissão, overflow, formatação ou ownership.
 - Se identity_lock disser que o speaker é desconhecido/incerto, neutralize concordância de 1ª pessoa quando não houver evidência segura.
 - "Gramaticalmente correto" não basta se soar traduzido, antiquado ou pouco espontâneo em PT-BR contemporâneo.
@@ -3055,6 +3369,29 @@ Você é o revisor semântico e linguístico FINAL de legendas EN→PT-BR.
 Você recebe EN e PT do MESMO cue, contexto curto e identity_lock. NÃO reescreva aqui: apenas sinalize IDs que devem ir para a única passada de repair.
 
 SEJA EXIGENTE. CORRETO MAS LITERAL DEMAIS = DEFEITO.
+
+NATURALIDADE É UM CRITÉRIO SEMÂNTICO, NÃO COSMÉTICO.
+Uma frase deve ser sinalizada mesmo que não contenha "erro" tradicional se um brasileiro nativo perceber imediatamente que foi traduzida do inglês.
+
+TESTE DE CALQUE:
+- Tente mentalmente reconstruir o inglês olhando apenas o PT.
+- Se a estrutura, metáfora, colocação ou ordem das ideias denunciar demais a frase inglesa, sinalize.
+- Não exija equivalência lexical quando a intenção pede localização.
+
+TESTE DE ORALIDADE:
+- Leia mentalmente a frase em voz alta.
+- Se parecer texto escrito/traduzido em vez da fala espontânea daquela pessoa, sinalize.
+- Reality, confessional, conversa, discussão, piada e shade devem soar FALADOS.
+
+TESTE DE CONCISÃO:
+- Se o PT ficou muito maior ou mais burocrático que o necessário por seguir a estrutura inglesa, sinalize.
+- Uma versão mais curta só é melhor quando preserva toda a informação e intenção.
+
+EXEMPLOS:
+- "picos e vales" para variação de performance pode ser calque; avalie "altos e baixos", "variação" etc.
+- "eu aprecio isso" frequentemente é artificial em fala casual.
+- "isso sendo dito" é calque.
+- construções como "para ela não estar mais aqui" podem exigir reorganização conforme o contexto para soar realmente brasileira.
 
 Para cada cue, pergunte silenciosamente:
 1. Um brasileiro falaria isso espontaneamente em 2026 nessa situação?
@@ -7210,18 +7547,15 @@ function localReasonsForCue(
   }
 
   if (
+  cueNeedsConciseRepair(
+    block,
     translated
-      .split("\n")
-      .some(
-        line =>
-          [...line].length >
-          52
-      )
-  ) {
-    reasons.push(
-      "OVERLONG_SUBTITLE_LINE"
-    );
-  }
+  )
+) {
+  reasons.push(
+    "SUBTITLE_TOO_DENSE"
+  );
+}
 
   if (
     en.includes(
@@ -7582,6 +7916,7 @@ function issuePriority(issue) {
   // ==========================================================
 
   if (
+    /SUBTITLE_TOO_DENSE/i.test(joined) ||
     /QA_PTBR/i.test(joined) ||
     /FALSE_COGNATE/i.test(joined) ||
     /IDIOM_/i.test(joined) ||
@@ -8227,7 +8562,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.7] fonte=${
+    `[PIPELINE 8.3.8] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -8250,11 +8585,26 @@ async function translateSrt(
     );
 
   mainTranslations =
-    sanitizeTranslationMap(
-      blocks,
-      mainTranslations,
-      job
-    );
+  sanitizeTranslationMap(
+    blocks,
+    mainTranslations,
+    job
+  );
+
+// SAFE DRAFT também recebe layout profissional.
+// A versão sem reflow continua em mainTranslations para QA/Repair.
+const mainLayoutTranslations =
+  applySubtitleLayout(
+    blocks,
+    mainTranslations,
+    "MAIN"
+  );
+
+const mainSrt =
+  buildSrt(
+    blocks,
+    mainLayoutTranslations
+  );
 
   const mainSrt =
     buildSrt(
@@ -8300,19 +8650,28 @@ async function translateSrt(
     );
 
   finalTranslations =
-    sanitizeTranslationMap(
-      blocks,
-      finalTranslations,
-      job
-    );
+  sanitizeTranslationMap(
+    blocks,
+    finalTranslations,
+    job
+  );
 
-  const remaining =
-    detectLocalIssues(
-      blocks,
-      finalTranslations,
-      job.filename,
-      plan
-    );
+// Layout final determinístico.
+// NÃO altera texto entre cues e NÃO altera timestamps.
+const finalLayoutTranslations =
+  applySubtitleLayout(
+    blocks,
+    finalTranslations,
+    "FINAL"
+  );
+
+const remaining =
+  detectLocalIssues(
+    blocks,
+    finalLayoutTranslations,
+    job.filename,
+    plan
+  );
 
   if (remaining.length) {
   logIssueSummary(
@@ -8328,10 +8687,10 @@ async function translateSrt(
 }
 
   const finalSrt =
-    buildSrt(
-      blocks,
-      finalTranslations
-    );
+  buildSrt(
+    blocks,
+    finalLayoutTranslations
+  );
 
   auditTimestamps(
     sourceSrt,
@@ -8340,7 +8699,7 @@ async function translateSrt(
   );
 
   console.log(
-    `[PIPELINE 8.3.7] FINAL OK | ${
+    `[PIPELINE 8.3.8] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -8741,7 +9100,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.7"
+            "Stremio-PTBR/8.3.8"
         }
       }
     );
@@ -8773,7 +9132,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.7"
+            "Stremio-PTBR/8.3.8"
         }
       }
     );
@@ -9059,7 +9418,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
   version:
-    "8.3.7",
+    "8.3.8",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -9816,7 +10175,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.7 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
+    " STREMIO PT-BR 8.3.8 — MAX TRANSLATION QUALITY + IDENTITY SAFE + ANTI-LITERAL + TRANSCRIBE BUDGET/MONTAGE"
   );
 
   console.log(
@@ -9866,6 +10225,22 @@ app.listen(PORT, () => {
   console.log(
     "Naturalidade PT-BR 2026 + Anti-Calque/Falsos Cognatos: ATIVOS ✅"
   );
+
+  console.log(
+  "Naturalness Lock: literal porém artificial = ERRO; intenção + oralidade PT-BR prioritárias ✅"
+);
+
+console.log(
+  `Subtitle Layout Lock: alvo máximo=${LAYOUT_MAX_LINES} linhas × ${LAYOUT_MAX_CHARS_PER_LINE} chars | quebra somente entre palavras ✅`
+);
+
+console.log(
+  "Layout Safety: zero truncamento | zero word-split | zero novos cues | zero alteração de timestamps ✅"
+);
+
+console.log(
+  "SUBTITLE_TOO_DENSE: Repair busca concisão natural antes do reflow final ✅"
+);
 
   console.log(
     `Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`
