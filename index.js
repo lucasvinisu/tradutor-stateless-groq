@@ -3886,6 +3886,29 @@ Para cada cue, compare rigorosamente:
    nunca autorização automática para mover conteúdo entre cues.
 
 ============================================================
+ABSOLUTE CUE OWNERSHIP — PRIORIDADE MÁXIMA
+============================================================
+
+ANTES de comparar BEFORE_PT com AFTER_PT, faça este teste:
+
+AFTER_PT realmente traduz o EN deste MESMO i?
+
+O EN do target é a autoridade absoluta de ownership.
+
+- BEFORE_CONTEXT e AFTER_CONTEXT servem SOMENTE para entender a cena.
+- Nunca use conteúdo dos cues vizinhos como conteúdo do target.
+- Se AFTER_PT traduz o EN do cue anterior ou seguinte, sinalize e CORRIJA.
+- Se o EN atual perdeu informação porque a tradução ficou deslocada,
+  sinalize e CORRIJA.
+- Se BEFORE_PT já estava deslocado e AFTER_PT manteve o mesmo erro,
+  ISSO CONTINUA SENDO ERRO.
+- Não é necessário existir piora de BEFORE_PT para AFTER_PT.
+- Cada correção deve traduzir SOMENTE o EN pertencente ao mesmo i.
+- Evidência explícita do EN atual sobre gênero/pronomes vence qualquer
+  Character Ledger conflitante.
+- Se gênero não estiver seguro, prefira PT-BR naturalmente neutro.
+
+============================================================
 PRINCÍPIO CENTRAL
 ============================================================
 
@@ -6598,12 +6621,104 @@ function mentionedPeople(
   );
 }
 
+function trustedPersonGender(
+  person
+) {
+  if (!person) {
+    return null;
+  }
+
+  const gender =
+    String(
+      person.gender ||
+      "unknown"
+    )
+      .toLocaleLowerCase()
+      .trim();
+
+  const confidence =
+    String(
+      person.confidence ||
+      "low"
+    )
+      .toLocaleLowerCase()
+      .trim();
+
+  const pronouns =
+    Array.isArray(
+      person.pronouns
+    )
+      ? person.pronouns
+          .map(
+            value =>
+              String(
+                value || ""
+              )
+                .toLocaleLowerCase()
+                .trim()
+          )
+          .filter(Boolean)
+      : [];
+
+  // O Ledger só pode IMPOR gênero quando:
+  // 1. a confiança é HIGH;
+  // 2. há pronome explícito compatível.
+  //
+  // Nome, aparência presumida ou palpite do Planner
+  // nunca bastam para marcar concordância em PT-BR.
+  if (
+    confidence !== "high"
+  ) {
+    return null;
+  }
+
+  if (
+    gender === "female" &&
+    pronouns.some(
+      value =>
+        value === "she" ||
+        value === "her"
+    )
+  ) {
+    return "female";
+  }
+
+  if (
+    gender === "male" &&
+    pronouns.some(
+      value =>
+        value === "he" ||
+        value === "him"
+    )
+  ) {
+    return "male";
+  }
+
+  if (
+    gender === "nonbinary" &&
+    pronouns.some(
+      value =>
+        value === "they" ||
+        value === "them"
+    )
+  ) {
+    return "nonbinary";
+  }
+
+  return null;
+}
+
 function compactPersonIdentity(
   person
 ) {
   if (!person) {
     return null;
   }
+
+  const trustedGender =
+    trustedPersonGender(
+      person
+    );
 
   return {
     canonical:
@@ -6612,13 +6727,14 @@ function compactPersonIdentity(
         ""
       ),
 
+    // Nunca exponha ao tradutor um gênero
+    // que o próprio backend não considera confiável.
     gender:
-      String(
-        person.gender ||
-        "unknown"
-      ),
+      trustedGender ||
+      "unknown",
 
     pronouns:
+      trustedGender &&
       Array.isArray(
         person.pronouns
       )
@@ -6632,44 +6748,10 @@ function compactPersonIdentity(
       ),
 
     confidence:
-      String(
-        person.confidence ||
-        "low"
-      )
+      trustedGender
+        ? "high"
+        : "low"
   };
-}
-
-function trustedPersonGender(
-  person
-) {
-  if (!person) {
-    return null;
-  }
-
-  const gender =
-    String(
-      person.gender ||
-      "unknown"
-    );
-
-  const confidence =
-    String(
-      person.confidence ||
-      "low"
-    );
-
-  if (
-    ![
-      "female",
-      "male",
-      "nonbinary"
-    ].includes(gender) ||
-    confidence === "low"
-  ) {
-    return null;
-  }
-
-  return gender;
 }
 
 function identityLockForCapsule(
@@ -7014,13 +7096,13 @@ function parseCueTranslation(
 // Não substituímos deterministicamente porque o equivalente
 // correto depende do contexto; forçamos o Gemini a reformular.
 if (
-  /(?:^|[^\p{L}\p{N}_])qualé(?=$|[^\p{L}\p{N}_])/iu.test(
+  /(?:^|[^\p{L}\p{N}_])(?:qualé|diacho)(?=$|[^\p{L}\p{N}_])/iu.test(
     pt
   )
 ) {
   throw new Error(
-    `PT-BR VOCAB HARD LOCK cue ${id}: termo proibido "qualé".`
-  );
+  `PT-BR VOCAB HARD LOCK cue ${id}: termo editorial proibido "qualé/diacho".`
+);
 }
 
     const expectedOwnershipKey =
@@ -9112,16 +9194,14 @@ function buildRepairPayload(
             )
             .map(
               item => ({
-                context_i:
-                  item.index,
-                en:
-                  item.text,
+  en:
+    item.text,
 
-                pt:
-                  translations.get(
-                    item.index
-                  ) || ""
-              })
+  pt:
+    translations.get(
+      item.index
+    ) || ""
+})
             ),
 
         after:
@@ -9136,17 +9216,14 @@ function buildRepairPayload(
             )
             .map(
               item => ({
-                context_i:
-                  item.index,
+  en:
+    item.text,
 
-                en:
-                  item.text,
-
-                pt:
-                  translations.get(
-                    item.index
-                  ) || ""
-              })
+  pt:
+    translations.get(
+      item.index
+    ) || ""
+})
             )
       };
     });
@@ -9397,13 +9474,66 @@ async function tryFocusedRepair(
     issues.length;
 
   issues =
-    mergeIssueLists(
-      issues,
-      extraIssues
+  mergeIssueLists(
+    issues,
+    extraIssues
+  );
+
+// ============================================================
+// ABSOLUTE OWNERSHIP AUDIT
+// ============================================================
+// Cues suspeitos de shift precisam ser auditados depois
+// mesmo que o Repair não os altere ou algum lote falhe.
+const ownershipAuditIds =
+  issues
+    .filter(
+      issue =>
+        Array.isArray(
+          issue?.reasons
+        ) &&
+        issue.reasons.some(
+          reason =>
+            /POSSIBLE_CUE_SHIFT_PAIR/i.test(
+              String(
+                reason || ""
+              )
+            )
+        )
+    )
+    .map(
+      issue =>
+        Number(
+          issue.id
+        )
+    )
+    .filter(
+      Number.isInteger
     );
 
-  job.stats.localFlags =
-    localOnlyCount;
+job.forceSemanticAuditIds = [
+  ...new Set([
+    ...(
+      Array.isArray(
+        job.forceSemanticAuditIds
+      )
+        ? job.forceSemanticAuditIds
+        : []
+    ),
+    ...ownershipAuditIds
+  ])
+];
+
+if (
+  ownershipAuditIds.length
+) {
+  console.log(
+    `[ABSOLUTE OWNERSHIP] ${ownershipAuditIds.length} cue(s) ` +
+    `serão obrigatoriamente auditados após o Repair.`
+  );
+}
+
+job.stats.localFlags =
+  localOnlyCount;
 
   if (!issues.length) {
     console.log(
@@ -10233,7 +10363,7 @@ function buildSemanticRewriteAuditBatches(
             pos
           )
           .map(item => ({
-            i: item.index,
+            
             en: item.text,
             ...(item.speakerHint
               ? {
@@ -10253,7 +10383,7 @@ function buildSemanticRewriteAuditBatches(
             )
           )
           .map(item => ({
-            i: item.index,
+            
             en: item.text,
             ...(item.speakerHint
               ? {
@@ -10548,13 +10678,51 @@ async function runPostRewriteSemanticAudit(
   }
 
   const candidates =
-    collectPostRewriteSemanticCandidates(
-      blocks,
-      beforeTranslations,
-      afterTranslations
-    );
+  collectPostRewriteSemanticCandidates(
+    blocks,
+    beforeTranslations,
+    afterTranslations
+  );
 
-  if (!candidates.length) {
+const forcedOwnershipIds =
+  new Set(
+    (
+      Array.isArray(
+        job?.forceSemanticAuditIds
+      )
+        ? job.forceSemanticAuditIds
+        : []
+    )
+      .map(Number)
+      .filter(
+        Number.isInteger
+      )
+  );
+
+const candidateIds =
+  new Set(
+    candidates.map(
+      item =>
+        item.id
+    )
+  );
+
+for (
+  const id of
+  forcedOwnershipIds
+) {
+  if (
+    !candidateIds.has(id)
+  ) {
+    candidates.push({
+      id
+    });
+
+    candidateIds.add(id);
+  }
+}
+
+if (!candidates.length) {
     console.log(
       "[SEMANTIC REWRITE GUARD] 0 cues realmente reescritos; auditoria dispensada."
     );
@@ -10619,7 +10787,7 @@ async function runPostRewriteSemanticAudit(
             `BÍBLIA:\n${JSON.stringify(plan)}\n\n` +
             `AUDITORIA PÓS-REESCRITA ${batchIndex + 1}/${batches.length}\n` +
             `CUES:\n${JSON.stringify(payload)}\n\n` +
-            `Marque SOMENTE regressões semânticas reais. ` +
+            `Marque regressões semânticas reais E qualquer violação absoluta de cue ownership EN→AFTER_PT. ` +
             `Reparo conservador de fonte claramente truncada é permitido. ` +
             `Paráfrase natural e fiel NÃO é erro.`,
 
@@ -10868,6 +11036,7 @@ const candidateWordCount =
   ).length;
 
 if (
+  !forcedOwnershipIds.has(id) &&
   sourceContinuesNextCue &&
   candidateWordCount >=
     currentWordCount + 2
