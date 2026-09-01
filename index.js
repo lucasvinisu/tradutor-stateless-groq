@@ -1919,6 +1919,257 @@ function cleanSourceLine(line) {
   return text;
 }
 
+function subtitleClockToMs(
+  value
+) {
+  const match =
+    String(value || "")
+      .trim()
+      .match(
+        /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/
+      );
+
+  if (!match) {
+    return null;
+  }
+
+  return (
+    (
+      (
+        Number(match[1]) * 60 +
+        Number(match[2])
+      ) * 60 +
+      Number(match[3])
+    ) * 1000 +
+    Number(match[4])
+  );
+}
+
+function rawMusicInfo(
+  raw
+) {
+  const lines =
+    String(raw || "")
+      .trim()
+      .split("\n");
+
+  const timingIndex =
+    lines.findIndex(
+      line =>
+        /-->/.test(line)
+    );
+
+  if (timingIndex < 0) {
+    return {
+      startMs: null,
+      endMs: null,
+      hasMusic: false,
+      hasSpeech: false
+    };
+  }
+
+  const timing =
+    String(
+      lines[timingIndex] || ""
+    ).trim();
+
+  const [
+    startText,
+    endText
+  ] =
+    timing.split(
+      /\s*-->\s*/
+    );
+
+  let hasMusic = false;
+  let hasSpeech = false;
+
+  for (
+    const rawLine of
+    lines.slice(
+      timingIndex + 1
+    )
+  ) {
+    const visible =
+      stripMarkup(
+        String(
+          rawLine || ""
+        )
+      ).trim();
+
+    if (!visible) {
+      continue;
+    }
+
+    if (
+      /[♪♫♬]/u.test(
+        visible
+      )
+    ) {
+      hasMusic = true;
+    } else if (
+      /[\p{L}\p{N}]/u.test(
+        visible
+      )
+    ) {
+      hasSpeech = true;
+    }
+  }
+
+  return {
+    startMs:
+      subtitleClockToMs(
+        startText
+      ),
+
+    endMs:
+      subtitleClockToMs(
+        endText
+      ),
+
+    hasMusic,
+    hasSpeech
+  };
+}
+
+function detectPerformanceMusicIndexes(
+  rawBlocks
+) {
+  const info =
+    rawBlocks.map(
+      rawMusicInfo
+    );
+
+  const musicIndexes =
+    info
+      .map(
+        (item, index) =>
+          item.hasMusic
+            ? index
+            : -1
+      )
+      .filter(
+        index =>
+          index >= 0
+      );
+
+  const keep =
+    new Set();
+
+  let cluster = [];
+
+  function finishCluster() {
+    if (!cluster.length) {
+      return;
+    }
+
+    const first =
+      info[
+        cluster[0]
+      ];
+
+    const last =
+      info[
+        cluster[
+          cluster.length - 1
+        ]
+      ];
+
+    const spanMs =
+      Number.isFinite(
+        first?.startMs
+      ) &&
+      Number.isFinite(
+        last?.endMs
+      )
+        ? last.endMs -
+          first.startMs
+        : 0;
+
+    // PERFORMANCE:
+    // pelo menos 4 cues musicais
+    // distribuídos por pelo menos 25 segundos.
+    //
+    // Música curta/isolada = background e será removida.
+    if (
+      cluster.length >= 4 &&
+      spanMs >= 25000
+    ) {
+      for (
+        const index of
+        cluster
+      ) {
+        keep.add(
+          index
+        );
+      }
+    }
+
+    cluster = [];
+  }
+
+  for (
+    const index of
+    musicIndexes
+  ) {
+    if (!cluster.length) {
+      cluster.push(
+        index
+      );
+      continue;
+    }
+
+    const previousIndex =
+      cluster[
+        cluster.length - 1
+      ];
+
+    const previous =
+      info[
+        previousIndex
+      ];
+
+    const current =
+      info[
+        index
+      ];
+
+    const gapMs =
+      Number.isFinite(
+        previous?.endMs
+      ) &&
+      Number.isFinite(
+        current?.startMs
+      )
+        ? current.startMs -
+          previous.endMs
+        : Infinity;
+
+    // Permite pequenas falas dos jurados
+    // no meio de uma apresentação.
+    if (
+      gapMs <= 12000
+    ) {
+      cluster.push(
+        index
+      );
+    } else {
+      finishCluster();
+
+      cluster.push(
+        index
+      );
+    }
+  }
+
+  finishCluster();
+
+  return {
+    info,
+    keep
+  };
+}
+
 function cleanSrtForTranslation(
   srt
 ) {
@@ -1930,17 +2181,33 @@ function cleanSrtForTranslation(
   }
 
   const rawBlocks =
-    normalized
-      .split(/\n{2,}/)
-      .filter(Boolean);
+  normalized
+    .split(/\n{2,}/)
+    .filter(Boolean);
 
-  const out = [];
+const {
+  info: musicInfo,
+  keep: performanceMusicIndexes
+} =
+  detectPerformanceMusicIndexes(
+    rawBlocks
+  );
+
+const out = [];
 
   let removed = 0;
   let speakerHints = 0;
   let bleepCues = 0;
 
-  for (const raw of rawBlocks) {
+  for (
+  let rawIndex = 0;
+  rawIndex < rawBlocks.length;
+  rawIndex++
+) {
+  const raw =
+    rawBlocks[
+      rawIndex
+    ];
     const lines =
       raw
         .trim()
@@ -1986,15 +2253,39 @@ function cleanSrtForTranslation(
       );
 
     for (
-      const sourceLine of
-      cleanedBlockText.split(
-        "\n"
+  const sourceLine of
+  cleanedBlockText.split(
+    "\n"
+  )
+) {
+  const visibleSourceLine =
+    stripMarkup(
+      String(
+        sourceLine || ""
       )
-    ) {
-      const info =
-        extractSpeaker(
-          sourceLine
-        );
+    ).trim();
+
+  const isMusicLine =
+    /[♪♫♬]/u.test(
+      visibleSourceLine
+    );
+
+  // Música marcada na fonte:
+  // só permanece se fizer parte de uma
+  // apresentação musical sustentada.
+  if (
+    isMusicLine &&
+    !performanceMusicIndexes.has(
+      rawIndex
+    )
+  ) {
+    continue;
+  }
+
+  const info =
+    extractSpeaker(
+      sourceLine
+    );
 
       if (info.speaker) {
         speakers.add(
