@@ -3775,12 +3775,24 @@ GAG / GAGGED / GAGGING EM SENTIDO DE REAÇÃO
 
 BOTTOM EM COMPETIÇÕES / REALITY
 - Em Drag Race/reality, bottom frequentemente significa colocação ruim ou risco de eliminação.
-- "in the bottom" -> "no bottom", "entre as piores" ou "na berlinda".
+- "in the bottom" -> "no bottom" ou "entre as piores".
 - "bottom queens" -> "queens do bottom" ou "as piores da semana".
 - "bottom two" -> "bottom 2" ou "as duas piores".
 - "bottom three" -> "bottom 3" ou "as três piores".
 - NUNCA traduza bottom competitivo como "fundo", "quintal", "parte de baixo" ou "inferior".
 - Diferencie bottom competitivo de bottom sexual pelo contexto.
+
+ELIMINATION / UP FOR ELIMINATION — DRAG RACE
+- Quando a fonte disser explicitamente "elimination", use "eliminação".
+- NUNCA substitua "elimination" por "berlinda", "zona de risco" ou outro eufemismo.
+- "I'm sorry, my dear, but you are up for elimination." =
+  "Sinto muito, querida, mas você está na eliminação."
+- "You are both up for elimination." =
+  "Vocês duas estão na eliminação."
+- "You're going straight to elimination." =
+  "Você vai direto para a eliminação."
+- Adapte singular/plural e a construção naturalmente, mas preserve o termo "eliminação".
+- Esta regra NÃO altera o uso de "bottom" quando a fonte realmente disser "bottom".
 
 PALAVRÕES E INTENSIFICADORES
 - "fuck", "fucking" e "the fuck" muitas vezes funcionam como intensidade, não como substantivos literais.
