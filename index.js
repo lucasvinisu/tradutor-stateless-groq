@@ -2076,35 +2076,77 @@ function detectPerformanceMusicIndexes(
       ];
 
     const spanMs =
-      Number.isFinite(
-        first?.startMs
-      ) &&
-      Number.isFinite(
-        last?.endMs
-      )
-        ? last.endMs -
-          first.startMs
-        : 0;
+  Number.isFinite(
+    first?.startMs
+  ) &&
+  Number.isFinite(
+    last?.endMs
+  )
+    ? last.endMs -
+      first.startMs
+    : 0;
 
-    // PERFORMANCE:
-    // pelo menos 4 cues musicais
-    // distribuídos por pelo menos 25 segundos.
-    //
-    // Música curta/isolada = background e será removida.
-    if (
-      cluster.length >= 4 &&
-      spanMs >= 25000
-    ) {
-      for (
-        const index of
-        cluster
-      ) {
-        keep.add(
-          index
-        );
-      }
-    }
+// ============================================================
+// TERMINAL OUTRO MUSIC GUARD
+// ============================================================
+// Um bloco musical curto/médio colado no fim do episódio,
+// sem nenhuma fala depois, é tratado como música de
+// encerramento/créditos — não como performance.
+const episodeEndMs =
+  [...info]
+    .reverse()
+    .find(
+      item =>
+        Number.isFinite(
+          item?.endMs
+        )
+    )
+    ?.endMs ?? null;
 
+const hasSpeechAfter =
+  info
+    .slice(
+      cluster[
+        cluster.length - 1
+      ] + 1
+    )
+    .some(
+      item =>
+        item?.hasSpeech
+    );
+
+const terminalOutroMusic =
+  Number.isFinite(
+    episodeEndMs
+  ) &&
+  Number.isFinite(
+    first?.startMs
+  ) &&
+  !hasSpeechAfter &&
+  spanMs <= 45000 &&
+  first.startMs >=
+    episodeEndMs - 45000;
+
+// PERFORMANCE:
+// pelo menos 4 cues musicais
+// distribuídos por pelo menos 25 segundos.
+//
+// Exceção:
+// música terminal de encerramento/créditos não é performance.
+if (
+  cluster.length >= 4 &&
+  spanMs >= 25000 &&
+  !terminalOutroMusic
+) {
+  for (
+    const index of
+    cluster
+  ) {
+    keep.add(
+      index
+    );
+  }
+}
     cluster = [];
   }
 
