@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.16 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.17 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.16-absolute-ownership-gender-evidence-music-gate-2x50";
+  "8.3.17-reliability-multilang-soft-vocab";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -752,6 +752,7 @@ function createJob({
   filename,
   sourceSrt,
   sourceKind,
+  sourceLang = "auto",
   lazy = false,
   recovery = null
 }) {
@@ -774,9 +775,10 @@ function createJob({
     filename,
     sourceSrt,
     sourceKind,
+    sourceLang,
     sourceHash,
     recovery,
-
+    
     cacheKey:
       makeCacheKey(
         type,
@@ -3412,6 +3414,24 @@ function applySubtitleLayout(
   return out;
 }
 
+function normalizeEditorialVocab(text) {
+  return String(text || "")
+    .replace(
+      /qualé/giu,
+      match =>
+        /^[A-ZÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛ]/u.test(match)
+          ? "Qual é"
+          : "qual é"
+    )
+    .replace(
+      /diacho/giu,
+      match =>
+        /^[A-ZÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛ]/u.test(match)
+          ? "Diabo"
+          : "diabo"
+    );
+}
+
 function buildSrt(
   blocks,
   translations
@@ -3424,11 +3444,13 @@ function buildSrt(
             block.index,
             block.timing,
 
-            String(
-              translations.get(
-                block.index
-              ) ??
-              block.text
+            normalizeEditorialVocab(
+              String(
+                translations.get(
+                  block.index
+                ) ??
+                block.text
+              )
             ).trim()
           ].join("\n")
       )
@@ -3501,7 +3523,17 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.16
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.17
+
+IDIOMA DA FONTE
+- A fonte normalmente é inglês, mas pode ser espanhol ou outro idioma.
+- Detecte e respeite o idioma realmente presente no target.
+- Traduza diretamente para PT-BR natural; nunca passe por tradução literal intermediária.
+- Regras específicas de inglês abaixo só se aplicam quando a fonte realmente estiver em inglês.
+- Todas as regras de identidade, ownership, significado, registro, layout e timestamps continuam valendo para qualquer idioma.
+- Campos internos chamados en/EN significam "texto-fonte" por compatibilidade e podem conter espanhol ou outro idioma.
+
+PRIORIDADE ABSOLUTA
 
 PRIORIDADE ABSOLUTA
 1. sentido/contexto correto;
@@ -3894,7 +3926,7 @@ FIDELIDADE E SINCRONIZAÇÃO
 `;
 
 const PLAN_PROMPT = `
-Você é editor de continuidade EN→PT-BR e responsável pelo CONTEXT + IDENTITY LOCK.
+Você é editor de continuidade FONTE→PT-BR e responsável pelo CONTEXT + IDENTITY LOCK.
 Leia a amostra do episódio e produza uma bíblia editorial CURTA e um Character Ledger confiável.
 
 IMPORTANTE: o schema de saída é deliberadamente simples para máxima compatibilidade.
@@ -3924,7 +3956,7 @@ Não traduza o episódio. Não invente fatos. Não proponha tradução para toke
 `;
 
 const PLAN_FALLBACK_PROMPT = `
-Você é editor de continuidade EN→PT-BR. A saída estruturada principal não pôde ser usada.
+Você é editor de continuidade FONTE→PT-BR. A saída estruturada principal não pôde ser usada.
 Produza TODO o plano dentro do único campo string "plan", uma linha por registro, usando SOMENTE estes prefixos:
 TONE=texto
 PERSON=canonical=NOME || aliases=A1, A2 || gender=female|male|nonbinary|unknown || pronouns=she/her ou he/him ou they/them ou vazio || relation=texto || confidence=high|medium|low || evidence=1,2,3
@@ -3938,7 +3970,7 @@ Registre também o nível correto de PT-BR contemporâneo e se Gen Z/Alpha/fando
 `;
 
 const TRANSLATOR_PROMPT = `
-Você é o tradutor principal de legendas EN→PT-BR.
+Você é o tradutor principal de legendas FONTE→PT-BR.
 
 ${STYLE_PACK}
 
@@ -3964,7 +3996,7 @@ Devolva exatamente um objeto por target, mantendo o mesmo id em i.
 `;
 
 const REPAIR_PROMPT = `
-Você é editor final EN→PT-BR.
+Você é editor final FONTE→PT-BR.
 
 ${STYLE_PACK}
 
@@ -4007,7 +4039,7 @@ Não redistribua conteúdo entre ids.
 `;
 
 const COMPACT_RESCUE_PROMPT = `
-Você é o editor audiovisual FINAL de legendas EN→PT-BR.
+Você é o editor audiovisual FINAL de legendas FONTE→PT-BR.
 
 ${STYLE_PACK}
 
@@ -4068,7 +4100,14 @@ A resposta deve conter exatamente um objeto por cue recebido.
 `;
 
 const QA_PROMPT = `
-Você é o revisor semântico e linguístico FINAL de legendas EN→PT-BR.
+Você é o revisor semântico e linguístico FINAL de legendas FONTE→PT-BR.
+
+IMPORTANTE SOBRE O IDIOMA DA FONTE:
+- "EN" neste prompt e nos campos internos é um rótulo legado para TEXTO-FONTE.
+- O texto-fonte pode estar em inglês, espanhol ou outro idioma.
+- Compare o PT com o idioma que realmente estiver presente no campo EN.
+- Regras e exemplos lexicalmente específicos do inglês só se aplicam quando a fonte realmente estiver em inglês.
+
 Você recebe EN e PT do MESMO cue, contexto curto e identity_lock. NÃO reescreva aqui: apenas sinalize IDs que devem ir para a única passada de repair.
 
 SEJA EXIGENTE. CORRETO MAS LITERAL DEMAIS = DEFEITO.
@@ -4213,7 +4252,9 @@ Se a opção atual soar como tradução mesmo estando entendível, MARQUE.
 `;
 
 const SEMANTIC_REWRITE_AUDIT_PROMPT = `
-Você é o AUDITOR SEMÂNTICO PÓS-REESCRITA de legendas EN→PT-BR.
+Você é o AUDITOR SEMÂNTICO PÓS-REESCRITA de legendas FONTE→PT-BR.
+
+IMPORTANTE: o campo EN é um nome legado para a legenda-fonte e pode conter inglês, espanhol ou outro idioma. Julgue sempre o idioma realmente presente nesse campo.
 
 Sua função NÃO é melhorar estilo por preferência.
 Sua função NÃO é retraduzir tudo.
@@ -4465,7 +4506,7 @@ SIGNIFICADO / INTENÇÃO COMPLETOS
 `;
 
 const SEMANTIC_COMPACT_RETRY_PROMPT = `
-Você é o COMPACTADOR SEMÂNTICO FINAL de um único cue EN→PT-BR.
+Você é o COMPACTADOR SEMÂNTICO FINAL de um único cue FONTE→PT-BR.
 
 A tradução recebida já foi identificada como semanticamente necessária.
 
@@ -6519,7 +6560,8 @@ async function buildEpisodePlan(
       "desconhecido"
     }\n` +
     `Tipo: ${job.type}\n` +
-    `ID: ${job.videoId}\n\n` +
+    `ID: ${job.videoId}\n` +
+    `Idioma da fonte: ${job.sourceLang || "auto"}\n\n` +
     `Amostra:\n${
       JSON.stringify({
         cues:
@@ -7433,21 +7475,23 @@ function parseCueTranslation(
       );
     }
 
-    // ============================================================
-// PT-BR VOCAB HARD LOCK — "qualé"
+        // ============================================================
+// PT-BR VOCAB SOFT LOCK — "qualé/diacho"
 // ============================================================
-// Preferência editorial absoluta:
-// essa forma nunca deve chegar à legenda final.
-// Não substituímos deterministicamente porque o equivalente
-// correto depende do contexto; forçamos o Gemini a reformular.
+// Preferência editorial continua valendo, mas nunca pode
+// derrubar um lote ou um episódio inteiro.
+//
+// QA/Repair ainda podem reformular contextualmente.
+// A rede final determinística será aplicada no buildSrt().
 if (
   /(?:^|[^\p{L}\p{N}_])(?:qualé|diacho)(?=$|[^\p{L}\p{N}_])/iu.test(
     pt
   )
 ) {
-  throw new Error(
-  `PT-BR VOCAB HARD LOCK cue ${id}: termo editorial proibido "qualé/diacho".`
-);
+  console.warn(
+    `[PT-BR VOCAB SOFT LOCK] cue ${id}: "qualé/diacho" detectado; ` +
+    `lote preservado e correção final garantida sem abortar o episódio.`
+  );
 }
 
     const expectedOwnershipKey =
@@ -7534,12 +7578,14 @@ async function translateMainBatch({
           system:
             TRANSLATOR_PROMPT,
 
-          user:
+                    user:
+  `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
   `BÍBLIA EDITORIAL:\n${
     JSON.stringify(
       plan
     )
   }\n\n` +
+                      
   `CÁPSULAS CUE-LOCK:\n${
     JSON.stringify(
       payload
@@ -8071,12 +8117,13 @@ async function scanPtbrQuality(
                 QA_PROMPT,
 
               user:
+                `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
                 `BÍBLIA EDITORIAL DO EPISÓDIO:\n${
                   JSON.stringify(
                     plan || {}
                   )
                 }\n\n` +
-                `CUES EN×PT PARA AUDITORIA:\n${
+                `CUES FONTE×PT PARA AUDITORIA:\n${
                   JSON.stringify(
                     batch
                   )
@@ -12563,6 +12610,15 @@ async function localTranslateHandler(
           : "embedded"
       );
 
+    const sourceLang =
+      String(
+        req.body?.sourceLang ||
+        "auto"
+      )
+        .trim()
+        .toLowerCase()
+        .slice(0, 32);
+    
     const rawSrt =
       req.body?.srt;
 
@@ -12618,13 +12674,15 @@ async function localTranslateHandler(
     const job =
       getOrCreateJob(
         {
+        {
           type,
           videoId,
           filename,
           sourceSrt,
-          sourceKind
+          sourceKind,
+          sourceLang
         },
-
+        
         {
           lazy: false
         }
@@ -13177,7 +13235,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    " STREMIO PT-BR 8.3.16 — MAX TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+    " STREMIO PT-BR 8.3.17 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
