@@ -12674,7 +12674,6 @@ async function localTranslateHandler(
     const job =
       getOrCreateJob(
         {
-        {
           type,
           videoId,
           filename,
@@ -12682,7 +12681,7 @@ async function localTranslateHandler(
           sourceKind,
           sourceLang
         },
-        
+
         {
           lazy: false
         }
