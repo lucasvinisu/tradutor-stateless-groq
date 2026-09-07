@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.18 — MAIN EMPTY-CUE RESCUE + TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.19 — UNIVERSAL SDH + CONTEXTUAL PERFORMANCE MUSIC + DIALOGUE TURN LOCK + MAIN EMPTY-CUE RESCUE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.18-main-empty-cue-rescue";
+  "8.3.19-sdh-music-dialogue-turn-lock";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1448,31 +1448,483 @@ function isEmptyVocalization(text) {
   );
 }
 
-function looksLikeSdhDescriptor(
+// ============================================================
+// UNIVERSAL SDH ACTION / ACCESSIBILITY CLASSIFIER
+// ============================================================
+//
+// Objetivo:
+// - remover descrições de acessibilidade por ESTRUTURA, não por nome/personagem;
+// - reconhecer "RUPAUL CACKLING", "NAYA CLEARS THROAT",
+//   "THE CROWD CHEERS", "DOORBELL RINGS" etc. sem hardcode de pessoas;
+// - continuar conservador com fala real.
+//
+// A lista abaixo descreve AÇÕES/ESTADOS de acessibilidade, nunca identidades.
+const SDH_ACTION_CORE_RE =
+  /(?:bursts?\s+into\s+(?:laughter|applause|cheers?)|erupts?\s+(?:in|into)\s+(?:laughter|applause|cheers?)|breaks?\s+into\s+(?:laughter|applause|cheers?)|falls?\s+silent|goes?\s+quiet|goes?\s+wild|music\s+(?:plays?|playing|swells?|swelling|fades?|fading|continues?|continuing|starts?|starting|stops?|stopping)|song\s+(?:plays?|playing|continues?|continuing|starts?|starting|stops?|stopping)|smiles?|smiling|grins?|grinning|nods?|nodding|shrugs?|shrugging|waves?|waving|points?|pointing|stares?|staring|looks?|looking|rolls?\s+(?:(?:his|her|their)\s+)?eyes|gestures?|gesturing|enters?|entering|exits?|exiting|walks?|walking|runs?|running|dances?|dancing|turns?|turning|sorri|sorrindo|acena|acenando|assente|assentindo|encolhe\s+os\s+ombros|aponta|apontando|encara|encarando|olha|olhando|revira\s+os\s+olhos|gesticula|gesticulando|entra|entrando|sai|saindo|caminha|caminhando|corre|correndo|dança|dançando|vira|virando|laughs?|laughing|cackles?|cackling|chuckles?|chuckling|giggles?|giggling|snickers?|snickering|sighs?|sighing|gasps?|gasping|pants?|panting|breathes?|breathing|inhales?|inhaling|exhales?|exhaling|whimpers?|whimpering|cries?|crying|sobs?|sobbing|sniffs?|sniffing|coughs?|coughing|sneezes?|sneezing|clears?\s+(?:(?:his|her|their|the)\s+)?throat|hums?|humming|whistles?|whistling|chants?|chanting|cheers?|cheering|applauds?|applauding|claps?|clapping|groans?|groaning|grunts?|grunting|screams?|screaming|yells?|yelling|shouts?|shouting|whispers?|whispering|murmurs?|murmuring|moans?|moaning|wheezes?|wheezing|snore?s?|snoring|growls?|growling|roars?|roaring|howls?|howling|barks?|barking|meows?|meowing|rings?|ringing|buzzes?|buzzing|beeps?|beeping|dings?|dinging|chimes?|chiming|knocks?|knocking|bangs?|banging|slams?|slamming|creaks?|creaking|cracks?|cracking|snaps?|snapping|shatters?|shattering|smashes?|smashing|honks?|honking|screeches?|screeching|rustles?|rustling|clicks?|clicking|thuds?|thudding|rattles?|rattling|approaches?|approaching|recedes?|receding|continues?\s+(?:laughing|crying|sobbing|singing|cheering|applauding)|(?:begins?|starts?)\s+(?:laughing|crying|sobbing|singing|cheering|applauding)|risos?|ri|rindo|gargalha|gargalhando|cai\s+na\s+risada|suspira|suspirando|ofega|ofegando|respira|respirando|chora|chorando|soluça|soluçando|fungando|tosse|tossindo|espirra|espirrando|limpa\s+(?:a\s+)?garganta|pigarreia|pigarreando|cantarola|cantarolando|assobia|assobiando|canta|cantando|grita|gritando|berrando|sussurra|sussurrando|murmura|murmurando|geme|gemendo|rosna|rosnando|uiva|uivando|late|latindo|mia|miando|toca|tocando|vibra|vibrando|bipa|bipando|tilinta|tilintando|bate|batendo|fecha|fechando|abre|abrindo|range|rangendo|quebra|quebrando|estilhaça|estilhaçando|buzina|buzinando|chia|chiando|farfalha|farfalhando|clica|clicando|se\s+aproxima|se\s+afasta)/iu;
+
+const SDH_EVENT_NOUN_RE =
+  /(?:laughter|applause|cheers?|cheering|whooping|whinnies|whinnying|chatter|chattering|babble|babbling|crowd\s+noise|audience\s+noise|giggles?|chuckles?|cackling|sighs?|gasps?|panting|heavy\s+breathing|crying|sobbing|sniffing|coughing|sneezing|humming|whistling|chanting|groans?|grunts?|screams?|yells?|shouts?|whispers?|murmuring|footsteps?|steps?|knocking|banging|ringing|buzzing|beeping|dinging|chimes?|static|thunder|rain|storm|wind|fire\s+crackling|glass\s+(?:breaking|shattering)|engine\s+(?:starting|idling)|horn|tires?\s+screeching|rustling|clicking|thuds?|impact|heartbeat|siren|alarm|gunshots?|explosion|risos?|gargalhadas?|aplausos?|palmas|gritos?|gritaria|suspiros?|ofegos?|respiração|choro|soluços?|tosse|espirros?|pigarro|canto|cantoria|assobios?|murmúrios?|gemidos?|rosnados?|uivos?|latidos?|miados?|passos?|batidas?|campainha|toque|toques|bipes?|estática|trovão|chuva|tempestade|vento|fogo\s+estalando|vidro\s+(?:quebrando|estilhaçando)|motor|buzina|pneus?\s+cantando|farfalhar|cliques?|baques?|impacto|batimentos?|sirene|alarme|tiros?|explosão)/iu;
+
+const SDH_ACTION_TAIL_RE =
+  /^(?:(?:loudly|softly|quietly|wildly|nervously|awkwardly|hysterically|together|again|offscreen|off-screen|onstage|on-stage|offstage|off-stage|away|back|in\s+background|in\s+the\s+background|in\s+distance|in\s+the\s+distance|faintly|briefly|continuously|heavily|rapidly|twice|once|three\s+times|a\s+lot|all\s+together|at\s+(?:him|her|them|camera|the\s+camera)|toward(?:s)?\s+\w+|to\s+camera|ao\s+fundo|ao\s+longe|baixinho|alto|altamente|forte|fortemente|nervosamente|sem\s+graça|histericamente|juntos?|juntas?|novamente|de\s+novo|duas\s+vezes|uma\s+vez|brevemente|continuamente|muito|bastante|para\s+(?:ele|ela|eles|elas|a\s+câmera)|em\s+direção\s+a\s+\w+|para\s+trás|embora)(?:\s+|$))*$/iu;
+
+function normalizeSdhCandidate(
   value
 ) {
-  const inside =
-    stripMarkup(value)
+  return stripMarkup(
+    String(value || "")
+  )
+    .replace(
+      /^\s*[-–—]\s*/u,
+      ""
+    )
+    .replace(
+      /^[\[(]\s*/u,
+      ""
+    )
+    .replace(
+      /\s*[\])]\s*$/u,
+      ""
+    )
+    .replace(
+      /[.:;!?…]+$/gu,
+      ""
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function sdhAllCapsLike(
+  value
+) {
+  const letters =
+    String(value || "")
       .replace(
-        /[.:;!?]+$/g,
+        /[^\p{L}]/gu,
+        ""
+      );
+
+  return (
+    Boolean(letters) &&
+    letters ===
+      letters.toLocaleUpperCase()
+  );
+}
+
+function looksLikeGenericAllCapsSdh(
+  value
+) {
+  const text =
+    String(
+      value || ""
+    )
+      .replace(
+        /[.:;!?…]+$/gu,
         ""
       )
-      .replace(/\s+/g, " ")
+      .replace(
+        /\s+/g,
+        " "
+      )
       .trim();
 
   if (
-    !inside ||
-    inside.length > 140
+    !text ||
+    !sdhAllCapsLike(
+      text
+    ) ||
+    /[!?…]/u.test(
+      value
+    )
+  ) {
+    return false;
+  }
+
+  const words =
+    text
+      .split(/\s+/)
+      .filter(Boolean);
+
+  if (
+    !words.length ||
+    words.length > 8
+  ) {
+    return false;
+  }
+
+  // Evita apagar respostas/interjeições gritadas comuns.
+  if (
+    /^(?:OK|OKAY|YES|NO|YEAH|YEP|NOPE|HI|HELLO|HEY|BYE|GOODBYE|THANKS|THANK YOU|PLEASE|SORRY|RIGHT|WRONG|WOW|AMAZING|BRILLIANT|HELP|STOP|WAIT|COME ON|LET'S GO|LETS GO|GO|READY|CHEERS)$/iu.test(
+      text
+    )
+  ) {
+    return false;
+  }
+
+  // Nomes de trilha/descrição musical sem ♪.
+  if (
+    words.length >= 2 &&
+    /^(?:MUSIC|SONG|SCORE|THEME|INSTRUMENTAL|MÚSICA|CANÇÃO|TRILHA)$/iu.test(
+      words[
+        words.length - 1
+      ]
+    )
+  ) {
+    return true;
+  }
+
+  // Eventos bare de uma palavra: WHOOPING, WHINNIES, COUGHING...
+  if (
+    words.length === 1 &&
+    (
+      /(?:ING|INGS|ED|S)$/iu.test(
+        words[0]
+      ) ||
+      SDH_EVENT_NOUN_RE.test(
+        text
+      ) ||
+      SDH_WORDS.test(
+        text
+      )
+    )
+  ) {
+    return true;
+  }
+
+  // "SPEAKS FRENCH", "SPEAKING SPANISH" etc.
+  if (
+    /^(?:SPEAKS?|SPEAKING|TALKS?|TALKING)\s+[A-ZÀ-Ý][A-ZÀ-Ý'’-]*(?:\s+[A-ZÀ-Ý][A-ZÀ-Ý'’-]*)?$/u.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  const subjectAction =
+    text.match(
+      /^(.{1,80}?)\s+([A-ZÀ-Ý][A-ZÀ-Ý'’-]*)$/u
+    );
+
+  if (
+    subjectAction
+  ) {
+    const subject =
+      subjectAction[1]
+        .trim();
+
+    const action =
+      subjectAction[2]
+        .trim();
+
+    const subjectWords =
+      subject
+        .split(/\s+/)
+        .filter(Boolean);
+
+    const firstSubjectWord =
+      subjectWords[0] ||
+      "";
+
+    const knownGroupSubject =
+      /^(?:HE|SHE|THEY|IT|EVERYONE|EVERYBODY|SOMEONE|SOMEBODY|AUDIENCE|CROWD|CAST|GROUP|PEOPLE|MAN|WOMAN|BOY|GIRL|MEN|WOMEN|KIDS|CHILDREN|DOG|CAT|HORSE|PHONE|DOOR|BELL|ENGINE|CAR|VEHICLE|ELE|ELA|ELES|ELAS|TODOS|TODAS|PÚBLICO|PLATEIA|GRUPO)$/iu.test(
+        firstSubjectWord
+      ) &&
+      subjectWords
+        .slice(1)
+        .every(
+          word =>
+            /^(?:ALL|BOTH|ENTIRE|WHOLE|JUNTOS|JUNTAS|TODO|TODA|TODOS|TODAS)$/iu.test(
+              word
+            )
+        );
+
+    const properOrObjectLabelSubject =
+      !/^(?:I|WE|YOU|HE|SHE|THEY|IT|EU|NÓS|NOS|VOCÊ|VOCÊS|ELE|ELA|ELES|ELAS)$/iu.test(
+        firstSubjectWord
+      ) &&
+      subjectWords.length <= 3 &&
+      subjectWords.every(
+        word =>
+          /^[A-ZÀ-Ý0-9][A-ZÀ-Ý0-9'’.-]*$/u.test(
+            word
+          )
+      );
+
+    const subjectLooksLikeDescriptor =
+      subjectWords.length <= 5 &&
+      (
+        knownGroupSubject ||
+        properOrObjectLabelSubject
+      );
+
+    const speechStateVerb =
+      /^(?:KNOWS?|THINKS?|WANTS?|NEEDS?|LOVES?|HATES?|LIKES?|HAS|HAVE|IS|ARE|WAS|WERE|CAN|COULD|WILL|WOULD|SHOULD|DOES?|DID|SAYS?|MEANS?|GETS?|GOES?|COMES?|SEES?|FEELS?|SABE|SABEM|PENSA|PENSAM|QUER|QUEREM|PRECISA|PRECISAM|AMA|AMAM|ODEIA|ODEIAM|GOSTA|GOSTAM|TEM|TÊM|É|SÃO|PODE|PODEM|VAI|VÃO|DIZ|DIZEM)$/iu.test(
+        action
+      );
+
+    const actionMorphology =
+      /(?:S|ING|ED)$/iu.test(
+        action
+      ) ||
+      !speechStateVerb;
+
+    if (
+      subjectLooksLikeDescriptor &&
+      !speechStateVerb &&
+      actionMorphology
+    ) {
+      return true;
+    }
+  }
+
+  const groupAction =
+    text.match(
+      /^(?:THEY|WE|HE|SHE|EVERYONE|EVERYBODY|AUDIENCE|CROWD|CAST|GROUP|PEOPLE|TODOS|TODAS|ELES|ELAS)(?:\s+(?:ALL|BOTH|ENTIRE|WHOLE|JUNTOS|JUNTAS))?\s+([A-ZÀ-Ý][A-ZÀ-Ý'’-]*)$/u
+    );
+
+  if (
+    groupAction
+  ) {
+    const action =
+      groupAction[1];
+
+    if (
+      !/^(?:KNOW|THINK|WANT|NEED|LOVE|HATE|LIKE|HAVE|ARE|CAN|WILL|DO|SAY|MEAN|GET|GO|COME|SEE|FEEL|SABEM|PENSAM|QUEREM|PRECISAM|AMAM|ODEIAM|GOSTAM|TÊM|SÃO|PODEM|VÃO|DIZEM)$/iu.test(
+        action
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function sdhTitleSubjectLike(
+  value
+) {
+  const subject =
+    String(value || "")
+      .trim();
+
+  if (!subject) {
+    return true;
+  }
+
+  if (
+    /^(?:he|she|they|it|everyone|everybody|someone|somebody|audience|crowd|group|cast|contestants?|judges?|people|man|woman|boy|girl|men|women|kids?|children|dog|cat|phone|door|bell|engine|car|vehicle|radio|tv|television)$/iu.test(
+      subject
+    )
+  ) {
+    return true;
+  }
+
+  const words =
+    subject
+      .split(/\s+/)
+      .filter(Boolean);
+
+  if (
+    !words.length ||
+    words.length > 6
+  ) {
+    return false;
+  }
+
+  return words.every(
+    word =>
+      /^[\p{Lu}\d][\p{L}\p{N}'’.-]*$/u.test(
+        word
+      ) ||
+      /^(?:the|all|entire|whole|both|several|some|a|an|o|a|os|as|todo|toda|todos|todas)$/iu.test(
+        word
+      )
+  );
+}
+
+function looksLikeUniversalSdhAction(
+  value,
+  {
+    bare = false
+  } = {}
+) {
+  const text =
+    normalizeSdhCandidate(
+      value
+    );
+
+  if (
+    !text ||
+    text.length > 180 ||
+    /[♪♫♬]/u.test(
+      text
+    )
+  ) {
+    return false;
+  }
+
+  const wordCount =
+    text
+      .split(/\s+/)
+      .filter(Boolean)
+      .length;
+
+  if (
+    !wordCount ||
+    wordCount > 14
   ) {
     return false;
   }
 
   if (
-    looksLikeSpeakerLabel(
-      inside
+    bare &&
+    looksLikeGenericAllCapsSdh(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  const eventOnly =
+    text
+      .split(
+        /\s*(?:,|&|\band\b|\be\b)\s*/iu
+      )
+      .map(
+        part =>
+          part.trim()
+      )
+      .filter(Boolean);
+
+  if (
+    eventOnly.length &&
+    eventOnly.every(
+      part =>
+        SDH_EVENT_NOUN_RE.test(
+          part
+        ) &&
+        part.replace(
+          SDH_EVENT_NOUN_RE,
+          ""
+        )
+          .replace(
+            /^(?:loud|soft|faint|distant|crowd|audience|background|offscreen|off-screen|continued|loudly|softly|quietly|fortes?|alto|baixinho|distantes?|ao fundo)\s*/iu,
+            ""
+          )
+          .trim() ===
+          ""
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    bare &&
+    sdhAllCapsLike(
+      text
+    ) &&
+    SDH_EVENT_NOUN_RE.test(
+      text
+    ) &&
+    !/[?]/u.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  const actionMatch =
+    text.match(
+      SDH_ACTION_CORE_RE
+    );
+
+  if (!actionMatch) {
+    return false;
+  }
+
+  const actionStart =
+    actionMatch.index ?? -1;
+
+  if (actionStart < 0) {
+    return false;
+  }
+
+  const before =
+    text
+      .slice(
+        0,
+        actionStart
+      )
+      .trim();
+
+  const after =
+    text
+      .slice(
+        actionStart +
+          actionMatch[0].length
+      )
+      .trim();
+
+  if (
+    before
+      .split(/\s+/)
+      .filter(Boolean)
+      .length > 6
+  ) {
+    return false;
+  }
+
+  if (
+    after &&
+    !SDH_ACTION_TAIL_RE.test(
+      after
     )
   ) {
     return false;
+  }
+
+  if (!bare) {
+    return true;
+  }
+
+  return (
+    sdhAllCapsLike(
+      text
+    ) ||
+    !before ||
+    sdhTitleSubjectLike(
+      before
+    )
+  );
+}
+
+function looksLikeSdhDescriptor(
+  value
+) {
+  const inside =
+    normalizeSdhCandidate(
+      value
+    );
+
+  if (
+    !inside ||
+    inside.length > 180
+  ) {
+    return false;
+  }
+
+  if (
+    looksLikeUniversalSdhAction(
+      inside,
+      {
+        bare: false
+      }
+    )
+  ) {
+    return true;
   }
 
   return SDH_WORDS.test(
@@ -1483,26 +1935,56 @@ function looksLikeSdhDescriptor(
 function looksLikeBareSdhLine(
   value
 ) {
-  const text =
-    stripMarkup(value)
-      .replace(
-        /[.:;!?]+$/g,
-        ""
+  const original =
+    stripMarkup(
+      String(
+        value || ""
       )
-      .replace(/\s+/g, " ")
-      .trim();
+    ).trim();
 
   if (
-    !text ||
-    text.length > 100 ||
-    looksLikeSpeakerLabel(
-      text
+    /^[-–—]\s+/u.test(
+      original
     )
   ) {
     return false;
   }
 
-  return /^(?:sound of |sounds of )?(?:static|laughter|applause|music(?: playing)?|song(?: playing)?|footsteps?(?: approaching| receding)?|door (?:opens|closes|slams|creaks)|phone (?:rings|buzzes)|wind (?:blows|howls)|thunder|rain(?: falling)?|fire crackling|glass (?:breaks|shatters)|engine (?:starts|idles)|car horn|tires? screeching|branch (?:breaks|snaps)|leaves rustling|heavy breathing|panting|gasping|sobbing|crying|humming|whistling|growling|roaring|howling|muffled voices?|distant voices?|estática|risos?|aplausos?|música|passos?(?: se aproximando| ao longe)?|porta (?:abrindo|fechando|batendo|rangendo)|telefone (?:tocando|vibrando)|vento (?:soprando|uivando)|trovão|chuva|fogo estalando|vidro (?:quebrando|estilhaçando)|motor (?:ligando|em marcha lenta)|buzina|pneus? cantando|galho (?:quebrando|estalando)|folhas farfalhando|respiração (?:forte|ofegante)|ofegante|ofegando|chorando|soluçando|tarareando|assobiando|rosnado|uivo|vozes? abafadas?|vozes? ao longe|som (?:abafado )?(?:de )?(?:passos|pisadas|esmagamento|algo sendo esmagado)|esmagando|som pastoso)$/i.test(
+  const text =
+    normalizeSdhCandidate(
+      original
+    );
+
+  if (
+    !text ||
+    text.length > 140
+  ) {
+    return false;
+  }
+
+  if (
+    /[!?…]\s*$/u.test(
+      original
+    ) &&
+    !sdhAllCapsLike(
+      original
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    looksLikeUniversalSdhAction(
+      text,
+      {
+        bare: true
+      }
+    )
+  ) {
+    return true;
+  }
+
+  return /^(?:sound of |sounds of )?(?:static|laughter|applause|music(?: playing)?|song(?: playing)?|footsteps?(?: approaching| receding)?|door (?:opens|closes|slams|creaks)|phone (?:rings|buzzes)|wind (?:blows|howls)|thunder|rain(?: falling)?|fire crackling|glass (?:breaks|shatters)|engine (?:starts|idles)|car horn|tires? screeching|branch (?:breaks|snaps)|leaves rustling|heavy breathing|panting|gasping|sobbing|crying|humming|whistling|growling|roaring|howling|muffled voices?|distant voices?|estática|risos?|aplausos?|música|passos?(?: se aproximando| ao longe)?|porta (?:abrindo|fechando|batendo|rangendo)|telefone (?:tocando|vibrando)|vento (?:soprando|uivando)|trovão|chuva|fogo estalando|vidro (?:quebrando|estilhaçando)|motor (?:ligando|em marcha lenta)|buzina|pneus? cantando|galho (?:quebrando|estalando)|folhas farfalhando|respiração (?:forte|ofegante)|ofegante|ofegando|chorando|soluçando|tarareando|assobiando|rosnado|uivo|vozes? abafadas?|vozes? ao longe|som (?:abafado )?(?:de )?(?:passos|pisadas|esmagamento|algo sendo esmagado)|esmagando|som pastoso)$/iu.test(
     text
   );
 }
@@ -1535,7 +2017,6 @@ function removeMultilineSdhSegments(
   return String(text || "")
     .replace(
       /\[([^\]]{1,220})\]/gsu,
-
       (match, inside) =>
         looksLikeSdhDescriptor(
           inside.replace(
@@ -1548,7 +2029,6 @@ function removeMultilineSdhSegments(
     )
     .replace(
       /\(([^)]{1,220})\)/gsu,
-
       (match, inside) =>
         looksLikeSdhDescriptor(
           inside.replace(
@@ -1962,6 +2442,207 @@ function subtitleClockToMs(
   );
 }
 
+// ============================================================
+// CONTEXTUAL PERFORMANCE MUSIC LOCK
+// ============================================================
+//
+// Princípio:
+// - música editorial/de fundo continua sendo removida;
+// - apresentação real continua sendo legendada;
+// - decisão musical é por CUE/BLOCO, nunca por linha isolada;
+// - uma letra nunca pode ser mutilada ("linha com ♪ some / continuação fica").
+//
+// Âncoras longas preservam a regra que funcionou no The Voice.
+// Clusters curtos só entram quando o contexto imediato prova lançamento
+// de performance ou quando ficam ENTRE dois clusters já confirmados.
+
+const MUSIC_CLUSTER_GAP_MS =
+  12000;
+
+const MUSIC_STRONG_MIN_CUES =
+  4;
+
+const MUSIC_STRONG_MIN_SPAN_MS =
+  25000;
+
+const MUSIC_SHOWCASE_REGION_GAP_MS =
+  45000;
+
+const MUSIC_LAUNCH_CONTEXT_MAX_GAP_MS =
+  6500;
+
+const PERFORMANCE_LAUNCH_RE =
+  /(?:\bhit it\b|\btake it away\b|\bgive it up\b|\blet'?s hear it\b|\blet'?s hear (?:it )?for\b|\bstart the music\b|\bmusic[, ]+maestro\b|\bplay it\b|\bshowtime\b|\b(?:now|next)[, ]+(?:performing|singing)\b|\bperforming live\b|\bsinging live\b|\bon stage now\b|\bmanda ver\b|\bsolta o som\b|\bcomeça a música\b|\bvamos ouvir\b|\bvalendo\b|\bagora[, ]+(?:cantando|se apresentando)\b)/iu;
+
+function rawCueVisibleLines(
+  raw
+) {
+  const lines =
+    String(raw || "")
+      .trim()
+      .split("\n");
+
+  const timingIndex =
+    lines.findIndex(
+      line =>
+        /-->/.test(
+          line
+        )
+    );
+
+  if (timingIndex < 0) {
+    return [];
+  }
+
+  return lines
+    .slice(
+      timingIndex + 1
+    )
+    .map(
+      line =>
+        stripMarkup(
+          String(
+            line || ""
+          )
+        ).trim()
+    )
+    .filter(Boolean);
+}
+
+function classifyMusicAwareLines(
+  rawLines
+) {
+  const lines =
+    (rawLines || [])
+      .map(
+        line => ({
+          raw:
+            String(
+              line || ""
+            ),
+
+          visible:
+            stripMarkup(
+              String(
+                line || ""
+              )
+            ).trim()
+        })
+      )
+      .filter(
+        item =>
+          item.visible
+      );
+
+  const hasAnyMusicMarker =
+    lines.some(
+      item =>
+        /[♪♫♬]/u.test(
+          item.visible
+        )
+    );
+
+  if (!hasAnyMusicMarker) {
+    return lines.map(
+      item => ({
+        ...item,
+        kind:
+          looksLikeBareSdhLine(
+            item.visible
+          )
+            ? "sdh"
+            : "speech"
+      })
+    );
+  }
+
+  const result = [];
+
+  let lyricContinuationOpen =
+    false;
+
+  for (
+    const item of lines
+  ) {
+    const visible =
+      item.visible;
+
+    if (
+      looksLikeBareSdhLine(
+        visible
+      )
+    ) {
+      result.push({
+        ...item,
+        kind:
+          "sdh"
+      });
+
+      lyricContinuationOpen =
+        false;
+
+      continue;
+    }
+
+    if (
+      /[♪♫♬]/u.test(
+        visible
+      )
+    ) {
+      result.push({
+        ...item,
+        kind:
+          "lyric"
+      });
+
+      lyricContinuationOpen =
+        true;
+
+      continue;
+    }
+
+    // Cue misto: fala real depois de linha musical não pode sumir.
+    if (
+      /^\s*[-–—]\s+/u.test(
+        visible
+      )
+    ) {
+      result.push({
+        ...item,
+        kind:
+          "speech"
+      });
+
+      lyricContinuationOpen =
+        false;
+
+      continue;
+    }
+
+    // Continuação de uma linha que começou com ♪.
+    // KEEP ou DROP ocorre para a unidade inteira.
+    if (
+      lyricContinuationOpen
+    ) {
+      result.push({
+        ...item,
+        kind:
+          "lyric"
+      });
+
+      continue;
+    }
+
+    result.push({
+      ...item,
+      kind:
+        "speech"
+    });
+  }
+
+  return result;
+}
+
 function rawMusicInfo(
   raw
 ) {
@@ -1973,7 +2654,9 @@ function rawMusicInfo(
   const timingIndex =
     lines.findIndex(
       line =>
-        /-->/.test(line)
+        /-->/.test(
+          line
+        )
     );
 
   if (timingIndex < 0) {
@@ -1981,13 +2664,18 @@ function rawMusicInfo(
       startMs: null,
       endMs: null,
       hasMusic: false,
-      hasSpeech: false
+      hasSpeech: false,
+      lyricLineCount: 0,
+      text: ""
     };
   }
 
   const timing =
     String(
-      lines[timingIndex] || ""
+      lines[
+        timingIndex
+      ] ||
+      ""
     ).trim();
 
   const [
@@ -1998,40 +2686,26 @@ function rawMusicInfo(
       /\s*-->\s*/
     );
 
-  let hasMusic = false;
-  let hasSpeech = false;
-
-  for (
-    const rawLine of
-    lines.slice(
-      timingIndex + 1
-    )
-  ) {
-    const visible =
-      stripMarkup(
-        String(
-          rawLine || ""
-        )
-      ).trim();
-
-    if (!visible) {
-      continue;
-    }
-
-    if (
-      /[♪♫♬]/u.test(
-        visible
+  const classified =
+    classifyMusicAwareLines(
+      lines.slice(
+        timingIndex + 1
       )
-    ) {
-      hasMusic = true;
-    } else if (
-      /[\p{L}\p{N}]/u.test(
-        visible
-      )
-    ) {
-      hasSpeech = true;
-    }
-  }
+    );
+
+  const hasMusic =
+    classified.some(
+      item =>
+        item.kind ===
+        "lyric"
+    );
+
+  const hasSpeech =
+    classified.some(
+      item =>
+        item.kind ===
+        "speech"
+    );
 
   return {
     startMs:
@@ -2045,8 +2719,205 @@ function rawMusicInfo(
       ),
 
     hasMusic,
-    hasSpeech
+    hasSpeech,
+
+    lyricLineCount:
+      classified.filter(
+        item =>
+          item.kind ===
+          "lyric"
+      ).length,
+
+    text:
+      classified
+        .filter(
+          item =>
+            item.kind !==
+            "sdh"
+        )
+        .map(
+          item =>
+            item.visible
+        )
+        .join(" ")
+        .trim()
   };
+}
+
+function clusterSpanMs(
+  cluster,
+  info
+) {
+  if (!cluster.length) {
+    return 0;
+  }
+
+  const first =
+    info[
+      cluster[0]
+    ];
+
+  const last =
+    info[
+      cluster[
+        cluster.length - 1
+      ]
+    ];
+
+  if (
+    !Number.isFinite(
+      first?.startMs
+    ) ||
+    !Number.isFinite(
+      last?.endMs
+    )
+  ) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    last.endMs -
+      first.startMs
+  );
+}
+
+function isTerminalOutroMusicCluster(
+  cluster,
+  info
+) {
+  if (!cluster.length) {
+    return false;
+  }
+
+  const first =
+    info[
+      cluster[0]
+    ];
+
+  const lastIndex =
+    cluster[
+      cluster.length - 1
+    ];
+
+  const episodeEndMs =
+    [...info]
+      .reverse()
+      .find(
+        item =>
+          Number.isFinite(
+            item?.endMs
+          )
+      )
+      ?.endMs ?? null;
+
+  const hasSpeechAfter =
+    info
+      .slice(
+        lastIndex + 1
+      )
+      .some(
+        item =>
+          item?.hasSpeech
+      );
+
+  const spanMs =
+    clusterSpanMs(
+      cluster,
+      info
+    );
+
+  return (
+    Number.isFinite(
+      episodeEndMs
+    ) &&
+    Number.isFinite(
+      first?.startMs
+    ) &&
+    !hasSpeechAfter &&
+    spanMs <= 45000 &&
+    first.startMs >=
+      episodeEndMs - 45000
+  );
+}
+
+function clusterHasImmediatePerformanceLaunch(
+  cluster,
+  info,
+  rawBlocks
+) {
+  if (!cluster.length) {
+    return false;
+  }
+
+  const firstIndex =
+    cluster[0];
+
+  const startMs =
+    info[
+      firstIndex
+    ]?.startMs;
+
+  const previousIndex =
+    firstIndex - 1;
+
+  const previous =
+    info[
+      previousIndex
+    ];
+
+  if (
+    !Number.isFinite(
+      startMs
+    ) ||
+    !previous ||
+    !Number.isFinite(
+      previous.endMs
+    )
+  ) {
+    return false;
+  }
+
+  const gapMs =
+    startMs -
+    previous.endMs;
+
+  if (
+    gapMs < -1000 ||
+    gapMs >
+      MUSIC_LAUNCH_CONTEXT_MAX_GAP_MS
+  ) {
+    return false;
+  }
+
+  const visible =
+    rawCueVisibleLines(
+      rawBlocks[
+        previousIndex
+      ]
+    )
+      .filter(
+        line =>
+          !looksLikeBareSdhLine(
+            line
+          ) &&
+          !/[♪♫♬]/u.test(
+            line
+          )
+      )
+      .join(" ")
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
+
+  return Boolean(
+    visible &&
+    PERFORMANCE_LAUNCH_RE.test(
+      visible
+    )
+  );
 }
 
 function detectPerformanceMusicIndexes(
@@ -2070,102 +2941,9 @@ function detectPerformanceMusicIndexes(
           index >= 0
       );
 
-  const keep =
-    new Set();
+  const clusters = [];
 
   let cluster = [];
-
-  function finishCluster() {
-    if (!cluster.length) {
-      return;
-    }
-
-    const first =
-      info[
-        cluster[0]
-      ];
-
-    const last =
-      info[
-        cluster[
-          cluster.length - 1
-        ]
-      ];
-
-    const spanMs =
-  Number.isFinite(
-    first?.startMs
-  ) &&
-  Number.isFinite(
-    last?.endMs
-  )
-    ? last.endMs -
-      first.startMs
-    : 0;
-
-// ============================================================
-// TERMINAL OUTRO MUSIC GUARD
-// ============================================================
-// Um bloco musical curto/médio colado no fim do episódio,
-// sem nenhuma fala depois, é tratado como música de
-// encerramento/créditos — não como performance.
-const episodeEndMs =
-  [...info]
-    .reverse()
-    .find(
-      item =>
-        Number.isFinite(
-          item?.endMs
-        )
-    )
-    ?.endMs ?? null;
-
-const hasSpeechAfter =
-  info
-    .slice(
-      cluster[
-        cluster.length - 1
-      ] + 1
-    )
-    .some(
-      item =>
-        item?.hasSpeech
-    );
-
-const terminalOutroMusic =
-  Number.isFinite(
-    episodeEndMs
-  ) &&
-  Number.isFinite(
-    first?.startMs
-  ) &&
-  !hasSpeechAfter &&
-  spanMs <= 45000 &&
-  first.startMs >=
-    episodeEndMs - 45000;
-
-// PERFORMANCE:
-// pelo menos 4 cues musicais
-// distribuídos por pelo menos 25 segundos.
-//
-// Exceção:
-// música terminal de encerramento/créditos não é performance.
-if (
-  cluster.length >= 4 &&
-  spanMs >= 25000 &&
-  !terminalOutroMusic
-) {
-  for (
-    const index of
-    cluster
-  ) {
-    keep.add(
-      index
-    );
-  }
-}
-    cluster = [];
-  }
 
   for (
     const index of
@@ -2175,6 +2953,7 @@ if (
       cluster.push(
         index
       );
+
       continue;
     }
 
@@ -2204,28 +2983,297 @@ if (
           previous.endMs
         : Infinity;
 
-    // Permite pequenas falas dos jurados
-    // no meio de uma apresentação.
     if (
-      gapMs <= 12000
+      gapMs <=
+      MUSIC_CLUSTER_GAP_MS
     ) {
       cluster.push(
         index
       );
     } else {
-      finishCluster();
+      clusters.push(
+        cluster
+      );
 
-      cluster.push(
+      cluster = [
         index
+      ];
+    }
+  }
+
+  if (cluster.length) {
+    clusters.push(
+      cluster
+    );
+  }
+
+  const keep =
+    new Set();
+
+  const confirmedClusters =
+    new Set();
+
+  // CAMADA 1 — regra segura original:
+  // 4+ cues distribuídos por 25+ segundos.
+  for (
+    let clusterIndex = 0;
+    clusterIndex <
+      clusters.length;
+    clusterIndex++
+  ) {
+    const current =
+      clusters[
+        clusterIndex
+      ];
+
+    const spanMs =
+      clusterSpanMs(
+        current,
+        info
+      );
+
+    const terminalOutro =
+      isTerminalOutroMusicCluster(
+        current,
+        info
+      );
+
+    if (
+      current.length >=
+        MUSIC_STRONG_MIN_CUES &&
+      spanMs >=
+        MUSIC_STRONG_MIN_SPAN_MS &&
+      !terminalOutro
+    ) {
+      confirmedClusters.add(
+        clusterIndex
       );
     }
   }
 
-  finishCluster();
+  // CAMADA 2 — performance curta com lançamento explícito.
+  for (
+    let clusterIndex = 0;
+    clusterIndex <
+      clusters.length;
+    clusterIndex++
+  ) {
+    if (
+      confirmedClusters.has(
+        clusterIndex
+      )
+    ) {
+      continue;
+    }
+
+    const current =
+      clusters[
+        clusterIndex
+      ];
+
+    if (
+      isTerminalOutroMusicCluster(
+        current,
+        info
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      clusterHasImmediatePerformanceLaunch(
+        current,
+        info,
+        rawBlocks
+      )
+    ) {
+      confirmedClusters.add(
+        clusterIndex
+      );
+    }
+  }
+
+  // CAMADA 3 — região de showcase.
+  // Clusters curtos ENTRE duas performances confirmadas
+  // pertencem à mesma sequência de apresentações.
+  const regions = [];
+
+  let region = [];
+
+  for (
+    let clusterIndex = 0;
+    clusterIndex <
+      clusters.length;
+    clusterIndex++
+  ) {
+    const current =
+      clusters[
+        clusterIndex
+      ];
+
+    if (!region.length) {
+      region.push(
+        clusterIndex
+      );
+
+      continue;
+    }
+
+    const previousClusterIndex =
+      region[
+        region.length - 1
+      ];
+
+    const previous =
+      clusters[
+        previousClusterIndex
+      ];
+
+    const previousEnd =
+      info[
+        previous[
+          previous.length - 1
+        ]
+      ]?.endMs;
+
+    const currentStart =
+      info[
+        current[0]
+      ]?.startMs;
+
+    const gapMs =
+      Number.isFinite(
+        previousEnd
+      ) &&
+      Number.isFinite(
+        currentStart
+      )
+        ? currentStart -
+          previousEnd
+        : Infinity;
+
+    if (
+      gapMs <=
+      MUSIC_SHOWCASE_REGION_GAP_MS
+    ) {
+      region.push(
+        clusterIndex
+      );
+    } else {
+      regions.push(
+        region
+      );
+
+      region = [
+        clusterIndex
+      ];
+    }
+  }
+
+  if (region.length) {
+    regions.push(
+      region
+    );
+  }
+
+  for (
+    const currentRegion of
+    regions
+  ) {
+    const confirmedPositions =
+      currentRegion
+        .map(
+          (
+            clusterIndex,
+            position
+          ) =>
+            confirmedClusters.has(
+              clusterIndex
+            )
+              ? position
+              : -1
+        )
+        .filter(
+          position =>
+            position >= 0
+        );
+
+    if (
+      confirmedPositions.length <
+      2
+    ) {
+      continue;
+    }
+
+    const firstConfirmed =
+      Math.min(
+        ...confirmedPositions
+      );
+
+    const lastConfirmed =
+      Math.max(
+        ...confirmedPositions
+      );
+
+    for (
+      let position =
+        firstConfirmed;
+      position <=
+        lastConfirmed;
+      position++
+    ) {
+      confirmedClusters.add(
+        currentRegion[
+          position
+        ]
+      );
+    }
+  }
+
+  for (
+    const clusterIndex of
+    confirmedClusters
+  ) {
+    for (
+      const rawIndex of
+      clusters[
+        clusterIndex
+      ]
+    ) {
+      keep.add(
+        rawIndex
+      );
+    }
+  }
+
+  const strongCount =
+    clusters.filter(
+      current =>
+        current.length >=
+          MUSIC_STRONG_MIN_CUES &&
+        clusterSpanMs(
+          current,
+          info
+        ) >=
+          MUSIC_STRONG_MIN_SPAN_MS &&
+        !isTerminalOutroMusicCluster(
+          current,
+          info
+        )
+    ).length;
+
+  console.log(
+    `[MUSIC CONTEXT] cues com ♪=${musicIndexes.length} | ` +
+    `clusters=${clusters.length} | âncoras fortes=${strongCount} | ` +
+    `clusters confirmados=${confirmedClusters.size} | ` +
+    `cues de performance mantidos=${keep.size}.`
+  );
 
   return {
     info,
-    keep
+    keep,
+    clusters,
+    confirmedClusters
   };
 }
 
@@ -2233,40 +3281,49 @@ function cleanSrtForTranslation(
   srt
 ) {
   const normalized =
-    normalizeSrt(srt);
+    normalizeSrt(
+      srt
+    );
 
   if (!normalized) {
     return "";
   }
 
   const rawBlocks =
-  normalized
-    .split(/\n{2,}/)
-    .filter(Boolean);
+    normalized
+      .split(
+        /\n{2,}/
+      )
+      .filter(Boolean);
 
-const {
-  info: musicInfo,
-  keep: performanceMusicIndexes
-} =
-  detectPerformanceMusicIndexes(
-    rawBlocks
-  );
+  const {
+    keep:
+      performanceMusicIndexes
+  } =
+    detectPerformanceMusicIndexes(
+      rawBlocks
+    );
 
-const out = [];
+  const out = [];
 
   let removed = 0;
   let speakerHints = 0;
   let bleepCues = 0;
+  let sdhLinesRemoved = 0;
+  let backgroundLyricLinesRemoved = 0;
+  let performanceLyricLinesKept = 0;
 
   for (
-  let rawIndex = 0;
-  rawIndex < rawBlocks.length;
-  rawIndex++
-) {
-  const raw =
-    rawBlocks[
-      rawIndex
-    ];
+    let rawIndex = 0;
+    rawIndex <
+      rawBlocks.length;
+    rawIndex++
+  ) {
+    const raw =
+      rawBlocks[
+        rawIndex
+      ];
+
     const lines =
       raw
         .trim()
@@ -2275,7 +3332,9 @@ const out = [];
     const timingIndex =
       lines.findIndex(
         line =>
-          /-->/.test(line)
+          /-->/.test(
+            line
+          )
       );
 
     if (timingIndex < 0) {
@@ -2296,6 +3355,7 @@ const out = [];
     }
 
     const dialogue = [];
+
     const speakers =
       new Set();
 
@@ -2311,42 +3371,54 @@ const out = [];
           .join("\n")
       );
 
+    const classifiedLines =
+      classifyMusicAwareLines(
+        cleanedBlockText.split(
+          "\n"
+        )
+      );
+
     for (
-  const sourceLine of
-  cleanedBlockText.split(
-    "\n"
-  )
-) {
-  const visibleSourceLine =
-    stripMarkup(
-      String(
-        sourceLine || ""
-      )
-    ).trim();
+      const classified of
+      classifiedLines
+    ) {
+      const sourceLine =
+        classified.raw;
 
-  const isMusicLine =
-    /[♪♫♬]/u.test(
-      visibleSourceLine
-    );
+      if (
+        classified.kind ===
+        "sdh"
+      ) {
+        sdhLinesRemoved++;
+        continue;
+      }
 
-  // Música marcada na fonte:
-  // só permanece se fizer parte de uma
-  // apresentação musical sustentada.
-  if (
-    isMusicLine &&
-    !performanceMusicIndexes.has(
-      rawIndex
-    )
-  ) {
-    continue;
-  }
+      if (
+        classified.kind ===
+        "lyric" &&
+        !performanceMusicIndexes.has(
+          rawIndex
+        )
+      ) {
+        backgroundLyricLinesRemoved++;
+        continue;
+      }
 
-  const info =
-    extractSpeaker(
-      sourceLine
-    );
+      if (
+        classified.kind ===
+        "lyric"
+      ) {
+        performanceLyricLinesKept++;
+      }
 
-      if (info.speaker) {
+      const info =
+        extractSpeaker(
+          sourceLine
+        );
+
+      if (
+        info.speaker
+      ) {
         speakers.add(
           info.speaker
         );
@@ -2411,7 +3483,9 @@ const out = [];
           encodeURIComponent(
             speaker
           )
-        }@@ ${dialogue[0]}`;
+        }@@ ${
+          dialogue[0]
+        }`;
 
       speakerHints++;
     }
@@ -2429,6 +3503,12 @@ const out = [];
       out.length
     }; removidos=${
       removed
+    }; SDH-linhas=${
+      sdhLinesRemoved
+    }; música-fundo-linhas=${
+      backgroundLyricLinesRemoved
+    }; letra-performance-linhas=${
+      performanceLyricLinesKept
     }; speakerHints=${
       speakerHints
     }; bleepCues=${
@@ -2443,7 +3523,10 @@ const out = [];
   return (
     out
       .map(
-        (block, index) =>
+        (
+          block,
+          index
+        ) =>
           [
             index + 1,
             block.timing,
@@ -2455,7 +3538,6 @@ const out = [];
     "\n"
   );
 }
-
 function parseSrt(srt) {
   const normalized =
     normalizeSrt(srt);
@@ -2770,20 +3852,161 @@ function missingCanonicalCultureLocks(
 // FINAL FORMAT LOCK
 // ============================================================
 
-function sourceDialogueDashCount(
+// ============================================================
+// DIALOGUE TURN LOCK
+// ============================================================
+//
+// A fonte é a autoridade para a quantidade/ordem de speakers dentro do cue.
+// O Gemini pode escolher palavras e concisão; não pode apagar fronteiras.
+// O layout final pode agrupar turns na mesma linha, mas nunca quebrar um turn
+// de forma que pareça pertencer ao speaker seguinte.
+
+function sourceDialogueTurns(
   block
 ) {
   return String(
-    block?.text || ""
+    block?.text ||
+    ""
   )
     .split("\n")
+    .map(
+      line =>
+        String(
+          line || ""
+        ).trim()
+    )
     .filter(
       line =>
         /^\s*[-–—]\s+/u.test(
           line
         )
     )
-    .length;
+    .map(
+      line =>
+        line.replace(
+          /^\s*[-–—]\s+/u,
+          ""
+        ).trim()
+    )
+    .filter(Boolean);
+}
+
+function sourceDialogueDashCount(
+  block
+) {
+  return sourceDialogueTurns(
+    block
+  ).length;
+}
+
+function normalizeDialogueTurnText(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .replace(/\r/g, "")
+    .replace(
+      /\s*\n\s*/g,
+      " "
+    )
+    .replace(
+      /[ \t]+/g,
+      " "
+    )
+    .trim();
+}
+
+function translatedDialogueTurns(
+  block,
+  value
+) {
+  const expected =
+    sourceDialogueDashCount(
+      block
+    );
+
+  if (
+    expected < 2
+  ) {
+    return [];
+  }
+
+  const flattened =
+    normalizeDialogueTurnText(
+      value
+    );
+
+  if (!flattened) {
+    return [];
+  }
+
+  const pieces =
+    flattened
+      .split(
+        /(?:^|\s)[-–—]\s+/u
+      )
+      .map(
+        part =>
+          part
+            .replace(
+              /^[ \t]+|[ \t]+$/g,
+              ""
+            )
+      )
+      .filter(Boolean);
+
+  return pieces;
+}
+
+function translatedDialogueTurnCount(
+  block,
+  value
+) {
+  return translatedDialogueTurns(
+    block,
+    value
+  ).length;
+}
+
+function canonicalDialogueTurnText(
+  block,
+  value
+) {
+  const expected =
+    sourceDialogueDashCount(
+      block
+    );
+
+  if (
+    expected < 2
+  ) {
+    return String(
+      value || ""
+    ).trim();
+  }
+
+  const turns =
+    translatedDialogueTurns(
+      block,
+      value
+    );
+
+  if (
+    turns.length !==
+    expected
+  ) {
+    return String(
+      value || ""
+    ).trim();
+  }
+
+  return turns
+    .map(
+      turn =>
+        `- ${turn}`
+    )
+    .join("\n");
 }
 
 function stripOutputAccessibilityLine(
@@ -2875,23 +4098,25 @@ function sanitizeFinalCue(
   value
 ) {
   let text =
-  String(value || "")
-    .replace(
-      /<[^>]+>/g,
-      ""
+    String(
+      value || ""
     )
-    .replace(
-      /\{\\[^}]+\}/g,
-      " "
-    )
-    .replace(
-      /[♪♫♬]/gu,
-      " "
-    )
-    .replace(
-      /\\+/gu,
-      " "
-    );
+      .replace(
+        /<[^>]+>/g,
+        ""
+      )
+      .replace(
+        /\{\\[^}]+\}/g,
+        " "
+      )
+      .replace(
+        /[♪♫♬]/gu,
+        " "
+      )
+      .replace(
+        /\\+/gu,
+        " "
+      );
 
   text =
     collapseExtendedVocalization(
@@ -2913,10 +4138,10 @@ function sanitizeFinalCue(
       "[censurado]"
     );
 
-  const preserveDialogueDashes =
+  const expectedDialogueTurns =
     sourceDialogueDashCount(
       block
-    ) >= 2;
+    );
 
   let lines =
     text
@@ -2926,98 +4151,105 @@ function sanitizeFinalCue(
         stripOutputAccessibilityLine
       )
       .map(
-        line => line.trim()
+        line =>
+          String(
+            line || ""
+          ).trim()
       )
       .filter(Boolean)
-      .map(line => {
-        let cleaned =
-          line
-            .replace(
-              /^\s*[\/\\|]{1,4}\s*/u,
-              ""
-            )
-            .replace(
-              /^\s*[•·▪◦]+\s*/u,
-              ""
-            )
-            .replace(
-              /\s+[\/\\|]{1,3}\s+/gu,
-              " "
-            )
-            .trim();
+      .map(
+        line => {
+          let cleaned =
+            line
+              .replace(
+                /^\s*[\/\\|]{1,4}\s*/u,
+                ""
+              )
+              .replace(
+                /^\s*[•·▪◦]+\s*/u,
+                ""
+              )
+              .replace(
+                /\s+[\/\\|]{1,3}\s+/gu,
+                " "
+              )
+              .trim();
 
-        if (
-          !preserveDialogueDashes
-        ) {
+          if (
+            expectedDialogueTurns <
+            2
+          ) {
+            cleaned =
+              cleaned.replace(
+                /^\s*[-–—]+\s*/u,
+                ""
+              );
+          } else {
+            cleaned =
+              cleaned.replace(
+                /^\s*[-–—]+\s*/u,
+                "- "
+              );
+          }
+
           cleaned =
-            cleaned.replace(
-              /^\s*[-–—]+\s*/u,
-              ""
-            );
-        } else {
-          cleaned =
-            cleaned.replace(
-              /^\s*[-–—]+\s*/u,
-              "- "
-            );
-        }
-
-        cleaned =
-          cleaned
-            .replace(
-              /([^\s])\s*[-–—]{2,}\s*([^\s])/gu,
-              "$1… $2"
-            )
-            .replace(
-              /\s+[-–—]{2,}\s+/gu,
-              " "
-            )
-            .replace(
-              /\s+([,.;:!?])/g,
-              "$1"
-            )
-            .replace(
-              /\[censurado\]\s*([,.;:!?])/gi,
-              "[censurado]$1"
-            )
-            .replace(
-              /[ \t]{2,}/g,
-              " "
-            )
-            .trim();
-
-        if (
-          /^[-–—/\\|.:;·•_*~…\s]+$/u.test(
             cleaned
-          )
-        ) {
-          return "";
-        }
+              .replace(
+                /([^\s])\s*[-–—]{2,}\s*([^\s])/gu,
+                "$1… $2"
+              )
+              .replace(
+                /\s+[-–—]{2,}\s+/gu,
+                " "
+              )
+              .replace(
+                /\s+([,.;:!?])/g,
+                "$1"
+              )
+              .replace(
+                /\[censurado\]\s*([,.;:!?])/gi,
+                "[censurado]$1"
+              )
+              .replace(
+                /[ \t]{2,}/g,
+                " "
+              )
+              .trim();
 
-        return cleaned;
-      })
+          if (
+            /^[-–—/\\|.:;·•_*~…\s]+$/u.test(
+              cleaned
+            )
+          ) {
+            return "";
+          }
+
+          return cleaned;
+        }
+      )
       .filter(Boolean);
 
   if (!lines.length) {
     return "";
   }
 
+  let result =
+    lines
+      .join("\n")
+      .trim();
+
   if (
-    preserveDialogueDashes &&
-    lines.length >= 2
+    expectedDialogueTurns >=
+    2
   ) {
-    lines =
-      lines.map(
-        line =>
-          line.startsWith("- ")
-            ? line
-            : `- ${line}`
+    result =
+      canonicalDialogueTurnText(
+        block,
+        result
       );
   }
 
-  return lines
-    .join("\n")
-    .trim();
+  return result;
 }
 
 function sanitizeFallbackCue(
@@ -3291,60 +4523,273 @@ function bestTwoLineSplit(value, maxChars = LAYOUT_MAX_CHARS_PER_LINE) {
   };
 }
 
+function bestDialogueTurnLayout(
+  block,
+  value
+) {
+  const expected =
+    sourceDialogueDashCount(
+      block
+    );
+
+  const turns =
+    translatedDialogueTurns(
+      block,
+      value
+    );
+
+  if (
+    expected < 2 ||
+    turns.length !==
+      expected
+  ) {
+    const fallback =
+      bestTwoLineSplit(
+        value,
+        LAYOUT_MAX_CHARS_PER_LINE
+      );
+
+    return {
+      text:
+        fallback.lines.join(
+          "\n"
+        ),
+
+      fits: false,
+
+      lines:
+        fallback.lines.length,
+
+      maxLineLength:
+        fallback.maxLineLength,
+
+      dialogueTurnMismatch:
+        true
+    };
+  }
+
+  const segments =
+    turns.map(
+      turn =>
+        `- ${turn}`
+    );
+
+  // Dois speakers = um por linha.
+  if (
+    segments.length ===
+    2
+  ) {
+    const lengths =
+      segments.map(
+        layoutVisibleLength
+      );
+
+    return {
+      text:
+        segments.join(
+          "\n"
+        ),
+
+      fits:
+        lengths.every(
+          length =>
+            length <=
+            LAYOUT_MAX_CHARS_PER_LINE
+        ),
+
+      lines: 2,
+
+      maxLineLength:
+        Math.max(
+          ...lengths
+        ),
+
+      dialogueTurnMismatch:
+        false
+    };
+  }
+
+  // 3+ turns:
+  // testamos todas as divisões contíguas entre APENAS duas linhas.
+  // Nenhum speaker é partido ao meio para encaixar o seguinte.
+  let best = null;
+
+  for (
+    let split = 1;
+    split <
+      segments.length;
+    split++
+  ) {
+    const first =
+      segments
+        .slice(
+          0,
+          split
+        )
+        .join(" ");
+
+    const second =
+      segments
+        .slice(
+          split
+        )
+        .join(" ");
+
+    const firstLength =
+      layoutVisibleLength(
+        first
+      );
+
+    const secondLength =
+      layoutVisibleLength(
+        second
+      );
+
+    const overflow =
+      Math.max(
+        0,
+        firstLength -
+          LAYOUT_MAX_CHARS_PER_LINE
+      ) +
+      Math.max(
+        0,
+        secondLength -
+          LAYOUT_MAX_CHARS_PER_LINE
+      );
+
+    const difference =
+      Math.abs(
+        firstLength -
+          secondLength
+      );
+
+    const idealDistance =
+      Math.abs(
+        firstLength -
+          LAYOUT_IDEAL_CHARS_PER_LINE
+      ) +
+      Math.abs(
+        secondLength -
+          LAYOUT_IDEAL_CHARS_PER_LINE
+      );
+
+    const score =
+      overflow * 10000 +
+      difference * 30 +
+      idealDistance * 3;
+
+    if (
+      !best ||
+      score <
+        best.score
+    ) {
+      best = {
+        score,
+
+        text:
+          `${first}\n${second}`,
+
+        fits:
+          firstLength <=
+            LAYOUT_MAX_CHARS_PER_LINE &&
+          secondLength <=
+            LAYOUT_MAX_CHARS_PER_LINE,
+
+        lines: 2,
+
+        maxLineLength:
+          Math.max(
+            firstLength,
+            secondLength
+          ),
+
+        dialogueTurnMismatch:
+          false
+      };
+    }
+  }
+
+  return best || {
+    text:
+      segments.join(
+        "\n"
+      ),
+
+    fits: false,
+
+    lines:
+      segments.length,
+
+    maxLineLength:
+      Math.max(
+        ...segments.map(
+          layoutVisibleLength
+        )
+      ),
+
+    dialogueTurnMismatch:
+      false
+  };
+}
+
 function layoutCueResult(block, value) {
-  const raw = String(value || "")
-    .replace(/\r/g, "")
-    .trim();
+  const raw =
+    String(
+      value || ""
+    )
+      .replace(/\r/g, "")
+      .trim();
 
   if (!raw) {
     return {
       text: "",
       fits: true,
       lines: 0,
-      maxLineLength: 0
+      maxLineLength: 0,
+      dialogueTurnMismatch:
+        false
     };
   }
 
-  const sourceHasTwoDialogueTurns =
-    sourceDialogueDashCount(block) >= 2;
-
-  const existingLines = raw
-    .split("\n")
-    .map(line => line.trim())
-    .filter(Boolean);
-
-  // Cues com duas falas são uma exceção semântica importante.
-  // Não juntamos speakers diferentes só para obedecer ao layout.
   if (
-    sourceHasTwoDialogueTurns &&
-    existingLines.length === 2
+    sourceDialogueDashCount(
+      block
+    ) >= 2
   ) {
-    const lengths = existingLines.map(layoutVisibleLength);
-
-    return {
-      text: existingLines.join("\n"),
-      fits: lengths.every(
-        length => length <= LAYOUT_MAX_CHARS_PER_LINE
-      ),
-      lines: 2,
-      maxLineLength: Math.max(...lengths)
-    };
+    return bestDialogueTurnLayout(
+      block,
+      raw
+    );
   }
 
-  // Para fala normal, as quebras vindas da fonte deixam de ser autoridade.
-  // Transformamos o cue em texto contínuo e recalculamos a melhor quebra.
-  const flattened = normalizeLayoutWhitespace(raw);
+  const flattened =
+    normalizeLayoutWhitespace(
+      raw
+    );
 
-  const result = bestTwoLineSplit(
-    flattened,
-    LAYOUT_MAX_CHARS_PER_LINE
-  );
+  const result =
+    bestTwoLineSplit(
+      flattened,
+      LAYOUT_MAX_CHARS_PER_LINE
+    );
 
   return {
-    text: result.lines.join("\n"),
-    fits: result.fits,
-    lines: result.lines.length,
-    maxLineLength: result.maxLineLength
+    text:
+      result.lines.join(
+        "\n"
+      ),
+
+    fits:
+      result.fits,
+
+    lines:
+      result.lines.length,
+
+    maxLineLength:
+      result.maxLineLength,
+
+    dialogueTurnMismatch:
+      false
   };
 }
 
@@ -3538,7 +4983,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.18
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.19
 
 IDIOMA DA FONTE
 - A fonte normalmente é inglês, mas pode ser espanhol ou outro idioma.
@@ -3926,8 +5371,13 @@ FORMATAÇÃO
 - Não devolva linhas com "/", "//", "---", "--", pipes ou sequências de traços como decoração.
 - Não invente bullets, asteriscos ou notas musicais.
 - Não adicione nomes de speaker, [NOME], NOME:, SDH ou comentários.
-- Use hífen de diálogo apenas quando o próprio cue tiver duas falas separadas.
-- Preserve quebra de linha quando ela separar duas falas no mesmo cue.
+- Use hífen de diálogo apenas quando o próprio cue tiver DUAS OU MAIS falas/turnos separados.
+- DIALOGUE TURN LOCK: cada linha-fonte iniciada por hífen representa um turno/speaker independente.
+- Preserve EXATAMENTE a quantidade e a ordem desses turnos.
+- No pt bruto, devolva cada turno em sua própria linha começando por "- ".
+- Nunca transforme quebra visual dentro de uma fala em novo speaker.
+- Nunca una dois speakers apagando a fronteira entre eles.
+- O JavaScript fará a composição visual final em no máximo 2x50 sem perder os turnos.
 
 FIDELIDADE E SINCRONIZAÇÃO
 - Não resuma.
@@ -7305,8 +8755,24 @@ function buildOwnershipPayload(
         i:
           block.index,
 
-        en:
+                en:
           protectedTarget.text,
+
+        ...(
+          sourceDialogueDashCount(
+            block
+          ) >= 2
+            ? {
+                dialogue_turn_count:
+                  sourceDialogueDashCount(
+                    block
+                  ),
+
+                dialogue_turn_lock:
+                  "Preserve exatamente esta quantidade e ordem de turns; cada turn deve começar com '- ' no pt bruto."
+              }
+            : {}
+        ),
 
         ...(
           block.speakerHint
@@ -9046,18 +10512,28 @@ function localReasonsForCue(
     );
   }
 
-  if (
+    const expectedDialogueTurns =
     sourceDialogueDashCount(
       block
-    ) >= 2 &&
-    translated
-      .split("\n")
-      .filter(Boolean)
-      .length < 2
-  ) {
-    reasons.push(
-      "MISSING_DIALOGUE_BREAK"
     );
+
+  if (
+    expectedDialogueTurns >= 2
+  ) {
+    const actualDialogueTurns =
+      translatedDialogueTurnCount(
+        block,
+        translated
+      );
+
+    if (
+      actualDialogueTurns !==
+      expectedDialogueTurns
+    ) {
+      reasons.push(
+        `DIALOGUE_TURN_MISMATCH expected=${expectedDialogueTurns} got=${actualDialogueTurns}`
+      );
+    }
   }
 
   if (
@@ -9145,6 +10621,21 @@ function localReasonsForCue(
     );
   }
 
+    if (
+    translated
+      .split("\n")
+      .some(
+        line =>
+          looksLikeBareSdhLine(
+            line
+          )
+      )
+  ) {
+    reasons.push(
+      "SDH_RESIDUE"
+    );
+  }
+  
   if (
     /\b(?:nabeira|olurando|dem[oô]nico|podrindo|qualé|ossas)\b/i.test(
       translated
@@ -9565,8 +11056,12 @@ function issueReasonBucket(reason) {
     return "IDIOM_LITERAL";
   }
 
-  if (/LITERAL/i.test(text)) {
+    if (/LITERAL/i.test(text)) {
     return "LITERALITY";
+  }
+
+  if (/^DIALOGUE_TURN_MISMATCH/i.test(text)) {
+    return "DIALOGUE_TURN_MISMATCH";
   }
 
   return text || "UNKNOWN";
@@ -9594,7 +11089,7 @@ function issuePriority(issue) {
     /UNRESOLVED_BLEEP_TOKEN/i.test(joined) ||
     /BLEEP_CREATED_DANGLING_SENTENCE/i.test(joined) ||
     /ARTIFICIAL_PROFANITY_CENSORSHIP/i.test(joined) ||
-    /MISSING_DIALOGUE_BREAK/i.test(joined) ||
+    /(?:MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH)/i.test(joined) ||
 
     // Motivos escritos pelo Gemini QA.
     /\bg[eê]nero\b/i.test(joined) ||
@@ -9862,8 +11357,24 @@ function buildRepairPayload(
             block.index
           ),
 
-        reasons:
+                reasons:
           issue.reasons,
+
+        ...(
+          sourceDialogueDashCount(
+            block
+          ) >= 2
+            ? {
+                dialogue_turn_count:
+                  sourceDialogueDashCount(
+                    block
+                  ),
+
+                dialogue_turn_lock:
+                  "Preserve exatamente a quantidade e a ordem dos speakers; devolva cada turn em linha própria começando por '- '."
+              }
+            : {}
+        ),
 
         hard_locks:
           protectedTarget
@@ -9988,6 +11499,7 @@ async function repairBatch(
               )
             }\n\n` +
             `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
+            `Se dialogue_turn_count existir, preserve EXATAMENTE os turns e devolva cada um em linha própria iniciada por "- ". ` +
             `O token ${BLEEP_TOKEN} deve ser resolvido naturalmente e nunca copiado.`,
 
           schema:
@@ -10061,8 +11573,26 @@ function repairCandidateRegressionReasons(
   candidatePt,
   filename
 ) {
-  const before = String(beforePt || "").trim();
+    const before = String(beforePt || "").trim();
   const candidate = String(candidatePt || "").trim();
+
+  const expectedDialogueTurns =
+    sourceDialogueDashCount(
+      block
+    );
+
+  if (
+    expectedDialogueTurns >= 2 &&
+    translatedDialogueTurnCount(
+      block,
+      candidate
+    ) !==
+      expectedDialogueTurns
+  ) {
+    return [
+      "DIALOGUE_TURN_LOCK_VIOLATION"
+    ];
+  }
 
   const beforeReasons = new Set(
     localReasonsForCue(
@@ -10083,7 +11613,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isCriticalRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK)/i.test(
         reason
       );
 
@@ -10544,8 +12074,24 @@ function buildCompactRescuePayload(
         pt:
           current,
 
-        reasons:
+                reasons:
           issue.reasons,
+
+        ...(
+          sourceDialogueDashCount(
+            block
+          ) >= 2
+            ? {
+                dialogue_turn_count:
+                  sourceDialogueDashCount(
+                    block
+                  ),
+
+                dialogue_turn_lock:
+                  "Preserve exatamente a quantidade e a ordem dos speakers; devolva cada turn em linha própria começando por '- '."
+              }
+            : {}
+        ),
 
         hard_locks:
           protectedTarget.locks.map(
@@ -10676,6 +12222,7 @@ async function compactRescueBatch(
             `COMPACT RESCUE — RODADA ${round}/${COMPACT_RESCUE_MAX_ROUNDS}\n` +
             `CUES:\n${JSON.stringify(payload)}\n\n` +
             `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
+            `Se dialogue_turn_count existir, preserve EXATAMENTE os turns; compactar não autoriza unir speakers. ` +
             `O objetivo é conteúdo COMPLETO + PT-BR natural + 2x50.`,
 
           schema:
@@ -11843,7 +13390,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.18] fonte=${
+    `[PIPELINE 8.3.19] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -12462,7 +14009,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.18"
+            "Stremio-PTBR/8.3.19"
         }
       }
     );
@@ -12780,7 +14327,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.3.18",
+    "8.3.19",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -13547,7 +15094,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-    " STREMIO PT-BR 8.3.18 — MAIN EMPTY-CUE RESCUE + TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+        " STREMIO PT-BR 8.3.19 — UNIVERSAL SDH + CONTEXTUAL PERFORMANCE MUSIC + DIALOGUE TURN LOCK + MAIN EMPTY-CUE RESCUE"
   );
 
   console.log(
@@ -13608,6 +15155,18 @@ console.log(
 
 console.log(
   "Layout Safety: zero truncamento | zero word-split | zero novos cues | zero alteração de timestamps ✅"
+);
+
+console.log(
+  "Universal SDH Action Classifier: sujeito/personagem genérico + ação/evento; sem hardcode de programa ✅"
+);
+
+console.log(
+  "Contextual Performance Music Lock: fundo editorial sai; performance real fica; decisão atômica por cue ✅"
+);
+
+console.log(
+  `Dialogue Turn Lock: speakers/turns preservados + layout turn-aware dentro de ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} ✅`
 );
 
 console.log(
