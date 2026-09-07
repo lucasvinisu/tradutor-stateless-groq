@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.17 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
+// STREMIO PT-BR 8.3.18 — MAIN EMPTY-CUE RESCUE + TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.17-reliability-multilang-soft-vocab";
+  "8.3.18-main-empty-cue-rescue";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -69,6 +69,16 @@ const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 120000;
 const MAIN_HTTP_RETRIES = 4;
 const MAIN_PARSE_ATTEMPTS = 3;
+
+// MAIN EMPTY-CUE RESCUE
+// Se uma resposta estruturalmente válida trouxer pt vazio para um target
+// não vazio, preservamos os demais cues do lote e refazemos SOMENTE o cue vazio.
+const MAIN_EMPTY_CUE_RESCUE_ENABLED = true;
+const MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS = 3;
+const MAIN_EMPTY_CUE_RESCUE_THINKING = "high";
+const MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS = 2400;
+const MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS = 90000;
+const MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES = 3;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
@@ -822,6 +832,11 @@ function createJob({
       mainAttempts: 0,
       main429: 0,
       mainParseRetries: 0,
+
+      mainEmptyCueRescueCues: 0,
+      mainEmptyCueRescueCalls: 0,
+      mainEmptyCueRescueParseRetries: 0,
+      mainEmptyCueRescueFailures: 0,
 
       localFlags: 0,
 
@@ -3523,7 +3538,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.17
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.18
 
 IDIOMA DA FONTE
 - A fonte normalmente é inglês, mas pode ser espanhol ou outro idioma.
@@ -7358,7 +7373,8 @@ function parseCueTranslation(
   raw,
   locksById = new Map(),
   ownershipById = new Map(),
-  enforceOrder = false
+  enforceOrder = false,
+  allowEmpty = false
 ) {
   let parsed;
 
@@ -7438,6 +7454,11 @@ function parseCueTranslation(
   const byId =
     new Map();
 
+  const seenIds =
+    new Set();
+
+  const emptyIds = [];
+
   for (
     const item of
     parsed.cues
@@ -7462,37 +7483,14 @@ function parseCueTranslation(
     }
 
     if (
-      byId.has(id)
+      seenIds.has(id)
     ) {
       throw new Error(
         `ID duplicado ${id}.`
       );
     }
 
-    if (!pt) {
-      throw new Error(
-        `Cue ${id} vazio.`
-      );
-    }
-
-        // ============================================================
-// PT-BR VOCAB SOFT LOCK — "qualé/diacho"
-// ============================================================
-// Preferência editorial continua valendo, mas nunca pode
-// derrubar um lote ou um episódio inteiro.
-//
-// QA/Repair ainda podem reformular contextualmente.
-// A rede final determinística será aplicada no buildSrt().
-if (
-  /(?:^|[^\p{L}\p{N}_])(?:qualé|diacho)(?=$|[^\p{L}\p{N}_])/iu.test(
-    pt
-  )
-) {
-  console.warn(
-    `[PT-BR VOCAB SOFT LOCK] cue ${id}: "qualé/diacho" detectado; ` +
-    `lote preservado e correção final garantida sem abortar o episódio.`
-  );
-}
+    seenIds.add(id);
 
     const expectedOwnershipKey =
       ownershipById.get(
@@ -7518,6 +7516,36 @@ if (
       }
     }
 
+    if (!pt) {
+      if (allowEmpty) {
+        emptyIds.push(id);
+        continue;
+      }
+
+      throw new Error(
+        `Cue ${id} vazio.`
+      );
+    }
+
+    // ============================================================
+    // PT-BR VOCAB SOFT LOCK — "qualé/diacho"
+    // ============================================================
+    // Preferência editorial continua valendo, mas nunca pode
+    // derrubar um lote ou um episódio inteiro.
+    //
+    // QA/Repair ainda podem reformular contextualmente.
+    // A rede final determinística será aplicada no buildSrt().
+    if (
+      /(?:^|[^\p{L}\p{N}_])(?:qualé|diacho)(?=$|[^\p{L}\p{N}_])/iu.test(
+        pt
+      )
+    ) {
+      console.warn(
+        `[PT-BR VOCAB SOFT LOCK] cue ${id}: "qualé/diacho" detectado; ` +
+        `lote preservado e correção final garantida sem abortar o episódio.`
+      );
+    }
+
     pt =
       restoreCulturalLocks(
         pt,
@@ -7533,6 +7561,23 @@ if (
   }
 
   if (
+    seenIds.size !==
+    ids.length
+  ) {
+    throw new Error(
+      `Tradução estruturalmente incompleta ` +
+      `${seenIds.size}/${ids.length}.`
+    );
+  }
+
+  if (allowEmpty) {
+    return {
+      translations: byId,
+      emptyIds
+    };
+  }
+
+  if (
     byId.size !==
     ids.length
   ) {
@@ -7543,6 +7588,173 @@ if (
   }
 
   return byId;
+}
+
+async function rescueEmptyMainCue({
+  blocks,
+  posMap,
+  block,
+  plan,
+  job
+}) {
+  let lastError = null;
+
+  const rescueBatch = [
+    block
+  ];
+
+  for (
+    let parseAttempt = 1;
+    parseAttempt <=
+      MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS;
+    parseAttempt++
+  ) {
+    try {
+      const {
+        payload,
+        locksById,
+        ownershipById
+      } =
+        buildOwnershipPayload(
+          blocks,
+          posMap,
+          rescueBatch,
+          plan
+        );
+
+      job.stats.mainEmptyCueRescueCalls++;
+
+      console.warn(
+        `[MAIN EMPTY-CUE RESCUE] cue ${block.index} | ` +
+        `tentativa ${parseAttempt}/${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS}.`
+      );
+
+      const response =
+        await geminiRequest({
+          system:
+            TRANSLATOR_PROMPT,
+
+          user:
+            `EMPTY-CUE RESCUE DO MAIN.\n\n` +
+            `A resposta anterior devolveu pt vazio para este target, ` +
+            `mas o target abaixo contém texto-fonte válido e NÃO pode desaparecer.\n\n` +
+            `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+            `BÍBLIA EDITORIAL:\n${
+              JSON.stringify(
+                plan
+              )
+            }\n\n` +
+            `CÁPSULA CUE-LOCK ÚNICA:\n${
+              JSON.stringify(
+                payload
+              )
+            }\n\n` +
+            `Retorne EXATAMENTE 1 cue. ` +
+            `Copie o mesmo i e o ownership_key exatamente para k. ` +
+            `O campo pt DEVE ser não vazio e traduzir SOMENTE o target deste ID. ` +
+            `Se o target for nome próprio, bordão, interjeição, reação curta ou termo que deva ser preservado, ` +
+            `retorne a forma correta/preservada em pt em vez de deixar vazio. ` +
+            `Não invente fala. Não use conteúdo de before/after como conteúdo do target. ` +
+            `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
+            `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
+
+          schema:
+            mainCueTranslationSchema(1),
+
+          thinkingLevel:
+            MAIN_EMPTY_CUE_RESCUE_THINKING,
+
+          maxOutputTokens:
+            MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS,
+
+          timeoutMs:
+            MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS,
+
+          maxRetries:
+            MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES,
+
+          job,
+
+          metric:
+            "main"
+        });
+
+      const translated =
+        parseCueTranslation(
+          rescueBatch,
+          response.text,
+          locksById,
+          ownershipById,
+          true,
+          false
+        );
+
+      const pt =
+        String(
+          translated.get(
+            block.index
+          ) ||
+          ""
+        ).trim();
+
+      if (!pt) {
+        throw new Error(
+          `Cue ${block.index} continuou vazio no rescue.`
+        );
+      }
+
+      console.log(
+        `[MAIN EMPTY-CUE RESCUE] cue ${block.index} recuperado ✅ | ` +
+        `${pt.length} chars.`
+      );
+
+      return pt;
+    } catch (error) {
+      lastError = error;
+
+      if (
+        parseAttempt <
+        MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
+      ) {
+        job.stats.mainEmptyCueRescueParseRetries++;
+
+        console.warn(
+          `[MAIN EMPTY-CUE RESCUE] cue ${block.index} ainda inválido: ${
+            errorMessage(
+              error
+            ).slice(
+              0,
+              280
+            )
+          }`
+        );
+
+        continue;
+      }
+    }
+  }
+
+  job.stats.mainEmptyCueRescueFailures++;
+
+  const finalError =
+    new Error(
+      `MAIN EMPTY-CUE RESCUE falhou no cue ${block.index} após ${
+        MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
+      } tentativa(s): ${
+        errorMessage(
+          lastError
+        ).slice(
+          0,
+          320
+        )
+      }`
+    );
+
+  // Não faz sentido retraduzir todo o lote de até 60 cues
+  // depois de várias tentativas isoladas do único cue problemático.
+  finalError.noFullBatchRetry = true;
+
+  throw finalError;
 }
 
 async function translateMainBatch({
@@ -7562,11 +7774,11 @@ async function translateMainBatch({
   ) {
     try {
       const {
-  payload,
-  locksById,
-  ownershipById
-} =
-  buildOwnershipPayload(
+        payload,
+        locksById,
+        ownershipById
+      } =
+        buildOwnershipPayload(
           blocks,
           posMap,
           batch,
@@ -7578,34 +7790,33 @@ async function translateMainBatch({
           system:
             TRANSLATOR_PROMPT,
 
-                    user:
-  `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
-  `BÍBLIA EDITORIAL:\n${
-    JSON.stringify(
-      plan
-    )
-  }\n\n` +
-                      
-  `CÁPSULAS CUE-LOCK:\n${
-    JSON.stringify(
-      payload
-    )
-  }\n\n` +
-  `Os cues estão em ORDEM CRONOLÓGICA. ` +
-  `Retorne os IDs EXATAMENTE na mesma ordem recebida. ` +
-  `Output exatamente ${
-    batch.length
-  } cues. ` +
-  `Para cada cápsula, copie ownership_key EXATAMENTE para o campo k do mesmo ID. ` +
-  `Traduza SOMENTE target para pt. ` +
-  `Nunca use em pt conteúdo pertencente ao target, before ou after de outro ID. ` +
-  `Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
-  `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
+          user:
+            `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+            `BÍBLIA EDITORIAL:\n${
+              JSON.stringify(
+                plan
+              )
+            }\n\n` +
+            `CÁPSULAS CUE-LOCK:\n${
+              JSON.stringify(
+                payload
+              )
+            }\n\n` +
+            `Os cues estão em ORDEM CRONOLÓGICA. ` +
+            `Retorne os IDs EXATAMENTE na mesma ordem recebida. ` +
+            `Output exatamente ${
+              batch.length
+            } cues. ` +
+            `Para cada cápsula, copie ownership_key EXATAMENTE para o campo k do mesmo ID. ` +
+            `Traduza SOMENTE target para pt. ` +
+            `Nunca use em pt conteúdo pertencente ao target, before ou after de outro ID. ` +
+            `Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
+            `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
 
           schema:
-  mainCueTranslationSchema(
-    batch.length
-  ),
+            mainCueTranslationSchema(
+              batch.length
+            ),
 
           thinkingLevel:
             MAIN_THINKING,
@@ -7625,36 +7836,138 @@ async function translateMainBatch({
             "main"
         });
 
-      return parseCueTranslation(
-  batch,
-  response.text,
-  locksById,
-  ownershipById,
-  true
-);
-    } catch (error) {
-      lastError =
-        error;
+      if (
+        !MAIN_EMPTY_CUE_RESCUE_ENABLED
+      ) {
+        return parseCueTranslation(
+          batch,
+          response.text,
+          locksById,
+          ownershipById,
+          true,
+          false
+        );
+      }
+
+      const parsed =
+        parseCueTranslation(
+          batch,
+          response.text,
+          locksById,
+          ownershipById,
+          true,
+          true
+        );
 
       if (
-  parseAttempt >=
-  MAIN_PARSE_ATTEMPTS
-) {
-  console.error(
-    `[MAIN CUE-LOCK] lote rejeitado definitivamente após ${
-      MAIN_PARSE_ATTEMPTS
-    } tentativa(s): ${
-      errorMessage(
-        error
-      ).slice(
-        0,
-        320
-      )
-    }`
-  );
+        !parsed.emptyIds.length
+      ) {
+        return parsed.translations;
+      }
 
-  throw error;
-}
+      job.stats.mainEmptyCueRescueCues +=
+        parsed.emptyIds.length;
+
+      console.warn(
+        `[MAIN EMPTY-CUE RESCUE] lote principal válido, mas ${
+          parsed.emptyIds.length
+        } cue(s) vieram com pt vazio: ${
+          parsed.emptyIds.join(", ")
+        }. Preservando os demais cues e refazendo somente os vazios.`
+      );
+
+      const batchById =
+        new Map(
+          batch.map(
+            block => [
+              block.index,
+              block
+            ]
+          )
+        );
+
+      for (
+        const id of
+        parsed.emptyIds
+      ) {
+        const block =
+          batchById.get(id);
+
+        if (!block) {
+          throw new Error(
+            `MAIN EMPTY-CUE RESCUE: bloco ${id} não encontrado no lote.`
+          );
+        }
+
+        const rescuedPt =
+          await rescueEmptyMainCue({
+            blocks,
+            posMap,
+            block,
+            plan,
+            job
+          });
+
+        parsed.translations.set(
+          id,
+          rescuedPt
+        );
+      }
+
+      if (
+        parsed.translations.size !==
+        batch.length
+      ) {
+        throw new Error(
+          `MAIN EMPTY-CUE RESCUE terminou incompleto: ${
+            parsed.translations.size
+          }/${
+            batch.length
+          }.`
+        );
+      }
+
+      return parsed.translations;
+    } catch (error) {
+      lastError = error;
+
+      if (
+        error?.noFullBatchRetry
+      ) {
+        console.error(
+          `[MAIN CUE-LOCK] rescue isolado falhou; lote inteiro NÃO será retraduzido: ${
+            errorMessage(
+              error
+            ).slice(
+              0,
+              360
+            )
+          }`
+        );
+
+        throw error;
+      }
+
+      if (
+        parseAttempt >=
+        MAIN_PARSE_ATTEMPTS
+      ) {
+        console.error(
+          `[MAIN CUE-LOCK] lote rejeitado definitivamente após ${
+            MAIN_PARSE_ATTEMPTS
+          } tentativa(s): ${
+            errorMessage(
+              error
+            ).slice(
+              0,
+              320
+            )
+          }`
+        );
+
+        throw error;
+      }
+
       job.stats.mainParseRetries++;
 
       console.warn(
@@ -11530,7 +11843,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.16] fonte=${
+    `[PIPELINE 8.3.18] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -11748,7 +12061,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.16] FINAL OK | ${
+    `[PIPELINE 8.3.18] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -12149,7 +12462,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.16"
+            "Stremio-PTBR/8.3.18"
         }
       }
     );
@@ -12181,7 +12494,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.16"
+            "Stremio-PTBR/8.3.18"
         }
       }
     );
@@ -12466,8 +12779,8 @@ const manifest = {
   id:
     "org.tradutor.stateless.gemini.free",
 
-  version:
-    "8.3.16",
+    version:
+    "8.3.18",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -13233,8 +13546,8 @@ app.listen(PORT, () => {
     "============================================================"
   );
 
-  console.log(
-    " STREMIO PT-BR 8.3.17 — TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
+    console.log(
+    " STREMIO PT-BR 8.3.18 — MAIN EMPTY-CUE RESCUE + TRANSLATION QUALITY + OWNERSHIP HARD LOCK + SEMANTIC COMPACT + CANONICAL LOCKS"
   );
 
   console.log(
@@ -13329,8 +13642,13 @@ console.log(
   `Semantic Guard Safety: qualquer correção ainda exige CANONICAL LOCKS + sentido + ${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE} ✅`
 );
 
-  console.log(
+    console.log(
     `Main: até ${MAIN_BATCH_MAX_CUES} cues / ${MAIN_BATCH_MAX_CHARS} chars | concorrência=${MAIN_CONCURRENCY} ✅`
+  );
+
+  console.log(
+    `Main Empty-Cue Rescue: ${MAIN_EMPTY_CUE_RESCUE_ENABLED ? "ATIVO" : "DESATIVADO"} | ` +
+    `somente cue vazio é refeito | até ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) isoladas ✅`
   );
 
   console.log(
