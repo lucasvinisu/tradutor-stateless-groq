@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.1 — 8.4.0 QUALITY CORE + MULTILINGUAL AUDIO-SYNC ADAPTER
+// STREMIO PT-BR 8.4.2 — 8.4.1 MULTILINGUAL CORE + FINAL AUDIT SCHEMA-SAFE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -115,21 +115,21 @@ const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
 
 // ============================================================
-// FINAL CRITICAL CONVERGENCE — 8.4.0
+// FINAL CRITICAL CONVERGENCE — 8.4.2 SCHEMA-SAFE
 // ============================================================
 // Um problema de QUALIDADE não encerra o job. O gate audita a legenda
 // que seria realmente servida e corrige somente os cues reprovados
 // até que não reste defeito crítico. Falhas transitórias de Gemini
 // também entram em retry; não viram "failed" por conveniência.
 const FINAL_CRITICAL_GATE_ENABLED = true;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 120;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 42000;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 80;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 32000;
 const FINAL_CRITICAL_AUDIT_CONCURRENCY = 2;
 const FINAL_CRITICAL_AUDIT_THINKING = "high";
 const FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS = 10000;
 const FINAL_CRITICAL_AUDIT_TIMEOUT_MS = 120000;
 const FINAL_CRITICAL_AUDIT_HTTP_RETRIES = 4;
-const FINAL_CRITICAL_MAX_ISSUES = 360;
+const FINAL_CRITICAL_MAX_ISSUES = 80;
 const FINAL_CRITICAL_RETRY_BASE_MS = 4300;
 const FINAL_CRITICAL_RETRY_MAX_MS = 60000;
 const FINAL_CRITICAL_CONTEXT_RADIUS = 1;
@@ -13839,21 +13839,42 @@ Devolva exatamente um objeto por cue recebido.
 `;
 
 const FINAL_CRITICAL_AUDIT_SCHEMA = {
+  // 8.4.2: deliberadamente simples.
+  // O Interactions structured-output pode rejeitar schemas cujo limite
+  // de array expanda demais a gramática/constraint. O limite real aqui
+  // já é imposto pelo tamanho do lote e pelo parser local.
   type: "object",
-  additionalProperties: false,
   properties: {
     issues: {
       type: "array",
-      maxItems: FINAL_CRITICAL_MAX_ISSUES,
       items: {
         type: "object",
-        additionalProperties: false,
         properties: {
           i: { type: "integer" },
           category: { type: "string" },
           reason: { type: "string" }
         },
         required: ["i", "category", "reason"]
+      }
+    }
+  },
+  required: ["issues"]
+};
+
+const FINAL_CRITICAL_AUDIT_FALLBACK_SCHEMA = {
+  // Fallback ainda menor para um eventual HTTP 400 de validação.
+  // category pode ser omitido; parseFinalCriticalAudit usa "CRITICAL".
+  type: "object",
+  properties: {
+    issues: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          i: { type: "integer" },
+          reason: { type: "string" }
+        },
+        required: ["i", "reason"]
       }
     }
   },
@@ -13967,14 +13988,62 @@ function buildFinalCriticalAuditBatches(
 
 async function finalCriticalGeminiRequest(args, job, label) {
   let failures = 0;
+  let schemaFallbackUsed = false;
+  let activeArgs = { ...args };
 
   while (true) {
     try {
-      return await geminiRequest(args);
+      return await geminiRequest(activeArgs);
     } catch (error) {
       failures++;
       job.stats.finalCriticalTechnicalRetries =
         (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+
+      const message = errorMessage(error);
+      const status = Number(error?.status || 0);
+
+      // 8.4.2: HTTP 400/INVALID_ARGUMENT não é tratado cegamente como
+      // "falha transitória" do mesmo payload. Primeiro mudamos de forma
+      // determinística para um schema ainda menor e reduzimos a pressão
+      // de geração. O job continua vivo e a qualidade continua fail-closed.
+      if (
+        !schemaFallbackUsed &&
+        status === 400 &&
+        /invalid argument|invalid_request/i.test(message)
+      ) {
+        schemaFallbackUsed = true;
+
+        job.stats.finalCriticalSchemaFallbacks =
+          (job.stats.finalCriticalSchemaFallbacks || 0) + 1;
+
+        activeArgs = {
+          ...activeArgs,
+          schema: FINAL_CRITICAL_AUDIT_FALLBACK_SCHEMA,
+          thinkingLevel: "medium",
+          maxOutputTokens: Math.min(
+            Number(activeArgs.maxOutputTokens || 7000),
+            7000
+          ),
+          user:
+            `${activeArgs.user}\n\n` +
+            `FALLBACK DE SCHEMA: retorne somente {"issues":[{"i":123,"reason":"..."}]}. ` +
+            `Não inclua category nesta tentativa.`
+        };
+
+        job.error =
+          `SCHEMA FALLBACK ${label}: ${message.slice(0, 260)}`;
+        job.status = "processing";
+        job.progress = Math.min(99, Math.max(94, job.progress || 0));
+        job.updatedAt = Date.now();
+
+        console.warn(
+          `[FINAL CRITICAL SCHEMA FALLBACK] ${label}: HTTP 400/INVALID_ARGUMENT; ` +
+          `trocando para schema mínimo sem liberar a legenda.`
+        );
+
+        await sleep(1500);
+        continue;
+      }
 
       const waitMs = Math.min(
         FINAL_CRITICAL_RETRY_MAX_MS,
@@ -13982,7 +14051,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
       );
 
       job.error =
-        `RETRY ${label}: ${errorMessage(error).slice(0, 260)}`;
+        `RETRY ${label}: ${message.slice(0, 260)}`;
       job.status = "processing";
       job.progress = Math.min(99, Math.max(94, job.progress || 0));
       job.updatedAt = Date.now();
@@ -13990,7 +14059,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
       console.warn(
         `[FINAL CRITICAL RETRY] ${label} falhou (${failures}); ` +
         `job continua vivo; nova tentativa em ${(waitMs / 1000).toFixed(1)}s | ` +
-        `${errorMessage(error).slice(0, 320)}`
+        `${message.slice(0, 320)}`
       );
 
       await sleep(waitMs);
@@ -14016,6 +14085,10 @@ function parseFinalCriticalAudit(text, allowedIds) {
       id,
       reasons: [`FINAL_CRITICAL:${category}: ${reason}`]
     });
+
+    if (out.length >= FINAL_CRITICAL_MAX_ISSUES) {
+      break;
+    }
   }
 
   return out;
@@ -16151,7 +16224,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.1 — 8.4.0 QUALITY CORE + MULTILINGUAL AUDIO-SYNC ADAPTER"
+        " STREMIO PT-BR 8.4.2 — 8.4.1 MULTILINGUAL CORE + FINAL AUDIT SCHEMA-SAFE"
   );
 
   console.log(
@@ -16380,7 +16453,11 @@ console.log(
   );
 
   console.log(
-    "Job Retry 8.4.0: falha transitória não vira failed nem cacheia safe draft; permanece processing ✅"
+    "Final Audit 8.4.2: lotes <=80 + schema sem maxItems + fallback adaptativo para HTTP 400 ✅"
+  );
+
+  console.log(
+    "Job Retry 8.4.2: falha transitória não vira failed nem cacheia safe draft; permanece processing ✅"
   );
 
   console.log(
