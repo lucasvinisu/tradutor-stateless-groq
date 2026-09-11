@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.0 — SOURCE HYGIENE + GENDER INTEGRITY V2 + SEMANTIC OWNERSHIP AUDIT + FINAL CRITICAL CONVERGENCE
+// STREMIO PT-BR 8.4.1 — 8.4.0 QUALITY CORE + MULTILINGUAL AUDIO-SYNC ADAPTER
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -28,6 +28,16 @@ const MAX_SOURCE_CHARS = 800000;
 const FETCH_TIMEOUT_MS = 25000;
 
 const GEMINI_MIN_START_INTERVAL_MS = 4300;
+
+// Multilingual Audio-Sync Adapter.
+// A Ponte usa este endpoint SOMENTE para construir texto-proxy lexical
+// no idioma real do áudio. Não gera timestamps e não altera a tradução final.
+const SYNC_PROXY_MAX_ITEMS = 260;
+const SYNC_PROXY_MAX_CHARS = 36000;
+const SYNC_PROXY_THINKING = "low";
+const SYNC_PROXY_MAX_OUTPUT_TOKENS = 12000;
+const SYNC_PROXY_TIMEOUT_MS = 90000;
+const SYNC_PROXY_HTTP_RETRIES = 3;
 
 // Gemini Transcribe free-tier guard: 3 RPM / 10k TPM / 25 RPD.
 // O projeto usa 22s entre inícios, teto interno de 24 chamadas/24h e
@@ -6210,6 +6220,135 @@ const QA_SCHEMA = {
   ]
 };
 
+const SYNC_PROXY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: "array",
+      maxItems: SYNC_PROXY_MAX_ITEMS,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: { type: "integer" },
+          text: { type: "string" }
+        },
+        required: ["i", "text"]
+      }
+    }
+  },
+  required: ["items"]
+};
+
+function normalizeSyncLanguageCode(value, fallback = "en") {
+  const raw = String(value || "").trim().toLowerCase();
+  const map = {
+    eng: "en", en: "en",
+    spa: "es", esp: "es", es: "es",
+    por: "pt", pt: "pt", "pt-br": "pt-BR", "pt-pt": "pt-PT",
+    fra: "fr", fre: "fr", fr: "fr",
+    ita: "it", it: "it",
+    deu: "de", ger: "de", de: "de",
+    nld: "nl", dut: "nl", nl: "nl",
+    jpn: "ja", ja: "ja",
+    kor: "ko", ko: "ko",
+    zho: "zh", chi: "zh", zh: "zh",
+    rus: "ru", ru: "ru",
+    pol: "pl", pl: "pl",
+    tur: "tr", tr: "tr",
+    ara: "ar", ar: "ar",
+    heb: "he", he: "he",
+    ces: "cs", cze: "cs", cs: "cs",
+    hun: "hu", hu: "hu",
+    ron: "ro", rum: "ro", ro: "ro",
+    ukr: "uk", uk: "uk"
+  };
+  if (map[raw]) return map[raw];
+  if (/^[a-z]{2}(?:-[a-z]{2})?$/i.test(raw)) return raw;
+  return fallback;
+}
+
+function syncLanguageName(code) {
+  const c = normalizeSyncLanguageCode(code, "en").toLowerCase();
+  const names = {
+    en: "English", es: "Spanish", pt: "Portuguese", "pt-br": "Brazilian Portuguese",
+    "pt-pt": "European Portuguese", fr: "French", it: "Italian", de: "German",
+    nl: "Dutch", ja: "Japanese", ko: "Korean", zh: "Chinese", ru: "Russian",
+    pl: "Polish", tr: "Turkish", ar: "Arabic", he: "Hebrew", cs: "Czech",
+    hu: "Hungarian", ro: "Romanian", uk: "Ukrainian"
+  };
+  return names[c] || c;
+}
+
+async function buildMultilingualSyncProxy(items, sourceLang, targetLang) {
+  const cleanItems = (Array.isArray(items) ? items : [])
+    .map(item => ({
+      i: Number(item?.i),
+      text: String(item?.text || "").replace(/\s+/g, " ").trim()
+    }))
+    .filter(item => Number.isInteger(item.i) && item.text);
+
+  if (!cleanItems.length) {
+    throw new Error("SYNC PROXY sem itens válidos.");
+  }
+  if (cleanItems.length > SYNC_PROXY_MAX_ITEMS) {
+    throw new Error(`SYNC PROXY excede ${SYNC_PROXY_MAX_ITEMS} itens.`);
+  }
+
+  const charCount = cleanItems.reduce((sum, item) => sum + item.text.length, 0);
+  if (charCount > SYNC_PROXY_MAX_CHARS) {
+    throw new Error(`SYNC PROXY excede ${SYNC_PROXY_MAX_CHARS} caracteres.`);
+  }
+
+  const src = normalizeSyncLanguageCode(sourceLang, "auto");
+  const dst = normalizeSyncLanguageCode(targetLang, "en");
+
+  if (src !== "auto" && src.toLowerCase() === dst.toLowerCase()) {
+    return cleanItems;
+  }
+
+  const system = `You create lexical proxy text ONLY for subtitle/audio synchronization.
+Translate each item from ${syncLanguageName(src)} to ${syncLanguageName(dst)}.
+Rules:
+- Keep exactly the same integer i for every item and return the same number of items.
+- Translate the spoken meaning faithfully and literally enough for word matching against a transcript.
+- Preserve names, numbers, profanity, repeated words and short discourse markers when they are spoken.
+- Do not summarize, omit, merge, split, censor, embellish or move content between ids.
+- Do not add speaker labels, explanations or timestamps.
+- Output JSON only.`;
+
+  const response = await geminiRequest({
+    system,
+    user: JSON.stringify({
+      source_language: src,
+      target_language: dst,
+      items: cleanItems
+    }),
+    schema: SYNC_PROXY_SCHEMA,
+    thinkingLevel: SYNC_PROXY_THINKING,
+    maxOutputTokens: SYNC_PROXY_MAX_OUTPUT_TOKENS,
+    timeoutMs: SYNC_PROXY_TIMEOUT_MS,
+    maxRetries: SYNC_PROXY_HTTP_RETRIES,
+    job: null,
+    metric: "syncproxy"
+  });
+
+  const parsed = JSON.parse(stripCodeFences(response.text));
+  const returned = Array.isArray(parsed?.items) ? parsed.items : [];
+  const byId = new Map(returned.map(item => [Number(item?.i), String(item?.text || "").trim()]));
+  const out = [];
+  for (const item of cleanItems) {
+    const text = byId.get(item.i);
+    if (!text) throw new Error(`SYNC PROXY perdeu o cue ${item.i}.`);
+    out.push({ i: item.i, text });
+  }
+  if (out.length !== cleanItems.length) {
+    throw new Error("SYNC PROXY retornou contagem divergente.");
+  }
+  return out;
+}
+
 // Deliberadamente simples.
 // O 8.3.5 estava enviando objetos aninhados em people e o PLAN
 // recebia HTTP 400. Agora Gemini devolve strings simples e o
@@ -7171,7 +7310,8 @@ async function geminiTranscribeInline(
   audioBase64,
   mimeType = "audio/wav",
   durationMs = 0,
-  label = "audio-sync"
+  label = "audio-sync",
+  languageCode = "en"
 ) {
   if (!GEMINI_API_KEY) {
     throw new Error(
@@ -7272,7 +7412,7 @@ async function geminiTranscribeInline(
                 generation_config: {
                   transcription_config: {
                     language_codes: [
-                      "en"
+                      normalizeSyncLanguageCode(languageCode, "en")
                     ],
 
                     mode: {
@@ -15193,7 +15333,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.4.0",
+    "8.4.1",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -15457,6 +15597,42 @@ app.post(
     )
 );
 
+// Proxy lexical multilíngue para o Auto-Sync da Ponte.
+// Não toca em timestamps nem na tradução PT-BR final.
+app.post(
+  "/api/sync-proxy",
+
+  async (req, res) => {
+    if (!authorized(req)) {
+      return safeJson(res, { error: "Unauthorized" }, 401);
+    }
+
+    try {
+      const sourceLang = String(req.body?.sourceLang || "auto").trim();
+      const targetLang = String(req.body?.targetLang || "en").trim();
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+      const translated = await buildMultilingualSyncProxy(
+        items,
+        sourceLang,
+        targetLang
+      );
+
+      return safeJson(res, {
+        ok: true,
+        sourceLang: normalizeSyncLanguageCode(sourceLang, "auto"),
+        targetLang: normalizeSyncLanguageCode(targetLang, "en"),
+        items: translated
+      });
+    } catch (error) {
+      console.error(
+        `[SYNC PROXY API] ${errorMessage(error).slice(0, 500)}`
+      );
+      return safeJson(res, { error: errorMessage(error) }, 500);
+    }
+  }
+);
+
 // Ponte monta várias janelas em um WAV.
 // Render mantém chave Gemini, orçamento e word timestamps.
 app.post(
@@ -15517,6 +15693,12 @@ app.post(
               ?.durationMs ||
             0
           )
+        );
+
+      const languageCode =
+        normalizeSyncLanguageCode(
+          req.body?.languageCode || "en",
+          "en"
         );
 
       if (
@@ -15599,7 +15781,8 @@ app.post(
           audioBase64,
           mimeType,
           durationMs,
-          label
+          label,
+          languageCode
         );
 
       return safeJson(
@@ -15968,7 +16151,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.0 — SOURCE HYGIENE + GENDER V2 + SEMANTIC OWNERSHIP + FINAL CONVERGENCE"
+        " STREMIO PT-BR 8.4.1 — 8.4.0 QUALITY CORE + MULTILINGUAL AUDIO-SYNC ADAPTER"
   );
 
   console.log(
@@ -16202,6 +16385,10 @@ console.log(
 
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
+  );
+
+  console.log(
+    "Multilingual Audio-Sync API: /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
   );
 
   console.log(
