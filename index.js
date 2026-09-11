@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.4 - INTENTIONAL EMPTY CUES + NO FULL RESTART
-// 8.4.3 CONVERGENCE CONSENSUS + FOCUSED REPAIR PRESERVED
+// STREMIO PT-BR 8.4.5 - PRE-REPAIR SEMANTIC CONFIRMATION + CONCURRENCY EFFICIENCY
+// 8.4.4 INTENTIONAL EMPTY + NO FULL RESTART PRESERVED
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -72,7 +72,7 @@ const PLAN_FALLBACK_RETRIES = 1;
 
 const MAIN_BATCH_MAX_CUES = 60;
 const MAIN_BATCH_MAX_CHARS = 15000;
-const MAIN_CONCURRENCY = 2;
+const MAIN_CONCURRENCY = 3;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
 const MAIN_THINKING = "high";
@@ -116,9 +116,26 @@ const QA_TIMEOUT_MS = 120000;
 const QA_HTTP_RETRIES = 3;
 const QA_PARSE_ATTEMPTS = 2;
 const QA_MAX_FLAGS_TOTAL = 120;
-const QA_CONCURRENCY = 2;
+const QA_CONCURRENCY = 3;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
+
+// ============================================================
+// PRE-REPAIR SEMANTIC CONFIRMATION — 8.4.5
+// ============================================================
+// Heurísticas ambíguas não ganham autoridade para reescrever texto sozinhas.
+// Duas auditorias semânticas independentes precisam concordar que o cue está
+// limpo para dispensar Repair. Qualquer flag OU falha técnica mantém Repair.
+const PRE_REPAIR_CONFIRM_ENABLED = true;
+const PRE_REPAIR_CONFIRM_ROUNDS = 2;
+const PRE_REPAIR_CONFIRM_BATCH_MAX_CUES = 70;
+const PRE_REPAIR_CONFIRM_BATCH_MAX_CHARS = 30000;
+const PRE_REPAIR_CONFIRM_CONCURRENCY = 2;
+const PRE_REPAIR_CONFIRM_THINKING = "high";
+const PRE_REPAIR_CONFIRM_MAX_OUTPUT_TOKENS = 6500;
+const PRE_REPAIR_CONFIRM_TIMEOUT_MS = 120000;
+const PRE_REPAIR_CONFIRM_HTTP_RETRIES = 3;
+
 
 // ============================================================
 // FINAL CRITICAL CONVERGENCE — 8.4.2 SCHEMA-SAFE
@@ -191,6 +208,7 @@ const SEMANTIC_REWRITE_AUDIT_ENABLED = true;
 const SEMANTIC_REWRITE_AUDIT_MAX_CUES_PER_BATCH = 80;
 const SEMANTIC_REWRITE_AUDIT_MAX_CHARS_PER_BATCH = 32000;
 const SEMANTIC_REWRITE_AUDIT_MAX_ISSUES = 80;
+const SEMANTIC_REWRITE_AUDIT_CONCURRENCY = 2;
 
 const SEMANTIC_REWRITE_AUDIT_THINKING = "high";
 const SEMANTIC_REWRITE_AUDIT_MAX_OUTPUT_TOKENS = 7000;
@@ -902,6 +920,14 @@ function createJob({
       qa429: 0,
       qaParseRetries: 0,
       qaFlags: 0,
+
+      preRepairConfirmCalls: 0,
+      preRepairConfirmAttempts: 0,
+      preRepairConfirm429: 0,
+      preRepairConfirmCandidates: 0,
+      preRepairConfirmSuppressed: 0,
+      preRepairConfirmConfirmed: 0,
+      preRepairConfirmTechnicalFallback: 0,
 
       finalCriticalRounds: 0,
       finalCriticalAuditCalls: 0,
@@ -5993,6 +6019,43 @@ Se houver duas boas traduções naturais, NÃO marque.
 Se a opção atual soar como tradução mesmo estando entendível, MARQUE.
 `;
 
+const PRE_REPAIR_CONFIRM_PROMPT = `
+Você é o AUDITOR SEMÂNTICO PRÉ-REPAIR de legendas SOURCE→PT-BR.
+
+Sua função é CONFIRMAR OU DESCARTAR SOMENTE suspeitas heurísticas ambíguas.
+Você NÃO reescreve tradução. Você NÃO melhora estilo. Você NÃO marca uma
+alternativa apenas porque faria diferente.
+
+Para cada target:
+- SOURCE do mesmo i é a autoridade absoluta de conteúdo e ownership;
+- PT do mesmo i é a tradução atual;
+- before/after existem SOMENTE para contexto;
+- nunca puxe conteúdo de vizinhos para o target.
+
+POSSIBLE_CUE_SHIFT_PAIR:
+Marque SOMENTE se PT[i] traduz conteúdo pertencente claramente a SOURCE
+de outro cue, ou se informação pertencente a SOURCE[i] está deslocada para
+um vizinho. Diferença natural de tamanho, ordem sintática ou uma frase que
+continua legitimamente entre cues NÃO é shift.
+
+POSSIBLE_OMISSION:
+Marque SOMENTE quando uma unidade de significado real de SOURCE[i] estiver
+ausente em PT[i]. Conciliação, contração e tradução não literal fiel não são
+omissão.
+
+GENDER_V2_UNKNOWN_SPEAKER_MARKED / UNKNOWN_SPEAKER_GENDER_MARKED:
+Marque SOMENTE se PT atribui gênero a speaker/referente sem evidência segura
+da SOURCE, identity_lock ou contexto fornecido. Não marque gênero que esteja
+claramente sustentado pela fala/cena.
+
+REGRA FAIL-SAFE DO AUDITOR:
+- se houver defeito real, inclua o ID em issues e explique a prova;
+- se a suspeita heurística for falso positivo, NÃO inclua o ID;
+- não proponha pt novo; não faça revisão cosmética.
+
+Cada rodada é um julgamento independente.
+`;
+
 const SEMANTIC_REWRITE_AUDIT_PROMPT = `
 Você é o AUDITOR SEMÂNTICO PÓS-REESCRITA de legendas FONTE→PT-BR.
 
@@ -6329,6 +6392,26 @@ const SEMANTIC_REWRITE_AUDIT_SCHEMA = {
   required: [
     "issues"
   ]
+};
+
+const PRE_REPAIR_CONFIRM_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    issues: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: { type: "integer" },
+          reason: { type: "string" }
+        },
+        required: ["i", "reason"]
+      }
+    }
+  },
+  required: ["issues"]
 };
 
 const QA_SCHEMA = {
@@ -6887,6 +6970,10 @@ function markAttempt(
   if (metric === "qa") {
     job.stats.qaAttempts++;
   }
+
+  if (metric === "preconfirm") {
+    job.stats.preRepairConfirmAttempts++;
+  }
 }
 
 function mark429(
@@ -6907,6 +6994,10 @@ function mark429(
 
   if (metric === "qa") {
     job.stats.qa429++;
+  }
+
+  if (metric === "preconfirm") {
+    job.stats.preRepairConfirm429++;
   }
 }
 
@@ -6933,6 +7024,10 @@ function markSuccess(
 
   if (metric === "qa") {
     job.stats.qaCalls++;
+  }
+
+  if (metric === "preconfirm") {
+    job.stats.preRepairConfirmCalls++;
   }
 
   job.stats.inputTokens +=
@@ -12185,6 +12280,9 @@ async function repairBatch(
                 payload
               )
             }\n\n` +
+            `CUE OWNERSHIP ABSOLUTO: cada i é uma caixa fechada. Traduza SOMENTE o campo en daquele mesmo i. ` +
+            `before/after servem SOMENTE para contexto e NUNCA podem fornecer conteúdo ao target. ` +
+            `Se o pt atual estiver deslocado, reconstrua diretamente do en do mesmo i. ` +
             `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
             `Se dialogue_turn_count existir, preserve EXATAMENTE os turns e devolva cada um em linha própria iniciada por "- ". ` +
             `O token ${BLEEP_TOKEN} deve ser resolvido naturalmente e nunca copiado.`,
@@ -12252,6 +12350,261 @@ async function repairBatch(
   }
 
   throw lastError;
+}
+
+function preRepairAmbiguousHeuristicReason(reason) {
+  return /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR)$/i.test(
+    String(reason || "").trim()
+  );
+}
+
+function preRepairNeedsSemanticConfirmation(issue) {
+  const reasons = Array.isArray(issue?.reasons)
+    ? issue.reasons.map(reason => String(reason || "").trim()).filter(Boolean)
+    : [];
+
+  return (
+    reasons.length > 0 &&
+    reasons.every(preRepairAmbiguousHeuristicReason)
+  );
+}
+
+function buildPreRepairConfirmBatches(
+  blocks,
+  translations,
+  issues,
+  plan
+) {
+  const posMap = positionMap(blocks);
+  const batches = [];
+  let current = [];
+  let currentChars = 0;
+
+  for (const issue of issues) {
+    const pos = posMap.get(Number(issue?.id));
+    if (!Number.isInteger(pos)) continue;
+
+    const block = blocks[pos];
+    if (!block) continue;
+
+    const item = {
+      i: block.index,
+      source: String(block.text || ""),
+      pt: String(translations.get(block.index) || ""),
+      heuristic_reasons: Array.isArray(issue.reasons) ? issue.reasons : [],
+      identity_lock: conciseIdentityForQa(block, plan),
+      before: blocks
+        .slice(Math.max(0, pos - 1), pos)
+        .map(context => ({
+          i: context.index,
+          source: String(context.text || ""),
+          pt: String(translations.get(context.index) || "")
+        })),
+      after: blocks
+        .slice(pos + 1, Math.min(blocks.length, pos + 2))
+        .map(context => ({
+          i: context.index,
+          source: String(context.text || ""),
+          pt: String(translations.get(context.index) || "")
+        }))
+    };
+
+    const size = JSON.stringify(item).length;
+
+    if (
+      current.length &&
+      (
+        current.length >= PRE_REPAIR_CONFIRM_BATCH_MAX_CUES ||
+        currentChars + size > PRE_REPAIR_CONFIRM_BATCH_MAX_CHARS
+      )
+    ) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+    }
+
+    current.push(item);
+    currentChars += size;
+  }
+
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function parsePreRepairConfirmation(text, allowedIds) {
+  const parsed = JSON.parse(stripCodeFences(text));
+  const raw = Array.isArray(parsed?.issues) ? parsed.issues : [];
+  const flagged = new Set();
+
+  for (const issue of raw) {
+    const id = Number(issue?.i);
+    if (!Number.isInteger(id) || !allowedIds.has(id)) continue;
+    flagged.add(id);
+  }
+
+  return flagged;
+}
+
+async function preConfirmAmbiguousRepairIssues(
+  blocks,
+  translations,
+  issues,
+  plan,
+  job
+) {
+  if (!PRE_REPAIR_CONFIRM_ENABLED) return issues;
+
+  const candidates = (Array.isArray(issues) ? issues : [])
+    .filter(preRepairNeedsSemanticConfirmation);
+
+  if (!candidates.length) return issues;
+
+  job.stats.preRepairConfirmCandidates =
+    (job.stats.preRepairConfirmCandidates || 0) + candidates.length;
+
+  const candidateById = new Map(
+    candidates.map(issue => [Number(issue.id), issue])
+  );
+  const candidateIds = new Set(candidateById.keys());
+  const batches = buildPreRepairConfirmBatches(
+    blocks,
+    translations,
+    candidates,
+    plan
+  );
+
+  console.log(
+    `[PRE-REPAIR CONFIRM] heurísticos=${candidates.length} | ` +
+    `lotes=${batches.length} | rounds=${PRE_REPAIR_CONFIRM_ROUNDS} | ` +
+    `concorrência=${Math.min(PRE_REPAIR_CONFIRM_CONCURRENCY, Math.max(1, batches.length))}.`
+  );
+
+  const confirmedIds = new Set();
+  const coveredIds = new Set(
+    batches.flatMap(batch => batch.map(item => Number(item.i)))
+  );
+  const technicalFallbackIds = new Set(
+    [...candidateIds].filter(id => !coveredIds.has(id))
+  );
+  let cursor = 0;
+
+  async function worker(workerId) {
+    while (true) {
+      const batchIndex = cursor++;
+      if (batchIndex >= batches.length) return;
+
+      const batch = batches[batchIndex];
+      const allowedIds = new Set(batch.map(item => Number(item.i)));
+      const roundResults = [];
+      let technicalFailure = false;
+
+      for (let round = 1; round <= PRE_REPAIR_CONFIRM_ROUNDS; round++) {
+        try {
+          const response = await geminiRequest({
+            system: PRE_REPAIR_CONFIRM_PROMPT,
+            user:
+              `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+              `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
+              `RODADA INDEPENDENTE ${round}/${PRE_REPAIR_CONFIRM_ROUNDS}\n` +
+              `CUES HEURÍSTICOS:\n${JSON.stringify({ cues: batch })}\n\n` +
+              `Retorne em issues SOMENTE IDs cujo defeito heurístico está semanticamente CONFIRMADO. ` +
+              `Cue correto deve ser omitido de issues. Não reescreva texto.`,
+            schema: PRE_REPAIR_CONFIRM_SCHEMA,
+            thinkingLevel: PRE_REPAIR_CONFIRM_THINKING,
+            maxOutputTokens: PRE_REPAIR_CONFIRM_MAX_OUTPUT_TOKENS,
+            timeoutMs: PRE_REPAIR_CONFIRM_TIMEOUT_MS,
+            maxRetries: PRE_REPAIR_CONFIRM_HTTP_RETRIES,
+            job,
+            metric: "preconfirm"
+          });
+
+          const flagged = parsePreRepairConfirmation(
+            response.text,
+            allowedIds
+          );
+          roundResults.push(flagged);
+
+          console.log(
+            `[PRE-REPAIR CONFIRM W${workerId}] lote ${batchIndex + 1}/${batches.length} | ` +
+            `round=${round}/${PRE_REPAIR_CONFIRM_ROUNDS} | confirmados=${flagged.size}.`
+          );
+        } catch (error) {
+          technicalFailure = true;
+          console.warn(
+            `[PRE-REPAIR CONFIRM W${workerId}] lote ${batchIndex + 1}/${batches.length} | ` +
+            `round=${round} falhou; FAIL-SAFE mantém Repair | ` +
+            `${errorMessage(error).slice(0, 320)}`
+          );
+          break;
+        }
+      }
+
+      if (technicalFailure || roundResults.length !== PRE_REPAIR_CONFIRM_ROUNDS) {
+        for (const id of allowedIds) technicalFallbackIds.add(id);
+        continue;
+      }
+
+      for (const result of roundResults) {
+        for (const id of result) confirmedIds.add(id);
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      {
+        length: Math.min(
+          PRE_REPAIR_CONFIRM_CONCURRENCY,
+          Math.max(1, batches.length)
+        )
+      },
+      (_, index) => worker(index + 1)
+    )
+  );
+
+  const suppressedIds = new Set();
+
+  for (const id of candidateIds) {
+    if (confirmedIds.has(id) || technicalFallbackIds.has(id)) continue;
+    suppressedIds.add(id);
+
+    const issue = candidateById.get(id);
+    if (!job.finalCriticalConsensusState || typeof job.finalCriticalConsensusState !== "object") {
+      job.finalCriticalConsensusState = Object.create(null);
+    }
+
+    for (const reason of Array.isArray(issue?.reasons) ? issue.reasons : []) {
+      if (!preRepairAmbiguousHeuristicReason(reason)) continue;
+      const key = `${id}::${String(reason)}`;
+      job.finalCriticalConsensusState[key] = Math.max(
+        Number(job.finalCriticalConsensusState[key] || 0),
+        PRE_REPAIR_CONFIRM_ROUNDS
+      );
+    }
+  }
+
+  job.stats.preRepairConfirmSuppressed =
+    (job.stats.preRepairConfirmSuppressed || 0) + suppressedIds.size;
+  job.stats.preRepairConfirmConfirmed =
+    (job.stats.preRepairConfirmConfirmed || 0) + confirmedIds.size;
+  job.stats.preRepairConfirmTechnicalFallback =
+    (job.stats.preRepairConfirmTechnicalFallback || 0) + technicalFallbackIds.size;
+
+  console.log(
+    `[PRE-REPAIR CONFIRM] semanticamente-confirmados=${confirmedIds.size} | ` +
+    `limpos=${suppressedIds.size} | ` +
+    `fail-safe-técnico=${technicalFallbackIds.size}.`
+  );
+
+  if (suppressedIds.size) {
+    console.log(
+      `[PRE-REPAIR CONFIRM] ${suppressedIds.size} cue(s) preservados SEM rewrite; ` +
+      `Final Critical global continua com autoridade para contradizer esta decisão.`
+    );
+  }
+
+  return (Array.isArray(issues) ? issues : [])
+    .filter(issue => !suppressedIds.has(Number(issue?.id)));
 }
 
 function repairCandidateRegressionReasons(
@@ -12391,6 +12744,16 @@ async function tryFocusedRepair(
   }
 
   issues = mergeIssueLists(issues, extraIssues);
+
+  if (!extraOnly) {
+    issues = await preConfirmAmbiguousRepairIssues(
+      blocks,
+      translations,
+      issues,
+      plan,
+      job
+    );
+  }
 
 // ============================================================
 // ABSOLUTE OWNERSHIP AUDIT
@@ -13681,7 +14044,7 @@ if (!candidates.length) {
   console.log(
     `[SEMANTIC REWRITE GUARD] ` +
     `${candidates.length} cue(s) realmente reescrito(s) | ` +
-    `${batches.length} lote(s) EN×BEFORE×AFTER.`
+    `${batches.length} lote(s) EN×BEFORE×AFTER | concorrência=${Math.min(SEMANTIC_REWRITE_AUDIT_CONCURRENCY, batches.length)}.`
   );
 
   const updated =
@@ -13694,11 +14057,13 @@ if (!candidates.length) {
   let totalRejected = 0;
   let semanticCompactRetries = 0;
 
-  for (
-    let batchIndex = 0;
-    batchIndex < batches.length;
-    batchIndex++
-  ) {
+  let semanticCursor = 0;
+
+  async function semanticWorker(workerId) {
+    while (true) {
+      const batchIndex = semanticCursor++;
+      if (batchIndex >= batches.length) return;
+
     const batch =
       batches[batchIndex];
 
@@ -14037,7 +14402,21 @@ if (
         `${errorMessage(error).slice(0, 350)}`
       );
     }
+    }
   }
+
+  await Promise.all(
+    Array.from(
+      {
+        length: Math.min(
+          SEMANTIC_REWRITE_AUDIT_CONCURRENCY,
+          batches.length
+        )
+      },
+      (_, index) => semanticWorker(index + 1)
+    )
+  );
+
 
   console.log(
     `[SEMANTIC REWRITE GUARD] FINAL | ` +
@@ -14899,7 +15278,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.4.4] fonte=${
+    `[PIPELINE 8.4.5] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -15149,7 +15528,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.4.4] FINAL OK | ${
+    `[PIPELINE 8.4.5] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -16643,7 +17022,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.4 - INTENTIONAL EMPTY CUES + NO FULL RESTART"
+        " STREMIO PT-BR 8.4.5 - PRE-REPAIR SEMANTIC CONFIRMATION + CONCURRENCY EFFICIENCY"
   );
 
   console.log(
@@ -16836,6 +17215,14 @@ console.log(
   );
 
   console.log(
+    `Pre-Repair Semantic Confirmation 8.4.5: ${PRE_REPAIR_CONFIRM_ROUNDS} auditorias limpas para heurística ambígua escapar do Repair; falha técnica=FAIL-SAFE ✅`
+  );
+
+  console.log(
+    `Concurrency Efficiency 8.4.5: MAIN=${MAIN_CONCURRENCY} | QA=${QA_CONCURRENCY} | Semantic=${SEMANTIC_REWRITE_AUDIT_CONCURRENCY} | gate global=${GEMINI_MIN_START_INTERVAL_MS}ms INALTERADO ✅`
+  );
+
+  console.log(
     "Intentional Empty 8.4.4: somente SOURCE realmente descartável pode sumir; fala real continua fail-closed ✅"
   );
 
@@ -16900,6 +17287,14 @@ console.log(
 
   console.log(
     "Multilingual Audio-Sync API: /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
+  );
+
+  console.log(
+    "Pre-Repair 8.4.5: heuristic-only issues require 2 clean semantic confirmations before rewrite suppression. OK"
+  );
+
+  console.log(
+    "Concurrency 8.4.5: more in-flight work without increasing Gemini start rate. OK"
   );
 
   console.log(
