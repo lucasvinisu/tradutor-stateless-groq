@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.2 — 8.4.1 MULTILINGUAL CORE + FINAL AUDIT SCHEMA-SAFE
+// STREMIO PT-BR 8.4.3 - CONVERGENCE CONSENSUS + FOCUSED REPAIR
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -134,6 +134,7 @@ const FINAL_CRITICAL_RETRY_BASE_MS = 4300;
 const FINAL_CRITICAL_RETRY_MAX_MS = 60000;
 const FINAL_CRITICAL_CONTEXT_RADIUS = 1;
 const FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER = 2;
+const FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
 const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 12;
 const FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
 const FINAL_CRITICAL_ESCALATED_TIMEOUT_MS = 120000;
@@ -12048,40 +12049,28 @@ async function tryFocusedRepair(
   translations,
   plan,
   job,
-  extraIssues = []
+  extraIssues = [],
+  options = {}
 ) {
   if (!REPAIR_ENABLED) {
     return translations;
   }
 
-  let issues;
+  const extraOnly = Boolean(options && options.extraOnly);
+  let issues = [];
+  let localOnlyCount = 0;
 
-  try {
-    issues =
-      detectLocalIssues(
-        blocks,
-        translations,
-        job.filename,
-        plan
-      );
-  } catch (error) {
-    console.warn(
-      `[LOCAL GUARD] falhou; mantendo principal: ${
-        errorMessage(error)
-      }`
-    );
-
-    return translations;
+  if (!extraOnly) {
+    try {
+      issues = detectLocalIssues(blocks, translations, job.filename, plan);
+    } catch (error) {
+      console.warn(`[LOCAL GUARD] falhou; mantendo principal: ${errorMessage(error)}`);
+      return translations;
+    }
+    localOnlyCount = issues.length;
   }
 
-  const localOnlyCount =
-    issues.length;
-
-  issues =
-  mergeIssueLists(
-    issues,
-    extraIssues
-  );
+  issues = mergeIssueLists(issues, extraIssues);
 
 // ============================================================
 // ABSOLUTE OWNERSHIP AUDIT
@@ -12136,21 +12125,14 @@ if (
   );
 }
 
-job.stats.localFlags =
-  localOnlyCount;
+if (!extraOnly) job.stats.localFlags = localOnlyCount;
 
   if (!issues.length) {
-    console.log(
-      "[LOCAL GUARD] 0 suspeitos."
-    );
-
+    console.log(extraOnly ? "[FINAL CRITICAL REPAIR] 0 blockers." : "[LOCAL GUARD] 0 suspeitos.");
     return translations;
   }
 
-  logIssueSummary(
-    "PRÉ-REPAIR",
-    issues
-  );
+  logIssueSummary(extraOnly ? "FINAL-CRITICAL-REPAIR" : "PRÉ-REPAIR", issues);
 
   issues.sort((a, b) => {
     const priorityDiff =
@@ -12202,11 +12184,9 @@ job.stats.localFlags =
     selected.length;
 
   console.log(
-    `[LOCAL GUARD] ${
-      issues.length
-    } suspeitos combinados (local+QA); reparando até ${
-      selected.length
-    }.`
+    extraOnly
+      ? `[FINAL CRITICAL REPAIR] ${issues.length} blocker(s) desta rodada; reparando somente ${selected.length} cue(s).`
+      : `[LOCAL GUARD] ${issues.length} suspeitos combinados (local+QA); reparando até ${selected.length}.`
   );
 
   const posMap =
@@ -13896,6 +13876,51 @@ function finalReasonBlocks(reason) {
   );
 }
 
+
+function finalCriticalHeuristicReason(reason) {
+  return /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR)$/i.test(String(reason || "").trim());
+}
+
+function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, job) {
+  const semanticIds = new Set((Array.isArray(semanticIssues) ? semanticIssues : []).map(x => Number(x && x.id)).filter(Number.isInteger));
+  if (!job.finalCriticalConsensusState || typeof job.finalCriticalConsensusState !== "object") job.finalCriticalConsensusState = Object.create(null);
+  const state = job.finalCriticalConsensusState;
+  const active = new Set();
+  const out = [];
+  let suppressed = 0;
+  let waiting = 0;
+
+  for (const issue of Array.isArray(localIssues) ? localIssues : []) {
+    const id = Number(issue && issue.id);
+    if (!Number.isInteger(id)) continue;
+    const kept = [];
+    for (const raw of Array.isArray(issue.reasons) ? issue.reasons : []) {
+      const reason = String(raw || "");
+      if (!finalCriticalHeuristicReason(reason)) { kept.push(reason); continue; }
+      const key = id + "::" + reason;
+      active.add(key);
+      const audited = !auditedIds || auditedIds.has(id);
+      if (!audited) { kept.push(reason); waiting++; continue; }
+      if (semanticIds.has(id)) { state[key] = 0; kept.push(reason); waiting++; continue; }
+      const clean = Number(state[key] || 0) + 1;
+      state[key] = clean;
+      if (clean >= FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS) {
+        suppressed++;
+        job.stats.finalCriticalConsensusSuppressions = (job.stats.finalCriticalConsensusSuppressions || 0) + 1;
+      } else {
+        kept.push(reason);
+        waiting++;
+      }
+    }
+    if (kept.length) out.push({ id, reasons: [...new Set(kept)] });
+  }
+
+  for (const key of Object.keys(state)) if (!active.has(key)) delete state[key];
+  if (suppressed) console.log(`[FINAL CRITICAL CONSENSUS] ${suppressed} heuristic flag(s) had 2 clean semantic audits and will not block alone. OK`);
+  if (waiting) console.log(`[FINAL CRITICAL CONSENSUS] ${waiting} heuristic flag(s) still awaiting semantic consensus.`);
+  return out;
+}
+
 function blockingLocalIssues(blocks, translations, job, plan) {
   return detectLocalIssues(
     blocks,
@@ -14391,17 +14416,19 @@ async function convergeFinalCriticalQuality(
 
     // A primeira passagem é GLOBAL: exatamente para capturar cadeias de
     // ownership como +1/-1 que detectores locais por tamanho não enxergam.
+    const auditFocusIds = firstAudit ? null : focusIds;
     const semantic = await scanFinalCriticalAudit(
       blocks,
       current,
       plan,
       job,
-      firstAudit ? null : focusIds
+      auditFocusIds
     );
 
     firstAudit = false;
 
-    let issues = mergeIssueLists(local, semantic);
+    const consensusLocal = applyFinalCriticalConsensus(local, semantic, auditFocusIds, job);
+    let issues = mergeIssueLists(consensusLocal, semantic);
 
     if (!issues.length) {
       console.log(
@@ -14458,7 +14485,8 @@ async function convergeFinalCriticalQuality(
         current,
         plan,
         job,
-        issues
+        issues,
+        { extraOnly: true }
       );
     }
 
@@ -16224,7 +16252,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.2 — 8.4.1 MULTILINGUAL CORE + FINAL AUDIT SCHEMA-SAFE"
+        " STREMIO PT-BR 8.4.3 - 8.4.2 CORE + CONVERGENCE CONSENSUS + FOCUSED REPAIR"
   );
 
   console.log(
@@ -16455,6 +16483,9 @@ console.log(
   console.log(
     "Final Audit 8.4.2: lotes <=80 + schema sem maxItems + fallback adaptativo para HTTP 400 ✅"
   );
+
+  console.log("Convergence 8.4.3: 2 clean semantic audits can clear ambiguous heuristic-only blockers. OK");
+  console.log("Focused Repair 8.4.3: Final Critical repairs only current-round blockers. OK");
 
   console.log(
     "Job Retry 8.4.2: falha transitória não vira failed nem cacheia safe draft; permanece processing ✅"
