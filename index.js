@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.3.19 — UNIVERSAL SDH + CONTEXTUAL PERFORMANCE MUSIC + DIALOGUE TURN LOCK + MAIN EMPTY-CUE RESCUE
+// STREMIO PT-BR 8.4.0 — SOURCE HYGIENE + GENDER INTEGRITY V2 + SEMANTIC OWNERSHIP AUDIT + FINAL CRITICAL CONVERGENCE
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -21,7 +21,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.3.19-sdh-music-dialogue-turn-lock";
+  "8.4.0-source-hygiene-gender-v2-semantic-ownership-final-convergence";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -89,7 +89,7 @@ const REPAIR_TIMEOUT_MS = 90000;
 const REPAIR_HTTP_RETRIES = 3;
 const REPAIR_PARSE_ATTEMPTS = 2;
 
-// QA semântico EN×PT para TODAS as fontes.
+// QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
 const QA_BATCH_MAX_CUES = 160;
@@ -103,6 +103,32 @@ const QA_MAX_FLAGS_TOTAL = 120;
 const QA_CONCURRENCY = 2;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
+
+// ============================================================
+// FINAL CRITICAL CONVERGENCE — 8.4.0
+// ============================================================
+// Um problema de QUALIDADE não encerra o job. O gate audita a legenda
+// que seria realmente servida e corrige somente os cues reprovados
+// até que não reste defeito crítico. Falhas transitórias de Gemini
+// também entram em retry; não viram "failed" por conveniência.
+const FINAL_CRITICAL_GATE_ENABLED = true;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 120;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 42000;
+const FINAL_CRITICAL_AUDIT_CONCURRENCY = 2;
+const FINAL_CRITICAL_AUDIT_THINKING = "high";
+const FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS = 10000;
+const FINAL_CRITICAL_AUDIT_TIMEOUT_MS = 120000;
+const FINAL_CRITICAL_AUDIT_HTTP_RETRIES = 4;
+const FINAL_CRITICAL_MAX_ISSUES = 360;
+const FINAL_CRITICAL_RETRY_BASE_MS = 4300;
+const FINAL_CRITICAL_RETRY_MAX_MS = 60000;
+const FINAL_CRITICAL_CONTEXT_RADIUS = 1;
+const FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER = 2;
+const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 12;
+const FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
+const FINAL_CRITICAL_ESCALATED_TIMEOUT_MS = 120000;
+const JOB_RETRY_BASE_MS = 5000;
+const JOB_RETRY_MAX_MS = 60000;
 
 // ============================================================
 // SUBTITLE LAYOUT LOCK
@@ -853,6 +879,14 @@ function createJob({
       qa429: 0,
       qaParseRetries: 0,
       qaFlags: 0,
+
+      finalCriticalRounds: 0,
+      finalCriticalAuditCalls: 0,
+      finalCriticalFlags: 0,
+      finalCriticalRepairRounds: 0,
+      finalCriticalTechnicalRetries: 0,
+      finalCriticalNoProgressEscalations: 0,
+      jobRetries: 0,
 
       pacerWaitMs: 0,
 
@@ -2328,6 +2362,67 @@ function looksLikeCaptionCredit(
   );
 }
 
+// ============================================================
+// SOURCE HYGIENE 8.4.0
+// ============================================================
+// Alguns SRTs/OCRs convertem símbolos musicais em lixo textual, por
+// exemplo: Ff, ff, J'j', J“j“ ou wrappers J“ ... j“.
+//
+// Regras conservadoras:
+// - wrapper com CONTEÚDO real: remove só o wrapper e preserva a fala/letra;
+// - marcador isolado sem conteúdo: remove o cue antes do Gemini;
+// - pontuação isolada (..., …, -- etc.) não vira legenda inventada.
+function stripPseudoMusicOcrWrappers(value) {
+  let text = String(value || "").trim();
+
+  // J“ in the land ... j“  -> in the land ...
+  // j" I was an angel j"   -> I was an angel
+  text = text
+    .replace(/^\s*[Jj]\s*[“”"'‘’`´]+\s*/u, "")
+    .replace(/\s*[Jj]\s*[“”"'‘’`´]+\s*$/u, "")
+    .trim();
+
+  return text;
+}
+
+function looksLikeSourceGarbageLine(value) {
+  const text = String(value || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\{\\[^}]+\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return true;
+
+  if (/^(?:f{2,4})$/iu.test(text)) return true;
+
+  if (
+    /^(?:[Jj]\s*[“”"'‘’`´]+\s*[Jj]\s*[“”"'‘’`´]*|[Jj]\s*(?:\.{2,}|…+|-+))$/u.test(text)
+  ) {
+    return true;
+  }
+
+  if (/^[.·•…,:;!?_~*#@\-–—/\\|\s]+$/u.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+function looksLikeFinalGarbageCue(value) {
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return true;
+
+  return (
+    /^(?:f{2,4})$/iu.test(text) ||
+    /^(?:[Jj]\s*[“”"'‘’`´]+\s*[Jj]\s*[“”"'‘’`´]*|[Jj]\s*(?:\.{2,}|…+|-+))$/u.test(text) ||
+    /^[.·•…,:;!?_~*#@\-–—/\\|\s]+$/u.test(text)
+  );
+}
+
 function cleanSourceLine(line) {
   let text =
     stripMarkup(
@@ -2337,6 +2432,19 @@ function cleanSourceLine(line) {
   if (
     !text ||
     looksLikeCaptionCredit(
+      text
+    )
+  ) {
+    return "";
+  }
+
+  text =
+    stripPseudoMusicOcrWrappers(
+      text
+    );
+
+  if (
+    looksLikeSourceGarbageLine(
       text
     )
   ) {
@@ -2370,6 +2478,14 @@ function cleanSourceLine(line) {
     normalizeNoiseSymbols(
       text
     );
+
+  if (
+    looksLikeSourceGarbageLine(
+      text
+    )
+  ) {
+    return "";
+  }
 
   text =
     text
@@ -4371,8 +4487,11 @@ function sanitizeTranslationMap(
           before
         );
 
+      // 8.4.0: NUNCA inventar "…" para esconder vazio.
+      // Se ainda estiver vazio, ele permanece vazio e será tratado
+      // como defeito CRÍTICO pelo Final Critical Gate.
       if (!after) {
-        after = "…";
+        after = "";
       }
 
       rescuedEmpty++;
@@ -4380,7 +4499,8 @@ function sanitizeTranslationMap(
       console.warn(
         `[FORMAT LOCK] cue ${
           block.index
-        } ficaria vazio; fallback conservador aplicado | raw=${
+        } ficou vazio após sanitização; ` +
+        `será obrigado a passar pelo rescue crítico | raw=${
           JSON.stringify(
             before.slice(
               0,
@@ -4983,7 +5103,7 @@ function auditTimestamps(
 // ============================================================
 
 const STYLE_PACK = `
-PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.3.19
+PORTUGUÊS BRASILEIRO NATURAL — GUIA EDITORIAL 8.4.0
 
 IDIOMA DA FONTE
 - A fonte normalmente é inglês, mas pode ser espanhol ou outro idioma.
@@ -10398,6 +10518,85 @@ function literalCalqueReasons(
   return reasons;
 }
 
+function sourceLanguageIsEnglish(value) {
+  return /^(?:en|eng)(?:[-_][a-z]{2,4})?$/iu.test(
+    String(value || "").trim()
+  );
+}
+
+function sourceLanguageIsKnownNonEnglish(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return Boolean(
+    text &&
+    !["auto", "und", "unknown", "unk"].includes(text) &&
+    !sourceLanguageIsEnglish(text)
+  );
+}
+
+function looksPredominantlyEnglishSource(value) {
+  const tokens = words(value);
+  if (!tokens.length) return false;
+
+  const common = new Set([
+    "the", "a", "an", "and", "or", "but", "i", "you", "he", "she",
+    "we", "they", "it", "is", "are", "was", "were", "be", "been",
+    "to", "of", "in", "on", "for", "with", "that", "this", "what",
+    "who", "where", "when", "why", "how", "my", "your", "his", "her",
+    "our", "their", "do", "does", "did", "have", "has", "had", "not"
+  ]);
+
+  const hits = tokens.filter(token => common.has(token)).length;
+  return hits >= 2 || (tokens.length >= 4 && hits / tokens.length >= 0.25);
+}
+
+function blockSourceIsEnglish(block) {
+  if (sourceLanguageIsEnglish(block?.sourceLang)) return true;
+  if (sourceLanguageIsKnownNonEnglish(block?.sourceLang)) return false;
+  return looksPredominantlyEnglishSource(block?.text || "");
+}
+
+const FIRST_PERSON_MALE_MARKERS = [
+  /\bobrigado\b/iu,
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|nascido|criado|preparado|acostumado)\b/iu,
+  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|preparado|acostumado)\b/iu
+];
+
+const FIRST_PERSON_FEMALE_MARKERS = [
+  /\bobrigada\b/iu,
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|nascida|criada|preparada|acostumada|gr[aá]vida)\b/iu,
+  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|preparada|acostumada|gr[aá]vida)\b/iu
+];
+
+function genderIntegrityV2Reasons(block, pt, plan) {
+  const text = String(pt || "");
+  if (!text.trim()) return [];
+
+  const male = FIRST_PERSON_MALE_MARKERS.some(re => re.test(text));
+  const female = FIRST_PERSON_FEMALE_MARKERS.some(re => re.test(text));
+  const reasons = [];
+
+  if (male && female) {
+    reasons.push("GENDER_V2_SELF_CONTRADICTION");
+  }
+
+  const lock = identityLockForCapsule(block, plan);
+  const trusted = lock.trusted_speaker_gender;
+
+  if (trusted === "female" && male) {
+    reasons.push("GENDER_V2_TRUSTED_FEMALE_MASCULINE_SELF_MARKER");
+  }
+
+  if (trusted === "male" && female) {
+    reasons.push("GENDER_V2_TRUSTED_MALE_FEMININE_SELF_MARKER");
+  }
+
+  if (!trusted && (male || female)) {
+    reasons.push("GENDER_V2_UNKNOWN_SPEAKER_MARKED");
+  }
+
+  return [...new Set(reasons)];
+}
+
 const UNKNOWN_SPEAKER_GENDERED_STATE_RE =
   /\b(?:estou|t[oô]|fiquei|estava|sou|me\s+sinto)\s+(?:muito\s+)?(?:assustad[oa]s?|cansad[oa]s?|preocupad[oa]s?|nervos[oa]s?|sozinh[oa]s?|pront[oa]s?|lou[cq][oa]s?|chocad[oa]s?|confus[oa]s?|exaust[oa]s?|orgulhos[oa]s?|aliviad[oa]s?|animad[oa]s?|decepcionad[oa]s?|desesperad[oa]s?|irritad[oa]s?|furios[oa]s?|envergonhad[oa]s?|surpres[oa]s?)\b/i;
 
@@ -10476,6 +10675,7 @@ function localReasonsForCue(
   }
 
   if (
+    blockSourceIsEnglish(block) &&
     enCount >= 5 &&
     copiedEnglishRatio(
       en,
@@ -10485,6 +10685,27 @@ function localReasonsForCue(
     reasons.push(
       "POSSIBLE_UNTRANSLATED"
     );
+  }
+
+  if (
+    looksLikeFinalGarbageCue(
+      translated
+    )
+  ) {
+    reasons.push(
+      "FINAL_GARBAGE_OR_PLACEHOLDER"
+    );
+  }
+
+  for (
+    const reason of
+    genderIntegrityV2Reasons(
+      block,
+      translated,
+      plan
+    )
+  ) {
+    reasons.push(reason);
   }
 
   if (
@@ -10777,6 +10998,7 @@ function localReasonsForCue(
   }
 
   if (
+    blockSourceIsEnglish(block) &&
     unknownSpeakerGenderRisk(
       block,
       translated,
@@ -11081,6 +11303,10 @@ function issuePriority(issue) {
   // ==========================================================
 
   if (
+    /FINAL_CRITICAL/i.test(joined) ||
+    /GENDER_V2_/i.test(joined) ||
+    /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
+    /CUE_OWNERSHIP_SHIFT/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
     /POSSIBLE_OMISSION/i.test(joined) ||
     /POSSIBLE_CUE_SHIFT_PAIR/i.test(joined) ||
@@ -11571,7 +11797,8 @@ function repairCandidateRegressionReasons(
   block,
   beforePt,
   candidatePt,
-  filename
+  filename,
+  plan = null
 ) {
     const before = String(beforePt || "").trim();
   const candidate = String(candidatePt || "").trim();
@@ -11598,7 +11825,8 @@ function repairCandidateRegressionReasons(
     localReasonsForCue(
       block,
       before,
-      filename
+      filename,
+      plan
     )
   );
 
@@ -11606,14 +11834,15 @@ function repairCandidateRegressionReasons(
     localReasonsForCue(
       block,
       candidate,
-      filename
+      filename,
+      plan
     );
 
   const regressions = [];
 
   for (const reason of afterReasons) {
     const isCriticalRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V2_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_SHIFT)/i.test(
         reason
       );
 
@@ -11923,7 +12152,8 @@ job.stats.localFlags =
             block,
             beforePt,
             candidatePt,
-            job.filename
+            job.filename,
+            plan
           );
 
         if (regressions.length) {
@@ -12432,7 +12662,8 @@ async function runCompactRescue(
               block,
               beforePt,
               candidatePt,
-              job.filename
+              job.filename,
+              plan
             );
 
           if (regressions.length) {
@@ -12839,7 +13070,8 @@ async function trySemanticCompactCorrection({
       block,
       semanticCandidate,
       candidate,
-      job.filename
+      job.filename,
+      plan
     );
 
   if (
@@ -13314,7 +13546,8 @@ if (
             block,
             currentPt,
             candidatePt,
-            job.filename
+            job.filename,
+            plan
           );
 
         if (regressions.length) {
@@ -13368,6 +13601,689 @@ if (
   return updated;
 }
 
+// ============================================================
+// FINAL CRITICAL GATE 8.4.0
+// ============================================================
+// IMPORTANTE: SOURCE pode ser inglês, espanhol, francês, italiano,
+// alemão, neerlandês ou qualquer outro idioma que a Ponte tenha
+// escolhido. Inglês é preferência de seleção, NÃO pré-condição.
+const FINAL_CRITICAL_AUDIT_PROMPT = `
+Você é o FINAL CRITICAL AUDITOR de legendas SOURCE→PT-BR.
+
+SOURCE é a legenda-fonte REAL escolhida pelo orquestrador e pode estar
+em QUALQUER idioma. O rótulo EN usado em partes antigas do sistema é
+apenas legado interno. NUNCA presuma inglês.
+
+Sua função é encontrar SOMENTE defeitos CRÍTICOS. Não faça revisão
+cosmética e não marque uma alternativa apenas porque você escreveria diferente.
+
+Para cada cue, compare primeiro SOURCE[i] com PT[i]. Os cues aparecem em
+ordem cronológica e os vizinhos servem apenas para contexto.
+
+1) CUE OWNERSHIP — CRÍTICO
+- PT[i] precisa traduzir SOURCE[i], não SOURCE[i-1] nem SOURCE[i+1].
+- Se PT[i] traduz claramente o vizinho, marque category=CUE_OWNERSHIP_SHIFT.
+- Se houver uma cadeia deslocada +1/-1, marque TODOS os IDs afetados.
+- Continuação legítima de frase entre cues não é shift: cada ID preserva
+  somente a parte pertencente ao SOURCE daquele mesmo ID.
+
+2) GENDER / REFERENT — CRÍTICO
+- Respeite identidade_lock e evidência real da cena.
+- Speaker é quem fala; mentions são pessoas citadas.
+- Não transfira gênero entre speaker e pessoa mencionada.
+- Speaker desconhecido NÃO autoriza adivinhar masculino/feminino.
+- Se PT marcar gênero sem evidência segura quando seria possível neutralizar,
+  marque category=GENDER_OR_REFERENT.
+- Contradição dentro do mesmo speaker no mesmo cue é sempre crítica,
+  por exemplo masculino em uma palavra e feminino em outra sem mudança de referente.
+
+3) MEANING INTEGRITY — CRÍTICO
+Marque somente perda/troca/invenção real de informação importante:
+negação, ação, sujeito, objeto, quantidade, relação, causa, condição,
+contraste, intensidade, insulto, referente ou informação narrativa.
+category=MEANING_INTEGRITY.
+
+4) GARBAGE / EMPTY — CRÍTICO
+- PT vazio para SOURCE verbal não vazio;
+- lixo isolado como Ff, ff, J..., J-, J'j', reticências/pontuação sem fala;
+- placeholder ou resíduo evidente de OCR que não comunica fala.
+category=GARBAGE_OR_EMPTY.
+
+5) DIALOGUE / SDH — CRÍTICO
+- speaker/turn perdido ou unido quando SOURCE tem múltiplos turns;
+- descrição SDH inventada no lugar da fala.
+category=DIALOGUE_OR_SDH.
+
+NÃO marque:
+- mera preferência estilística;
+- uma tradução natural diferente mas fiel;
+- diferença de ordem sintática legítima em português;
+- ausência de correspondência palavra por palavra.
+
+A saída contém somente issues reais. reason deve explicar brevemente a prova.
+`;
+
+const FINAL_CRITICAL_REPAIR_PROMPT = `
+Você é o RESCUE CRÍTICO FINAL de legendas SOURCE→PT-BR.
+
+SOURCE pode estar em QUALQUER idioma. O idioma real do campo source é a
+autoridade. Você NÃO está editando por estilo: está reconstruindo do zero
+somente cues que falharam num gate crítico.
+
+Para cada item:
+- traduza EXCLUSIVAMENTE source daquele mesmo i;
+- current_pt é apenas evidência do erro atual, NÃO é autoridade;
+- before/after são contexto e JAMAIS podem fornecer conteúdo para o target;
+- reasons dizem exatamente por que o cue foi reprovado;
+- identity_lock é obrigatório;
+- se speaker for desconhecido, neutralize gênero de 1ª pessoa naturalmente;
+- nunca produza lixo/placeholder/reticências para preencher vazio;
+- preserve exatamente os hard_locks __LOCK_C...__;
+- preserve exatamente turns de diálogo quando dialogue_turn_count >= 2;
+- não altere timestamp, não crie cue e não mova conteúdo.
+
+CUE OWNERSHIP:
+Se o current_pt estiver deslocado para o cue anterior/seguinte, IGNORE-O e
+reconstrua a tradução diretamente do source do mesmo ID.
+
+GÊNERO:
+Se não houver prova segura, prefira formulações naturais sem marca de gênero.
+Nunca misture masculino e feminino para o mesmo speaker/referente.
+
+LAYOUT:
+Se possível, escreva de modo naturalmente conciso para caber em no máximo
+${LAYOUT_MAX_LINES} linhas de ${LAYOUT_MAX_CHARS_PER_LINE} caracteres sem
+remover informação.
+
+Devolva exatamente um objeto por cue recebido.
+`;
+
+const FINAL_CRITICAL_AUDIT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    issues: {
+      type: "array",
+      maxItems: FINAL_CRITICAL_MAX_ISSUES,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: { type: "integer" },
+          category: { type: "string" },
+          reason: { type: "string" }
+        },
+        required: ["i", "category", "reason"]
+      }
+    }
+  },
+  required: ["issues"]
+};
+
+function finalCriticalIssueSignature(issues) {
+  return (Array.isArray(issues) ? issues : [])
+    .map(issue => `${Number(issue.id)}:${(issue.reasons || []).join("|")}`)
+    .sort()
+    .join(";;");
+}
+
+// JavaScript não suporta flag /x. Mantemos a expressão acima legível
+// através desta implementação real equivalente.
+function finalReasonBlocks(reason) {
+  return /FINAL_CRITICAL|GENDER_V2_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+    String(reason || "")
+  );
+}
+
+function blockingLocalIssues(blocks, translations, job, plan) {
+  return detectLocalIssues(
+    blocks,
+    translations,
+    job.filename,
+    plan
+  )
+    .map(issue => ({
+      id: issue.id,
+      reasons: (issue.reasons || []).filter(finalReasonBlocks)
+    }))
+    .filter(issue => issue.reasons.length);
+}
+
+function finalCriticalAuditItem(block, translations, plan) {
+  return {
+    i: block.index,
+    source: String(block.text || ""),
+    pt: String(translations.get(block.index) || ""),
+    identity_lock: conciseIdentityForQa(block, plan),
+    dialogue_turn_count: sourceDialogueDashCount(block)
+  };
+}
+
+function buildFinalCriticalAuditBatches(
+  blocks,
+  translations,
+  plan,
+  focusIds = null
+) {
+  const focus = focusIds && focusIds.size
+    ? new Set([...focusIds].map(Number))
+    : null;
+
+  const targets = blocks.filter(block => !focus || focus.has(block.index));
+  const batches = [];
+  let current = [];
+  let chars = 0;
+
+  const posMap = positionMap(blocks);
+
+  const flush = () => {
+    if (!current.length) return;
+
+    const firstPos = posMap.get(current[0].i);
+    const lastPos = posMap.get(current[current.length - 1].i);
+
+    const before = Number.isInteger(firstPos) && firstPos > 0
+      ? finalCriticalAuditItem(blocks[firstPos - 1], translations, plan)
+      : null;
+
+    const after = Number.isInteger(lastPos) && lastPos + 1 < blocks.length
+      ? finalCriticalAuditItem(blocks[lastPos + 1], translations, plan)
+      : null;
+
+    batches.push({
+      targetIds: new Set(current.map(item => item.i)),
+      cues: [
+        ...(before ? [{ ...before, context_only: true }] : []),
+        ...current.map(item => ({ ...item, context_only: false })),
+        ...(after ? [{ ...after, context_only: true }] : [])
+      ]
+    });
+
+    current = [];
+    chars = 0;
+  };
+
+  for (const block of targets) {
+    const item = finalCriticalAuditItem(block, translations, plan);
+    const size = JSON.stringify(item).length;
+
+    if (
+      current.length &&
+      (
+        current.length >= FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES ||
+        chars + size > FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS
+      )
+    ) {
+      flush();
+    }
+
+    current.push(item);
+    chars += size;
+  }
+
+  flush();
+  return batches;
+}
+
+async function finalCriticalGeminiRequest(args, job, label) {
+  let failures = 0;
+
+  while (true) {
+    try {
+      return await geminiRequest(args);
+    } catch (error) {
+      failures++;
+      job.stats.finalCriticalTechnicalRetries =
+        (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+
+      const waitMs = Math.min(
+        FINAL_CRITICAL_RETRY_MAX_MS,
+        FINAL_CRITICAL_RETRY_BASE_MS * Math.pow(1.65, Math.min(failures - 1, 8))
+      );
+
+      job.error =
+        `RETRY ${label}: ${errorMessage(error).slice(0, 260)}`;
+      job.status = "processing";
+      job.progress = Math.min(99, Math.max(94, job.progress || 0));
+      job.updatedAt = Date.now();
+
+      console.warn(
+        `[FINAL CRITICAL RETRY] ${label} falhou (${failures}); ` +
+        `job continua vivo; nova tentativa em ${(waitMs / 1000).toFixed(1)}s | ` +
+        `${errorMessage(error).slice(0, 320)}`
+      );
+
+      await sleep(waitMs);
+    }
+  }
+}
+
+function parseFinalCriticalAudit(text, allowedIds) {
+  const parsed = JSON.parse(stripCodeFences(text));
+  const raw = Array.isArray(parsed?.issues) ? parsed.issues : [];
+  const out = [];
+  const seen = new Set();
+
+  for (const issue of raw) {
+    const id = Number(issue?.i);
+    if (!Number.isInteger(id) || !allowedIds.has(id) || seen.has(id)) continue;
+    seen.add(id);
+
+    const category = String(issue?.category || "CRITICAL").trim().slice(0, 80);
+    const reason = String(issue?.reason || "defeito crítico").trim().slice(0, 260);
+
+    out.push({
+      id,
+      reasons: [`FINAL_CRITICAL:${category}: ${reason}`]
+    });
+  }
+
+  return out;
+}
+
+async function scanFinalCriticalAudit(
+  blocks,
+  translations,
+  plan,
+  job,
+  focusIds = null
+) {
+  if (!FINAL_CRITICAL_GATE_ENABLED) return [];
+
+  const batches = buildFinalCriticalAuditBatches(
+    blocks,
+    translations,
+    plan,
+    focusIds
+  );
+
+  if (!batches.length) return [];
+
+  const results = new Array(batches.length);
+  let cursor = 0;
+
+  console.log(
+    `[FINAL CRITICAL AUDIT] ${batches.length} lote(s) | ` +
+    `fonte=${job.sourceLang || "auto"} | ` +
+    `escopo=${focusIds?.size ? `${focusIds.size} cue(s) focais` : "episódio completo"}.`
+  );
+
+  async function worker(workerId) {
+    while (true) {
+      const index = cursor++;
+      if (index >= batches.length) return;
+
+      const batch = batches[index];
+      let parsed = null;
+      let parseFailures = 0;
+
+      while (!parsed) {
+        const response = await finalCriticalGeminiRequest(
+          {
+            system: FINAL_CRITICAL_AUDIT_PROMPT,
+            user:
+              `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
+              `IMPORTANTE: use o idioma REAL encontrado em SOURCE; não presuma inglês.\n\n` +
+              `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
+              `CUES EM ORDEM CRONOLÓGICA:\n${JSON.stringify(batch.cues)}\n\n` +
+              `Audite SOMENTE context_only=false. context_only=true existe apenas para comparar vizinhos.`,
+            schema: FINAL_CRITICAL_AUDIT_SCHEMA,
+            thinkingLevel: FINAL_CRITICAL_AUDIT_THINKING,
+            maxOutputTokens: FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS,
+            timeoutMs: FINAL_CRITICAL_AUDIT_TIMEOUT_MS,
+            maxRetries: FINAL_CRITICAL_AUDIT_HTTP_RETRIES,
+            job,
+            metric: "qa"
+          },
+          job,
+          `AUDIT W${workerId} lote ${index + 1}`
+        );
+
+        job.stats.finalCriticalAuditCalls =
+          (job.stats.finalCriticalAuditCalls || 0) + 1;
+
+        try {
+          parsed = parseFinalCriticalAudit(
+            response.text,
+            batch.targetIds
+          );
+        } catch (error) {
+          parseFailures++;
+          job.stats.finalCriticalTechnicalRetries =
+            (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+
+          console.warn(
+            `[FINAL CRITICAL AUDIT] JSON inválido no lote ${index + 1} ` +
+            `(tentativa ${parseFailures}); repetindo sem matar job | ` +
+            `${errorMessage(error).slice(0, 220)}`
+          );
+
+          await sleep(
+            Math.min(
+              FINAL_CRITICAL_RETRY_MAX_MS,
+              FINAL_CRITICAL_RETRY_BASE_MS * Math.max(1, parseFailures)
+            )
+          );
+        }
+      }
+
+      results[index] = parsed;
+
+      console.log(
+        `[FINAL CRITICAL AUDIT W${workerId}] lote ${index + 1}/${batches.length}: ` +
+        `${parsed.length} crítico(s).`
+      );
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(FINAL_CRITICAL_AUDIT_CONCURRENCY, batches.length) },
+      (_, index) => worker(index + 1)
+    )
+  );
+
+  const merged = mergeIssueLists(...results.map(x => Array.isArray(x) ? x : []));
+  job.stats.finalCriticalFlags = merged.length;
+  return merged;
+}
+
+function idsFromIssues(issues, blocks, radius = FINAL_CRITICAL_CONTEXT_RADIUS) {
+  const posMap = positionMap(blocks);
+  const ids = new Set();
+
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    const pos = posMap.get(Number(issue?.id));
+    if (!Number.isInteger(pos)) continue;
+
+    for (let delta = -radius; delta <= radius; delta++) {
+      const block = blocks[pos + delta];
+      if (block) ids.add(block.index);
+    }
+  }
+
+  return ids;
+}
+
+async function runFinalCriticalEscalatedRepair(
+  blocks,
+  translations,
+  issues,
+  plan,
+  job
+) {
+  const posMap = positionMap(blocks);
+  const updated = new Map(translations);
+  const selected = [...issues].sort((a, b) => issuePriority(a) - issuePriority(b));
+
+  for (
+    let offset = 0;
+    offset < selected.length;
+    offset += FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES
+  ) {
+    const batchIssues = selected.slice(
+      offset,
+      offset + FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES
+    );
+
+    let completed = false;
+    let parseFailures = 0;
+
+    while (!completed) {
+      const locksById = new Map();
+
+      const cues = batchIssues.map(issue => {
+        const pos = posMap.get(issue.id);
+        const block = blocks[pos];
+        const protectedTarget = protectCulturalLocks(block.text, block.index);
+        locksById.set(block.index, protectedTarget.locks);
+
+        return {
+          i: block.index,
+          source: protectedTarget.text,
+          current_pt: String(updated.get(block.index) || ""),
+          reasons: issue.reasons,
+          identity_lock: identityLockForCapsule(block, plan),
+          dialogue_turn_count: sourceDialogueDashCount(block),
+          hard_locks: protectedTarget.locks.map(lock => lock.token),
+          before: blocks
+            .slice(Math.max(0, pos - 2), pos)
+            .map(item => ({
+              i: item.index,
+              source: item.text,
+              pt: String(updated.get(item.index) || "")
+            })),
+          after: blocks
+            .slice(pos + 1, Math.min(blocks.length, pos + 3))
+            .map(item => ({
+              i: item.index,
+              source: item.text,
+              pt: String(updated.get(item.index) || "")
+            }))
+        };
+      });
+
+      try {
+        const response = await finalCriticalGeminiRequest(
+          {
+            system: FINAL_CRITICAL_REPAIR_PROMPT,
+            user:
+              `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
+              `Use o idioma REAL de source.\n\n` +
+              `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
+              `CUES CRÍTICOS PARA RECONSTRUÇÃO:\n${JSON.stringify({ cues })}`,
+            schema: cueTranslationSchema(batchIssues.length),
+            thinkingLevel: "high",
+            maxOutputTokens: FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS,
+            timeoutMs: FINAL_CRITICAL_ESCALATED_TIMEOUT_MS,
+            maxRetries: REPAIR_HTTP_RETRIES,
+            job,
+            metric: "repair"
+          },
+          job,
+          `ESCALATED REPAIR ${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1}`
+        );
+
+        const repaired = parseCueTranslation(
+          batchIssues.map(issue => blocks[posMap.get(issue.id)]),
+          response.text,
+          locksById
+        );
+
+        let accepted = 0;
+
+        for (const [id, candidate] of repaired) {
+          const block = blocks[posMap.get(id)];
+          const beforePt = String(updated.get(id) || "");
+          const candidatePt = String(candidate || "").trim();
+
+          const regressions = repairCandidateRegressionReasons(
+            block,
+            beforePt,
+            candidatePt,
+            job.filename,
+            plan
+          );
+
+          if (regressions.length) {
+            console.warn(
+              `[FINAL CRITICAL ESCALATED] cue ${id} rejeitado localmente | ` +
+              `${regressions.join(", ")}.`
+            );
+            continue;
+          }
+
+          updated.set(id, candidatePt);
+          accepted++;
+        }
+
+        console.log(
+          `[FINAL CRITICAL ESCALATED] lote ` +
+          `${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1} | ` +
+          `aceitos=${accepted}/${batchIssues.length}.`
+        );
+
+        completed = true;
+      } catch (error) {
+        parseFailures++;
+        job.stats.finalCriticalTechnicalRetries =
+          (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+
+        const waitMs = Math.min(
+          FINAL_CRITICAL_RETRY_MAX_MS,
+          FINAL_CRITICAL_RETRY_BASE_MS * Math.max(1, parseFailures)
+        );
+
+        console.warn(
+          `[FINAL CRITICAL ESCALATED] lote não foi descartado; ` +
+          `repetindo em ${(waitMs / 1000).toFixed(1)}s | ` +
+          `${errorMessage(error).slice(0, 320)}`
+        );
+
+        await sleep(waitMs);
+      }
+    }
+  }
+
+  return updated;
+}
+
+async function convergeFinalCriticalQuality(
+  blocks,
+  translations,
+  plan,
+  job
+) {
+  if (!FINAL_CRITICAL_GATE_ENABLED) return translations;
+
+  let current = new Map(translations);
+  let previousSignature = "";
+  let stagnantRounds = 0;
+  let firstAudit = true;
+  let focusIds = null;
+
+  while (true) {
+    job.stats.finalCriticalRounds =
+      (job.stats.finalCriticalRounds || 0) + 1;
+
+    current = sanitizeTranslationMap(blocks, current, job);
+    current = applySubtitleLayout(blocks, current, "FINAL-CRITICAL-CANDIDATE");
+
+    const local = blockingLocalIssues(
+      blocks,
+      current,
+      job,
+      plan
+    );
+
+    // A primeira passagem é GLOBAL: exatamente para capturar cadeias de
+    // ownership como +1/-1 que detectores locais por tamanho não enxergam.
+    const semantic = await scanFinalCriticalAudit(
+      blocks,
+      current,
+      plan,
+      job,
+      firstAudit ? null : focusIds
+    );
+
+    firstAudit = false;
+
+    let issues = mergeIssueLists(local, semantic);
+
+    if (!issues.length) {
+      console.log(
+        `[FINAL CRITICAL GATE] PASSOU ✅ | ` +
+        `rounds=${job.stats.finalCriticalRounds} | ` +
+        `0 defeitos críticos; resultado autorizado para cache/serve.`
+      );
+
+      job.error = null;
+      return current;
+    }
+
+    logIssueSummary("FINAL-CRITICAL", issues);
+
+    const signature = finalCriticalIssueSignature(issues);
+    if (signature === previousSignature) {
+      stagnantRounds++;
+    } else {
+      stagnantRounds = 0;
+      previousSignature = signature;
+    }
+
+    if (stagnantRounds >= FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER) {
+      job.stats.finalCriticalNoProgressEscalations =
+        (job.stats.finalCriticalNoProgressEscalations || 0) + 1;
+
+      // Escalonamento: somente os cues efetivamente críticos entram no
+      // Repair, sem poluição de flags cosméticas. Continuamos repetindo
+      // quantas rodadas forem necessárias; não existe \"mata o episódio\".
+      console.warn(
+        `[FINAL CRITICAL ESCALATION] mesmos defeitos persistiram por ` +
+        `${stagnantRounds + 1} rodada(s); repair hiperfocado nos IDs críticos.`
+      );
+    }
+
+    job.stats.finalCriticalRepairRounds =
+      (job.stats.finalCriticalRepairRounds || 0) + 1;
+
+    const before = new Map(current);
+
+    if (
+      stagnantRounds >= FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER
+    ) {
+      current = await runFinalCriticalEscalatedRepair(
+        blocks,
+        current,
+        issues,
+        plan,
+        job
+      );
+    } else {
+      current = await tryFocusedRepair(
+        blocks,
+        current,
+        plan,
+        job,
+        issues
+      );
+    }
+
+    current = sanitizeTranslationMap(blocks, current, job);
+
+    // Qualquer overflow criado/retido é tratado imediatamente sem tocar
+    // nos timestamps nem nos cues já bons.
+    current = await runCompactRescue(
+      blocks,
+      current,
+      plan,
+      job
+    );
+
+    current = sanitizeTranslationMap(blocks, current, job);
+
+    const changedIds = new Set();
+    for (const block of blocks) {
+      const a = String(before.get(block.index) || "").replace(/\s+/g, " ").trim();
+      const b = String(current.get(block.index) || "").replace(/\s+/g, " ").trim();
+      if (a !== b) changedIds.add(block.index);
+    }
+
+    focusIds = idsFromIssues(issues, blocks);
+    for (const id of changedIds) focusIds.add(id);
+
+    job.status = "processing";
+    job.progress = 98;
+    job.updatedAt = Date.now();
+
+    console.log(
+      `[FINAL CRITICAL GATE] rodada ${job.stats.finalCriticalRounds} ` +
+      `reprovou ${issues.length} cue(s); ` +
+      `${changedIds.size} cue(s) alterado(s); reauditoria focada continuará.`
+    );
+  }
+}
+
 async function translateSrt(
   sourceSrt,
   job
@@ -13386,11 +14302,15 @@ async function translateSrt(
     );
   }
 
+  for (const block of blocks) {
+    block.sourceLang = String(job.sourceLang || "auto");
+  }
+
   job.stats.sourceCues =
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.3.19] fonte=${
+    `[PIPELINE 8.4.0] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -13540,66 +14460,62 @@ finalTranslations =
   );
 
 // ============================================================
-// LAYOUT LOCK — FINAL
+// FINAL CRITICAL CONVERGENCE
 // ============================================================
-// A tradução final é diagramada deterministicamente.
-// Nenhuma palavra é cortada.
-// Nenhum conteúdo é movido para outro cue.
-// Nenhum timestamp é criado ou alterado.
+// Diferente do 8.3.x, defeito crítico remanescente NÃO é apenas logado
+// e NÃO autoriza cache/serve. O job continua vivo e corrige só os cues
+// reprovados até que o gate passe.
+finalTranslations =
+  await convergeFinalCriticalQuality(
+    blocks,
+    finalTranslations,
+    plan,
+    job
+  );
+
+// Layout final exatamente do texto autorizado pelo gate.
 const finalLayoutTranslations =
   applySubtitleLayout(
     blocks,
     finalTranslations,
-    "FINAL"
+    "FINAL-AUTHORIZED"
   );
 
- const finalLayoutOverflow =
+const finalLayoutOverflow =
   collectCompactRescueIssues(
     blocks,
     finalLayoutTranslations
   );
 
-if (!finalLayoutOverflow.length) {
-  console.log(
-    `[LAYOUT HARD CAP] PASSOU ✅ | ` +
-    `${blocks.length}/${blocks.length} cues em no máximo ` +
-    `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}.`
-  );
-} else {
+if (finalLayoutOverflow.length) {
+  // Em teoria convergeFinalCriticalQuality já impede isto.
+  // Se alguma mudança futura quebrar a invariável, voltamos ao próprio
+  // gate em vez de publicar silenciosamente.
   console.warn(
-    `[LAYOUT HARD CAP] ATENÇÃO ❌ | ` +
-    `${finalLayoutOverflow.length} cue(s) ainda excedem ` +
-    `${LAYOUT_MAX_LINES}x${LAYOUT_MAX_CHARS_PER_LINE}. ` +
-    `Conteúdo NÃO foi truncado.`
+    `[LAYOUT HARD CAP] ${finalLayoutOverflow.length} overflow(s) ` +
+    `apareceram após autorização; reabrindo gate crítico.`
   );
+
+  finalTranslations =
+    await convergeFinalCriticalQuality(
+      blocks,
+      finalLayoutTranslations,
+      plan,
+      job
+    );
 }
-  
-// O guard final analisa exatamente o texto que será servido.
-const remaining =
-  detectLocalIssues(
+
+const authorizedLayoutTranslations =
+  applySubtitleLayout(
     blocks,
-    finalLayoutTranslations,
-    job.filename,
-    plan
+    finalTranslations,
+    "FINAL-AUTHORIZED-2"
   );
-
-if (remaining.length) {
-  logIssueSummary(
-    "PÓS-REPAIR",
-    remaining
-  );
-
-  console.log(
-    `[POST-REPAIR GUARD] ${
-      remaining.length
-    } cue(s) ainda sinalizado(s) após o repair; mantendo o primeiro repair para evitar retradução repetitiva e perda de velocidade.`
-  );
-}
 
 const finalSrt =
   buildSrt(
     blocks,
-    finalLayoutTranslations
+    authorizedLayoutTranslations
   );
 
 auditTimestamps(
@@ -13608,7 +14524,7 @@ auditTimestamps(
   "FINAL"
 );
   console.log(
-    `[PIPELINE 8.3.18] FINAL OK | ${
+    `[PIPELINE 8.4.0] FINAL OK | ${
       blocks.length
     } cues | ${
       (
@@ -13627,123 +14543,73 @@ auditTimestamps(
 async function processJob(
   job
 ) {
-  job.status =
-    "processing";
+  job.status = "processing";
+  job.progress = Math.max(1, job.progress || 0);
+  job.updatedAt = Date.now();
 
-  job.progress =
-    Math.max(
-      1,
-      job.progress || 0
-    );
+  let attempt = 0;
 
-  job.updatedAt =
-    Date.now();
+  while (true) {
+    try {
+      const cached = getCache(job.cacheKey);
 
-  try {
-    const cached =
-      getCache(
-        job.cacheKey
-      );
+      if (cached) {
+        auditTimestamps(
+          job.sourceSrt,
+          cached,
+          "CACHE"
+        );
 
-    if (cached) {
-      auditTimestamps(
-        job.sourceSrt,
-        cached,
-        "CACHE"
-      );
+        job.result = cached;
+        job.status = "completed";
+        job.progress = 100;
+        job.error = null;
+        return;
+      }
 
-      job.result =
-        cached;
-
-      job.status =
-        "completed";
-
-      job.progress =
-        100;
-
-      return;
-    }
-
-    const finalSrt =
-      await translateSrt(
+      const finalSrt = await translateSrt(
         job.sourceSrt,
         job
       );
 
-    setCache(
-      job.cacheKey,
-      finalSrt
-    );
-
-    job.result =
-      finalSrt;
-
-    job.status =
-      "completed";
-
-    job.progress =
-      100;
-  } catch (error) {
-    if (job.safeDraft) {
-      try {
-        auditTimestamps(
-          job.sourceSrt,
-          job.safeDraft,
-          "SAFE-DRAFT-FALLBACK"
-        );
-
-        setCache(
-          job.cacheKey,
-          job.safeDraft
-        );
-
-        job.result =
-          job.safeDraft;
-
-        job.status =
-          "completed";
-
-        job.progress =
-          100;
-
-        job.stats.usedSafeDraftFallback =
-          true;
-
-        console.warn(
-          `[JOB ${
-            job.id
-          }] entregando SAFE DRAFT após erro opcional: ${
-            errorMessage(
-              error
-            ).slice(
-              0,
-              300
-            )
-          }`
-        );
-
-        return;
-      } catch {}
-    }
-
-    job.status =
-      "failed";
-
-    job.error =
-      errorMessage(
-        error
+      // Só chega aqui depois do FINAL CRITICAL GATE PASSAR.
+      setCache(
+        job.cacheKey,
+        finalSrt
       );
 
-    console.error(
-      `[JOB ${
-        job.id
-      }] Falhou: ${
-        job.error
-      }`
-    );
-  } finally {
-    job.updatedAt =
-      Date.now();
+      job.result = finalSrt;
+      job.status = "completed";
+      job.progress = 100;
+      job.error = null;
+      return;
+    } catch (error) {
+      attempt++;
+      job.stats.jobRetries =
+        (job.stats.jobRetries || 0) + 1;
+
+      const waitMs = Math.min(
+        JOB_RETRY_MAX_MS,
+        JOB_RETRY_BASE_MS * Math.pow(1.7, Math.min(attempt - 1, 7))
+      );
+
+      // 8.4.0: NÃO cachear safeDraft defeituoso e NÃO marcar failed.
+      // Mantemos o job vivo e repetimos. SafeDraft continua apenas como
+      // proteção interna/diagnóstico; nunca ganha selo FINAL por erro.
+      job.status = "processing";
+      job.progress = Math.min(99, Math.max(1, job.progress || 1));
+      job.error =
+        `RETRYING (${attempt}): ${errorMessage(error).slice(0, 500)}`;
+      job.updatedAt = Date.now();
+
+      console.warn(
+        `[JOB ${job.id}] erro não matou a legenda; ` +
+        `retry ${attempt} em ${(waitMs / 1000).toFixed(1)}s | ` +
+        `${errorMessage(error).slice(0, 420)}`
+      );
+
+      await sleep(waitMs);
+    }
   }
 }
 
@@ -14009,7 +14875,7 @@ async function fetchOpenSubtitlesSource({
             "application/json",
 
           "User-Agent":
-            "Stremio-PTBR/8.3.19"
+            "Stremio-PTBR/8.4.0"
         }
       }
     );
@@ -14041,7 +14907,7 @@ async function fetchOpenSubtitlesSource({
       {
         headers: {
           "User-Agent":
-            "Stremio-PTBR/8.3.18"
+            "Stremio-PTBR/8.4.0"
         }
       }
     );
@@ -14327,13 +15193,13 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.3.19",
+    "8.4.0",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
 
   description:
-    "OpenSubtitles inglês → PT-BR com Context + Identity Lock, Character Ledger, Cue Ownership, HARD SDH, QA EN×PT e suporte ao OpenSub Sync V5 por Gemini Transcribe, Character Ledger compatível e QA anti-literalidade.",
+    "OpenSubtitles inglês → PT-BR com Context + Identity Lock, Character Ledger, Cue Ownership, HARD SDH, QA SOURCE×PT e suporte ao OpenSub Sync V5 por Gemini Transcribe, Character Ledger compatível e QA anti-literalidade.",
 
   resources: [
     "subtitles"
@@ -15068,11 +15934,19 @@ app.get(
       job.status ===
       "failed"
     ) {
+      console.warn(
+        `[SELF-HEAL 8.4.0] job ${job.id} estava failed; ` +
+        `reativando como processing em vez de matar a legenda.`
+      );
+
+      job.status = "pending";
+      job.started = false;
+      startJob(job);
+
       return sendSrt(
         res,
-        errorSrt(
-          job.error
-        )
+        processingSrt(job),
+        "no-store, no-cache, must-revalidate"
       );
     }
 
@@ -15094,7 +15968,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.3.19 — UNIVERSAL SDH + CONTEXTUAL PERFORMANCE MUSIC + DIALOGUE TURN LOCK + MAIN EMPTY-CUE RESCUE"
+        " STREMIO PT-BR 8.4.0 — SOURCE HYGIENE + GENDER V2 + SEMANTIC OWNERSHIP + FINAL CONVERGENCE"
   );
 
   console.log(
@@ -15279,7 +16153,7 @@ console.log(
   );
 
   console.log(
-    `PT-BR QA contextual EN×PT + Identity Lock + anti-literalidade: ATIVO | concorrência=${QA_CONCURRENCY} ✅`
+    `PT-BR QA contextual SOURCE×PT + Identity Lock + anti-literalidade: ATIVO | concorrência=${QA_CONCURRENCY} ✅`
   );
 
   console.log(
@@ -15299,11 +16173,31 @@ console.log(
   );
 
   console.log(
-    "Repair: UMA passada cirúrgica; sem segunda retradução ✅"
+    "Repair inicial: cirúrgico; Final Critical Gate repete SOMENTE cues críticos até convergir ✅"
   );
 
   console.log(
-    "SAFE DRAFT: ATIVO ✅"
+    "SAFE DRAFT: ATIVO ✅ (diagnóstico interno; nunca substitui FINAL crítico reprovado)"
+  );
+
+  console.log(
+    "Source Hygiene 8.4.0: Ff/J'j'/J“j“/pontuação isolada removidos; wrappers com conteúdo preservam o conteúdo ✅"
+  );
+
+  console.log(
+    "Gender Integrity V2: contradição intracuе + speaker unknown marcado + trusted gender hard-check ✅"
+  );
+
+  console.log(
+    "Semantic Ownership Audit: SOURCE[i]×PT[i] contra vizinhos; SOURCE pode ser QUALQUER idioma ✅"
+  );
+
+  console.log(
+    "Final Critical Gate: fail-closed para QUALIDADE, mas job permanece vivo e autocorrige até PASSAR ✅"
+  );
+
+  console.log(
+    "Job Retry 8.4.0: falha transitória não vira failed nem cacheia safe draft; permanece processing ✅"
   );
 
   console.log(
