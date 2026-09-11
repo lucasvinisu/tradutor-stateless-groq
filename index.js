@@ -10,7 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.3 - CONVERGENCE CONSENSUS + FOCUSED REPAIR
+// STREMIO PT-BR 8.4.4 - INTENTIONAL EMPTY CUES + NO FULL RESTART
+// 8.4.3 CONVERGENCE CONSENSUS + FOCUSED REPAIR PRESERVED
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -89,6 +90,11 @@ const MAIN_EMPTY_CUE_RESCUE_THINKING = "high";
 const MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS = 2400;
 const MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS = 90000;
 const MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES = 3;
+
+// 8.4.4: empty cue real nunca reinicia PLAN + MAIN. Após as tentativas
+// isoladas normais, o retry continua SOMENTE naquele cue com backoff.
+const MAIN_EMPTY_CUE_LOCAL_RETRY_BASE_MS = 4300;
+const MAIN_EMPTY_CUE_LOCAL_RETRY_MAX_MS = 60000;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
@@ -851,6 +857,9 @@ function createJob({
     createdAt: now,
     updatedAt: now,
 
+    // Relógio real da tradução: não reinicia em retry técnico.
+    translationStartedAt: null,
+
     expiresAt:
       now + JOB_TTL_MS,
 
@@ -874,6 +883,9 @@ function createJob({
       mainEmptyCueRescueCalls: 0,
       mainEmptyCueRescueParseRetries: 0,
       mainEmptyCueRescueFailures: 0,
+      mainEmptyCueLocalRetryCycles: 0,
+      mainIntentionalEmptyCues: 0,
+      mainSanitizedEmptyRecoveries: 0,
 
       localFlags: 0,
 
@@ -2541,6 +2553,60 @@ function cleanSourceLine(line) {
   }
 
   return text;
+}
+
+// ============================================================
+// INTENTIONAL EMPTY CUES — 8.4.4
+// ============================================================
+// Autoriza ausência visual SOMENTE se a própria SOURCE, reavaliada pelas
+// mesmas regras conservadoras de Source Hygiene, não contiver conteúdo
+// semântico. Qualquer fala, palavra, número ou bleep continua fail-closed.
+function sourceCueAllowsIntentionalEmpty(
+  block
+) {
+  const source =
+    String(
+      block?.text ||
+      ""
+    )
+      .replace(/\r/g, "")
+      .trim();
+
+  if (!source) {
+    return true;
+  }
+
+  const lines =
+    source
+      .split("\n")
+      .map(
+        line =>
+          String(
+            line || ""
+          ).trim()
+      )
+      .filter(Boolean);
+
+  if (!lines.length) {
+    return true;
+  }
+
+  for (const line of lines) {
+    const info =
+      extractSpeaker(
+        line
+      );
+
+    if (
+      cleanSourceLine(
+        info.text
+      )
+    ) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function subtitleClockToMs(
@@ -4473,7 +4539,9 @@ function sanitizeTranslationMap(
     new Map();
 
   let changes = 0;
-  let rescuedEmpty = 0;
+  let emptiedAfterSanitizer = 0;
+  let intentionalEmpty = 0;
+  let needsLocalRecovery = 0;
 
   for (
     const block of blocks
@@ -4498,28 +4566,48 @@ function sanitizeTranslationMap(
           before
         );
 
-      // 8.4.0: NUNCA inventar "…" para esconder vazio.
-      // Se ainda estiver vazio, ele permanece vazio e será tratado
-      // como defeito CRÍTICO pelo Final Critical Gate.
       if (!after) {
         after = "";
-      }
+        emptiedAfterSanitizer++;
 
-      rescuedEmpty++;
-
-      console.warn(
-        `[FORMAT LOCK] cue ${
-          block.index
-        } ficou vazio após sanitização; ` +
-        `será obrigado a passar pelo rescue crítico | raw=${
-          JSON.stringify(
-            before.slice(
-              0,
-              140
-            )
+        if (
+          sourceCueAllowsIntentionalEmpty(
+            block
           )
-        }`
-      );
+        ) {
+          intentionalEmpty++;
+
+          if (job) {
+            job.stats.mainIntentionalEmptyCues =
+              (
+                job.stats.mainIntentionalEmptyCues ||
+                0
+              ) + 1;
+          }
+
+          console.log(
+            `[INTENTIONAL EMPTY] cue ${
+              block.index
+            } autorizado: SOURCE sem conteúdo semântico utilizável.`
+          );
+        } else {
+          needsLocalRecovery++;
+
+          console.warn(
+            `[FORMAT LOCK] cue ${
+              block.index
+            } ficou vazio após sanitização, mas a SOURCE contém conteúdo real; ` +
+            `rescue LOCAL será obrigatório | raw=${
+              JSON.stringify(
+                before.slice(
+                  0,
+                  140
+                )
+              )
+            }`
+          );
+        }
+      }
     }
 
     if (
@@ -4546,9 +4634,14 @@ function sanitizeTranslationMap(
   console.log(
     `[FORMAT LOCK] ${
       changes
-    } cue(s) normalizado(s); ${
-      rescuedEmpty
-    } cue(s) resgatado(s) de vazio; SDH/ruído/alongamentos controlados.`
+    } cue(s) normalizado(s); ` +
+    `vazios pós-sanitizer=${
+      emptiedAfterSanitizer
+    }; intencionais=${
+      intentionalEmpty
+    }; rescue-local=${
+      needsLocalRecovery
+    }; SDH/ruído/alongamentos controlados.`
   );
 
   return out;
@@ -5027,28 +5120,36 @@ function buildSrt(
   blocks,
   translations
 ) {
-  return (
-    blocks
-      .map(
-        block =>
-          [
-            block.index,
-            block.timing,
+  const rendered = [];
 
-            normalizeEditorialVocab(
-              String(
-                translations.get(
-                  block.index
-                ) ??
-                block.text
-              )
-            ).trim()
-          ].join("\n")
-      )
-      .join("\n\n")
-      .trim() +
-    "\n"
-  );
+  for (const block of blocks) {
+    const text =
+      normalizeEditorialVocab(
+        String(
+          translations.get(
+            block.index
+          ) ??
+          block.text
+        )
+      ).trim();
+
+    // Vazio autorizado não vira "..." nem bloco visual artificial.
+    if (!text) {
+      continue;
+    }
+
+    rendered.push(
+      [
+        block.index,
+        block.timing,
+        text
+      ].join("\n")
+    );
+  }
+
+  return rendered.length
+    ? rendered.join("\n\n").trim() + "\n"
+    : "";
 }
 
 function auditTimestamps(
@@ -5062,40 +5163,83 @@ function auditTimestamps(
   const final =
     parseSrt(finalSrt);
 
-  if (
-    source.length !==
-    final.length
-  ) {
-    throw new Error(
-      `TIMING LOCK ${
-        label
-      }: ${
-        source.length
-      }/${
-        final.length
-      }.`
+  const finalById =
+    new Map();
+
+  for (const item of final) {
+    if (
+      finalById.has(
+        item.index
+      )
+    ) {
+      throw new Error(
+        `TIMING LOCK ${
+          label
+        }: cue duplicado ${
+          item.index
+        }.`
+      );
+    }
+
+    finalById.set(
+      item.index,
+      item
     );
   }
 
-  for (
-    let i = 0;
-    i < source.length;
-    i++
-  ) {
+  let intentionalOmitted = 0;
+
+  for (const sourceItem of source) {
+    const finalItem =
+      finalById.get(
+        sourceItem.index
+      );
+
+    if (!finalItem) {
+      if (
+        sourceCueAllowsIntentionalEmpty(
+          sourceItem
+        )
+      ) {
+        intentionalOmitted++;
+        continue;
+      }
+
+      throw new Error(
+        `TIMING LOCK ${
+          label
+        }: cue ${
+          sourceItem.index
+        } ausente sem autorização de vazio intencional.`
+      );
+    }
+
     if (
-      source[i].index !==
-        final[i].index ||
-      source[i].timing !==
-        final[i].timing
+      sourceItem.timing !==
+      finalItem.timing
     ) {
       throw new Error(
         `TIMING LOCK ${
           label
         }: cue ${
-          source[i].index
-        }.`
+          sourceItem.index
+        } teve timestamp alterado.`
       );
     }
+
+    finalById.delete(
+      sourceItem.index
+    );
+  }
+
+  if (finalById.size) {
+    throw new Error(
+      `TIMING LOCK ${
+        label
+      }: ${
+        finalById.size
+      } cue(s) extra(s) inexistente(s) na SOURCE.`
+    );
   }
 
   console.log(
@@ -5103,9 +5247,11 @@ function auditTimestamps(
       label
     }: PASSOU — ${
       source.length
-    }/${
-      source.length
-    }; 0 alterações.`
+    } source / ${
+      final.length
+    } visíveis; ${
+      intentionalOmitted
+    } vazio(s) intencional(is) omitido(s); 0 alterações de timestamp.`
   );
 }
 
@@ -9324,150 +9470,230 @@ async function rescueEmptyMainCue({
   plan,
   job
 }) {
-  let lastError = null;
+  if (
+    sourceCueAllowsIntentionalEmpty(
+      block
+    )
+  ) {
+    job.stats.mainIntentionalEmptyCues =
+      (
+        job.stats.mainIntentionalEmptyCues ||
+        0
+      ) + 1;
+
+    console.log(
+      `[INTENTIONAL EMPTY] cue ${block.index}: SOURCE descartável; ` +
+      `nenhuma chamada Gemini extra.`
+    );
+
+    return "";
+  }
 
   const rescueBatch = [
     block
   ];
 
-  for (
-    let parseAttempt = 1;
-    parseAttempt <=
-      MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS;
-    parseAttempt++
-  ) {
-    try {
-      const {
-        payload,
-        locksById,
-        ownershipById
-      } =
-        buildOwnershipPayload(
-          blocks,
-          posMap,
-          rescueBatch,
-          plan
-        );
+  let localCycle = 0;
 
-      job.stats.mainEmptyCueRescueCalls++;
+  while (true) {
+    let lastError = null;
 
-      console.warn(
-        `[MAIN EMPTY-CUE RESCUE] cue ${block.index} | ` +
-        `tentativa ${parseAttempt}/${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS}.`
-      );
-
-      const response =
-        await geminiRequest({
-          system:
-            TRANSLATOR_PROMPT,
-
-          user:
-            `EMPTY-CUE RESCUE DO MAIN.\n\n` +
-            `A resposta anterior devolveu pt vazio para este target, ` +
-            `mas o target abaixo contém texto-fonte válido e NÃO pode desaparecer.\n\n` +
-            `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
-            `BÍBLIA EDITORIAL:\n${
-              JSON.stringify(
-                plan
-              )
-            }\n\n` +
-            `CÁPSULA CUE-LOCK ÚNICA:\n${
-              JSON.stringify(
-                payload
-              )
-            }\n\n` +
-            `Retorne EXATAMENTE 1 cue. ` +
-            `Copie o mesmo i e o ownership_key exatamente para k. ` +
-            `O campo pt DEVE ser não vazio e traduzir SOMENTE o target deste ID. ` +
-            `Se o target for nome próprio, bordão, interjeição, reação curta ou termo que deva ser preservado, ` +
-            `retorne a forma correta/preservada em pt em vez de deixar vazio. ` +
-            `Não invente fala. Não use conteúdo de before/after como conteúdo do target. ` +
-            `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
-            `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
-
-          schema:
-            mainCueTranslationSchema(1),
-
-          thinkingLevel:
-            MAIN_EMPTY_CUE_RESCUE_THINKING,
-
-          maxOutputTokens:
-            MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS,
-
-          timeoutMs:
-            MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS,
-
-          maxRetries:
-            MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES,
-
-          job,
-
-          metric:
-            "main"
-        });
-
-      const translated =
-        parseCueTranslation(
-          rescueBatch,
-          response.text,
+    for (
+      let parseAttempt = 1;
+      parseAttempt <=
+        MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS;
+      parseAttempt++
+    ) {
+      try {
+        const {
+          payload,
           locksById,
-          ownershipById,
-          true,
-          false
-        );
+          ownershipById
+        } =
+          buildOwnershipPayload(
+            blocks,
+            posMap,
+            rescueBatch,
+            plan
+          );
 
-      const pt =
-        String(
-          translated.get(
-            block.index
-          ) ||
-          ""
-        ).trim();
-
-      if (!pt) {
-        throw new Error(
-          `Cue ${block.index} continuou vazio no rescue.`
-        );
-      }
-
-      console.log(
-        `[MAIN EMPTY-CUE RESCUE] cue ${block.index} recuperado ✅ | ` +
-        `${pt.length} chars.`
-      );
-
-      return pt;
-    } catch (error) {
-      lastError = error;
-
-      if (
-        parseAttempt <
-        MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
-      ) {
-        job.stats.mainEmptyCueRescueParseRetries++;
+        job.stats.mainEmptyCueRescueCalls++;
 
         console.warn(
-          `[MAIN EMPTY-CUE RESCUE] cue ${block.index} ainda inválido: ${
-            errorMessage(
-              error
-            ).slice(
-              0,
-              280
-            )
-          }`
+          `[MAIN EMPTY-CUE RESCUE] cue ${block.index} | ` +
+          `ciclo ${localCycle + 1} | ` +
+          `tentativa ${parseAttempt}/${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS}.`
         );
 
-        continue;
+        const response =
+          await geminiRequest({
+            system:
+              TRANSLATOR_PROMPT,
+
+            user:
+              `EMPTY-CUE RESCUE DO MAIN — 8.4.4.\n\n` +
+              `A SOURCE deste cue contém conteúdo real e NÃO pode desaparecer. ` +
+              `A resposta só será aceita se continuar válida DEPOIS do sanitizer final.\n\n` +
+              `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+              `BÍBLIA EDITORIAL:\n${
+                JSON.stringify(
+                  plan
+                )
+              }\n\n` +
+              `CÁPSULA CUE-LOCK ÚNICA:\n${
+                JSON.stringify(
+                  payload
+                )
+              }\n\n` +
+              `Retorne EXATAMENTE 1 cue. ` +
+              `Copie o mesmo i e o ownership_key exatamente para k. ` +
+              `O campo pt DEVE traduzir SOMENTE o target deste ID e preservar o conteúdo semântico. ` +
+              `NÃO devolva vazio, "...", reticências isoladas, [suspiro], (suspiro), ` +
+              `ruído SDH, speaker label isolado, placeholder ou descrição de acessibilidade. ` +
+              `Se o target terminar em dois-pontos e for fala/narração real, formule PT-BR natural ` +
+              `que não pareça um rótulo de speaker isolado. ` +
+              `Não invente fala. Não use before/after como conteúdo do target. ` +
+              `Todos os tokens __LOCK_C...__ devem voltar idênticos. ` +
+              `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
+
+            schema:
+              mainCueTranslationSchema(1),
+
+            thinkingLevel:
+              MAIN_EMPTY_CUE_RESCUE_THINKING,
+
+            maxOutputTokens:
+              MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS,
+
+            timeoutMs:
+              MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS,
+
+            maxRetries:
+              MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES,
+
+            job,
+
+            metric:
+              "main"
+          });
+
+        const translated =
+          parseCueTranslation(
+            rescueBatch,
+            response.text,
+            locksById,
+            ownershipById,
+            true,
+            false
+          );
+
+        const pt =
+          String(
+            translated.get(
+              block.index
+            ) ||
+            ""
+          ).trim();
+
+        if (!pt) {
+          throw new Error(
+            `Cue ${block.index} continuou vazio no rescue.`
+          );
+        }
+
+        const sanitized =
+          (
+            sanitizeFinalCue(
+              block,
+              pt
+            ) ||
+            sanitizeFallbackCue(
+              pt
+            )
+          ).trim();
+
+        if (!sanitized) {
+          throw new Error(
+            `Cue ${block.index} virou vazio/lixo após sanitizer | raw=${
+              JSON.stringify(
+                pt.slice(
+                  0,
+                  140
+                )
+              )
+            }`
+          );
+        }
+
+        console.log(
+          `[MAIN EMPTY-CUE RESCUE] cue ${block.index} recuperado ✅ | ` +
+          `${sanitized.length} chars pós-sanitizer.`
+        );
+
+        return sanitized;
+      } catch (error) {
+        lastError = error;
+
+        if (
+          parseAttempt <
+          MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
+        ) {
+          job.stats.mainEmptyCueRescueParseRetries++;
+
+          console.warn(
+            `[MAIN EMPTY-CUE RESCUE] cue ${block.index} ainda inválido: ${
+              errorMessage(
+                error
+              ).slice(
+                0,
+                320
+              )
+            }`
+          );
+
+          continue;
+        }
       }
     }
-  }
 
-  job.stats.mainEmptyCueRescueFailures++;
+    job.stats.mainEmptyCueRescueFailures++;
+    job.stats.mainEmptyCueLocalRetryCycles =
+      (
+        job.stats.mainEmptyCueLocalRetryCycles ||
+        0
+      ) + 1;
 
-  const finalError =
-    new Error(
-      `MAIN EMPTY-CUE RESCUE falhou no cue ${block.index} após ${
-        MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
-      } tentativa(s): ${
+    localCycle++;
+
+    const waitMs =
+      Math.min(
+        MAIN_EMPTY_CUE_LOCAL_RETRY_MAX_MS,
+        MAIN_EMPTY_CUE_LOCAL_RETRY_BASE_MS *
+          Math.pow(
+            1.7,
+            Math.min(
+              localCycle - 1,
+              7
+            )
+          )
+      );
+
+    job.status = "processing";
+    job.error =
+      `EMPTY-CUE LOCAL RETRY cue ${block.index}: ${
+        errorMessage(
+          lastError
+        ).slice(
+          0,
+          320
+        )
+      }`;
+    job.updatedAt = Date.now();
+
+    console.warn(
+      `[MAIN EMPTY-CUE LOCAL RETRY] cue ${block.index} ainda não passou; ` +
+      `episódio NÃO será reiniciado. Nova tentativa SOMENTE deste cue em ` +
+      `${(waitMs / 1000).toFixed(1)}s | ${
         errorMessage(
           lastError
         ).slice(
@@ -9477,11 +9703,10 @@ async function rescueEmptyMainCue({
       }`
     );
 
-  // Não faz sentido retraduzir todo o lote de até 60 cues
-  // depois de várias tentativas isoladas do único cue problemático.
-  finalError.noFullBatchRetry = true;
-
-  throw finalError;
+    await sleep(
+      waitMs
+    );
+  }
 }
 
 async function translateMainBatch({
@@ -9711,6 +9936,92 @@ async function translateMainBatch({
   }
 
   throw lastError;
+}
+
+async function recoverSanitizedEmptyCues({
+  blocks,
+  translations,
+  plan,
+  job,
+  stage
+}) {
+  const updated =
+    new Map(
+      translations
+    );
+
+  const posMap =
+    positionMap(
+      blocks
+    );
+
+  let recovered = 0;
+  let intentional = 0;
+
+  for (const block of blocks) {
+    const current =
+      String(
+        updated.get(
+          block.index
+        ) ??
+        ""
+      ).trim();
+
+    if (current) {
+      continue;
+    }
+
+    if (
+      sourceCueAllowsIntentionalEmpty(
+        block
+      )
+    ) {
+      intentional++;
+      continue;
+    }
+
+    console.warn(
+      `[EMPTY-CUE LOCAL RECOVERY] ${stage} | cue ${block.index} vazio ` +
+      `com SOURCE real; corrigindo SOMENTE este cue.`
+    );
+
+    const rescued =
+      await rescueEmptyMainCue({
+        blocks,
+        posMap,
+        block,
+        plan,
+        job
+      });
+
+    updated.set(
+      block.index,
+      rescued
+    );
+
+    recovered++;
+
+    job.stats.mainSanitizedEmptyRecoveries =
+      (
+        job.stats.mainSanitizedEmptyRecoveries ||
+        0
+      ) + 1;
+  }
+
+  if (
+    recovered ||
+    intentional
+  ) {
+    console.log(
+      `[EMPTY-CUE LOCAL RECOVERY] ${stage} | recuperados=${
+        recovered
+      } | intencionais=${
+        intentional
+      } | full-restart=0.`
+    );
+  }
+
+  return updated;
 }
 
 async function translateAllMain(
@@ -10806,6 +11117,15 @@ function localReasonsForCue(
       filename,
       en
     );
+
+  if (
+    !translated.trim() &&
+    sourceCueAllowsIntentionalEmpty(
+      block
+    )
+  ) {
+    return [];
+  }
 
   if (
     !translated.trim()
@@ -12351,6 +12671,15 @@ function collectCompactRescueIssues(
         translations.get(block.index) ??
         block.text
       ).trim();
+
+    if (
+      !current &&
+      sourceCueAllowsIntentionalEmpty(
+        block
+      )
+    ) {
+      continue;
+    }
 
     const layout =
       layoutCueResult(
@@ -13955,7 +14284,26 @@ function buildFinalCriticalAuditBatches(
     ? new Set([...focusIds].map(Number))
     : null;
 
-  const targets = blocks.filter(block => !focus || focus.has(block.index));
+  const targets = blocks.filter(
+    block =>
+      (
+        !focus ||
+        focus.has(
+          block.index
+        )
+      ) &&
+      !(
+        sourceCueAllowsIntentionalEmpty(
+          block
+        ) &&
+        !String(
+          translations.get(
+            block.index
+          ) ||
+          ""
+        ).trim()
+      )
+  );
   const batches = [];
   let current = [];
   let chars = 0;
@@ -14551,7 +14899,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.4.0] fonte=${
+    `[PIPELINE 8.4.4] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -14579,6 +14927,19 @@ mainTranslations =
     mainTranslations,
     job
   );
+
+// 8.4.4: qualquer fala real que tenha virado vazio no sanitizer é
+// recuperada aqui, cue por cue, antes do Timing Lock.
+mainTranslations =
+  await recoverSanitizedEmptyCues({
+    blocks,
+    translations:
+      mainTranslations,
+    plan,
+    job,
+    stage:
+      "MAIN"
+  });
 
 // ============================================================
 // LAYOUT LOCK — SAFE DRAFT
@@ -14764,18 +15125,39 @@ auditTimestamps(
   finalSrt,
   "FINAL"
 );
-  console.log(
-    `[PIPELINE 8.4.0] FINAL OK | ${
-      blocks.length
-    } cues | ${
+  const pipelineElapsedSeconds =
+    (
       (
+        Date.now() -
+        startedAt
+      ) /
+      1000
+    );
+
+  const jobElapsedSeconds =
+    (
+      (
+        Date.now() -
         (
-          Date.now() -
+          Number(
+            job.translationStartedAt
+          ) ||
           startedAt
-        ) /
-        1000
-      ).toFixed(1)
-    }s.`
+        )
+      ) /
+      1000
+    );
+
+  console.log(
+    `[PIPELINE 8.4.4] FINAL OK | ${
+      blocks.length
+    } source cues | pipeline=${
+      pipelineElapsedSeconds.toFixed(1)
+    }s | job-total=${
+      jobElapsedSeconds.toFixed(1)
+    }s | full-job-retries=${
+      job.stats.jobRetries || 0
+    }.`
   );
 
   return finalSrt;
@@ -14784,6 +15166,15 @@ auditTimestamps(
 async function processJob(
   job
 ) {
+  if (
+    !Number(
+      job.translationStartedAt
+    )
+  ) {
+    job.translationStartedAt =
+      Date.now();
+  }
+
   job.status = "processing";
   job.progress = Math.max(1, job.progress || 0);
   job.updatedAt = Date.now();
@@ -16252,7 +16643,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.3 - 8.4.2 CORE + CONVERGENCE CONSENSUS + FOCUSED REPAIR"
+        " STREMIO PT-BR 8.4.4 - INTENTIONAL EMPTY CUES + NO FULL RESTART"
   );
 
   console.log(
@@ -16365,7 +16756,7 @@ console.log(
 
   console.log(
     `Main Empty-Cue Rescue: ${MAIN_EMPTY_CUE_RESCUE_ENABLED ? "ATIVO" : "DESATIVADO"} | ` +
-    `somente cue vazio é refeito | até ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) isoladas ✅`
+    `somente cue vazio é refeito | ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) por ciclo + retry local contínuo ✅`
   );
 
   console.log(
@@ -16445,6 +16836,18 @@ console.log(
   );
 
   console.log(
+    "Intentional Empty 8.4.4: somente SOURCE realmente descartável pode sumir; fala real continua fail-closed ✅"
+  );
+
+  console.log(
+    "No Full Restart 8.4.4: empty cue/sanitizer retry fica no cue; PLAN+MAIN não reiniciam por esse motivo ✅"
+  );
+
+  console.log(
+    "Job Wall Clock 8.4.4: FINAL reporta pipeline + tempo real total do job ✅"
+  );
+
+  console.log(
     "Localização brasileira por intenção: ATIVA ✅"
   );
 
@@ -16497,6 +16900,10 @@ console.log(
 
   console.log(
     "Multilingual Audio-Sync API: /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
+  );
+
+  console.log(
+    "Empty-Cue 8.4.4: intentional omission + sanitizer-aware local recovery + no full restart. OK"
   );
 
   console.log(
