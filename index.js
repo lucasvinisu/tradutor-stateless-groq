@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.5 - PRE-REPAIR SEMANTIC CONFIRMATION + CONCURRENCY EFFICIENCY
-// 8.4.4 INTENTIONAL EMPTY + NO FULL RESTART PRESERVED
+// STREMIO PT-BR 8.4.6 - BOUNDED CONVERGENCE + MULTILINGUAL SDH CONSENSUS
+// 8.4.5 QUALITY / CONCURRENCY PRESERVED
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.4.0-source-hygiene-gender-v2-semantic-ownership-final-convergence";
+  "8.4.6-bounded-convergence-multilingual-sdh-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -91,10 +91,11 @@ const MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS = 2400;
 const MAIN_EMPTY_CUE_RESCUE_TIMEOUT_MS = 90000;
 const MAIN_EMPTY_CUE_RESCUE_HTTP_RETRIES = 3;
 
-// 8.4.4: empty cue real nunca reinicia PLAN + MAIN. Após as tentativas
-// isoladas normais, o retry continua SOMENTE naquele cue com backoff.
-const MAIN_EMPTY_CUE_LOCAL_RETRY_BASE_MS = 4300;
-const MAIN_EMPTY_CUE_LOCAL_RETRY_MAX_MS = 60000;
+// 8.4.6: nenhuma cue pode manter o job eternamente em processing.
+// Duas respostas independentes classificadas como SDH confirmam omissão;
+// caso contrário, após um ciclo finito preservamos uma base segura para QA.
+const MAIN_EMPTY_CUE_MAX_CYCLES = 1;
+const MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN = 2;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
@@ -161,8 +162,13 @@ const FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
 const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 12;
 const FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
 const FINAL_CRITICAL_ESCALATED_TIMEOUT_MS = 120000;
+const FINAL_CRITICAL_REQUEST_MAX_FAILURES = 3;
+const FINAL_CRITICAL_PARSE_MAX_FAILURES = 3;
+const FINAL_CRITICAL_ESCALATED_MAX_FAILURES = 3;
+const FINAL_CRITICAL_MAX_ROUNDS = 4;
 const JOB_RETRY_BASE_MS = 5000;
 const JOB_RETRY_MAX_MS = 60000;
+const JOB_MAX_ATTEMPTS = 2;
 
 // ============================================================
 // SUBTITLE LAYOUT LOCK
@@ -805,16 +811,56 @@ function getCache(key) {
   return item.srt;
 }
 
-function setCache(key, srt) {
+function setCache(
+  key,
+  srt,
+  job = null
+) {
   translationCache.set(
     key,
     {
       srt,
+      intentionalEmptyIds:
+        job?.intentionalEmptyCueIds instanceof Set
+          ? [
+              ...job.intentionalEmptyCueIds
+            ]
+          : [],
       expiresAt:
         Date.now() +
         CACHE_TTL_MS
     }
   );
+}
+
+function restoreIntentionalEmptyIdsFromCache(
+  key,
+  job
+) {
+  if (!job) return;
+
+  const item =
+    translationCache.get(
+      key
+    );
+
+  if (!item) return;
+
+  if (!(job.intentionalEmptyCueIds instanceof Set)) {
+    job.intentionalEmptyCueIds = new Set();
+  }
+
+  for (
+    const rawId of
+    Array.isArray(item.intentionalEmptyIds)
+      ? item.intentionalEmptyIds
+      : []
+  ) {
+    const id = Number(rawId);
+    if (Number.isInteger(id)) {
+      job.intentionalEmptyCueIds.add(id);
+    }
+  }
 }
 
 function createJob({
@@ -868,6 +914,11 @@ function createJob({
     result: null,
     safeDraft: null,
     error: null,
+    qualityStatus: "pending",
+
+    // IDs removidos por regra SDH multilíngue ou por consenso de duas
+    // respostas independentes. O Set nunca é exposto diretamente na API.
+    intentionalEmptyCueIds: new Set(),
 
     started: false,
     promise: null,
@@ -904,6 +955,8 @@ function createJob({
       mainEmptyCueLocalRetryCycles: 0,
       mainIntentionalEmptyCues: 0,
       mainSanitizedEmptyRecoveries: 0,
+      mainSdhConsensusOmissions: 0,
+      mainEmergencySourceFallbacks: 0,
 
       localFlags: 0,
 
@@ -933,6 +986,8 @@ function createJob({
       finalCriticalAuditCalls: 0,
       finalCriticalFlags: 0,
       finalCriticalRepairRounds: 0,
+      finalCriticalBoundedReleases: 0,
+      boundedSafeDraftReleases: 0,
       finalCriticalTechnicalRetries: 0,
       finalCriticalNoProgressEscalations: 0,
       jobRetries: 0,
@@ -1007,11 +1062,19 @@ function getOrCreateJob(
         });
     }
 
+    restoreIntentionalEmptyIdsFromCache(
+      cacheKey,
+      job
+    );
+
     job.status =
       "completed";
 
     job.progress =
       100;
+
+    job.qualityStatus =
+      "cache_verified";
 
     job.result =
       cached;
@@ -1580,6 +1643,99 @@ function normalizeSdhCandidate(
     .trim();
 }
 
+// A ponte pode escolher uma SOURCE embutida em qualquer idioma. A 8.4.5
+// reconhecia ações SDH em inglês/português, mas deixava descritores franceses
+// como "Angela rit" e "musique tendue" chegarem ao tradutor como se fossem
+// diálogo. O Gemini então devolvia corretamente "Angela ri"/"Risos" e o
+// sanitizer PT-BR apagava a resposta, criando um ciclo impossível.
+const FRENCH_SDH_EVENT_RE =
+  /^(?:rires?|éclats? de rire|gloussements?|ricanements?|sourires?|soupirs?|halètements?|respiration(?: forte| lourde)?|pleurs?|sanglots?|reniflements?|toux|éternuements?|raclement de gorge|fredonnement|sifflements?|chants?|applaudissements?|acclamations?|cris?|chuchotements?|murmures?|gémissements?|grognements?|hurlements?|aboiements?|miaulements?|sonnerie|bips?|grincements?|claquements?|coups?|tonnerre|pluie|vent|orage|musique(?: [\p{L}'’-]+){0,5}|chanson(?: [\p{L}'’-]+){0,5}|bruit(?:s)?(?: [\p{L}'’-]+){0,6}|pas(?: [\p{L}'’-]+){0,5})$/iu;
+
+const FRENCH_SDH_ACTION_RE =
+  /(?:éclate(?:nt)? de rire|se met(?:tent)? à rire|rit|rient|rigole|rigolent|glousse|gloussent|ricane|ricanent|sourit|sourient|soupire|soupirent|halète|halètent|respire|respirent|pleure|pleurent|sanglote|sanglotent|renifle|reniflent|tousse|toussent|éternue|éternuent|se racle(?:nt)? la gorge|fredonne|fredonnent|siffle|sifflent|chante|chantent|applaudit|applaudissent|crie|crient|chuchote|chuchotent|murmure|murmurent|gémit|gémissent|grogne|grognent|hurle|hurlent|aboie|aboient|miaule|miaulent|sonne|sonnent|vibre|vibrent|grince|grincent|claque|claquent|frappe|frappent|s'ouvre|s'ouvrent|se ferme|se ferment)$/iu;
+
+function looksLikeFrenchSdhDescriptor(
+  value
+) {
+  const text =
+    normalizeSdhCandidate(
+      value
+    );
+
+  if (
+    !text ||
+    text.length > 180 ||
+    /[?]/u.test(text)
+  ) {
+    return false;
+  }
+
+  if (
+    FRENCH_SDH_EVENT_RE.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  const action =
+    text.match(
+      FRENCH_SDH_ACTION_RE
+    );
+
+  if (!action) {
+    return false;
+  }
+
+  const before =
+    text
+      .slice(
+        0,
+        action.index ?? 0
+      )
+      .trim();
+
+  const after =
+    text
+      .slice(
+        (action.index ?? 0) +
+        action[0].length
+      )
+      .replace(
+        /^(?:fort|fortement|doucement|nerveusement|ensemble|encore|au loin|en arrière-plan|hors champ|brièvement)$/iu,
+        ""
+      )
+      .trim();
+
+  if (after) {
+    return false;
+  }
+
+  if (!before) {
+    return true;
+  }
+
+  if (
+    /^(?:je|j'|tu|nous|vous|on)$/iu.test(
+      before
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    before.split(/\s+/).length <= 6 &&
+    (
+      /^(?:il|elle|ils|elles|tout le monde|la foule|le public|le groupe)$/iu.test(
+        before
+      ) ||
+      sdhTitleSubjectLike(
+        before
+      )
+    )
+  );
+}
+
 function sdhAllCapsLike(
   value
 ) {
@@ -2010,6 +2166,14 @@ function looksLikeSdhDescriptor(
     return true;
   }
 
+  if (
+    looksLikeFrenchSdhDescriptor(
+      inside
+    )
+  ) {
+    return true;
+  }
+
   return SDH_WORDS.test(
     inside
   );
@@ -2062,6 +2226,14 @@ function looksLikeBareSdhLine(
       {
         bare: true
       }
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    looksLikeFrenchSdhDescriptor(
+      text
     )
   ) {
     return true;
@@ -2587,9 +2759,81 @@ function cleanSourceLine(line) {
 // Autoriza ausência visual SOMENTE se a própria SOURCE, reavaliada pelas
 // mesmas regras conservadoras de Source Hygiene, não contiver conteúdo
 // semântico. Qualquer fala, palavra, número ou bleep continua fail-closed.
-function sourceCueAllowsIntentionalEmpty(
-  block
+function markIntentionalEmptyCue(
+  job,
+  block,
+  reason = "SDH"
 ) {
+  const id =
+    Number(
+      block?.index
+    );
+
+  if (!Number.isInteger(id)) {
+    return false;
+  }
+
+  if (block) {
+    block.intentionalEmptyApproved = true;
+  }
+
+  if (
+    !job?.intentionalEmptyCueIds ||
+    !(job.intentionalEmptyCueIds instanceof Set)
+  ) {
+    if (job) {
+      job.intentionalEmptyCueIds = new Set();
+    }
+  }
+
+  if (!job) {
+    return true;
+  }
+
+  const already =
+    job.intentionalEmptyCueIds.has(
+      id
+    );
+
+  job.intentionalEmptyCueIds.add(
+    id
+  );
+
+  if (!already) {
+    job.stats.mainIntentionalEmptyCues =
+      (
+        job.stats.mainIntentionalEmptyCues ||
+        0
+      ) + 1;
+
+    console.log(
+      `[INTENTIONAL EMPTY] cue ${id} autorizado | ${reason}.`
+    );
+  }
+
+  return true;
+}
+
+function sourceCueAllowsIntentionalEmpty(
+  block,
+  job = null
+) {
+  const id =
+    Number(
+      block?.index
+    );
+
+  if (
+    block?.intentionalEmptyApproved ||
+    (
+      Number.isInteger(id) &&
+      job?.intentionalEmptyCueIds instanceof Set &&
+      job.intentionalEmptyCueIds.has(id)
+    )
+  ) {
+    return true;
+  }
+
   const source =
     String(
       block?.text ||
@@ -2633,6 +2877,88 @@ function sourceCueAllowsIntentionalEmpty(
   }
 
   return true;
+}
+
+function rejectedCueIsSdhOnly(
+  value
+) {
+  const lines =
+    stripMarkup(
+      String(value || "")
+    )
+      .replace(/\r/g, "")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+
+  return (
+    lines.length > 0 &&
+    lines.every(
+      line =>
+        looksLikeBareSdhLine(
+          line
+        ) ||
+        (
+          /^\s*[\[(].*[\])]\s*$/u.test(line) &&
+          looksLikeSdhDescriptor(
+            normalizeSdhCandidate(
+              line
+            )
+          )
+        )
+    )
+  );
+}
+
+function safestMainRescueFallback(
+  block,
+  rejectedCandidates = []
+) {
+  for (
+    let index = rejectedCandidates.length - 1;
+    index >= 0;
+    index--
+  ) {
+    const candidate =
+      String(
+        rejectedCandidates[index] ||
+        ""
+      ).trim();
+
+    const sanitized =
+      sanitizeFinalCue(
+        block,
+        candidate
+      ) ||
+      sanitizeFallbackCue(
+        candidate
+      );
+
+    if (sanitized) {
+      return sanitized;
+    }
+  }
+
+  const source =
+    cleanSourceLine(
+      block?.text ||
+      ""
+    ) ||
+    stripMarkup(
+      block?.text ||
+      ""
+    ).trim();
+
+  return (
+    sanitizeFinalCue(
+      block,
+      source
+    ) ||
+    sanitizeFallbackCue(
+      source
+    ) ||
+    source
+  ).trim();
 }
 
 function subtitleClockToMs(
@@ -4598,23 +4924,16 @@ function sanitizeTranslationMap(
 
         if (
           sourceCueAllowsIntentionalEmpty(
-            block
+            block,
+            job
           )
         ) {
           intentionalEmpty++;
 
-          if (job) {
-            job.stats.mainIntentionalEmptyCues =
-              (
-                job.stats.mainIntentionalEmptyCues ||
-                0
-              ) + 1;
-          }
-
-          console.log(
-            `[INTENTIONAL EMPTY] cue ${
-              block.index
-            } autorizado: SOURCE sem conteúdo semântico utilizável.`
+          markIntentionalEmptyCue(
+            job,
+            block,
+            "SOURCE sem conteúdo semântico utilizável"
           );
         } else {
           needsLocalRecovery++;
@@ -5181,7 +5500,8 @@ function buildSrt(
 function auditTimestamps(
   sourceSrt,
   finalSrt,
-  label
+  label,
+  job = null
 ) {
   const source =
     parseSrt(sourceSrt);
@@ -5224,7 +5544,8 @@ function auditTimestamps(
     if (!finalItem) {
       if (
         sourceCueAllowsIntentionalEmpty(
-          sourceItem
+          sourceItem,
+          job
         )
       ) {
         intentionalOmitted++;
@@ -6456,7 +6777,6 @@ const SYNC_PROXY_SCHEMA = {
   properties: {
     items: {
       type: "array",
-      maxItems: SYNC_PROXY_MAX_ITEMS,
       items: {
         type: "object",
         additionalProperties: false,
@@ -9567,18 +9887,14 @@ async function rescueEmptyMainCue({
 }) {
   if (
     sourceCueAllowsIntentionalEmpty(
-      block
+      block,
+      job
     )
   ) {
-    job.stats.mainIntentionalEmptyCues =
-      (
-        job.stats.mainIntentionalEmptyCues ||
-        0
-      ) + 1;
-
-    console.log(
-      `[INTENTIONAL EMPTY] cue ${block.index}: SOURCE descartável; ` +
-      `nenhuma chamada Gemini extra.`
+    markIntentionalEmptyCue(
+      job,
+      block,
+      "SOURCE descartável; nenhuma chamada Gemini extra"
     );
 
     return "";
@@ -9588,10 +9904,15 @@ async function rescueEmptyMainCue({
     block
   ];
 
-  let localCycle = 0;
+  let lastError = null;
+  const rejectedCandidates = [];
+  const rejectedSdhCandidates = [];
 
-  while (true) {
-    let lastError = null;
+  for (
+    let localCycle = 0;
+    localCycle < MAIN_EMPTY_CUE_MAX_CYCLES;
+    localCycle++
+  ) {
 
     for (
       let parseAttempt = 1;
@@ -9626,7 +9947,7 @@ async function rescueEmptyMainCue({
               TRANSLATOR_PROMPT,
 
             user:
-              `EMPTY-CUE RESCUE DO MAIN — 8.4.4.\n\n` +
+              `EMPTY-CUE RESCUE DO MAIN — 8.4.6.\n\n` +
               `A SOURCE deste cue contém conteúdo real e NÃO pode desaparecer. ` +
               `A resposta só será aceita se continuar válida DEPOIS do sanitizer final.\n\n` +
               `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
@@ -9696,6 +10017,10 @@ async function rescueEmptyMainCue({
           );
         }
 
+        rejectedCandidates.push(
+          pt
+        );
+
         const sanitized =
           (
             sanitizeFinalCue(
@@ -9708,6 +10033,41 @@ async function rescueEmptyMainCue({
           ).trim();
 
         if (!sanitized) {
+          if (
+            rejectedCueIsSdhOnly(
+              pt
+            )
+          ) {
+            rejectedSdhCandidates.push(
+              pt
+            );
+
+            if (
+              rejectedSdhCandidates.length >=
+              MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN
+            ) {
+              markIntentionalEmptyCue(
+                job,
+                block,
+                `consenso SDH ${rejectedSdhCandidates.length}/${rejectedCandidates.length}`
+              );
+
+              job.stats.mainSdhConsensusOmissions =
+                (
+                  job.stats.mainSdhConsensusOmissions ||
+                  0
+                ) + 1;
+
+              console.log(
+                `[MAIN EMPTY-CUE SDH CONSENSUS] cue ${block.index} ` +
+                `omitido corretamente após ${rejectedSdhCandidates.length} ` +
+                `respostas SDH independentes; retry encerrado ✅.`
+              );
+
+              return "";
+            }
+          }
+
           throw new Error(
             `Cue ${block.index} virou vazio/lixo após sanitizer | raw=${
               JSON.stringify(
@@ -9752,56 +10112,41 @@ async function rescueEmptyMainCue({
     }
 
     job.stats.mainEmptyCueRescueFailures++;
-    job.stats.mainEmptyCueLocalRetryCycles =
+  }
+
+  // Liveness sem sacrificar o restante do episódio: nunca reinicia MAIN e
+  // nunca agenda ciclos eternos. Uma fala real fica preservada como base
+  // temporária; QA/Repair ainda tentam localizá-la antes do gate final.
+  const fallback =
+    safestMainRescueFallback(
+      block,
+      rejectedCandidates
+    );
+
+  if (fallback) {
+    job.stats.mainEmergencySourceFallbacks =
       (
-        job.stats.mainEmptyCueLocalRetryCycles ||
+        job.stats.mainEmergencySourceFallbacks ||
         0
       ) + 1;
 
-    localCycle++;
-
-    const waitMs =
-      Math.min(
-        MAIN_EMPTY_CUE_LOCAL_RETRY_MAX_MS,
-        MAIN_EMPTY_CUE_LOCAL_RETRY_BASE_MS *
-          Math.pow(
-            1.7,
-            Math.min(
-              localCycle - 1,
-              7
-            )
-          )
-      );
-
-    job.status = "processing";
-    job.error =
-      `EMPTY-CUE LOCAL RETRY cue ${block.index}: ${
-        errorMessage(
-          lastError
-        ).slice(
-          0,
-          320
-        )
-      }`;
-    job.updatedAt = Date.now();
-
     console.warn(
-      `[MAIN EMPTY-CUE LOCAL RETRY] cue ${block.index} ainda não passou; ` +
-      `episódio NÃO será reiniciado. Nova tentativa SOMENTE deste cue em ` +
-      `${(waitMs / 1000).toFixed(1)}s | ${
-        errorMessage(
-          lastError
-        ).slice(
-          0,
-          320
-        )
+      `[MAIN EMPTY-CUE SAFE FALLBACK] cue ${block.index} encerrou ` +
+      `${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) sem consenso SDH; ` +
+      `conteúdo preservado para QA/Repair | ${
+        errorMessage(lastError).slice(0, 260)
       }`
     );
 
-    await sleep(
-      waitMs
-    );
+    return fallback;
   }
+
+  throw (
+    lastError ||
+    new Error(
+      `Cue ${block.index} sem fallback seguro.`
+    )
+  );
 }
 
 async function translateMainBatch({
@@ -10068,7 +10413,8 @@ async function recoverSanitizedEmptyCues({
 
     if (
       sourceCueAllowsIntentionalEmpty(
-        block
+        block,
+        job
       )
     ) {
       intentional++;
@@ -14797,6 +15143,18 @@ async function finalCriticalGeminiRequest(args, job, label) {
         continue;
       }
 
+      if (
+        failures >=
+        FINAL_CRITICAL_REQUEST_MAX_FAILURES
+      ) {
+        throw new Error(
+          `FINAL CRITICAL ${label}: ${failures} falhas técnicas consecutivas; ` +
+          `encerrando esta etapa para o fallback seguro do job | ${
+            message.slice(0, 320)
+          }`
+        );
+      }
+
       const waitMs = Math.min(
         FINAL_CRITICAL_RETRY_MAX_MS,
         FINAL_CRITICAL_RETRY_BASE_MS * Math.pow(1.65, Math.min(failures - 1, 8))
@@ -14810,7 +15168,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
 
       console.warn(
         `[FINAL CRITICAL RETRY] ${label} falhou (${failures}); ` +
-        `job continua vivo; nova tentativa em ${(waitMs / 1000).toFixed(1)}s | ` +
+        `nova tentativa limitada em ${(waitMs / 1000).toFixed(1)}s | ` +
         `${message.slice(0, 320)}`
       );
 
@@ -14882,7 +15240,11 @@ async function scanFinalCriticalAudit(
       let parsed = null;
       let parseFailures = 0;
 
-      while (!parsed) {
+      while (
+        !parsed &&
+        parseFailures <
+          FINAL_CRITICAL_PARSE_MAX_FAILURES
+      ) {
         const response = await finalCriticalGeminiRequest(
           {
             system: FINAL_CRITICAL_AUDIT_PROMPT,
@@ -14930,6 +15292,13 @@ async function scanFinalCriticalAudit(
             )
           );
         }
+      }
+
+      if (!parsed) {
+        throw new Error(
+          `FINAL CRITICAL AUDIT lote ${index + 1}: ` +
+          `${FINAL_CRITICAL_PARSE_MAX_FAILURES} respostas inválidas consecutivas.`
+        );
       }
 
       results[index] = parsed;
@@ -14994,7 +15363,11 @@ async function runFinalCriticalEscalatedRepair(
     let completed = false;
     let parseFailures = 0;
 
-    while (!completed) {
+    while (
+      !completed &&
+      parseFailures <
+        FINAL_CRITICAL_ESCALATED_MAX_FAILURES
+    ) {
       const locksById = new Map();
 
       const cues = batchIssues.map(issue => {
@@ -15108,6 +15481,15 @@ async function runFinalCriticalEscalatedRepair(
         await sleep(waitMs);
       }
     }
+
+    if (!completed) {
+      console.warn(
+        `[FINAL CRITICAL ESCALATED] lote ` +
+        `${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1} ` +
+        `atingiu o limite de ${FINAL_CRITICAL_ESCALATED_MAX_FAILURES} falhas; ` +
+        `candidato anterior preservado sem loop.`
+      );
+    }
   }
 
   return updated;
@@ -15126,8 +15508,14 @@ async function convergeFinalCriticalQuality(
   let stagnantRounds = 0;
   let firstAudit = true;
   let focusIds = null;
+  let roundsThisRun = 0;
 
-  while (true) {
+  while (
+    roundsThisRun <
+    FINAL_CRITICAL_MAX_ROUNDS
+  ) {
+    roundsThisRun++;
+
     job.stats.finalCriticalRounds =
       (job.stats.finalCriticalRounds || 0) + 1;
 
@@ -15183,8 +15571,8 @@ async function convergeFinalCriticalQuality(
         (job.stats.finalCriticalNoProgressEscalations || 0) + 1;
 
       // Escalonamento: somente os cues efetivamente críticos entram no
-      // Repair, sem poluição de flags cosméticas. Continuamos repetindo
-      // quantas rodadas forem necessárias; não existe \"mata o episódio\".
+      // Repair, sem poluição de flags cosméticas. A convergência continua
+      // somente até FINAL_CRITICAL_MAX_ROUNDS.
       console.warn(
         `[FINAL CRITICAL ESCALATION] mesmos defeitos persistiram por ` +
         `${stagnantRounds + 1} rodada(s); repair hiperfocado nos IDs críticos.`
@@ -15250,6 +15638,23 @@ async function convergeFinalCriticalQuality(
       `${changedIds.size} cue(s) alterado(s); reauditoria focada continuará.`
     );
   }
+
+  job.stats.finalCriticalBoundedReleases =
+    (
+      job.stats.finalCriticalBoundedReleases ||
+      0
+    ) + 1;
+
+  job.qualityStatus =
+    "bounded_best_candidate";
+
+  console.warn(
+    `[FINAL CRITICAL GATE] limite de ${FINAL_CRITICAL_MAX_ROUNDS} rodada(s) ` +
+    `atingido; melhor candidato protegido pelos guards locais será finalizado ` +
+    `em vez de manter o job eternamente em processing.`
+  );
+
+  return current;
 }
 
 async function translateSrt(
@@ -15278,7 +15683,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.4.5] fonte=${
+    `[PIPELINE 8.4.6] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -15341,7 +15746,8 @@ const mainSrt =
 auditTimestamps(
   sourceSrt,
   mainSrt,
-  "MAIN"
+  "MAIN",
+  job
 );
 
 job.safeDraft =
@@ -15443,9 +15849,9 @@ finalTranslations =
 // ============================================================
 // FINAL CRITICAL CONVERGENCE
 // ============================================================
-// Diferente do 8.3.x, defeito crítico remanescente NÃO é apenas logado
-// e NÃO autoriza cache/serve. O job continua vivo e corrige só os cues
-// reprovados até que o gate passe.
+// Defeito crítico remanescente aciona reparo focado por até quatro rodadas.
+// Se não houver convergência, o melhor candidato protegido é finalizado;
+// nenhum job pode permanecer em processing indefinidamente.
 finalTranslations =
   await convergeFinalCriticalQuality(
     blocks,
@@ -15502,7 +15908,8 @@ const finalSrt =
 auditTimestamps(
   sourceSrt,
   finalSrt,
-  "FINAL"
+  "FINAL",
+  job
 );
   const pipelineElapsedSeconds =
     (
@@ -15528,7 +15935,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.4.5] FINAL OK | ${
+    `[PIPELINE 8.4.6] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -15559,22 +15966,34 @@ async function processJob(
   job.updatedAt = Date.now();
 
   let attempt = 0;
+  let lastJobError = null;
 
-  while (true) {
+  while (
+    attempt <
+    JOB_MAX_ATTEMPTS
+  ) {
     try {
       const cached = getCache(job.cacheKey);
 
       if (cached) {
+        restoreIntentionalEmptyIdsFromCache(
+          job.cacheKey,
+          job
+        );
+
         auditTimestamps(
           job.sourceSrt,
           cached,
-          "CACHE"
+          "CACHE",
+          job
         );
 
         job.result = cached;
         job.status = "completed";
         job.progress = 100;
         job.error = null;
+        job.qualityStatus =
+          "cache_verified";
         return;
       }
 
@@ -15586,15 +16005,24 @@ async function processJob(
       // Só chega aqui depois do FINAL CRITICAL GATE PASSAR.
       setCache(
         job.cacheKey,
-        finalSrt
+        finalSrt,
+        job
       );
 
       job.result = finalSrt;
       job.status = "completed";
       job.progress = 100;
       job.error = null;
+      if (
+        job.qualityStatus ===
+        "pending"
+      ) {
+        job.qualityStatus =
+          "final_pass";
+      }
       return;
     } catch (error) {
+      lastJobError = error;
       attempt++;
       job.stats.jobRetries =
         (job.stats.jobRetries || 0) + 1;
@@ -15613,15 +16041,69 @@ async function processJob(
         `RETRYING (${attempt}): ${errorMessage(error).slice(0, 500)}`;
       job.updatedAt = Date.now();
 
-      console.warn(
-        `[JOB ${job.id}] erro não matou a legenda; ` +
-        `retry ${attempt} em ${(waitMs / 1000).toFixed(1)}s | ` +
-        `${errorMessage(error).slice(0, 420)}`
-      );
+      if (
+        attempt <
+        JOB_MAX_ATTEMPTS
+      ) {
+        console.warn(
+          `[JOB ${job.id}] falha transitória; ` +
+          `retry ${attempt}/${JOB_MAX_ATTEMPTS - 1} em ` +
+          `${(waitMs / 1000).toFixed(1)}s | ` +
+          `${errorMessage(error).slice(0, 420)}`
+        );
 
-      await sleep(waitMs);
+        await sleep(waitMs);
+      }
     }
   }
+
+  if (job.safeDraft) {
+    auditTimestamps(
+      job.sourceSrt,
+      job.safeDraft,
+      "BOUNDED-SAFE-DRAFT",
+      job
+    );
+
+    job.result =
+      job.safeDraft;
+    job.status =
+      "completed";
+    job.progress = 100;
+    job.error = null;
+    job.qualityStatus =
+      "bounded_safe_draft";
+    job.stats.boundedSafeDraftReleases =
+      (
+        job.stats.boundedSafeDraftReleases ||
+        0
+      ) + 1;
+    job.updatedAt = Date.now();
+
+    console.warn(
+      `[JOB ${job.id}] ${JOB_MAX_ATTEMPTS} tentativa(s) encerradas; ` +
+      `SAFE DRAFT íntegro liberado sem cache e sem loop ✅ | ${
+        errorMessage(lastJobError).slice(0, 360)
+      }`
+    );
+
+    return;
+  }
+
+  job.status = "failed";
+  job.progress = 100;
+  job.error =
+    `Falha terminal antes da criação do SAFE DRAFT: ${
+      errorMessage(lastJobError).slice(0, 500)
+    }`;
+  job.qualityStatus =
+    "no_safe_draft";
+  job.updatedAt = Date.now();
+
+  console.error(
+    `[JOB ${job.id}] encerrado sem SAFE DRAFT após ${JOB_MAX_ATTEMPTS} tentativa(s) | ` +
+    `${errorMessage(lastJobError).slice(0, 420)}`
+  );
 }
 
 function startJob(job) {
@@ -15657,6 +16139,9 @@ function jobResponse(
 
     status:
       job.status,
+
+    qualityStatus:
+      job.qualityStatus,
 
     progress:
       job.progress,
@@ -16804,6 +17289,9 @@ app.get(
         status:
           job.status,
 
+        qualityStatus:
+          job.qualityStatus,
+
         sourceKind:
           job.sourceKind,
 
@@ -16964,7 +17452,8 @@ app.get(
         auditTimestamps(
           job.sourceSrt,
           job.result,
-          "SERVING"
+          "SERVING",
+          job
         );
       } catch (error) {
         return sendSrt(
@@ -17022,7 +17511,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.5 - PRE-REPAIR SEMANTIC CONFIRMATION + CONCURRENCY EFFICIENCY"
+        " STREMIO PT-BR 8.4.6 - BOUNDED CONVERGENCE + MULTILINGUAL SDH"
   );
 
   console.log(
@@ -17135,7 +17624,7 @@ console.log(
 
   console.log(
     `Main Empty-Cue Rescue: ${MAIN_EMPTY_CUE_RESCUE_ENABLED ? "ATIVO" : "DESATIVADO"} | ` +
-    `somente cue vazio é refeito | ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) por ciclo + retry local contínuo ✅`
+    `somente cue vazio é refeito | ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) | consenso SDH=${MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN} | zero loop ✅`
   );
 
   console.log(
@@ -17278,7 +17767,7 @@ console.log(
   console.log("Focused Repair 8.4.3: Final Critical repairs only current-round blockers. OK");
 
   console.log(
-    "Job Retry 8.4.2: falha transitória não vira failed nem cacheia safe draft; permanece processing ✅"
+    `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
 
   console.log(
