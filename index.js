@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.6.0 - SEMANTIC SYNC + FAST QUALITY
+// STREMIO PT-BR 8.7.0 - FINAL FAST QUALITY
 // ONE GLOBAL QA; FINAL CRITICAL IS FOCUSED; QUALITY-CRITICAL THINKING PRESERVED
 // ============================================================
 
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.6.0-semantic-sync-fast-quality-v1";
+  "8.7.0-final-fast-quality-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -7160,6 +7160,11 @@ function cueTranslationSchema(
 function mainCueTranslationSchema(
   expectedCount
 ) {
+  // 8.7: NÃO codificamos o tamanho do lote no JSON Schema.
+  // O parser local abaixo já exige contagem exata, ordem exata, IDs e ownership_key.
+  // Isso evita rejeição do request pelo provedor quando lotes grandes (ex.: 140)
+  // são expressos como minItems/maxItems rígidos, sem relaxar nenhuma validação.
+  void expectedCount;
   return {
     type: "object",
     additionalProperties: false,
@@ -7167,25 +7172,14 @@ function mainCueTranslationSchema(
     properties: {
       cues: {
         type: "array",
-        minItems: expectedCount,
-        maxItems: expectedCount,
-
         items: {
           type: "object",
           additionalProperties: false,
 
           properties: {
-            i: {
-              type: "integer"
-            },
-
-            k: {
-              type: "string"
-            },
-
-            pt: {
-              type: "string"
-            }
+            i: { type: "integer" },
+            k: { type: "string" },
+            pt: { type: "string" }
           },
 
           required: [
@@ -7201,6 +7195,13 @@ function mainCueTranslationSchema(
       "cues"
     ]
   };
+}
+
+function isDeterministicGeminiRequestError(error) {
+  const status = Number(error?.status || 0);
+  if ([400, 401, 403, 404, 413, 422].includes(status)) return true;
+  const text = String(error?.message || error || "");
+  return /HTTP\s+(?:400|401|403|404|413|422)\b|invalid argument/i.test(text);
 }
 
 // ============================================================
@@ -10307,7 +10308,8 @@ async function translateMainBatch({
   posMap,
   batch,
   plan,
-  job
+  job,
+  splitDepth = 0
 }) {
   let lastError;
 
@@ -10475,6 +10477,34 @@ async function translateMainBatch({
       return parsed.translations;
     } catch (error) {
       lastError = error;
+
+      if (isDeterministicGeminiRequestError(error)) {
+        if (batch.length > 90 && splitDepth < 1) {
+          const mid = Math.ceil(batch.length / 2);
+          const leftBatch = batch.slice(0, mid);
+          const rightBatch = batch.slice(mid);
+
+          console.warn(
+            `[MAIN ADAPTIVE 8.7] request grande recebeu erro determinístico; ` +
+            `dividindo ${batch.length} cues uma única vez em ${leftBatch.length}+${rightBatch.length}, ` +
+            `sem repetir o mesmo request e sem reiniciar o job.`
+          );
+
+          const [left, right] = await Promise.all([
+            translateMainBatch({ blocks, posMap, batch: leftBatch, plan, job, splitDepth: splitDepth + 1 }),
+            translateMainBatch({ blocks, posMap, batch: rightBatch, plan, job, splitDepth: splitDepth + 1 })
+          ]);
+          return new Map([...left, ...right]);
+        }
+
+        error.noFullBatchRetry = true;
+        error.noJobRetry = true;
+        console.error(
+          `[MAIN FAIL-FAST 8.7] erro determinístico do request; ` +
+          `não será martelado até virar 429 nem reiniciará o job | ${errorMessage(error).slice(0, 360)}`
+        );
+        throw error;
+      }
 
       if (
         error?.noFullBatchRetry
@@ -15856,7 +15886,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.6.0 FAST] fonte=${
+    `[PIPELINE 8.7.0 FINAL] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16144,7 +16174,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.6.0 FAST] FINAL OK | ${
+    `[PIPELINE 8.7.0 FINAL] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -16232,6 +16262,16 @@ async function processJob(
       return;
     } catch (error) {
       lastJobError = error;
+
+      if (error?.noJobRetry || isDeterministicGeminiRequestError(error)) {
+        attempt = JOB_MAX_ATTEMPTS;
+        console.error(
+          `[JOB ${job.id}] erro determinístico; full-job retry PROIBIDO em 8.7 | ` +
+          `${errorMessage(error).slice(0, 420)}`
+        );
+        break;
+      }
+
       attempt++;
       job.stats.jobRetries =
         (job.stats.jobRetries || 0) + 1;
@@ -17756,7 +17796,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.6.0 - SEMANTIC SYNC + FAST QUALITY"
+        " STREMIO PT-BR 8.7.0 - FINAL FAST QUALITY"
   );
 
   console.log(
@@ -18014,9 +18054,11 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Fast 8.6.0: MAIN=140 / QA=240 / Final=200; thinking HIGH preservado nas etapas críticas ✅");
-  console.log("Final Critical 8.6.0: QA global único; gate final somente cues suspeitos/alterados ✅");
-  console.log("Semantic Sync 8.6.0: SOURCE e ASR podem estar em idiomas diferentes sem traduzir a legenda inteira ✅");
+  console.log("Final 8.7.0: MAIN=140 / QA=240 / Final=200; thinking HIGH preservado nas etapas críticas ✅");
+  console.log("MAIN Schema 8.7: sem minItems/maxItems; contagem/ordem/ownership validados localmente ✅");
+  console.log("MAIN Fail-Fast 8.7: HTTP 400 determinístico não repete lote nem reinicia episódio; lote >90 pode dividir UMA vez ✅");
+  console.log("Final Critical 8.7.0: QA global único; gate final somente cues suspeitos/alterados ✅");
+  console.log("Semantic Sync API preservada para OpenSub; Embedded 2.5 não depende dela ✅");
 
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
