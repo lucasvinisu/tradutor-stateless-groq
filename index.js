@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.7.0 - FINAL FAST QUALITY
-// ONE GLOBAL QA; FINAL CRITICAL IS FOCUSED; QUALITY-CRITICAL THINKING PRESERVED
+// STREMIO PT-BR 8.8.0 - BOUNDED FAST QUALITY
+// HIGH-QUALITY TRANSLATION; ONE GLOBAL QA; BOUNDED FINAL QUALITY; ZERO CONVERGENCE LOOPS
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.7.0-final-fast-quality-v1";
+  "8.8.0-bounded-fast-quality-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -80,8 +80,8 @@ const PLAN_FALLBACK_THINKING = "low";
 const PLAN_FALLBACK_MAX_OUTPUT_TOKENS = 5000;
 const PLAN_FALLBACK_RETRIES = 1;
 
-const MAIN_BATCH_MAX_CUES = 140;
-const MAIN_BATCH_MAX_CHARS = 32000;
+const MAIN_BATCH_MAX_CUES = 160;
+const MAIN_BATCH_MAX_CHARS = 36000;
 const MAIN_CONCURRENCY = 4;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
@@ -89,7 +89,7 @@ const MAIN_THINKING = "high";
 const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 120000;
 const MAIN_HTTP_RETRIES = 4;
-const MAIN_PARSE_ATTEMPTS = 3;
+const MAIN_PARSE_ATTEMPTS = 2;
 
 // MAIN EMPTY-CUE RESCUE
 // Se uma resposta estruturalmente válida trouxer pt vazio para um target
@@ -109,18 +109,19 @@ const MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN = 2;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
-const REPAIR_BATCH_MAX_CUES = 24;
+const REPAIR_BATCH_MAX_CUES = 32;
 const REPAIR_THINKING = "high";
 const REPAIR_MAX_OUTPUT_TOKENS = 10000;
 const REPAIR_TIMEOUT_MS = 90000;
 const REPAIR_HTTP_RETRIES = 3;
 const REPAIR_PARSE_ATTEMPTS = 2;
+const REPAIR_CONCURRENCY = 3;
 
 // QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 240;
-const QA_BATCH_MAX_CHARS = 52000;
+const QA_BATCH_MAX_CUES = 420;
+const QA_BATCH_MAX_CHARS = 90000;
 const QA_THINKING = "high";
 const QA_MAX_OUTPUT_TOKENS = 9000;
 const QA_TIMEOUT_MS = 120000;
@@ -137,7 +138,7 @@ const QA_CONTEXT_AFTER = 1;
 // Heurísticas ambíguas não ganham autoridade para reescrever texto sozinhas.
 // Duas auditorias semânticas independentes precisam concordar que o cue está
 // limpo para dispensar Repair. Qualquer flag OU falha técnica mantém Repair.
-const PRE_REPAIR_CONFIRM_ENABLED = true;
+const PRE_REPAIR_CONFIRM_ENABLED = false;
 const PRE_REPAIR_CONFIRM_ROUNDS = 2;
 const PRE_REPAIR_CONFIRM_BATCH_MAX_CUES = 70;
 const PRE_REPAIR_CONFIRM_BATCH_MAX_CHARS = 30000;
@@ -169,13 +170,13 @@ const FINAL_CRITICAL_RETRY_MAX_MS = 60000;
 const FINAL_CRITICAL_CONTEXT_RADIUS = 1;
 const FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER = 2;
 const FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
-const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 12;
+const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 24;
 const FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
 const FINAL_CRITICAL_ESCALATED_TIMEOUT_MS = 120000;
 const FINAL_CRITICAL_REQUEST_MAX_FAILURES = 3;
 const FINAL_CRITICAL_PARSE_MAX_FAILURES = 3;
 const FINAL_CRITICAL_ESCALATED_MAX_FAILURES = 3;
-const FINAL_CRITICAL_MAX_ROUNDS = 4;
+const FINAL_CRITICAL_MAX_ROUNDS = 2;
 const JOB_RETRY_BASE_MS = 5000;
 const JOB_RETRY_MAX_MS = 60000;
 const JOB_MAX_ATTEMPTS = 2;
@@ -202,7 +203,7 @@ const LAYOUT_IDEAL_CHARS_PER_LINE = 44;
 const COMPACT_RESCUE_ENABLED = true;
 const COMPACT_RESCUE_MAX_CUES_TOTAL = 120;
 const COMPACT_RESCUE_BATCH_MAX_CUES = 24;
-const COMPACT_RESCUE_MAX_ROUNDS = 2;
+const COMPACT_RESCUE_MAX_ROUNDS = 1;
 
 const COMPACT_RESCUE_THINKING = "high";
 const COMPACT_RESCUE_MAX_OUTPUT_TOKENS = 7000;
@@ -219,7 +220,7 @@ const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
 
 // Audita somente cues cujo TEXTO foi realmente reescrito
 // depois do MAIN. Mudança apenas de quebra de linha não conta.
-const SEMANTIC_REWRITE_AUDIT_ENABLED = true;
+const SEMANTIC_REWRITE_AUDIT_ENABLED = false;
 
 const SEMANTIC_REWRITE_AUDIT_MAX_CUES_PER_BATCH = 80;
 const SEMANTIC_REWRITE_AUDIT_MAX_CHARS_PER_BATCH = 32000;
@@ -9667,26 +9668,71 @@ function conciseIdentityForQa(
   };
 }
 
+function compactIdentityHint(
+  block,
+  plan
+) {
+  const speaker =
+    findPersonForSpeaker(
+      plan,
+      block.speakerHint
+    );
+
+  const gender =
+    trustedPersonGender(
+      speaker
+    ) || "unknown";
+
+  const refs =
+    mentionedPeople(
+      plan,
+      block.text,
+      speaker?.canonical || ""
+    )
+      .map(person => ({
+        n: String(person?.canonical || ""),
+        g: trustedPersonGender(person) || "unknown"
+      }))
+      .filter(item => item.n)
+      .slice(0, 4);
+
+  return {
+    s: String(
+      speaker?.canonical ||
+      block.speakerHint ||
+      "unknown"
+    ),
+    g: gender,
+    r: refs
+  };
+}
+
 function buildOwnershipPayload(
   allBlocks,
   posMap,
   batch,
   plan
 ) {
-  const locksById =
-    new Map();
+  const locksById = new Map();
+  const ownershipById = new Map();
 
-  const ownershipById =
-    new Map();
+  const firstPos =
+    Math.max(
+      0,
+      Number(
+        posMap.get(batch[0]?.index) || 0
+      )
+    );
 
-  const capsules = [];
+  const lastPos =
+    Math.max(
+      firstPos,
+      Number(
+        posMap.get(batch[batch.length - 1]?.index) || firstPos
+      )
+    );
 
-  for (const block of batch) {
-    const pos =
-      posMap.get(
-        block.index
-      );
-
+  const cues = batch.map(block => {
     const protectedTarget =
       protectCulturalLocks(
         block.text,
@@ -9706,110 +9752,57 @@ function buildOwnershipPayload(
       ownershipKey
     );
 
-    capsules.push({
-      i:
-        block.index,
+    const turns =
+      sourceDialogueDashCount(block);
 
-      ownership_key:
-        ownershipKey,
+    return {
+      i: block.index,
+      k: ownershipKey,
+      en: protectedTarget.text,
+      idn: compactIdentityHint(block, plan),
+      ...(turns >= 2 ? { turns } : {}),
+      ...(protectedTarget.locks.length
+        ? { hard: protectedTarget.locks.map(lock => lock.token) }
+        : {})
+    };
+  });
+
+  return {
+    payload: {
+      rule:
+        "Lista cronológica. Traduza exclusivamente en do mesmo i. " +
+        "k pertence ao mesmo cue e deve voltar idêntico. " +
+        "before/after são contexto compartilhado, nunca conteúdo do target. " +
+        "idn.g só é confiável quando diferente de unknown; sem prova, neutralize gênero naturalmente. " +
+        "Não antecipe, atrase, duplique ou mova conteúdo entre IDs.",
 
       before:
         allBlocks
           .slice(
-            Math.max(
-              0,
-              pos -
-                CAPSULE_CONTEXT_BEFORE
-            ),
-            pos
+            Math.max(0, firstPos - CAPSULE_CONTEXT_BEFORE),
+            firstPos
           )
-          .map(
-            contextCue
-          ),
+          .map(contextCue),
 
-      target: {
-        i:
-          block.index,
-
-                en:
-          protectedTarget.text,
-
-        ...(
-          sourceDialogueDashCount(
-            block
-          ) >= 2
-            ? {
-                dialogue_turn_count:
-                  sourceDialogueDashCount(
-                    block
-                  ),
-
-                dialogue_turn_lock:
-                  "Preserve exatamente esta quantidade e ordem de turns; cada turn deve começar com '- ' no pt bruto."
-              }
-            : {}
-        ),
-
-        ...(
-          block.speakerHint
-            ? {
-                speaker:
-                  block.speakerHint
-              }
-            : {}
-        )
-      },
+      cues,
 
       after:
         allBlocks
           .slice(
-            pos + 1,
-
+            lastPos + 1,
             Math.min(
               allBlocks.length,
-
-              pos +
-                1 +
-                CAPSULE_CONTEXT_AFTER
+              lastPos + 1 + CAPSULE_CONTEXT_AFTER
             )
           )
-          .map(
-            contextCue
-          ),
-
-      identity_lock:
-        identityLockForCapsule(
-          block,
-          plan
-        ),
-
-      hard_locks:
-        protectedTarget
-          .locks
-          .map(
-            lock =>
-              lock.token
-          )
-    });
-  }
-
-  return {
-    payload: {
-      ownership_rule:
-        "As cápsulas estão em ordem cronológica. " +
-        "Cada ownership_key pertence exclusivamente ao target do mesmo ID. " +
-        "Na saída, copie ownership_key exatamente para o campo k. " +
-        "Traduza somente target para pt. " +
-        "before/after servem exclusivamente para contexto. " +
-        "Nunca copie, antecipe, atrase, duplique ou mova conteúdo entre IDs.",
-
-      capsules
+          .map(contextCue)
     },
 
     locksById,
     ownershipById
   };
 }
+
 function parseCueTranslation(
   batch,
   raw,
@@ -10030,6 +10023,95 @@ function parseCueTranslation(
   }
 
   return byId;
+}
+
+function parseMainCueTranslationRobust(
+  batch,
+  raw,
+  locksById,
+  ownershipById
+) {
+  let parsed;
+
+  try {
+    parsed = JSON.parse(stripCodeFences(raw));
+  } catch {
+    throw new Error("JSON MAIN inválido.");
+  }
+
+  if (!Array.isArray(parsed?.cues)) {
+    throw new Error("Resposta MAIN sem cues.");
+  }
+
+  const expectedIds = batch.map(block => Number(block.index));
+  const expected = new Set(expectedIds);
+  const translations = new Map();
+  const emptyIds = [];
+  let ignoredExtras = 0;
+  let ignoredDuplicates = 0;
+  let badOwnership = 0;
+
+  for (const item of parsed.cues) {
+    const id = Number(item?.i);
+
+    if (!Number.isInteger(id) || !expected.has(id)) {
+      ignoredExtras++;
+      continue;
+    }
+
+    if (translations.has(id) || emptyIds.includes(id)) {
+      ignoredDuplicates++;
+      continue;
+    }
+
+    const expectedKey = String(ownershipById.get(id) || "");
+    const returnedKey = String(item?.k || "").trim();
+
+    if (expectedKey && returnedKey !== expectedKey) {
+      badOwnership++;
+      continue;
+    }
+
+    let pt = String(item?.pt ?? "").trim();
+
+    if (!pt) {
+      emptyIds.push(id);
+      continue;
+    }
+
+    if (/(?:^|[^\p{L}\p{N}_])(?:qualé|diacho)(?=$|[^\p{L}\p{N}_])/iu.test(pt)) {
+      console.warn(
+        `[PT-BR VOCAB SOFT LOCK] cue ${id}: "qualé/diacho" detectado; ` +
+        `candidato preservado para correção focal.`
+      );
+    }
+
+    pt = restoreCulturalLocks(
+      pt,
+      locksById.get(id) || [],
+      id
+    );
+
+    translations.set(id, pt);
+  }
+
+  const missingIds = expectedIds.filter(
+    id => !translations.has(id) && !emptyIds.includes(id)
+  );
+
+  if (ignoredExtras || ignoredDuplicates || badOwnership) {
+    console.warn(
+      `[MAIN ROBUST PARSER 8.8] extras=${ignoredExtras} | ` +
+      `duplicados=${ignoredDuplicates} | ownership-inválido=${badOwnership}; ` +
+      `cues válidos foram preservados, sem retraduzir o lote.`
+    );
+  }
+
+  return {
+    translations,
+    emptyIds,
+    missingIds
+  };
 }
 
 async function rescueEmptyMainCue({
@@ -10344,7 +10426,7 @@ async function translateMainBatch({
                 plan
               )
             }\n\n` +
-            `CÁPSULAS CUE-LOCK:\n${
+            `LOTE CUE-LOCK COM CONTEXTO COMPARTILHADO:\n${
               JSON.stringify(
                 payload
               )
@@ -10354,10 +10436,10 @@ async function translateMainBatch({
             `Output exatamente ${
               batch.length
             } cues. ` +
-            `Para cada cápsula, copie ownership_key EXATAMENTE para o campo k do mesmo ID. ` +
-            `Traduza SOMENTE target para pt. ` +
-            `Nunca use em pt conteúdo pertencente ao target, before ou after de outro ID. ` +
-            `Todos os tokens __LOCK_C...__ recebidos no target devem voltar idênticos em pt. ` +
+            `Para cada item de cues, copie k EXATAMENTE para o campo k do mesmo ID. ` +
+            `Traduza SOMENTE en do mesmo item para pt. ` +
+            `Nunca use em pt conteúdo pertencente a outro ID ou aos contextos before/after. ` +
+            `Todos os tokens __LOCK_C...__ recebidos em en devem voltar idênticos em pt. ` +
             `O token ${BLEEP_TOKEN} deve ser resolvido em linguagem natural, nunca copiado.`,
 
           schema:
@@ -10383,94 +10465,58 @@ async function translateMainBatch({
             "main"
         });
 
-      if (
-        !MAIN_EMPTY_CUE_RESCUE_ENABLED
-      ) {
-        return parseCueTranslation(
-          batch,
-          response.text,
-          locksById,
-          ownershipById,
-          true,
-          false
-        );
-      }
-
       const parsed =
-        parseCueTranslation(
+        parseMainCueTranslationRobust(
           batch,
           response.text,
           locksById,
-          ownershipById,
-          true,
-          true
+          ownershipById
         );
 
-      if (
-        !parsed.emptyIds.length
-      ) {
+      const rescueIds = [
+        ...new Set([
+          ...parsed.emptyIds,
+          ...parsed.missingIds
+        ])
+      ];
+
+      if (!rescueIds.length) {
         return parsed.translations;
       }
 
-      job.stats.mainEmptyCueRescueCues +=
-        parsed.emptyIds.length;
+      job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN EMPTY-CUE RESCUE] lote principal válido, mas ${
-          parsed.emptyIds.length
-        } cue(s) vieram com pt vazio: ${
-          parsed.emptyIds.join(", ")
-        }. Preservando os demais cues e refazendo somente os vazios.`
+        `[MAIN FOCAL RESCUE 8.8] preservando ${parsed.translations.size}/${batch.length} ` +
+        `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
+        `${rescueIds.join(", ")}.`
       );
 
-      const batchById =
-        new Map(
-          batch.map(
-            block => [
-              block.index,
-              block
-            ]
-          )
-        );
+      const batchById = new Map(
+        batch.map(block => [block.index, block])
+      );
 
-      for (
-        const id of
-        parsed.emptyIds
-      ) {
-        const block =
-          batchById.get(id);
+      for (const id of rescueIds) {
+        const block = batchById.get(id);
 
         if (!block) {
-          throw new Error(
-            `MAIN EMPTY-CUE RESCUE: bloco ${id} não encontrado no lote.`
-          );
+          throw new Error(`MAIN FOCAL RESCUE: bloco ${id} não encontrado.`);
         }
 
-        const rescuedPt =
-          await rescueEmptyMainCue({
-            blocks,
-            posMap,
-            block,
-            plan,
-            job
-          });
+        const rescuedPt = await rescueEmptyMainCue({
+          blocks,
+          posMap,
+          block,
+          plan,
+          job
+        });
 
-        parsed.translations.set(
-          id,
-          rescuedPt
-        );
+        parsed.translations.set(id, rescuedPt);
       }
 
-      if (
-        parsed.translations.size !==
-        batch.length
-      ) {
+      if (parsed.translations.size !== batch.length) {
         throw new Error(
-          `MAIN EMPTY-CUE RESCUE terminou incompleto: ${
-            parsed.translations.size
-          }/${
-            batch.length
-          }.`
+          `MAIN FOCAL RESCUE incompleto: ${parsed.translations.size}/${batch.length}.`
         );
       }
 
@@ -10810,119 +10856,41 @@ function buildQaBatches(
   plan
 ) {
   const batches = [];
-
   let current = [];
   let chars = 0;
 
-  for (
-    let pos = 0;
-    pos < blocks.length;
-    pos++
-  ) {
-    const block =
-      blocks[pos];
+  for (let pos = 0; pos < blocks.length; pos++) {
+    const block = blocks[pos];
+    const lock = identityLockForCapsule(block, plan);
 
     const item = {
-      i:
-        block.index,
-
-      en:
-        String(
-          block.text ||
-          ""
-        ),
-
-      pt:
-        String(
-          translations.get(
-            block.index
-          ) ||
-          ""
-        ),
-
-      ...(
-        block.speakerHint
-          ? {
-              speaker:
-                block.speakerHint
-            }
-          : {}
-      ),
-
-      identity_lock:
-        conciseIdentityForQa(
-          block,
-          plan
-        ),
-
-      before:
-        blocks
-          .slice(
-            Math.max(
-              0,
-              pos -
-              QA_CONTEXT_BEFORE
-            ),
-
-            pos
-          )
-          .map(
-            contextCue
-          ),
-
-      after:
-        blocks
-          .slice(
-            pos + 1,
-
-            Math.min(
-              blocks.length,
-              pos +
-              1 +
-              QA_CONTEXT_AFTER
-            )
-          )
-          .map(
-            contextCue
-          )
+      i: block.index,
+      en: String(block.text || ""),
+      pt: String(translations.get(block.index) || ""),
+      s: String(lock?.speaker?.canonical || block.speakerHint || "unknown"),
+      g: String(lock?.trusted_speaker_gender || "unknown"),
+      turns: sourceDialogueDashCount(block)
     };
 
-    const size =
-      JSON.stringify(
-        item
-      ).length;
+    const size = JSON.stringify(item).length;
 
     if (
       current.length &&
       (
-        current.length >=
-          QA_BATCH_MAX_CUES ||
-        chars + size >
-          QA_BATCH_MAX_CHARS
+        current.length >= QA_BATCH_MAX_CUES ||
+        chars + size > QA_BATCH_MAX_CHARS
       )
     ) {
-      batches.push(
-        current
-      );
-
+      batches.push(current);
       current = [];
       chars = 0;
     }
 
-    current.push(
-      item
-    );
-
-    chars +=
-      size;
+    current.push(item);
+    chars += size;
   }
 
-  if (current.length) {
-    batches.push(
-      current
-    );
-  }
-
+  if (current.length) batches.push(current);
   return batches;
 }
 
@@ -11098,12 +11066,12 @@ async function scanPtbrQuality(
                     plan || {}
                   )
                 }\n\n` +
-                `CUES FONTE×PT PARA AUDITORIA:\n${
+                `SEQUÊNCIA CRONOLÓGICA FONTE×PT PARA AUDITORIA (vizinhos da própria lista são o contexto):\n${
                   JSON.stringify(
                     batch
                   )
                 }\n\n` +
-                `Retorne IDs que merecem repair por erro semântico, gênero/referente, calque, literalidade ou naturalidade insuficiente. Não reescreva os cues.`,
+                `Retorne SOMENTE IDs que realmente merecem repair por erro semântico, gênero/referente, ownership, calque, literalidade ou naturalidade insuficiente. A lista já está em ordem cronológica; use os vizinhos como contexto sem mover conteúdo entre IDs. Não reescreva os cues.`,
 
               schema:
                 QA_SCHEMA,
@@ -13411,76 +13379,54 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
       translations
     );
 
-  const totalBatches =
-    Math.ceil(
-      selected.length /
-      REPAIR_BATCH_MAX_CUES
-    );
-
-  let successfulBatches = 0;
-  let failedBatches = 0;
-  let acceptedCues = 0;
-
+  const repairBatches = [];
   for (
     let i = 0;
     i < selected.length;
-    i +=
-      REPAIR_BATCH_MAX_CUES
+    i += REPAIR_BATCH_MAX_CUES
   ) {
-    const batch =
-      selected.slice(
-        i,
-        i +
-        REPAIR_BATCH_MAX_CUES
-      );
+    repairBatches.push(
+      selected.slice(i, i + REPAIR_BATCH_MAX_CUES)
+    );
+  }
 
-    const batchNumber =
-      Math.floor(
-        i /
-        REPAIR_BATCH_MAX_CUES
-      ) + 1;
+  const totalBatches = repairBatches.length;
+  let successfulBatches = 0;
+  let failedBatches = 0;
+  let acceptedCues = 0;
+  let repairCursor = 0;
 
-    try {
-      const repaired =
-        await repairBatch(
+  async function repairWorker(workerId) {
+    while (true) {
+      const batchIndex = repairCursor++;
+      if (batchIndex >= repairBatches.length) return;
+
+      const batch = repairBatches[batchIndex];
+      const batchNumber = batchIndex + 1;
+
+      try {
+        const repaired = await repairBatch(
           blocks,
           posMap,
-          updated,
+          translations,
           batch,
           plan,
           job
         );
 
-      let acceptedThisBatch = 0;
+        let acceptedThisBatch = 0;
 
-      for (
-        const [id, pt]
-        of repaired
-      ) {
-        const pos =
-          posMap.get(id);
+        for (const [id, pt] of repaired) {
+          const pos = posMap.get(id);
+          const block = blocks[pos];
+          if (!block) continue;
 
-        const block =
-          blocks[pos];
-
-        if (!block) {
-          continue;
-        }
-
-        const beforePt =
-          String(
-            updated.get(id) ??
-            translations.get(id) ??
-            ""
+          const beforePt = String(
+            translations.get(id) ?? ""
           ).trim();
+          const candidatePt = String(pt || "").trim();
 
-        const candidatePt =
-          String(
-            pt || ""
-          ).trim();
-
-        const regressions =
-          repairCandidateRegressionReasons(
+          const regressions = repairCandidateRegressionReasons(
             block,
             beforePt,
             candidatePt,
@@ -13488,54 +13434,39 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
             plan
           );
 
-        if (regressions.length) {
-          console.warn(
-            `[REPAIR REGRESSION GUARD] cue ${id} rejeitado | ` +
-            `${regressions.join(", ")}.`
-          );
+          if (regressions.length) {
+            console.warn(
+              `[REPAIR REGRESSION GUARD] cue ${id} rejeitado | ${regressions.join(", ")}.`
+            );
+            continue;
+          }
 
-          continue;
+          updated.set(id, candidatePt);
+          acceptedThisBatch++;
+          acceptedCues++;
         }
 
-        updated.set(
-          id,
-          candidatePt
+        successfulBatches++;
+        console.log(
+          `[REPAIR W${workerId}] lote ${batchNumber}/${totalBatches} OK | aceitos=${acceptedThisBatch}.`
         );
-
-        acceptedThisBatch++;
-        acceptedCues++;
+      } catch (error) {
+        failedBatches++;
+        job.stats.repairFailures++;
+        console.warn(
+          `[REPAIR W${workerId}] lote ${batchNumber}/${totalBatches} falhou; ` +
+          `candidato anterior preservado | ${errorMessage(error).slice(0, 350)}`
+        );
       }
-
-      successfulBatches++;
-
-      console.log(
-        `[REPAIR] lote ${batchNumber}/${totalBatches} OK | ` +
-        `aceitos=${acceptedThisBatch}.`
-      );
-    } catch (error) {
-      failedBatches++;
-
-      job.stats.repairFailures++;
-
-      console.warn(
-        `[REPAIR] lote ${batchNumber}/${totalBatches} falhou sem matar Repair | ` +
-        `mantendo lotes anteriores e continuando | ${
-          errorMessage(
-            error
-          ).slice(
-            0,
-            350
-          )
-        }`
-      );
-
-      // MUITO IMPORTANTE:
-      // não retorna translations;
-      // não apaga os lotes já reparados;
-      // simplesmente segue para o próximo lote.
-      continue;
     }
   }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(REPAIR_CONCURRENCY, Math.max(1, totalBatches)) },
+      (_, index) => repairWorker(index + 1)
+    )
+  );
 
   console.log(
     `[REPAIR] FINAL | ` +
@@ -15177,7 +15108,7 @@ function finalCriticalAuditItem(block, translations, plan) {
     i: block.index,
     source: String(block.text || ""),
     pt: String(translations.get(block.index) || ""),
-    identity_lock: conciseIdentityForQa(block, plan),
+    identity_lock: compactIdentityHint(block, plan),
     dialogue_turn_count: sourceDialogueDashCount(block)
   };
 }
@@ -15860,6 +15791,151 @@ async function convergeFinalCriticalQuality(
   return current;
 }
 
+async function runBoundedFinalQuality88(
+  blocks,
+  translations,
+  mainTranslations,
+  qaIssues,
+  plan,
+  job
+) {
+  let current = sanitizeTranslationMap(
+    blocks,
+    translations,
+    job
+  );
+
+  const initialFocus = idsFromIssues(qaIssues, blocks);
+
+  for (const block of blocks) {
+    const before = String(mainTranslations.get(block.index) || "")
+      .replace(/\s+/g, " ").trim();
+    const after = String(current.get(block.index) || "")
+      .replace(/\s+/g, " ").trim();
+    if (before !== after) initialFocus.add(block.index);
+  }
+
+  const localBefore = blockingLocalIssues(
+    blocks,
+    applySubtitleLayout(blocks, current, "FINAL-88-CANDIDATE"),
+    job,
+    plan
+  );
+  for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
+
+  console.log(
+    `[FINAL BOUNDED 8.8] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `zero convergência aberta.`
+  );
+
+  const semantic1 = await scanFinalCriticalAudit(
+    blocks,
+    current,
+    plan,
+    job,
+    initialFocus
+  );
+
+  let issues1 = mergeIssueLists(localBefore, semantic1);
+  let changedAfterFinalRepair = new Set();
+
+  if (issues1.length) {
+    logIssueSummary("FINAL-88-REPAIR", issues1);
+    const beforeRepair = new Map(current);
+
+    current = await runFinalCriticalEscalatedRepair(
+      blocks,
+      current,
+      issues1,
+      plan,
+      job
+    );
+
+    current = sanitizeTranslationMap(blocks, current, job);
+    current = await runCompactRescue(blocks, current, plan, job);
+    current = sanitizeTranslationMap(blocks, current, job);
+
+    for (const block of blocks) {
+      const a = String(beforeRepair.get(block.index) || "").replace(/\s+/g, " ").trim();
+      const b = String(current.get(block.index) || "").replace(/\s+/g, " ").trim();
+      if (a !== b) changedAfterFinalRepair.add(block.index);
+    }
+  }
+
+  const verifyFocus = new Set([
+    ...idsFromIssues(issues1, blocks),
+    ...changedAfterFinalRepair
+  ]);
+
+  if (verifyFocus.size) {
+    console.log(
+      `[FINAL BOUNDED 8.8] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `esta é a última auditoria Gemini do job.`
+    );
+
+    const laidOut = applySubtitleLayout(
+      blocks,
+      current,
+      "FINAL-88-VERIFY"
+    );
+
+    const local2 = blockingLocalIssues(
+      blocks,
+      laidOut,
+      job,
+      plan
+    ).filter(issue => verifyFocus.has(Number(issue.id)));
+
+    const semantic2 = await scanFinalCriticalAudit(
+      blocks,
+      current,
+      plan,
+      job,
+      verifyFocus
+    );
+
+    const issues2 = mergeIssueLists(local2, semantic2);
+
+    if (issues2.length) {
+      logIssueSummary("FINAL-88-LAST-REPAIR", issues2);
+      console.warn(
+        `[FINAL BOUNDED 8.8] ${issues2.length} blocker(s) residuais; ` +
+        `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
+      );
+
+      current = await runFinalCriticalEscalatedRepair(
+        blocks,
+        current,
+        issues2,
+        plan,
+        job
+      );
+      current = sanitizeTranslationMap(blocks, current, job);
+      current = await runCompactRescue(blocks, current, plan, job);
+      current = sanitizeTranslationMap(blocks, current, job);
+    }
+  }
+
+  const finalLocal = blockingLocalIssues(
+    blocks,
+    applySubtitleLayout(blocks, current, "FINAL-88-LOCAL"),
+    job,
+    plan
+  );
+
+  if (finalLocal.length) {
+    console.warn(
+      `[FINAL BOUNDED 8.8] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
+    );
+    job.qualityStatus = "bounded_best_candidate";
+  } else {
+    job.qualityStatus = "final_pass";
+  }
+
+  return current;
+}
+
 async function translateSrt(
   sourceSrt,
   job
@@ -15886,7 +15962,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.7.0 FINAL] fonte=${
+    `[PIPELINE 8.8.0 BOUNDED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16028,114 +16104,27 @@ finalTranslations =
   );
 
 // ============================================================
-// POST-REWRITE SEMANTIC GUARD
+// FINAL QUALITY — 8.8 BOUNDED
 // ============================================================
-// Compara EN × tradução pré-rewrite × resultado pós-rewrite.
-// Permite reparo conservador de fonte claramente truncada.
-// Toda correção ainda precisa obedecer 2x50.
-finalTranslations =
-  await runPostRewriteSemanticAudit(
-    blocks,
-    preRewriteTranslations,
-    finalTranslations,
-    plan,
-    job
-  );
-
-finalTranslations =
-  sanitizeTranslationMap(
-    blocks,
-    finalTranslations,
-    job
-  );
-
-// ============================================================
-// FINAL CRITICAL CONVERGENCE — 8.6 FOCUSED
-// ============================================================
-// O QA acima já auditou o episódio inteiro com thinking HIGH.
-// O gate final reaudita SOMENTE:
-// 1) cues marcados pelo QA;
-// 2) cues cujo texto mudou depois do MAIN;
-// 3) blockers locais encontrados dentro do próprio gate.
-// Assim não pagamos por uma segunda auditoria global redundante.
-const finalCriticalFocusIds =
-  idsFromIssues(
-    qaIssues,
-    blocks
-  );
-
-for (const block of blocks) {
-  const before = String(
-    mainTranslations.get(block.index) || ""
-  ).replace(/\s+/g, " ").trim();
-
-  const after = String(
-    finalTranslations.get(block.index) || ""
-  ).replace(/\s+/g, " ").trim();
-
-  if (before !== after) {
-    finalCriticalFocusIds.add(block.index);
-  }
-}
-
-console.log(
-  `[FINAL CRITICAL 8.6] foco inicial=${finalCriticalFocusIds.size} cue(s); ` +
-  `QA global já concluído, zero segunda varredura integral.`
+// O QA global HIGH já cobriu o episódio inteiro. Depois dele existe somente:
+// 1) repair focal;
+// 2) uma auditoria HIGH focal;
+// 3) no máximo uma reconstrução focal + uma verificação HIGH final.
+// Não existe convergência aberta, reabertura por layout nem ciclo de rounds.
+finalTranslations = await runBoundedFinalQuality88(
+  blocks,
+  finalTranslations,
+  mainTranslations,
+  qaIssues,
+  plan,
+  job
 );
-
-finalTranslations =
-  await convergeFinalCriticalQuality(
-    blocks,
-    finalTranslations,
-    plan,
-    job,
-    finalCriticalFocusIds
-  );
-
-// Layout final exatamente do texto autorizado pelo gate.
-const finalLayoutTranslations =
-  applySubtitleLayout(
-    blocks,
-    finalTranslations,
-    "FINAL-AUTHORIZED"
-  );
-
-const finalLayoutOverflow =
-  collectCompactRescueIssues(
-    blocks,
-    finalLayoutTranslations
-  );
-
-if (finalLayoutOverflow.length) {
-  // Em teoria convergeFinalCriticalQuality já impede isto.
-  // Se alguma mudança futura quebrar a invariável, voltamos ao próprio
-  // gate em vez de publicar silenciosamente.
-  const overflowFocusIds =
-    idsFromIssues(
-      finalLayoutOverflow,
-      blocks
-    );
-
-  console.warn(
-    `[LAYOUT HARD CAP] ${finalLayoutOverflow.length} overflow(s) ` +
-    `apareceram após autorização; reabrindo SOMENTE ${overflowFocusIds.size} cue(s) focal(is).`
-  );
-
-  finalTranslations =
-    await convergeFinalCriticalQuality(
-      blocks,
-      finalLayoutTranslations,
-      plan,
-      job,
-      overflowFocusIds
-    );
-}
 
 const authorizedLayoutTranslations =
   applySubtitleLayout(
     blocks,
     finalTranslations,
-    "FINAL-AUTHORIZED-2"
+    "FINAL-AUTHORIZED-8.8"
   );
 
 const finalSrt =
@@ -16174,7 +16163,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.7.0 FINAL] FINAL OK | ${
+    `[PIPELINE 8.8.0 BOUNDED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17796,7 +17785,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.7.0 - FINAL FAST QUALITY"
+        " STREMIO PT-BR 8.8.0 - BOUNDED FAST QUALITY"
   );
 
   console.log(
@@ -17892,7 +17881,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite Semantic Guard: EN absoluto + BEFORE × AFTER + cues suspeitos de ownership ✅"
+  "Post-Rewrite 8.8: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -17945,7 +17934,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership capsules: ATIVAS ✅"
+    "Cue Ownership 8.8: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18054,10 +18043,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.7.0: MAIN=140 / QA=240 / Final=200; thinking HIGH preservado nas etapas críticas ✅");
-  console.log("MAIN Schema 8.7: sem minItems/maxItems; contagem/ordem/ownership validados localmente ✅");
-  console.log("MAIN Fail-Fast 8.7: HTTP 400 determinístico não repete lote nem reinicia episódio; lote >90 pode dividir UMA vez ✅");
-  console.log("Final Critical 8.7.0: QA global único; gate final somente cues suspeitos/alterados ✅");
+  console.log("Final 8.8.0: MAIN=160 / QA=420 / auditoria final FOCAL; thinking HIGH preservado nas etapas críticas ✅");
+  console.log("MAIN Robust 8.8: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
+  console.log("MAIN Fail-Fast 8.8: erro determinístico não vira loop; payload compacto + rescue focal ✅");
+  console.log("Final Bounded 8.8: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.5 não depende dela ✅");
 
   console.log(
@@ -18069,7 +18058,7 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.4.5: heuristic-only issues require 2 clean semantic confirmations before rewrite suppression. OK"
+    "Pre-Repair 8.8: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
   );
 
   console.log(
