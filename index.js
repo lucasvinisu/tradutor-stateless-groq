@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.4.6 - BOUNDED CONVERGENCE + MULTILINGUAL SDH CONSENSUS
-// 8.4.5 QUALITY / CONCURRENCY PRESERVED
+// STREMIO PT-BR 8.5.0 - FAST BOUNDED QUALITY + MULTILINGUAL SDH CONSENSUS
+// QUALITY-CRITICAL THINKING PRESERVED; REDUNDANT GLOBAL RE-AUDIT REMOVED
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.4.6-bounded-convergence-multilingual-sdh-v1";
+  "8.5.0-fast-bounded-quality-total-sync-v2";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -70,9 +70,9 @@ const PLAN_FALLBACK_THINKING = "low";
 const PLAN_FALLBACK_MAX_OUTPUT_TOKENS = 5000;
 const PLAN_FALLBACK_RETRIES = 1;
 
-const MAIN_BATCH_MAX_CUES = 60;
-const MAIN_BATCH_MAX_CHARS = 15000;
-const MAIN_CONCURRENCY = 3;
+const MAIN_BATCH_MAX_CUES = 90;
+const MAIN_BATCH_MAX_CHARS = 24000;
+const MAIN_CONCURRENCY = 4;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
 const MAIN_THINKING = "high";
@@ -109,15 +109,15 @@ const REPAIR_PARSE_ATTEMPTS = 2;
 // QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 160;
-const QA_BATCH_MAX_CHARS = 36000;
+const QA_BATCH_MAX_CUES = 180;
+const QA_BATCH_MAX_CHARS = 42000;
 const QA_THINKING = "high";
 const QA_MAX_OUTPUT_TOKENS = 9000;
 const QA_TIMEOUT_MS = 120000;
 const QA_HTTP_RETRIES = 3;
 const QA_PARSE_ATTEMPTS = 2;
 const QA_MAX_FLAGS_TOTAL = 120;
-const QA_CONCURRENCY = 3;
+const QA_CONCURRENCY = 4;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
 
@@ -146,9 +146,9 @@ const PRE_REPAIR_CONFIRM_HTTP_RETRIES = 3;
 // até que não reste defeito crítico. Falhas transitórias de Gemini
 // também entram em retry; não viram "failed" por conveniência.
 const FINAL_CRITICAL_GATE_ENABLED = true;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 80;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 32000;
-const FINAL_CRITICAL_AUDIT_CONCURRENCY = 2;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 120;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 48000;
+const FINAL_CRITICAL_AUDIT_CONCURRENCY = 3;
 const FINAL_CRITICAL_AUDIT_THINKING = "high";
 const FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS = 10000;
 const FINAL_CRITICAL_AUDIT_TIMEOUT_MS = 120000;
@@ -15499,15 +15499,30 @@ async function convergeFinalCriticalQuality(
   blocks,
   translations,
   plan,
-  job
+  job,
+  initialFocusIds = null
 ) {
   if (!FINAL_CRITICAL_GATE_ENABLED) return translations;
 
   let current = new Map(translations);
   let previousSignature = "";
   let stagnantRounds = 0;
-  let firstAudit = true;
-  let focusIds = null;
+
+  let focusIds = new Set(
+    initialFocusIds instanceof Set
+      ? [...initialFocusIds]
+      : Array.isArray(initialFocusIds)
+        ? initialFocusIds
+        : []
+  );
+
+  // A primeira invocação do pipeline continua GLOBAL para preservar
+  // exatamente a função do gate 8.4.6. Quando o gate é reaberto por um
+  // problema já conhecido (ex.: 1 overflow de layout), começamos focado
+  // nesses IDs e NUNCA varremos os ~3.000 cues outra vez.
+  let firstAudit =
+    focusIds.size === 0;
+
   let roundsThisRun = 0;
 
   while (
@@ -15529,9 +15544,15 @@ async function convergeFinalCriticalQuality(
       plan
     );
 
-    // A primeira passagem é GLOBAL: exatamente para capturar cadeias de
-    // ownership como +1/-1 que detectores locais por tamanho não enxergam.
-    const auditFocusIds = firstAudit ? null : focusIds;
+    for (const id of idsFromIssues(local, blocks)) {
+      focusIds.add(id);
+    }
+
+    const auditFocusIds =
+      firstAudit
+        ? null
+        : new Set(focusIds);
+
     const semantic = await scanFinalCriticalAudit(
       blocks,
       current,
@@ -15570,9 +15591,6 @@ async function convergeFinalCriticalQuality(
       job.stats.finalCriticalNoProgressEscalations =
         (job.stats.finalCriticalNoProgressEscalations || 0) + 1;
 
-      // Escalonamento: somente os cues efetivamente críticos entram no
-      // Repair, sem poluição de flags cosméticas. A convergência continua
-      // somente até FINAL_CRITICAL_MAX_ROUNDS.
       console.warn(
         `[FINAL CRITICAL ESCALATION] mesmos defeitos persistiram por ` +
         `${stagnantRounds + 1} rodada(s); repair hiperfocado nos IDs críticos.`
@@ -15607,8 +15625,6 @@ async function convergeFinalCriticalQuality(
 
     current = sanitizeTranslationMap(blocks, current, job);
 
-    // Qualquer overflow criado/retido é tratado imediatamente sem tocar
-    // nos timestamps nem nos cues já bons.
     current = await runCompactRescue(
       blocks,
       current,
@@ -15683,7 +15699,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.4.6] fonte=${
+    `[PIPELINE 8.5.0 FAST] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -15878,9 +15894,15 @@ if (finalLayoutOverflow.length) {
   // Em teoria convergeFinalCriticalQuality já impede isto.
   // Se alguma mudança futura quebrar a invariável, voltamos ao próprio
   // gate em vez de publicar silenciosamente.
+  const overflowFocusIds =
+    idsFromIssues(
+      finalLayoutOverflow,
+      blocks
+    );
+
   console.warn(
     `[LAYOUT HARD CAP] ${finalLayoutOverflow.length} overflow(s) ` +
-    `apareceram após autorização; reabrindo gate crítico.`
+    `apareceram após autorização; reabrindo SOMENTE ${overflowFocusIds.size} cue(s) focal(is).`
   );
 
   finalTranslations =
@@ -15888,7 +15910,8 @@ if (finalLayoutOverflow.length) {
       blocks,
       finalLayoutTranslations,
       plan,
-      job
+      job,
+      overflowFocusIds
     );
 }
 
@@ -15935,7 +15958,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.4.6] FINAL OK | ${
+    `[PIPELINE 8.5.0 FAST] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17511,7 +17534,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.4.6 - BOUNDED CONVERGENCE + MULTILINGUAL SDH"
+        " STREMIO PT-BR 8.5.0 - FAST BOUNDED QUALITY + TOTAL SYNC"
   );
 
   console.log(
@@ -17769,6 +17792,8 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
+  console.log("Fast 8.5.0: MAIN/QA/final-audit com lotes maiores; thinking HIGH preservado nas etapas críticas ✅");
+  console.log("Final Critical 8.5.0: primeira auditoria continua GLOBAL; reabertura por overflow é SOMENTE focal ✅");
 
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
