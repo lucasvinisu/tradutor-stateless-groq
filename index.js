@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.5.0 - FAST BOUNDED QUALITY + MULTILINGUAL SDH CONSENSUS
-// QUALITY-CRITICAL THINKING PRESERVED; REDUNDANT GLOBAL RE-AUDIT REMOVED
+// STREMIO PT-BR 8.6.0 - SEMANTIC SYNC + FAST QUALITY
+// ONE GLOBAL QA; FINAL CRITICAL IS FOCUSED; QUALITY-CRITICAL THINKING PRESERVED
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.5.0-fast-bounded-quality-total-sync-v2";
+  "8.6.0-semantic-sync-fast-quality-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -39,6 +39,16 @@ const SYNC_PROXY_THINKING = "low";
 const SYNC_PROXY_MAX_OUTPUT_TOKENS = 12000;
 const SYNC_PROXY_TIMEOUT_MS = 90000;
 const SYNC_PROXY_HTTP_RETRIES = 3;
+
+// Cross-language semantic anchor alignment.
+// Recebe SOMENTE poucos cues + palavras já transcritas; nunca traduz a legenda inteira.
+const SYNC_ALIGN_MAX_ITEMS = 20;
+const SYNC_ALIGN_MAX_WORDS_PER_ITEM = 120;
+const SYNC_ALIGN_MAX_CHARS = 30000;
+const SYNC_ALIGN_THINKING = "low";
+const SYNC_ALIGN_MAX_OUTPUT_TOKENS = 5000;
+const SYNC_ALIGN_TIMEOUT_MS = 60000;
+const SYNC_ALIGN_HTTP_RETRIES = 3;
 
 // Gemini Transcribe free-tier guard: 3 RPM / 10k TPM / 25 RPD.
 // O projeto usa 22s entre inícios, teto interno de 24 chamadas/24h e
@@ -70,8 +80,8 @@ const PLAN_FALLBACK_THINKING = "low";
 const PLAN_FALLBACK_MAX_OUTPUT_TOKENS = 5000;
 const PLAN_FALLBACK_RETRIES = 1;
 
-const MAIN_BATCH_MAX_CUES = 90;
-const MAIN_BATCH_MAX_CHARS = 24000;
+const MAIN_BATCH_MAX_CUES = 140;
+const MAIN_BATCH_MAX_CHARS = 32000;
 const MAIN_CONCURRENCY = 4;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
@@ -109,8 +119,8 @@ const REPAIR_PARSE_ATTEMPTS = 2;
 // QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 180;
-const QA_BATCH_MAX_CHARS = 42000;
+const QA_BATCH_MAX_CUES = 240;
+const QA_BATCH_MAX_CHARS = 52000;
 const QA_THINKING = "high";
 const QA_MAX_OUTPUT_TOKENS = 9000;
 const QA_TIMEOUT_MS = 120000;
@@ -146,8 +156,8 @@ const PRE_REPAIR_CONFIRM_HTTP_RETRIES = 3;
 // até que não reste defeito crítico. Falhas transitórias de Gemini
 // também entram em retry; não viram "failed" por conveniência.
 const FINAL_CRITICAL_GATE_ENABLED = true;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 120;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 48000;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 200;
+const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 56000;
 const FINAL_CRITICAL_AUDIT_CONCURRENCY = 3;
 const FINAL_CRITICAL_AUDIT_THINKING = "high";
 const FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS = 10000;
@@ -6896,6 +6906,149 @@ Rules:
   if (out.length !== cleanItems.length) {
     throw new Error("SYNC PROXY retornou contagem divergente.");
   }
+  return out;
+}
+
+const SYNC_ALIGN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: { type: "integer" },
+          matched: { type: "boolean" },
+          start_word: { type: "integer" },
+          end_word: { type: "integer" },
+          confidence: { type: "integer" }
+        },
+        required: ["i", "matched", "start_word", "end_word", "confidence"]
+      }
+    }
+  },
+  required: ["items"]
+};
+
+async function alignMultilingualSyncAnchors(items, sourceLang, audioLang) {
+  const src = normalizeSyncLanguageCode(sourceLang, "auto");
+  const aud = normalizeSyncLanguageCode(audioLang, "en");
+
+  const cleanItems = (Array.isArray(items) ? items : [])
+    .map(item => {
+      const words = (Array.isArray(item?.words) ? item.words : [])
+        .map((word, index) => ({
+          n: Number.isInteger(Number(word?.n)) ? Number(word.n) : index,
+          text: String(word?.text || "").replace(/\s+/g, " ").trim()
+        }))
+        .filter(word => Number.isInteger(word.n) && word.text)
+        .slice(0, SYNC_ALIGN_MAX_WORDS_PER_ITEM);
+
+      return {
+        i: Number(item?.i),
+        source_text: String(item?.sourceText || "").replace(/\s+/g, " ").trim(),
+        words
+      };
+    })
+    .filter(item =>
+      Number.isInteger(item.i) &&
+      item.source_text &&
+      item.words.length >= 2
+    );
+
+  if (!cleanItems.length) {
+    throw new Error("SYNC ALIGN sem itens válidos.");
+  }
+
+  if (cleanItems.length > SYNC_ALIGN_MAX_ITEMS) {
+    throw new Error(`SYNC ALIGN excede ${SYNC_ALIGN_MAX_ITEMS} itens.`);
+  }
+
+  const charCount = JSON.stringify(cleanItems).length;
+  if (charCount > SYNC_ALIGN_MAX_CHARS) {
+    throw new Error(`SYNC ALIGN excede ${SYNC_ALIGN_MAX_CHARS} caracteres.`);
+  }
+
+  const system = `You align subtitle cues to short ASR transcript windows for synchronization.
+SOURCE language: ${syncLanguageName(src)}.
+AUDIO transcript language: ${syncLanguageName(aud)}.
+
+For each item:
+- source_text is ONE subtitle cue.
+- words is the exact ordered ASR word list from the audio window, each with integer n.
+- Find the shortest contiguous word span that expresses the SAME spoken meaning as source_text.
+- Cross-language paraphrase is expected. Match meaning, names, numbers, profanity and intent; do not require literal wording.
+- Ignore subtitle timing completely. You do not receive timestamps.
+- If the source cue is not clearly represented in the word list, matched=false.
+- If matched=true, start_word/end_word MUST be existing n values and start_word <= end_word.
+- confidence must be an integer from 0 to 100 and should reflect semantic certainty.
+- Return every input i exactly once.
+- Never invent words or indices.
+Output JSON only.`;
+
+  const response = await geminiRequest({
+    system,
+    user: JSON.stringify({
+      source_language: src,
+      audio_language: aud,
+      items: cleanItems
+    }),
+    schema: SYNC_ALIGN_SCHEMA,
+    thinkingLevel: SYNC_ALIGN_THINKING,
+    maxOutputTokens: SYNC_ALIGN_MAX_OUTPUT_TOKENS,
+    timeoutMs: SYNC_ALIGN_TIMEOUT_MS,
+    maxRetries: SYNC_ALIGN_HTTP_RETRIES,
+    job: null,
+    metric: "syncalign"
+  });
+
+  const parsed = JSON.parse(stripCodeFences(response.text));
+  const returned = Array.isArray(parsed?.items) ? parsed.items : [];
+  const byId = new Map(returned.map(item => [Number(item?.i), item]));
+  const out = [];
+
+  for (const input of cleanItems) {
+    const raw = byId.get(input.i);
+    if (!raw) {
+      out.push({
+        i: input.i,
+        matched: false,
+        start_word: -1,
+        end_word: -1,
+        confidence: 0
+      });
+      continue;
+    }
+
+    const startWord = Number(raw.start_word);
+    const endWord = Number(raw.end_word);
+    const confidence = Math.max(0, Math.min(100, Math.round(Number(raw.confidence || 0))));
+    const allowed = new Set(input.words.map(word => word.n));
+
+    const matched =
+      Boolean(raw.matched) &&
+      Number.isInteger(startWord) &&
+      Number.isInteger(endWord) &&
+      startWord <= endWord &&
+      allowed.has(startWord) &&
+      allowed.has(endWord);
+
+    out.push({
+      i: input.i,
+      matched,
+      start_word: matched ? startWord : -1,
+      end_word: matched ? endWord : -1,
+      confidence: matched ? confidence : 0
+    });
+  }
+
+  console.log(
+    `[SYNC ALIGN] ${out.filter(item => item.matched).length}/${out.length} âncora(s) semanticamente alinhadas | ` +
+    `source=${src} | audio=${aud}.`
+  );
+
   return out;
 }
 
@@ -15005,14 +15158,18 @@ function buildFinalCriticalAuditBatches(
   plan,
   focusIds = null
 ) {
-  const focus = focusIds && focusIds.size
-    ? new Set([...focusIds].map(Number))
-    : null;
+  const hasExplicitFocus =
+    focusIds instanceof Set;
+
+  const focus =
+    hasExplicitFocus
+      ? new Set([...focusIds].map(Number))
+      : null;
 
   const targets = blocks.filter(
     block =>
       (
-        !focus ||
+        !hasExplicitFocus ||
         focus.has(
           block.index
         )
@@ -15228,7 +15385,7 @@ async function scanFinalCriticalAudit(
   console.log(
     `[FINAL CRITICAL AUDIT] ${batches.length} lote(s) | ` +
     `fonte=${job.sourceLang || "auto"} | ` +
-    `escopo=${focusIds?.size ? `${focusIds.size} cue(s) focais` : "episódio completo"}.`
+    `escopo=${focusIds instanceof Set ? `${focusIds.size} cue(s) focais` : "episódio completo"}.`
   );
 
   async function worker(workerId) {
@@ -15521,7 +15678,7 @@ async function convergeFinalCriticalQuality(
   // problema já conhecido (ex.: 1 overflow de layout), começamos focado
   // nesses IDs e NUNCA varremos os ~3.000 cues outra vez.
   let firstAudit =
-    focusIds.size === 0;
+    initialFocusIds == null;
 
   let roundsThisRun = 0;
 
@@ -15699,7 +15856,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.5.0 FAST] fonte=${
+    `[PIPELINE 8.6.0 FAST] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -15863,17 +16020,46 @@ finalTranslations =
   );
 
 // ============================================================
-// FINAL CRITICAL CONVERGENCE
+// FINAL CRITICAL CONVERGENCE — 8.6 FOCUSED
 // ============================================================
-// Defeito crítico remanescente aciona reparo focado por até quatro rodadas.
-// Se não houver convergência, o melhor candidato protegido é finalizado;
-// nenhum job pode permanecer em processing indefinidamente.
+// O QA acima já auditou o episódio inteiro com thinking HIGH.
+// O gate final reaudita SOMENTE:
+// 1) cues marcados pelo QA;
+// 2) cues cujo texto mudou depois do MAIN;
+// 3) blockers locais encontrados dentro do próprio gate.
+// Assim não pagamos por uma segunda auditoria global redundante.
+const finalCriticalFocusIds =
+  idsFromIssues(
+    qaIssues,
+    blocks
+  );
+
+for (const block of blocks) {
+  const before = String(
+    mainTranslations.get(block.index) || ""
+  ).replace(/\s+/g, " ").trim();
+
+  const after = String(
+    finalTranslations.get(block.index) || ""
+  ).replace(/\s+/g, " ").trim();
+
+  if (before !== after) {
+    finalCriticalFocusIds.add(block.index);
+  }
+}
+
+console.log(
+  `[FINAL CRITICAL 8.6] foco inicial=${finalCriticalFocusIds.size} cue(s); ` +
+  `QA global já concluído, zero segunda varredura integral.`
+);
+
 finalTranslations =
   await convergeFinalCriticalQuality(
     blocks,
     finalTranslations,
     plan,
-    job
+    job,
+    finalCriticalFocusIds
   );
 
 // Layout final exatamente do texto autorizado pelo gate.
@@ -15958,7 +16144,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.5.0 FAST] FINAL OK | ${
+    `[PIPELINE 8.6.0 FAST] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17012,6 +17198,42 @@ app.post(
   }
 );
 
+// Alinhamento semântico SOURCE↔ASR para o Total Sync.
+// Trabalha só com poucos cues e palavras transcritas; não altera timestamps.
+app.post(
+  "/api/sync-align",
+
+  async (req, res) => {
+    if (!authorized(req)) {
+      return safeJson(res, { error: "Unauthorized" }, 401);
+    }
+
+    try {
+      const sourceLang = String(req.body?.sourceLang || "auto").trim();
+      const audioLang = String(req.body?.audioLang || "en").trim();
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+      const aligned = await alignMultilingualSyncAnchors(
+        items,
+        sourceLang,
+        audioLang
+      );
+
+      return safeJson(res, {
+        ok: true,
+        sourceLang: normalizeSyncLanguageCode(sourceLang, "auto"),
+        audioLang: normalizeSyncLanguageCode(audioLang, "en"),
+        items: aligned
+      });
+    } catch (error) {
+      console.error(
+        `[SYNC ALIGN API] ${errorMessage(error).slice(0, 500)}`
+      );
+      return safeJson(res, { error: errorMessage(error) }, 500);
+    }
+  }
+);
+
 // Ponte monta várias janelas em um WAV.
 // Render mantém chave Gemini, orçamento e word timestamps.
 app.post(
@@ -17534,7 +17756,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.5.0 - FAST BOUNDED QUALITY + TOTAL SYNC"
+        " STREMIO PT-BR 8.6.0 - SEMANTIC SYNC + FAST QUALITY"
   );
 
   console.log(
@@ -17792,15 +18014,16 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Fast 8.5.0: MAIN/QA/final-audit com lotes maiores; thinking HIGH preservado nas etapas críticas ✅");
-  console.log("Final Critical 8.5.0: primeira auditoria continua GLOBAL; reabertura por overflow é SOMENTE focal ✅");
+  console.log("Fast 8.6.0: MAIN=140 / QA=240 / Final=200; thinking HIGH preservado nas etapas críticas ✅");
+  console.log("Final Critical 8.6.0: QA global único; gate final somente cues suspeitos/alterados ✅");
+  console.log("Semantic Sync 8.6.0: SOURCE e ASR podem estar em idiomas diferentes sem traduzir a legenda inteira ✅");
 
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
 
   console.log(
-    "Multilingual Audio-Sync API: /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
+    "Multilingual Audio-Sync API: /api/sync-align + /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
   );
 
   console.log(
