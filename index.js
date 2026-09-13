@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.0 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
+// STREMIO PT-BR 8.9.1 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.0-multimodel-router-hard-sdh-neutral-gender-v1";
+  "8.9.1-multimodel-router-hard-sdh-neutral-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.0.
+// mas NÃO governam mais as chamadas de texto no 8.9.1.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -89,7 +89,7 @@ const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.2;
 const GEMINI_TOKEN_ESTIMATE_MARGIN = 1.12;
 const GEMINI_TEXT_BUDGET_FILE = String(
   process.env.GEMINI_TEXT_BUDGET_FILE ||
-  path.join(process.cwd(), "gemini-text-budget-8.9.0-legacy-unused.json")
+  path.join(process.cwd(), "gemini-text-budget-8.9.1-legacy-unused.json")
 );
 
 // Multilingual Audio-Sync Adapter.
@@ -6001,7 +6001,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.0 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.9.1 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -8231,12 +8231,12 @@ async function callGenerateContentModel({
   let routedUser = String(user || "");
 
   if (schema && profile.supportsStructuredOutput) {
-    generationConfig.responseFormat = {
-      text: {
-        mimeType: "application/json",
-        schema
-      }
-    };
+    // Raw REST generateContent uses the GenerationConfig JSON fields below.
+    // responseFormat is an SDK/new-surface shape and produced HTTP 400 on
+    // gemini-3.1-flash-lite in production. responseJsonSchema preserves our
+    // existing lowercase JSON Schema without enum/type conversion.
+    generationConfig.responseMimeType = "application/json";
+    generationConfig.responseJsonSchema = schema;
   } else if (schema) {
     routedUser +=
       `\n\nEMERGÊNCIA DE FORMATO: responda SOMENTE JSON válido, sem markdown nem explicações. ` +
@@ -8267,8 +8267,7 @@ async function callGenerateContentModel({
             role: "user",
             parts: [{ text: routedUser }]
           }],
-          generationConfig,
-          store: false
+          generationConfig
         }),
         signal: controller.signal
       }
@@ -8345,7 +8344,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.0: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 8.9.1: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -11095,7 +11094,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.0] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.9.1] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -16424,7 +16423,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.0] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.9.1] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -16469,7 +16468,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.0] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.9.1] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -16499,7 +16498,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.0] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.9.1] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -16525,7 +16524,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.0] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.9.1] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -16562,7 +16561,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.0 ROUTED] fonte=${
+    `[PIPELINE 8.9.1 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16605,7 +16604,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.0
+// HARD GUARD PRE-SAFE 8.9.1
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -16802,7 +16801,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.0 ROUTED] FINAL OK | ${
+    `[PIPELINE 8.9.1 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17574,7 +17573,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.0",
+    "8.9.1",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -18439,7 +18438,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.0 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
+        " STREMIO PT-BR 8.9.1 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -18539,7 +18538,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.0: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.9.1: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -18592,7 +18591,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.0: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.9.1: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18692,10 +18691,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.0: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.0: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.0: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.0: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 8.9.1: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 8.9.1: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 8.9.1: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 8.9.1: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -18707,11 +18706,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.0: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 8.9.1: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.0: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 8.9.1: chamadas de texto migradas de Interactions para REST generateContent ✅"
+  );
+  console.log(
+    "Structured Output REST 8.9.1: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -18719,23 +18721,23 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.0: caption/action-only eliminado ANTES do MAIN; SDH-only não aciona rescue Gemini ✅"
+    "HARD SDH 8.9.1: caption/action-only eliminado ANTES do MAIN; SDH-only não aciona rescue Gemini ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.0: masculino genérico NÃO conta como neutro; 1ª/2ª pessoa recebem hard guard + repair focal ✅"
+    "Gender Neutral 8.9.1: masculino genérico NÃO conta como neutro; 1ª/2ª pessoa recebem hard guard + repair focal ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.0: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Latency Contract 8.9.1: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
   );
 
   console.log(
-    "Model Router 8.9.0: 3.1 FL -> 3.5 FL -> 3.7/3.8; QA=3.8 -> 3.7 -> 3.1 -> 3.5; Gemma só último recurso com timeout rígido ✅"
+    "Model Router 8.9.1: 3.1 FL -> 3.5 FL -> 3.7/3.8; QA=3.8 -> 3.7 -> 3.1 -> 3.5; Gemma só último recurso com timeout rígido ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.0: RPD diário = skip do modelo no job; 503 = retry único só no 3.1 e depois fallback ✅"
+    "Quota Diagnostics 8.9.1: RPD diário = skip do modelo no job; 503 = retry único só no 3.1 e depois fallback ✅"
   );
 
   console.log(
