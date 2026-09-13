@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.8.0 - BOUNDED FAST QUALITY
-// HIGH-QUALITY TRANSLATION; ONE GLOBAL QA; BOUNDED FINAL QUALITY; ZERO CONVERGENCE LOOPS
+// STREMIO PT-BR 8.8.1 - HARD SDH + NEUTRAL GENDER
+// SAME BOUNDED PIPELINE; ZERO EXTRA GEMINI STAGES; SDH EARLY-DROP + GENDER-NEUTRAL DEFAULT
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,7 +22,7 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.8.0-bounded-fast-quality-v1";
+  "8.8.1-hard-sdh-neutral-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1357,7 +1357,6 @@ function normalizeSpeaker(value) {
   if (
     !speaker ||
     speaker.length > 60 ||
-    SDH_WORDS.test(speaker) ||
     /[!?;]/u.test(speaker)
   ) {
     return "";
@@ -1494,9 +1493,6 @@ function extractSpeaker(line) {
     if (
       speaker &&
       looksLikeSpeakerLabel(
-        bracket[1]
-      ) &&
-      !SDH_WORDS.test(
         bracket[1]
       )
     ) {
@@ -2151,6 +2147,70 @@ function looksLikeUniversalSdhAction(
   );
 }
 
+// ============================================================
+// HARD SDH STRUCTURE 8.8.1
+// ============================================================
+// Bracket/parenthetical captions are accessibility metadata far more often
+// than dialogue. The older lexical classifier missed perfectly normal CC
+// descriptions such as [takes off shoes], [typing], [melody ends],
+// [gun drops to floor] and [singers vocalizing].
+//
+// This classifier is intentionally used ONLY for accessibility-shaped
+// segments / bare caption lines. It does not rewrite ordinary dialogue.
+const STRUCTURED_SDH_EVENT_RE =
+  /(?:fanfare|melody|score|instrumental|chatter|typing|keyboard|keys?|liquid|water|shower|gun|wood|bag|zipper|insects?|singers?|vocali[sz](?:e|es|ing|ation)|retch(?:es|ing)|gag(?:s|ging)|scoffs?|mumbles?|stammers?|yawns?|yawning|whispers?|squeaks?|squeaking|trickl(?:e|es|ing)|trill(?:s|ing)|jingl(?:e|es|ing)|tapping|footsteps?|melodia|fanfarra|trilha|conversa|burburinho|cochichos?|teclado|teclando|digitando|chaves?|líquido|agua|água|chuveiro|arma|madeira|bolsa|zíper|insetos?|cantores?|vocaliza(?:ção|ndo)|ânsia|engasga(?:ndo)?|gagueja(?:ndo)?|sussurr(?:a|ando)|rangido|chiado)/iu;
+
+const STRUCTURED_SDH_ACTION_RE =
+  /(?:plays?|playing|fades?|fading|ends?|ending|stops?|stopping|starts?|starting|continues?|continuing|drops?|dropping|falls?|falling|opens?|opening|closes?|closing|unzips?|unzipping|zips?|zipping|taps?|tapping|types?|typing|trickles?|trickling|trills?|trilling|vocali[sz](?:es?|ing)|retches?|retching|gags?|gagging|scoffs?|scoffing|mumbles?|mumbling|stammers?|stammering|yawns?|yawning|whispers?|whispering|squeaks?|squeaking|jingl(?:e|es|ing)|snaps?|snapping|takes?\s+off|puts?\s+on|picks?\s+up|sets?\s+down|tocando|termina|terminando|para|parando|começa|começando|continua|continuando|cai|caindo|abre|abrindo|fecha|fechando|digita|digitando|tecla|teclando|goteja|gotejando|vocaliza|vocalizando|engasga|engasgando|gagueja|gaguejando|sussurra|sussurrando|tilinta|tilintando|estala|estalando)/iu;
+
+function looksLikeStructuredSdhSegment(value) {
+  const text = normalizeSdhCandidate(value);
+
+  if (!text || text.length > 220 || /\?\s*$/u.test(text)) {
+    return false;
+  }
+
+  const words = text.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 20) {
+    return false;
+  }
+
+  // A line that directly quotes a song title + "playing/tocando" is metadata,
+  // not a lyric line.
+  if (
+    /^(?:["“][^"”]{1,100}["”]\s+by\s+.{1,80}\s+playing|tocando\s+["“][^"”]{1,100}["”](?:\s*,?\s*(?:by|de|do|da)\s+.{1,80})?)$/iu.test(text)
+  ) {
+    return true;
+  }
+
+  const hasFirstSecondPerson =
+    /\b(?:i|i'm|i’m|i am|me|my|mine|we|us|our|ours|you|your|yours|eu|meu|minha|nós|nosso|nossa|você|vocês|seu|sua)\b/iu.test(text);
+
+  const hasEvent = STRUCTURED_SDH_EVENT_RE.test(text);
+  const hasAction = STRUCTURED_SDH_ACTION_RE.test(text);
+
+  if (hasEvent && (hasAction || words.length <= 4)) {
+    return true;
+  }
+
+  // Compact third-person / subjectless action captions:
+  // [Ian stammers], [takes off shoes], [unzips bag], [typing].
+  if (hasAction && words.length <= 10 && !hasFirstSecondPerson) {
+    return true;
+  }
+
+  // Single gerund/event captions such as [mocking], [retching], [typing].
+  if (
+    words.length <= 3 &&
+    !hasFirstSecondPerson &&
+    /(?:ing|ando|endo|indo)$/iu.test(text)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function looksLikeSdhDescriptor(
   value
 ) {
@@ -2167,6 +2227,9 @@ function looksLikeSdhDescriptor(
   }
 
   if (
+    looksLikeStructuredSdhSegment(
+      inside
+    ) ||
     looksLikeUniversalSdhAction(
       inside,
       {
@@ -2691,10 +2754,15 @@ function cleanSourceLine(line) {
   text =
     removeSdhSegments(
       text
-    ).replace(
-      /[♪♫♬★☆✦✧]/gu,
-      " "
-    );
+    )
+      .replace(
+        /^(\s*[-–—]\s*)[:;]+\s*/u,
+        "$1"
+      )
+      .replace(
+        /[♪♫♬★☆✦✧]/gu,
+        " "
+      );
 
   text =
     collapseExtendedVocalization(
@@ -3864,6 +3932,7 @@ function cleanSrtForTranslation(
 
   let removed = 0;
   let speakerHints = 0;
+  let speakerHintsSuppressedMultiTurn = 0;
   let bleepCues = 0;
   let sdhLinesRemoved = 0;
   let backgroundLyricLinesRemoved = 0;
@@ -4028,8 +4097,14 @@ function cleanSrtForTranslation(
       bleepCues++;
     }
 
+    const explicitDialogueTurns =
+      dialogue.filter(
+        line => /^\s*[-–—]\s+/u.test(line)
+      ).length;
+
     if (
-      speakers.size === 1
+      speakers.size === 1 &&
+      explicitDialogueTurns < 2
     ) {
       const speaker =
         [...speakers][0];
@@ -4044,6 +4119,13 @@ function cleanSrtForTranslation(
         }`;
 
       speakerHints++;
+    } else if (
+      speakers.size >= 1 &&
+      explicitDialogueTurns >= 2
+    ) {
+      // 8.8.1: a label de um turno NÃO vira identidade do cue inteiro.
+      // Isso impede "-I'm tired / -SARAH: ..." de atribuir Sarah ao 1º turno.
+      speakerHintsSuppressedMultiTurn++;
     }
 
     out.push({
@@ -4067,6 +4149,8 @@ function cleanSrtForTranslation(
       performanceLyricLinesKept
     }; speakerHints=${
       speakerHints
+    }; speakerHints-multiturno-suprimidos=${
+      speakerHintsSuppressedMultiTurn
     }; bleepCues=${
       bleepCues
     }.`
@@ -4608,9 +4692,22 @@ function stripOutputAccessibilityLine(
     extractSpeaker(text);
 
   if (info.speaker) {
+    const hadDash =
+      /^\s*[-–—]\s*/u.test(text);
+
     text =
-      info.text;
+      `${hadDash ? "- " : ""}${info.text}`.trim();
   }
+
+  // Fallback 8.8.1: speaker labels must never be visible in the final SRT.
+  // Conservative: removes only a prefix that itself passes looksLikeSpeakerLabel.
+  text = text.replace(
+    /^(\s*[-–—]\s*)?([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 #.'’_-]{0,45})\s*:\s*(?=\S)/u,
+    (match, dash, label) =>
+      looksLikeSpeakerLabel(label)
+        ? (dash ? "- " : "")
+        : match
+  );
 
   text =
     stripTrailingSpeakerLabel(
@@ -5666,20 +5763,21 @@ NAMED / CULTURAL ENTITY INTEGRITY — REGRA ABSOLUTA
 - Isso é diferente de uma tradução canônica da MESMA entidade.
 
 CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
-- A BÍBLIA EDITORIAL contém um Character Ledger. Trate identidades confirmadas como estado de continuidade do episódio.
-- Quando gênero/pronomes estiverem marcados como conhecidos/seguros, respeite-os na concordância e nos referentes em PT-BR.
-- Quando gênero for unknown/incerto, NÃO adivinhe. Reformule naturalmente para evitar marcar gênero sem necessidade.
+- A BÍBLIA EDITORIAL contém um Character Ledger. Use identidades confirmadas para impedir contradições de referente; NÃO use o Ledger como licença para introduzir gênero que a própria SOURCE não expressou.
 - Speaker é QUEM ESTÁ FALANDO; pessoa citada/mentioned é DE QUEM SE FALA. speaker ≠ pessoa mencionada.
-- Nunca transfira gênero, pronome, relação ou identidade do speaker para a pessoa mencionada, nem o contrário.
+- Nunca transfira gênero, pronome, relação ou identidade entre turnos, entre speaker e pessoa mencionada, nem entre cues vizinhos.
+- Em cue com duas falas, cada turno é independente. Um label explícito no segundo turno JAMAIS identifica o primeiro.
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-SAFE LANGUAGE — QUANDO O SPEAKER NÃO ESTÁ PROVADO
-- Ausência de speaker NÃO autoriza masculino genérico nem feminino por palpite.
-- Se identity_lock disser speaker_unknown/neutralize, evite concordância de 1ª pessoa que escolha gênero sem evidência.
-- Prefira reformulações naturais: "I'm scared" -> "Tô com medo"; "I'm exhausted" -> "Não aguento mais" / "Tô sem energia" quando o gênero do speaker não estiver provado.
-- Se before/after não provarem inequivocamente quem fala, preserve a incerteza. Não deduza gênero só porque uma pessoa conhecida aparece na cena ou é mencionada no target.
-- Se a pessoa mencionada tiver gênero conhecido, aplique esse gênero SOMENTE ao referente mencionado, nunca automaticamente ao speaker.
+GENDER-NEUTRAL DEFAULT 8.8.1 — REGRA ABSOLUTA
+- Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
+- O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
+- Prefira SEMPRE a formulação naturalmente neutra: "I'm scared" -> "Tô com medo"; "I'm confused" -> "Não tô entendendo"; "I'm alone" -> "Tô sem ninguém por perto"; "I'm worried" -> "Isso tá me preocupando".
+- Não use linguagem artificial como "cansade"/"confuse". Neutralidade aqui significa REESCREVER em PT-BR natural.
+- Só marque gênero quando ele for semanticamente necessário ou explicitamente sustentado pela SOURCE naquele referente: she/her, he/him, woman/man, daughter/son, mother/father etc.
+- Se before/after não provarem inequivocamente o referente, preserve a incerteza. Não deduza gênero só porque uma pessoa conhecida aparece na cena.
+- Gênero conhecido de pessoa mencionada aplica-se SOMENTE à pessoa mencionada, nunca automaticamente ao speaker.
 
 NATURALIDADE PT-BR 2026 — REGRA DE ACEITAÇÃO
 - CORRETO MAS LITERAL DEMAIS NÃO É SUFICIENTE. Tradução com cara de tradução é defeito editorial.
@@ -6131,7 +6229,7 @@ MEANING INTEGRITY DURANTE O REPAIR
 - Se o PT atual estiver semanticamente mais completo que sua proposta, NÃO piore o cue.
 
 Corrija defeitos reais de cultura, literalidade/calque, censura/bleep, gênero/referente, ortografia, palavra corrompida, naturalidade, SDH residual, omissão, overflow, formatação ou ownership.
-- Se identity_lock disser que o speaker é desconhecido/incerto, neutralize concordância de 1ª pessoa quando não houver evidência segura.
+- GENDER-NEUTRAL DEFAULT: se a SOURCE não marca gênero naquela ideia, reescreva a 1ª pessoa de forma naturalmente neutra mesmo quando o speaker for conhecido; o Ledger serve para evitar contradição, não para forçar marcação desnecessária.
 - "Gramaticalmente correto" não basta se soar traduzido, antiquado ou pouco espontâneo em PT-BR contemporâneo.
 - Se houver palavrão autocensurado graficamente, reconstrua a fala natural por extenso; nunca preserve f..., fu&#, *** ou equivalentes.
 Preserve o que já estiver bom.
@@ -6246,6 +6344,7 @@ MARQUE quando houver:
 - sentido errado: pessoa verbal, sujeito, objeto, negação, tempo, intensidade ou referente;
 - omissão, invenção ou conteúdo pertencente a outro cue;
 - gênero incorreto de pessoa conhecida;
+- concordância de 1ª pessoa masculina/feminina INTRODUZIDA pelo PT quando a SOURCE daquela ideia é neutra e uma formulação PT-BR natural sem gênero resolveria — mesmo se o speaker for conhecido;
 - speaker desconhecido com concordância de 1ª pessoa desnecessariamente masculina/feminina quando uma forma neutra natural resolveria;
 - confusão speaker ≠ pessoa mencionada;
 - expressão idiomática/calque/falso cognato;
@@ -9633,7 +9732,7 @@ function identityLockForCapsule(
 
     self_gender_policy:
       trustedGender
-        ? `speaker com gênero confiável=${trustedGender}; respeitar concordância quando ela realmente se referir ao speaker`
+        ? `DEFAULT_NEUTRALIZE: gênero confiável=${trustedGender} serve para impedir contradições, não para introduzir gênero em 1ª pessoa quando a SOURCE é neutra; prefira formulação PT-BR neutra natural`
         : "STRICT_NEUTRALIZE: não adivinhar masculino/feminino de 1ª pessoa; preferir formulação sem marca de gênero quando natural",
 
     mentions
@@ -9702,7 +9801,10 @@ function compactIdentityHint(
       block.speakerHint ||
       "unknown"
     ),
+    // g é apenas guard de contradição/referente. MAIN deve neutralizar
+    // estados de 1ª pessoa quando a SOURCE não marca gênero.
     g: gender,
+    n: "neutral-by-default",
     r: refs
   };
 }
@@ -10101,7 +10203,7 @@ function parseMainCueTranslationRobust(
 
   if (ignoredExtras || ignoredDuplicates || badOwnership) {
     console.warn(
-      `[MAIN ROBUST PARSER 8.8] extras=${ignoredExtras} | ` +
+      `[MAIN ROBUST PARSER 8.8.1] extras=${ignoredExtras} | ` +
       `duplicados=${ignoredDuplicates} | ownership-inválido=${badOwnership}; ` +
       `cues válidos foram preservados, sem retraduzir o lote.`
     );
@@ -10487,7 +10589,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.8] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.8.1] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11611,6 +11713,19 @@ const FIRST_PERSON_FEMALE_MARKERS = [
   /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|preparada|acostumada|gr[aá]vida)\b/iu
 ];
 
+function sourceExplicitlyMarksSelfGender(block) {
+  const source = String(block?.text || "")
+    .toLocaleLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!source) return false;
+
+  return /\b(?:i\s+am|i'm|i’m|i\s+was|i've\s+been|i’ve\s+been|as)\s+(?:(?:a|an)\s+)?(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male)\b/i.test(source) ||
+    /\b(?:sou|era|como)\s+(?:uma?\s+)?(?:mulher|homem|garota|garoto|menina|menino|mãe|pai|esposa|marido|filha|filho|irmã|irmão|noiva|noivo)\b/iu.test(source) ||
+    /\b(?:soy|era|como)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
+}
+
 function genderIntegrityV2Reasons(block, pt, plan) {
   const text = String(pt || "");
   if (!text.trim()) return [];
@@ -11634,8 +11749,11 @@ function genderIntegrityV2Reasons(block, pt, plan) {
     reasons.push("GENDER_V2_TRUSTED_MALE_FEMININE_SELF_MARKER");
   }
 
-  if (!trusted && (male || female)) {
-    reasons.push("GENDER_V2_UNKNOWN_SPEAKER_MARKED");
+  if (
+    (male || female) &&
+    !sourceExplicitlyMarksSelfGender(block)
+  ) {
+    reasons.push("GENDER_V3_NEUTRAL_DEFAULT_VIOLATION");
   }
 
   return [...new Set(reasons)];
@@ -12357,7 +12475,7 @@ function issuePriority(issue) {
 
   if (
     /FINAL_CRITICAL/i.test(joined) ||
-    /GENDER_V2_/i.test(joined) ||
+    /GENDER_V[23]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
     /CUE_OWNERSHIP_SHIFT/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
@@ -13153,7 +13271,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isCriticalRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V2_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_SHIFT)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[23]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_SHIFT)/i.test(
         reason
       );
 
@@ -15039,7 +15157,7 @@ function finalCriticalIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_CRITICAL|GENDER_V2_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_CRITICAL|GENDER_V[23]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -15824,7 +15942,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.8] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.8.1] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -15869,7 +15987,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.8] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.8.1] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -15899,7 +16017,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-88-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.8] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.8.1] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -15925,7 +16043,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.8] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.8.1] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -15962,7 +16080,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.8.0 BOUNDED] fonte=${
+    `[PIPELINE 8.8.1 BOUNDED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16163,7 +16281,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.8.0 BOUNDED] FINAL OK | ${
+    `[PIPELINE 8.8.1 BOUNDED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17785,7 +17903,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.8.0 - BOUNDED FAST QUALITY"
+        " STREMIO PT-BR 8.8.1 - HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -17881,7 +17999,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.8: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.8.1: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -17934,7 +18052,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.8: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.8.1: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18010,10 +18128,6 @@ console.log(
   );
 
   console.log(
-    "Repair inicial: cirúrgico; Final Critical Gate repete SOMENTE cues críticos até convergir ✅"
-  );
-
-  console.log(
     "SAFE DRAFT: ATIVO ✅ (diagnóstico interno; nunca substitui FINAL crítico reprovado)"
   );
 
@@ -18030,24 +18144,19 @@ console.log(
   );
 
   console.log(
-    "Final Critical Gate: fail-closed para QUALIDADE, mas job permanece vivo e autocorrige até PASSAR ✅"
-  );
-
-  console.log(
     "Final Audit 8.4.2: lotes <=80 + schema sem maxItems + fallback adaptativo para HTTP 400 ✅"
   );
 
-  console.log("Convergence 8.4.3: 2 clean semantic audits can clear ambiguous heuristic-only blockers. OK");
   console.log("Focused Repair 8.4.3: Final Critical repairs only current-round blockers. OK");
 
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.8.0: MAIN=160 / QA=420 / auditoria final FOCAL; thinking HIGH preservado nas etapas críticas ✅");
-  console.log("MAIN Robust 8.8: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
-  console.log("MAIN Fail-Fast 8.8: erro determinístico não vira loop; payload compacto + rescue focal ✅");
-  console.log("Final Bounded 8.8: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
-  console.log("Semantic Sync API preservada para OpenSub; Embedded 2.5 não depende dela ✅");
+  console.log("Final 8.8.1: mesmo pipeline bounded 8.8; HARD SDH early-drop + neutral gender default; zero estágio Gemini novo ✅");
+  console.log("MAIN Robust 8.8.1: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
+  console.log("MAIN Fail-Fast 8.8.1: erro determinístico não vira loop; payload compacto + rescue focal ✅");
+  console.log("Final Bounded 8.8.1: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
+  console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
@@ -18058,7 +18167,7 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.8: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
+    "Pre-Repair 8.8.1: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
   );
 
   console.log(
@@ -18067,6 +18176,18 @@ console.log(
 
   console.log(
     "Empty-Cue 8.4.4: intentional omission + sanitizer-aware local recovery + no full restart. OK"
+  );
+
+  console.log(
+    "HARD SDH 8.8.1: caption/action-only é eliminado ANTES do MAIN; SDH-only não pode acionar Gemini rescue ✅"
+  );
+
+  console.log(
+    "Gender Neutral Default 8.8.1: SOURCE neutra => PT-BR neutro natural; speaker label nunca atravessa turno ✅"
+  );
+
+  console.log(
+    "Latency Contract 8.8.1: zero etapa Gemini nova; mesmos MAIN/QA/REPAIR/FINAL bounded; SDH early-drop reduz trabalho ✅"
   );
 
   console.log(
