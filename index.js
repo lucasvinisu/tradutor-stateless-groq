@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.4 - GENERAL INVARIANT HARDENING
+// STREMIO PT-BR 8.9.5 - GENERAL INVARIANT HARDENING
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.4-multimodel-router-hard-sdh-neutral-gender-v1";
+  "8.9.5-multimodel-router-hard-sdh-neutral-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.4.
+// mas NÃO governam mais as chamadas de texto no 8.9.5.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -89,7 +89,7 @@ const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.2;
 const GEMINI_TOKEN_ESTIMATE_MARGIN = 1.12;
 const GEMINI_TEXT_BUDGET_FILE = String(
   process.env.GEMINI_TEXT_BUDGET_FILE ||
-  path.join(process.cwd(), "gemini-text-budget-8.9.4-legacy-unused.json")
+  path.join(process.cwd(), "gemini-text-budget-8.9.5-legacy-unused.json")
 );
 
 // Multilingual Audio-Sync Adapter.
@@ -1835,7 +1835,7 @@ function isEmptyVocalization(text) {
 }
 
 // ============================================================
-// SPOKEN VOCALIZATION LOCK — 8.9.4
+// SPOKEN VOCALIZATION LOCK — 8.9.5
 // ============================================================
 // "Hmm", "Mm-hmm", "Uh-huh", "Uhum", "Um" etc. são fala curta,
 // não descrição SDH. Quando aparecem sem colchetes/parênteses, preservamos
@@ -2625,7 +2625,7 @@ function looksLikeBareSdhLine(
     return false;
   }
 
-  // 8.9.4: linha curta falada nunca pode ser promovida a SDH só porque
+  // 8.9.5: linha curta falada nunca pode ser promovida a SDH só porque
   // também coincide lexicalmente com um verbo de ação (Look/Breathe/Dance/Entra).
   // Descrições estruturadas entre []/() continuam sendo removidas normalmente.
   if (looksLikeClearlySpokenBareLine(original)) {
@@ -2757,8 +2757,14 @@ function collapseExtendedVocalization(
     );
 }
 
+// 8.9.5 — reticência não é censura por si só.
+// Máscara gráfica explícita (*#@%&$) continua sendo forte evidência.
+// Para "palavra...", só aceitamos stems de palavrão de alta confiança;
+// fragmentos ambíguos/completos (me..., bit..., car..., por...) permanecem fala.
 function looksLikeMaskedProfanityToken(
-  token
+  token,
+  context = "",
+  tokenIndex = -1
 ) {
   const raw =
     String(token || "");
@@ -2807,72 +2813,37 @@ function looksLikeMaskedProfanityToken(
     return false;
   }
 
-  const dotPrefixes =
-    new Set([
-      "f",
-      "fu",
-      "fuc",
-      "fuck",
-      "motherf",
-
-      "sh",
-      "shi",
-
-      "b",
-      "bi",
-      "bit",
-
-      "c",
-      "cu",
-      "cun",
-      "car",
-      "cara",
-      "caral",
-
-      "p",
-      "pu",
-      "put",
-      "por",
-      "porr",
-      "pus",
-      "puss",
-
-      "ass",
-      "assh",
-
-      "d",
-      "di",
-      "dic",
-      "dick",
-
-      "fo",
-      "fod",
-      "fud",
-
-      "me",
-      "mer",
-      "merd"
-    ]);
-
-  if (
-    dotMask &&
-    !symbolMask
-  ) {
-    return dotPrefixes.has(
+  // Símbolos são censura editorial muito mais forte que reticências.
+  if (symbolMask) {
+    return /^(?:f|fu|fuc|fuck|motherf|sh|shi|b|bi|bit|bitc|c|cu|cun|car|cara|caral|p|pu|put|por|porr|pus|puss|ass|assh|d|di|dic|dick|fo|fod|fud|m|me|mer|merd|s)$/iu.test(
       visiblePrefix
     );
   }
 
-  const symbolPrefixes =
-    new Set([
-      ...dotPrefixes,
-      "s",
-      "m"
-    ]);
+  // Com pontos/reticências, use somente stems fortes que normalmente são
+  // incompletos. Isso evita converter palavras perfeitamente válidas seguidas
+  // de pausa em [censurado].
+  if (/^(?:fu|fuc|fuck|motherf|shi|bitc|cun|caral|porr|puss|assh|dic|fod|fud|merd)$/iu.test(visiblePrefix)) {
+    return true;
+  }
 
-  return symbolPrefixes.has(
-    visiblePrefix
-  );
+  // "sh..." e "f..." são curtos demais isoladamente. Só contam como bleep
+  // quando a própria frase traz uma moldura pragmática forte de palavrão.
+  if (/^(?:sh|f)$/iu.test(visiblePrefix)) {
+    const full = String(context || "");
+    const at = Number.isInteger(tokenIndex) && tokenIndex >= 0
+      ? tokenIndex
+      : Math.max(0, full.indexOf(raw));
+    const before = full
+      .slice(Math.max(0, at - 28), at)
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trimEnd();
+
+    return /(?:\bholy|\bwhat\s+the|\boh\s+my|\bmother)\s*$/iu.test(before);
+  }
+
+  return false;
 }
 
 function replaceMaskedProfanity(
@@ -2886,9 +2857,11 @@ function replaceMaskedProfanity(
   return decoded.replace(
     /[\p{L}][\p{L}0-9*#@%&$!._~…’'-]{1,28}/gu,
 
-    token =>
+    (token, offset, full) =>
       looksLikeMaskedProfanityToken(
-        token
+        token,
+        full,
+        offset
       )
         ? BLEEP_TOKEN
         : token
@@ -2917,9 +2890,14 @@ function hasArtificialCensorship(
     ) || [];
 
   if (
-    tokens.some(
-      looksLikeMaskedProfanityToken
-    )
+    tokens.some(token => {
+      const offset = text.indexOf(token);
+      return looksLikeMaskedProfanityToken(
+        token,
+        text,
+        offset
+      );
+    })
   ) {
     return true;
   }
@@ -4293,7 +4271,7 @@ function detectPerformanceMusicIndexes(
     }
   }
 
-  // CAMADA 4 — REPRISE ATÔMICA 8.9.4.
+  // CAMADA 4 — REPRISE ATÔMICA 8.9.5.
   // Um fragmento musical isolado que repete lexicalmente uma performance já
   // confirmada pertence à mesma performance e não pode desaparecer só porque
   // houve diálogo no meio. Iteramos até estabilizar para encadear reprises.
@@ -4371,12 +4349,17 @@ function detectPerformanceMusicIndexes(
   };
 }
 
+// 8.9.5 — marcador de speaker pode vir como "~ fala", "~fala",
+// "- fala" ou "-fala". Hífen colado a número negativo NÃO é speaker.
+const DIALOGUE_TURN_START_RE =
+  /^\s*(?:~\s*|[-–—](?:\s+|(?=[^\d\s])))(?=\S)/u;
+
 function sourceLineHasDialogueTurnMarker(value) {
-  return /^\s*(?:[-–—]\s+|~\s*)(?=\S)/u.test(String(value || ""));
+  return DIALOGUE_TURN_START_RE.test(String(value || ""));
 }
 
 function canonicalizeSourceDialogueTurnMarker(value) {
-  return String(value || "").replace(/^\s*(?:[-–—]\s+|~\s*)(?=\S)/u, "- ");
+  return String(value || "").replace(DIALOGUE_TURN_START_RE, "- ");
 }
 
 function looksLikeStandaloneCueSpeakerLabel(value) {
@@ -4494,7 +4477,7 @@ function cleanSrtForTranslation(
       const classified = classifiedLines[classifiedIndex];
       const sourceLine = classified.raw;
 
-      // 8.9.4: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
+      // 8.9.5: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
       // é metadata, não diálogo. Só removemos quando há outra linha real no mesmo cue.
       if (
         looksLikeStandaloneCueSpeakerLabel(sourceLine) &&
@@ -5007,14 +4990,14 @@ function sourceDialogueTurns(
     )
     .filter(
       line =>
-        /^\s*(?:[-–—]\s+|~\s*)(?=\S)/u.test(
+        sourceLineHasDialogueTurnMarker(
           line
         )
     )
     .map(
       line =>
         line.replace(
-          /^\s*(?:[-–—]\s+|~\s*)(?=\S)/u,
+          DIALOGUE_TURN_START_RE,
           ""
         ).trim()
     )
@@ -5071,29 +5054,32 @@ function translatedDialogueTurns(
     return [];
   }
 
-  let pieces =
-    flattened
-      .split(
-        /(?:^|\s)(?:[-–—]\s+|~\s*)(?=\S)/u
-      )
-      .map(
-        part =>
-          part
-            .replace(
-              /^[ \t]+|[ \t]+$/g,
-              ""
-            )
-      )
-      .filter(Boolean);
+  // Primeiro preserve fronteiras físicas de linha. Isso reconhece também
+  // "-fala" sem abrir espaço para interpretar hífens internos como speakers.
+  let pieces = String(value || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.replace(DIALOGUE_TURN_START_RE, "").trim());
 
-  // 8.9.4: alguns modelos preservam os dois turns em duas linhas, mas
-  // esquecem os hífens. Se a contagem de linhas bate EXATAMENTE com a SOURCE,
-  // restauramos os marcadores deterministicamente, sem chamada Gemini.
+  if (pieces.length !== expected) {
+    // Fallback para modelos que devolveram dois markers na MESMA linha.
+    pieces = flattened
+      .split(
+        /(?:^|\s)(?:~\s*|[-–—](?:\s+|(?=[^\d\s])))(?=\S)/u
+      )
+      .map(part => part.trim())
+      .filter(Boolean);
+  }
+
+  // Alguns modelos preservam os dois turns em duas linhas, mas esquecem os
+  // hífens. Se a contagem física bate exatamente com a SOURCE, ela é autoridade.
   if (pieces.length !== expected) {
     const rawLines = String(value || "")
       .replace(/\r/g, "")
       .split("\n")
-      .map(line => line.replace(/^\s*(?:[-–—]\s+|~\s*)(?=\S)/u, "").trim())
+      .map(line => line.replace(DIALOGUE_TURN_START_RE, "").trim())
       .filter(Boolean);
 
     if (rawLines.length === expected) {
@@ -5147,15 +5133,23 @@ function canonicalDialogueTurnText(
   }
 
   return turns
-    .map(
-      turn =>
-        `- ${turn}`
-    )
+    .map(turn => {
+      // Quando a fala começa por reticências, alguns modelos devolvem "-..."
+      // como conteúdo além do marker que nós próprios adicionaremos. Remova
+      // apenas esse hífen redundante; a interrupção/reticência continua intacta.
+      const cleanTurn = String(turn || "")
+        .replace(/^\s*[-–—]\s*(?=(?:\.{2,}|…))/u, "")
+        .trim();
+      return `- ${cleanTurn}`;
+    })
     .join("\n");
 }
 
 function stripOutputAccessibilityLine(
-  line
+  line,
+  {
+    preserveBareDialogue = false
+  } = {}
 ) {
   let text =
     stripMarkup(
@@ -5232,7 +5226,12 @@ function stripOutputAccessibilityLine(
       )
       .trim();
 
+  // 8.9.5: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
+  // toda a fala silenciosamente só porque a tradução "parece" uma ação SDH.
+  // SDH estruturado []/() continua sendo removido; bare SDH suspeito fica para
+  // o QA semântico/Repair em vez de virar EMPTY.
   if (
+    !preserveBareDialogue &&
     looksLikeBareSdhLine(
       text
     )
@@ -5294,7 +5293,7 @@ function sanitizeFinalCue(
         "g"
       ),
       "[censurado]"
-    ); // 8.9.4: preserva incerteza editorial da SOURCE; nunca reconstrói o conteúdo oculto.
+    ); // 8.9.5: preserva incerteza editorial da SOURCE; nunca reconstrói o conteúdo oculto.
 
   const expectedDialogueTurns =
     sourceDialogueDashCount(
@@ -5323,7 +5322,13 @@ function sanitizeFinalCue(
       .replace(/\r/g, "")
       .split("\n")
       .map(
-        stripOutputAccessibilityLine
+        line =>
+          stripOutputAccessibilityLine(
+            line,
+            {
+              preserveBareDialogue: true
+            }
+          )
       )
       .map(
         line =>
@@ -5556,7 +5561,7 @@ function sanitizeTranslationMap(
             Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
         }
         console.log(
-          `[LOCAL VOCALIZATION LOCK 8.9.4] cue ${block.index}: ` +
+          `[LOCAL VOCALIZATION LOCK 8.9.5] cue ${block.index}: ` +
           `${JSON.stringify(block.text)} -> ${JSON.stringify(after)} | 0 Gemini.`
         );
       }
@@ -6342,7 +6347,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.4 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.9.5 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -8714,7 +8719,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.4: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 8.9.5: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -11097,7 +11102,7 @@ async function rescueEmptyMainCue({
         Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
     }
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.4] cue ${block.index}: ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.5] cue ${block.index}: ` +
       `${JSON.stringify(block.text)} -> ${JSON.stringify(localVocalization)} | 0 Gemini.`
     );
     return localVocalization;
@@ -11498,7 +11503,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.4] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.9.5] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11547,7 +11552,7 @@ async function translateMainBatch({
           const rightBatch = batch.slice(mid);
 
           console.warn(
-            `[MAIN ADAPTIVE 8.9.4] request grande recebeu limite de payload; ` +
+            `[MAIN ADAPTIVE 8.9.5] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
             `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
           );
@@ -11740,7 +11745,7 @@ async function translateAllMain(
     job.stats.mainLocalVocalizationPrefill =
       Number(job.stats.mainLocalVocalizationPrefill || 0) + localVocalizationPrefill;
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.4] ${localVocalizationPrefill} cue(s) ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.5] ${localVocalizationPrefill} cue(s) ` +
       `resolvidos localmente antes do MAIN | 0 Gemini.`
     );
   }
@@ -11756,7 +11761,7 @@ async function translateAllMain(
   job.stats.mainCheckpointReused = translations.size;
 
   console.log(
-    `[MAIN 8.9.4] ${blocks.length} cues -> ${batches.length} lotes | ` +
+    `[MAIN 8.9.5] ${blocks.length} cues -> ${batches.length} lotes | ` +
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
@@ -12680,7 +12685,7 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
 }
 
 // ============================================================
-// GENDER POSTCONDITION LOCAL — 8.9.4
+// GENDER POSTCONDITION LOCAL — 8.9.5
 // ============================================================
 // O modelo continua responsável pela tradução. Este guard só reescreve
 // padrões de altíssima confiança quando a SOURCE é explicitamente neutra
@@ -12793,7 +12798,7 @@ function applyDeterministicGenderNeutrality(block, value) {
     }
   }
 
-  // 8.9.4 — padrões neutros adicionais observados em filme real.
+  // 8.9.5 — padrões neutros adicionais observados em filme real.
   if (!sourceExplicitlyMarksSelfGender(block)) {
     if (/\blet me be clear\b/i.test(source)) {
       pt = pt.replace(/\b(?:deixe-me|deixa eu)\s+ser\s+clar[oa]\b/iu, "deixa eu deixar isso claro");
@@ -13105,15 +13110,13 @@ function localReasonsForCue(
     );
   }
 
-    if (
+  if (
     translated
       .split("\n")
-      .some(
-        line =>
-          looksLikeBareSdhLine(
-            line
-          )
-      )
+      .some(line => looksLikeBareSdhLine(line)) &&
+    String(block?.text || "")
+      .split("\n")
+      .some(line => looksLikeBareSdhLine(line))
   ) {
     reasons.push(
       "SDH_RESIDUE"
@@ -15157,7 +15160,7 @@ function rememberCompactRescueFailure(job, id, value, reason = "rejeitado") {
   if (!job.compactRescueFailedSignatures.has(signature)) {
     job.compactRescueFailedSignatures.add(signature);
     job.stats.compactMemoizedFailures = Number(job.stats.compactMemoizedFailures || 0) + 1;
-    console.log(`[COMPACT MEMORY 8.9.4] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
+    console.log(`[COMPACT MEMORY 8.9.5] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
   }
 }
 
@@ -15209,7 +15212,7 @@ async function runCompactRescue(
     const memoSkipped = detectedIssues.length - allIssues.length;
     if (memoSkipped > 0) {
       console.log(
-        `[COMPACT MEMORY 8.9.4] ${memoSkipped} overflow(s) já reprovado(s) ` +
+        `[COMPACT MEMORY 8.9.5] ${memoSkipped} overflow(s) já reprovado(s) ` +
         `com o mesmo texto; 0 nova chamada cloud.`
       );
     }
@@ -17254,7 +17257,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.4] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.9.5] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -17299,7 +17302,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.4] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.9.5] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -17329,7 +17332,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.4] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.9.5] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -17355,7 +17358,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.4] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.9.5] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -17392,7 +17395,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.4 ROUTED] fonte=${
+    `[PIPELINE 8.9.5 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -17435,7 +17438,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.4
+// HARD GUARD PRE-SAFE 8.9.5
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -17632,7 +17635,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.4 ROUTED] FINAL OK | ${
+    `[PIPELINE 8.9.5 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -18404,7 +18407,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.4",
+    "8.9.5",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -19269,7 +19272,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.4 - GENERAL INVARIANT HARDENING"
+        " STREMIO PT-BR 8.9.5 - GENERAL INVARIANT HARDENING"
   );
 
   console.log(
@@ -19369,7 +19372,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.4: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.9.5: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -19422,7 +19425,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.4: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.9.5: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -19446,7 +19449,7 @@ console.log(
   );
 
   console.log(
-    "Censored Bleep Reconstruction: ATIVO ✅"
+    "Source Censorship Fidelity: reticência ≠ bleep; máscara explícita/fragmento forte preservados sem reconstrução ✅"
   );
 
   console.log(
@@ -19522,10 +19525,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.4: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.4: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.4: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.4: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 8.9.5: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 8.9.5: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 8.9.5: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 8.9.5: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -19537,14 +19540,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.4: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 8.9.5: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.4: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 8.9.5: chamadas de texto migradas de Interactions para REST generateContent ✅"
   );
   console.log(
-    "Structured Output REST 8.9.4: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
+    "Structured Output REST 8.9.5: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -19552,59 +19555,62 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.4 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
+    "HARD SDH 8.9.5 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
   );
 
   console.log(
-    "Spoken Vocalization Lock 8.9.4: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
+    "Spoken Vocalization Lock 8.9.5: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
   );
 
   console.log(
-    "Performance Atomic Reprise 8.9.4: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
+    "Performance Atomic Reprise 8.9.5: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
   );
 
   console.log(
-    "Dialogue Turn Restore 8.9.4: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
+    "Dialogue Turn Restore 8.9.5: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.4: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
+    "Gender Neutral 8.9.5: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
   );
 
   console.log(
-    "Absolute Ownership 8.9.4: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
+    "Absolute Ownership 8.9.5: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "Compact Memory 8.9.4: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
+    "Compact Memory 8.9.5: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.4: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Latency Contract 8.9.5: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
   );
 
   console.log(
-    "Model Router 8.9.4: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+    "Model Router 8.9.5: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
   );
 
   console.log(
-    "Model Health 8.9.4: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+    "Model Health 8.9.5: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.4: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
+    "Quota Diagnostics 8.9.5: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
   );
-  console.log("Turn Canonicalization 8.9.4: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
-  console.log("Standalone Speaker Labels 8.9.4: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
-  console.log("Short Performance Guard 8.9.4: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
-  console.log("Ownership 8.9.4: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
-  console.log("Gender Postcondition 8.9.4: right/secure/clear/late/good/not-alone cobertos localmente ✅");
-  console.log("Source Metadata 8.9.4: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
-  console.log("PT-BR Orthography 8.9.4: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
-  console.log("Dialogue Invariant 8.9.4: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
-  console.log("Bleep Fidelity 8.9.4: censura da SOURCE é hard lock; zero reconstrução especulativa ✅");
-  console.log("Ownership Boundary 8.9.4: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
-  console.log("Gender Neutrality 8.9.4: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
+  console.log("Turn Canonicalization 8.9.5: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
+  console.log("Standalone Speaker Labels 8.9.5: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
+  console.log("Short Performance Guard 8.9.5: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
+  console.log("Ownership 8.9.5: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
+  console.log("Gender Postcondition 8.9.5: right/secure/clear/late/good/not-alone cobertos localmente ✅");
+  console.log("Source Metadata 8.9.5: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
+  console.log("PT-BR Orthography 8.9.5: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
+  console.log("Dialogue Invariant 8.9.5: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
+  console.log("Bleep Fidelity 8.9.5: censura da SOURCE é hard lock; zero reconstrução especulativa ✅");
+  console.log("Ownership Boundary 8.9.5: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
+  console.log("Gender Neutrality 8.9.5: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
+  console.log("Bleep Detector 8.9.5: palavra válida + reticências nunca vira censura só pelo prefixo; dots exigem stem forte/contexto ✅");
+  console.log("Hyphen Turn 8.9.5: -fala/- fala reconhecidos no início da linha; números negativos protegidos ✅");
+  console.log("Bare SDH Safety 8.9.5: fala SOURCE sobrevivente não é apagada silenciosamente por heurística de ação ✅");
 
   console.log(
     "Status: ONLINE"
