@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.2 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
+// STREMIO PT-BR 8.9.3 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.2-multimodel-router-hard-sdh-neutral-gender-v1";
+  "8.9.3-multimodel-router-hard-sdh-neutral-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.2.
+// mas NÃO governam mais as chamadas de texto no 8.9.3.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -89,7 +89,7 @@ const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.2;
 const GEMINI_TOKEN_ESTIMATE_MARGIN = 1.12;
 const GEMINI_TEXT_BUDGET_FILE = String(
   process.env.GEMINI_TEXT_BUDGET_FILE ||
-  path.join(process.cwd(), "gemini-text-budget-8.9.2-legacy-unused.json")
+  path.join(process.cwd(), "gemini-text-budget-8.9.3-legacy-unused.json")
 );
 
 // Multilingual Audio-Sync Adapter.
@@ -1835,7 +1835,7 @@ function isEmptyVocalization(text) {
 }
 
 // ============================================================
-// SPOKEN VOCALIZATION LOCK — 8.9.2
+// SPOKEN VOCALIZATION LOCK — 8.9.3
 // ============================================================
 // "Hmm", "Mm-hmm", "Uh-huh", "Uhum", "Um" etc. são fala curta,
 // não descrição SDH. Quando aparecem sem colchetes/parênteses, preservamos
@@ -1933,7 +1933,12 @@ function looksLikeClearlySpokenBareLine(value) {
   }
 
   // Imperativos curtos que foram falsos-positivos reais do classificador SDH.
-  if (/^(?:(?:just|please|só|apenas|por favor)\s+)?(?:look|breathe|dance|enter|come in|run|turn|wait|listen|go|stop|stay|olha|olhe|respira|respire|dança|dance|entra|entre|corre|corra|vira|vire|espera|espere|escuta|escute|vai|vá|para|pare|fica|fique)(?:\s+(?:here|there|at me|at this|comigo|aqui|ali|pra mim|para mim))?$/iu.test(text)) {
+  if (/^(?:(?:just|please|só|apenas|por favor)\s+)?(?:look|breathe|dance|enter|come in|run|turn|wait|listen|go|leave|exit|stop|stay|olha|olhe|respira|respire|dança|dance|entra|entre|corre|corra|vira|vire|espera|espere|escuta|escute|vai|vá|sai|saia|para|pare|fica|fique)(?:\s+(?:here|there|at me|at this|comigo|aqui|ali|pra mim|para mim))?$/iu.test(text)) {
+    return true;
+  }
+
+  // Fala curta + hesitação/vocalização (ex.: "Oi. Hum...") continua sendo fala.
+  if (/^(?:hi|hello|hey|oi|olá|ola)[,!?.…]*\s+(?:mm-?hmm|mhm|uh-?huh|uhum|aham|hmm+|hm+|hum+|mm+|uh+|um+|ahn|ãh|ah)[.!?…]*$/iu.test(text)) {
     return true;
   }
 
@@ -2620,7 +2625,7 @@ function looksLikeBareSdhLine(
     return false;
   }
 
-  // 8.9.2: linha curta falada nunca pode ser promovida a SDH só porque
+  // 8.9.3: linha curta falada nunca pode ser promovida a SDH só porque
   // também coincide lexicalmente com um verbo de ação (Look/Breathe/Dance/Entra).
   // Descrições estruturadas entre []/() continuam sendo removidas normalmente.
   if (looksLikeClearlySpokenBareLine(original)) {
@@ -3006,10 +3011,11 @@ function looksLikeCaptionCredit(
     /^(?:caption(?:ed|ing)|closed captions?|subtitles?|subtitling)\s+(?:by|provided by|courtesy of)\b/i.test(
       text
     ) ||
-
-    /\bmedia access group\b.*\bwgbh\b/i.test(
-      text
-    )
+    /\bmedia access group\b.*\bwgbh\b/i.test(text) ||
+    /^(?:spaces? added|extended chars?|better for old tvs?|sync(?:ed|hronized)? by|resync(?:ed)? by|retimed by|translated by|encoded by|rip(?:ped)? by)\b/i.test(text) ||
+    /^(?:www\.|https?:\/\/|opensubtitles|subscene|addic7ed|yify|yts)\b/i.test(text) ||
+    /^(?:a|an)\s+.{1,55}\s+production[.!]?(?:\s+cheers\s+.{1,80})?$/iu.test(text) ||
+    /^cheers\s+.{1,80}(?:training scheme|subtitle|subtitles|team|crew)\b/iu.test(text)
   );
 }
 
@@ -3451,17 +3457,20 @@ const MUSIC_SHOWCASE_REGION_GAP_MS =
   45000;
 
 const MUSIC_LAUNCH_CONTEXT_MAX_GAP_MS =
-  6500;
+  20000;
 
 // Reprises/fragmentos da MESMA performance podem voltar entre falas.
 // Se o texto musical bate lexicalmente com um cluster já confirmado,
 // a decisão é atômica para aquela performance, sem apagar o fragmento isolado.
+const MUSIC_DENSE_MIN_CUES = 5;
+const MUSIC_DENSE_MIN_SPAN_MS = 12000;
+
 const MUSIC_REPRISE_MAX_GAP_MS = 90000;
 const MUSIC_REPRISE_MIN_SHARED_TOKENS = 2;
 const MUSIC_REPRISE_MIN_OVERLAP = 0.66;
 
 const PERFORMANCE_LAUNCH_RE =
-  /(?:\bhit it\b|\btake it away\b|\bgive it up\b|\blet'?s hear it\b|\blet'?s hear (?:it )?for\b|\bstart the music\b|\bmusic[, ]+maestro\b|\bplay it\b|\bshowtime\b|\b(?:now|next)[, ]+(?:performing|singing)\b|\bperforming live\b|\bsinging live\b|\bon stage now\b|\bmanda ver\b|\bsolta o som\b|\bcomeça a música\b|\bvamos ouvir\b|\bvalendo\b|\bagora[, ]+(?:cantando|se apresentando)\b)/iu;
+  /(?:\bhit it\b|\btake it away\b|\bgive it up\b|\blet'?s hear it\b|\blet'?s hear (?:it )?for\b|\bstart the music\b|\bmusic[, ]+maestro\b|\bplay it\b|\bshowtime\b|\b(?:now|next)[, ]+(?:performing|singing)\b|\bperforming live\b|\bsinging live\b|\bon stage now\b|\bi sang my song\b|\bi (?:wrote|made) (?:this|my) song\b|\b(?:here(?:'s| is)|this is) (?:my|our) song\b|\bi(?:'m| am) (?:going to|gonna) sing\b|\bi(?:'ll| will) sing\b|\bsing (?:my|our) song\b|\bmanda ver\b|\bsolta o som\b|\bcomeça a música\b|\bvamos ouvir\b|\bvalendo\b|\bagora[, ]+(?:cantando|se apresentando)\b|\beu cantei minha música\b|\beu (?:escrevi|fiz) (?:essa|esta|minha) música\b|\b(?:essa|esta) é (?:a )?minha música\b|\beu vou cantar\b)/iu;
 
 function rawCueVisibleLines(
   raw
@@ -3592,7 +3601,7 @@ function classifyMusicAwareLines(
 
     // Cue misto: fala real depois de linha musical não pode sumir.
     if (
-      /^\s*[-–—]\s+/u.test(
+      /^\s*(?:[-–—]|~)\s+/u.test(
         visible
       )
     ) {
@@ -4087,16 +4096,21 @@ function detectPerformanceMusicIndexes(
         info
       );
 
+    const denseLexicalPerformance =
+      current.length >= MUSIC_DENSE_MIN_CUES &&
+      spanMs >= MUSIC_DENSE_MIN_SPAN_MS &&
+      current.every(rawIndex => musicLexicalTokens(info[rawIndex]?.text).length >= 2);
+
     if (
-      current.length >=
-        MUSIC_STRONG_MIN_CUES &&
-      spanMs >=
-        MUSIC_STRONG_MIN_SPAN_MS &&
-      !terminalOutro
+      (
+        current.length >= MUSIC_STRONG_MIN_CUES &&
+        spanMs >= MUSIC_STRONG_MIN_SPAN_MS
+      ) ||
+      denseLexicalPerformance
     ) {
-      confirmedClusters.add(
-        clusterIndex
-      );
+      if (!terminalOutro) {
+        confirmedClusters.add(clusterIndex);
+      }
     }
   }
 
@@ -4279,7 +4293,7 @@ function detectPerformanceMusicIndexes(
     }
   }
 
-  // CAMADA 4 — REPRISE ATÔMICA 8.9.2.
+  // CAMADA 4 — REPRISE ATÔMICA 8.9.3.
   // Um fragmento musical isolado que repete lexicalmente uma performance já
   // confirmada pertence à mesma performance e não pode desaparecer só porque
   // houve diálogo no meio. Iteramos até estabilizar para encadear reprises.
@@ -4355,6 +4369,23 @@ function detectPerformanceMusicIndexes(
     clusters,
     confirmedClusters
   };
+}
+
+function sourceLineHasDialogueTurnMarker(value) {
+  return /^\s*(?:[-–—]|~)\s+/u.test(String(value || ""));
+}
+
+function canonicalizeSourceDialogueTurnMarker(value) {
+  return String(value || "").replace(/^\s*(?:[-–—]|~)\s+/u, "- ");
+}
+
+function looksLikeStandaloneCueSpeakerLabel(value) {
+  const text = stripMarkup(String(value || "")).trim();
+  if (!text || sourceLineHasDialogueTurnMarker(text) || /[♪♫♬]/u.test(text)) return false;
+  const letters = text.replace(/[^A-Za-zÀ-ÿ]/g, "");
+  if (letters.length < 2 || letters !== letters.toUpperCase()) return false;
+  if (!looksLikeSpeakerLabel(text)) return false;
+  return text.split(/\s+/).filter(Boolean).length <= 5;
 }
 
 function cleanSrtForTranslation(
@@ -4459,12 +4490,19 @@ function cleanSrtForTranslation(
         )
       );
 
-    for (
-      const classified of
-      classifiedLines
-    ) {
-      const sourceLine =
-        classified.raw;
+    for (let classifiedIndex = 0; classifiedIndex < classifiedLines.length; classifiedIndex++) {
+      const classified = classifiedLines[classifiedIndex];
+      const sourceLine = classified.raw;
+
+      // 8.9.3: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
+      // é metadata, não diálogo. Só removemos quando há outra linha real no mesmo cue.
+      if (
+        looksLikeStandaloneCueSpeakerLabel(sourceLine) &&
+        classifiedLines.slice(classifiedIndex + 1).some(item => String(item?.visible || "").trim())
+      ) {
+        speakers.add(normalizeSpeaker(sourceLine));
+        continue;
+      }
 
       if (
         classified.kind ===
@@ -4523,20 +4561,16 @@ function cleanSrtForTranslation(
           true;
       }
 
-      if (
-        info.hadDialogueDash &&
-        !/^\s*[-–—]\s*/u.test(
-          cleaned
-        )
-      ) {
-        cleaned =
-          `- ${cleaned}`;
+      const hadSourceTurnMarker =
+        info.hadDialogueDash || sourceLineHasDialogueTurnMarker(sourceLine);
+
+      if (hadSourceTurnMarker) {
+        cleaned = canonicalizeSourceDialogueTurnMarker(cleaned);
+        if (!/^\s*[-–—]\s*/u.test(cleaned)) {
+          cleaned = `- ${cleaned.replace(/^\s*~\s*/u, "")}`;
+        }
       } else {
-        cleaned =
-          cleaned.replace(
-            /^\s*[-–—]\s*/u,
-            "- "
-          );
+        cleaned = cleaned.replace(/^\s*[-–—]\s*/u, "- ");
       }
 
       dialogue.push(
@@ -4973,14 +5007,14 @@ function sourceDialogueTurns(
     )
     .filter(
       line =>
-        /^\s*[-–—]\s+/u.test(
+        /^\s*(?:[-–—]|~)\s+/u.test(
           line
         )
     )
     .map(
       line =>
         line.replace(
-          /^\s*[-–—]\s+/u,
+          /^\s*(?:[-–—]|~)\s+/u,
           ""
         ).trim()
     )
@@ -5040,7 +5074,7 @@ function translatedDialogueTurns(
   let pieces =
     flattened
       .split(
-        /(?:^|\s)[-–—]\s*/u
+        /(?:^|\s)(?:[-–—]|~)\s*/u
       )
       .map(
         part =>
@@ -5052,14 +5086,14 @@ function translatedDialogueTurns(
       )
       .filter(Boolean);
 
-  // 8.9.2: alguns modelos preservam os dois turns em duas linhas, mas
+  // 8.9.3: alguns modelos preservam os dois turns em duas linhas, mas
   // esquecem os hífens. Se a contagem de linhas bate EXATAMENTE com a SOURCE,
   // restauramos os marcadores deterministicamente, sem chamada Gemini.
   if (pieces.length !== expected) {
     const rawLines = String(value || "")
       .replace(/\r/g, "")
       .split("\n")
-      .map(line => line.replace(/^\s*[-–—]\s*/u, "").trim())
+      .map(line => line.replace(/^\s*(?:[-–—]|~)\s*/u, "").trim())
       .filter(Boolean);
 
     if (rawLines.length === expected) {
@@ -5266,6 +5300,23 @@ function sanitizeFinalCue(
     sourceDialogueDashCount(
       block
     );
+
+  if (expectedDialogueTurns >= 2) {
+    // Sources que usam "~" como marcador de speaker são canonicalizadas para hífen.
+    // Também desfaz o caso "~ fala A ~ fala B" em uma única linha.
+    text = text
+      .replace(/(^|\n)\s*~\s*/gu, "$1- ")
+      .replace(/\s+~\s+(?=\S)/gu, "\n- ");
+  }
+
+  // Se havia label de speaker metadata na SOURCE, qualquer prefixo ALL CAPS
+  // reaparecido/ traduzido pelo modelo é removido localmente.
+  if (block?.speakerHint) {
+    text = text.replace(
+      /^\s*(?:[A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9.'’_-]*)(?:\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9.'’_-]+){0,4}\s+(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇÀ-ÿ])/u,
+      ""
+    );
+  }
 
   let lines =
     text
@@ -5505,7 +5556,7 @@ function sanitizeTranslationMap(
             Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
         }
         console.log(
-          `[LOCAL VOCALIZATION LOCK 8.9.2] cue ${block.index}: ` +
+          `[LOCAL VOCALIZATION LOCK 8.9.3] cue ${block.index}: ` +
           `${JSON.stringify(block.text)} -> ${JSON.stringify(after)} | 0 Gemini.`
         );
       }
@@ -5572,6 +5623,11 @@ function sanitizeTranslationMap(
             genderSafe
           ) ||
           genderSafe;
+      }
+
+      const orthographySafe = applyDeterministicOrthography(after);
+      if (orthographySafe !== after) {
+        after = orthographySafe;
       }
     }
 
@@ -6286,7 +6342,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.2 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.9.3 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -8658,7 +8714,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.2: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 8.9.3: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -10683,6 +10739,8 @@ function buildOwnershipPayload(
         "before/after são contexto compartilhado, nunca conteúdo do target. " +
         "idn.g só é confiável quando diferente de unknown; sem prova, neutralize gênero naturalmente. " +
         "Não antecipe, atrase, duplique ou mova conteúdo entre IDs. " +
+        "Cada fragmento lexical presente em en[i] precisa continuar em pt[i], mesmo quando a frase atravessa dois cues. " +
+        "Se en[i] for fragmento, pt[i] também pode e deve ser fragmento; NÃO complete a frase usando en[i+1] nem transfira o fim de en[i] para pt[i+1]. " +
         "boundary.startsMidSentence/endsMidSentence descreve SOMENTE a borda do target: preserve o corte sem puxar conteúdo do vizinho.",
 
       before:
@@ -11039,7 +11097,7 @@ async function rescueEmptyMainCue({
         Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
     }
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.2] cue ${block.index}: ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.3] cue ${block.index}: ` +
       `${JSON.stringify(block.text)} -> ${JSON.stringify(localVocalization)} | 0 Gemini.`
     );
     return localVocalization;
@@ -11440,7 +11498,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.2] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.9.3] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11489,7 +11547,7 @@ async function translateMainBatch({
           const rightBatch = batch.slice(mid);
 
           console.warn(
-            `[MAIN ADAPTIVE 8.9.2] request grande recebeu limite de payload; ` +
+            `[MAIN ADAPTIVE 8.9.3] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
             `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
           );
@@ -11682,7 +11740,7 @@ async function translateAllMain(
     job.stats.mainLocalVocalizationPrefill =
       Number(job.stats.mainLocalVocalizationPrefill || 0) + localVocalizationPrefill;
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.2] ${localVocalizationPrefill} cue(s) ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.3] ${localVocalizationPrefill} cue(s) ` +
       `resolvidos localmente antes do MAIN | 0 Gemini.`
     );
   }
@@ -11698,7 +11756,7 @@ async function translateAllMain(
   job.stats.mainCheckpointReused = translations.size;
 
   console.log(
-    `[MAIN 8.9.2] ${blocks.length} cues -> ${batches.length} lotes | ` +
+    `[MAIN 8.9.3] ${blocks.length} cues -> ${batches.length} lotes | ` +
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
@@ -11788,7 +11846,8 @@ function buildQaBatches(
       pt: String(translations.get(block.index) || ""),
       s: String(lock?.speaker?.canonical || block.speakerHint || "unknown"),
       g: String(lock?.trusted_speaker_gender || "unknown"),
-      turns: sourceDialogueDashCount(block)
+      turns: sourceDialogueDashCount(block),
+      boundary: sourceBoundaryHint(block)
     };
 
     const size = JSON.stringify(item).length;
@@ -11990,7 +12049,11 @@ async function scanPtbrQuality(
                     batch
                   )
                 }\n\n` +
-                `Retorne SOMENTE IDs que realmente merecem repair por erro semântico, gênero/referente, ownership, calque, literalidade ou naturalidade insuficiente. A lista já está em ordem cronológica; use os vizinhos como contexto sem mover conteúdo entre IDs. Não reescreva os cues.`,
+                `Retorne SOMENTE IDs que realmente merecem repair por erro semântico, gênero/referente, ownership, calque, literalidade ou naturalidade insuficiente. ` +
+                `A lista já está em ordem cronológica; compare explicitamente SOURCE[i]×PT[i] com i-1/i+1. ` +
+                `Se uma parte lexical da SOURCE[i] apareceu em PT[i+1] ou PT[i-1], marque CUE_OWNERSHIP_SHIFT nos IDs afetados. ` +
+                `boundary indica se o target começa/termina no meio de uma frase; isso NÃO autoriza puxar palavras do vizinho. ` +
+                `Use os vizinhos apenas como contexto e não reescreva os cues.`,
 
               schema:
                 QA_SCHEMA,
@@ -12617,7 +12680,7 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
 }
 
 // ============================================================
-// GENDER POSTCONDITION LOCAL — 8.9.2
+// GENDER POSTCONDITION LOCAL — 8.9.3
 // ============================================================
 // O modelo continua responsável pela tradução. Este guard só reescreve
 // padrões de altíssima confiança quando a SOURCE é explicitamente neutra
@@ -12726,7 +12789,52 @@ function applyDeterministicGenderNeutrality(block, value) {
     }
   }
 
+  // 8.9.3 — padrões neutros adicionais observados em filme real.
+  if (!sourceExplicitlyMarksSelfGender(block)) {
+    if (/\blet me be clear\b/i.test(source)) {
+      pt = pt.replace(/\b(?:deixe-me|deixa eu)\s+ser\s+clar[oa]\b/iu, "deixa eu deixar isso claro");
+    }
+    if (/\bi(?:'m|’m| am| was)\s+(?:(?:really|very)\s+)?(?:late|delayed)\b/i.test(source)) {
+      pt = pt.replace(/\b(?:estou|t[oô]|fiquei|estava)\s+(?:muito\s+|realmente\s+)?atrasad[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Me atrasei" : "me atrasei");
+    }
+  }
+
+  if (!sourceExplicitlyMarksSecondPersonGender(block)) {
+    if (/\byou(?:'re|’re| are| were)\s+(?:alone|all alone)\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+(?:n[aã]o\s+)?(?:est[aá]|t[aá]|ficou)\s+sozinh[oa]\b/iu, "você tá sem ninguém por perto");
+    }
+    if (/\byou(?:'re|’re| are)\s+always\s+(?:good|great)\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+[ée]\s+sempre\s+(?:muito\s+)?bo[ma]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você é sempre incrível" : "você é sempre incrível");
+    }
+    if (/\byou(?:'re|’re| are| were)\s+(?:(?:really|very)\s+)?(?:late|delayed)\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+(?:est[aá]|t[aá]|ficou)\s+(?:muito\s+|realmente\s+)?atrasad[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você se atrasou" : "você se atrasou");
+    }
+    if (/\byou(?:'re|’re| are| were)\s+(?:(?:really|very)\s+)?clear\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+(?:foi|era|est[aá]|t[aá])\s+(?:muito\s+|bem\s+|realmente\s+)?clar[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você deixou isso bem claro" : "você deixou isso bem claro");
+    }
+  }
+
+  if (/\bif\s+i(?:'m|’m| am)\s+right\s+about\s+you\b/i.test(source)) {
+    pt = pt.replace(/\bse\s+eu\s+(?:estiver|tiver)\s+cert[oa]\s+sobre\s+voc[eê](?=\W|$)/iu, "se eu tiver razão sobre você");
+  }
+
+  if (/\bwhen\s+you\s+get\s+secure\b/i.test(source)) {
+    pt = pt.replace(/\bquando\s+(?:voc[eê]\s+)?estiver\s+segur[oa]\b/iu, "quando estiver em segurança");
+  }
+
+  if (/\byou\s+are\s+not\s+alone\b|\byou(?:'re|’re)\s+not\s+alone\b/i.test(source)) {
+    pt = pt.replace(/\bvoc[eê]\s+n[aã]o\s+(?:est[aá]|t[aá])\s+sozinh[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você não tá só" : "você não tá só");
+  }
+
   return pt.replace(/[ \t]{2,}/g, " ").trim();
+}
+
+function applyDeterministicOrthography(value) {
+  return String(value || "")
+    .replace(/\bemituiu\b/giu, "emitiu")
+    .replace(/\bAgüenta\b/gu, "Aguenta")
+    .replace(/\bagüenta\b/gu, "aguenta")
+    .trim();
 }
 
 function unknownSpeakerGenderRisk(
@@ -12942,14 +13050,12 @@ function localReasonsForCue(
     translated
       .split("\n")
       .some(line => {
-        const info =
-          extractSpeaker(
-            line
-          );
-
-        return Boolean(
-          info.speaker
-        );
+        const info = extractSpeaker(line);
+        if (info.speaker) return true;
+        if (block?.speakerHint) {
+          return /^\s*(?:[A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9.'’_-]*)(?:\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9.'’_-]+){0,4}\s+(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇÀ-ÿ])/u.test(String(line || ""));
+        }
+        return false;
       })
   ) {
     reasons.push(
@@ -13097,6 +13203,26 @@ function localReasonsForCue(
     reasons.push(
       "FORCED_PROFANITY_REGISTER"
     );
+  }
+
+  if (/\bemituiu\b|\bagüenta\b/iu.test(translated)) {
+    reasons.push("PTBR_ORTHOGRAPHY_ERROR");
+  }
+
+  if (/\bloosen your grip\b/i.test(en) && /\bafroux(?:e|a)\s+a\s+m[aã]o\b/iu.test(translated)) {
+    reasons.push("LITERALITY_GRIP");
+  }
+
+  if (/\bsecure the airway\b/i.test(en) && /\bcertifique-se\s+de\s+garantir\s+a\s+via\s+a[eé]rea\b/iu.test(translated)) {
+    reasons.push("LITERALITY_MEDICAL_AIRWAY");
+  }
+
+  if (/\bsecure private\b/i.test(en) && /\bprivado\s+seguro\b/iu.test(translated)) {
+    reasons.push("LITERALITY_SECURE_PRIVATE");
+  }
+
+  if (/\bdove on\b/i.test(en) && /\bmergulhou\s+em\s+cima\b/iu.test(translated)) {
+    reasons.push("LITERALITY_DOVE_ON");
   }
 
   if (
@@ -13556,7 +13682,7 @@ function sourceLooksLikeShortReaction(value) {
     .replace(/\s+/g, " ")
     .trim();
 
-  return /^(?:oh|ah|okay|ok|yeah|yes|no|right|sure|wow|huh|uh-huh|mm-hmm|well|entendi|tá|ta|sim|não|nao|certo|claro|beleza)(?:[.!?…]|\s|$)/iu.test(text);
+  return /^(?:oh|ah|okay|ok|yeah|yes|no|right|sure|wow|huh|uh-huh|mm-hmm|well|entendi|tá|ta|sim|não|nao|certo|claro|beleza)[.!?…]*$/iu.test(text);
 }
 
 function ownershipBoundaryMismatchReasons(previousBlock, block, previousPt, pt) {
@@ -14959,7 +15085,7 @@ function rememberCompactRescueFailure(job, id, value, reason = "rejeitado") {
   if (!job.compactRescueFailedSignatures.has(signature)) {
     job.compactRescueFailedSignatures.add(signature);
     job.stats.compactMemoizedFailures = Number(job.stats.compactMemoizedFailures || 0) + 1;
-    console.log(`[COMPACT MEMORY 8.9.2] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
+    console.log(`[COMPACT MEMORY 8.9.3] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
   }
 }
 
@@ -15011,7 +15137,7 @@ async function runCompactRescue(
     const memoSkipped = detectedIssues.length - allIssues.length;
     if (memoSkipped > 0) {
       console.log(
-        `[COMPACT MEMORY 8.9.2] ${memoSkipped} overflow(s) já reprovado(s) ` +
+        `[COMPACT MEMORY 8.9.3] ${memoSkipped} overflow(s) já reprovado(s) ` +
         `com o mesmo texto; 0 nova chamada cloud.`
       );
     }
@@ -16253,7 +16379,7 @@ function finalReasonBlocks(reason) {
 
 
 function finalCriticalHeuristicReason(reason) {
-  return /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR)$/i.test(String(reason || "").trim());
+  return /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_BOUNDARY_MISMATCH)$/i.test(String(reason || "").trim());
 }
 
 function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, job) {
@@ -17049,7 +17175,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.2] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.9.3] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -17094,7 +17220,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.2] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.9.3] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -17124,7 +17250,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.2] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.9.3] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -17150,7 +17276,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.2] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.9.3] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -17187,7 +17313,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.2 ROUTED] fonte=${
+    `[PIPELINE 8.9.3 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -17230,7 +17356,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.2
+// HARD GUARD PRE-SAFE 8.9.3
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -17427,7 +17553,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.2 ROUTED] FINAL OK | ${
+    `[PIPELINE 8.9.3 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -18199,7 +18325,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.2",
+    "8.9.3",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -19064,7 +19190,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.2 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
+        " STREMIO PT-BR 8.9.3 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -19164,7 +19290,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.2: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.9.3: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -19217,7 +19343,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.2: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.9.3: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -19317,10 +19443,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.2: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.2: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.2: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.2: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 8.9.3: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 8.9.3: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 8.9.3: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 8.9.3: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -19332,14 +19458,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.2: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 8.9.3: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.2: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 8.9.3: chamadas de texto migradas de Interactions para REST generateContent ✅"
   );
   console.log(
-    "Structured Output REST 8.9.2: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
+    "Structured Output REST 8.9.3: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -19347,48 +19473,55 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.2 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
+    "HARD SDH 8.9.3 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
   );
 
   console.log(
-    "Spoken Vocalization Lock 8.9.2: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
+    "Spoken Vocalization Lock 8.9.3: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
   );
 
   console.log(
-    "Performance Atomic Reprise 8.9.2: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
+    "Performance Atomic Reprise 8.9.3: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
   );
 
   console.log(
-    "Dialogue Turn Restore 8.9.2: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
+    "Dialogue Turn Restore 8.9.3: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.2: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
+    "Gender Neutral 8.9.3: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
   );
 
   console.log(
-    "Absolute Ownership 8.9.2: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
+    "Absolute Ownership 8.9.3: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "Compact Memory 8.9.2: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
+    "Compact Memory 8.9.3: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.2: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Latency Contract 8.9.3: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
   );
 
   console.log(
-    "Model Router 8.9.2: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+    "Model Router 8.9.3: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
   );
 
   console.log(
-    "Model Health 8.9.2: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+    "Model Health 8.9.3: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.2: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
+    "Quota Diagnostics 8.9.3: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
   );
+  console.log("Turn Canonicalization 8.9.3: ~ / hífen => speakers separados localmente; 0 Gemini extra ✅");
+  console.log("Standalone Speaker Labels 8.9.3: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
+  console.log("Short Performance Guard 8.9.3: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
+  console.log("Ownership 8.9.3: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
+  console.log("Gender Postcondition 8.9.3: right/secure/clear/late/good/not-alone cobertos localmente ✅");
+  console.log("Source Metadata 8.9.3: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
+  console.log("PT-BR Orthography 8.9.3: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
 
   console.log(
     "Status: ONLINE"
