@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.6 - CONTEXT SEMANTIC REGRESSION LOCK
+// STREMIO PT-BR 8.9.7 - CONTEXT SEMANTIC REGRESSION LOCK
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.6-context-semantic-regression-lock-v1";
+  "8.9.7-gender-v5-zero-cloud-broadcast-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.6.
+// mas NÃO governam mais as chamadas de texto no 8.9.7.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -1835,7 +1835,7 @@ function isEmptyVocalization(text) {
 }
 
 // ============================================================
-// SPOKEN VOCALIZATION LOCK — 8.9.6
+// SPOKEN VOCALIZATION LOCK — 8.9.7
 // ============================================================
 // "Hmm", "Mm-hmm", "Uh-huh", "Uhum", "Um" etc. são fala curta,
 // não descrição SDH. Quando aparecem sem colchetes/parênteses, preservamos
@@ -2625,7 +2625,7 @@ function looksLikeBareSdhLine(
     return false;
   }
 
-  // 8.9.6: linha curta falada nunca pode ser promovida a SDH só porque
+  // 8.9.7: linha curta falada nunca pode ser promovida a SDH só porque
   // também coincide lexicalmente com um verbo de ação (Look/Breathe/Dance/Entra).
   // Descrições estruturadas entre []/() continuam sendo removidas normalmente.
   if (looksLikeClearlySpokenBareLine(original)) {
@@ -2757,7 +2757,7 @@ function collapseExtendedVocalization(
     );
 }
 
-// 8.9.6 — reticência não é censura por si só.
+// 8.9.7 — reticência não é censura por si só.
 // Máscara gráfica explícita (*#@%&$) continua sendo forte evidência.
 // Para "palavra...", só aceitamos stems de palavrão de alta confiança;
 // fragmentos ambíguos/completos (me..., bit..., car..., por...) permanecem fala.
@@ -4271,7 +4271,7 @@ function detectPerformanceMusicIndexes(
     }
   }
 
-  // CAMADA 4 — REPRISE ATÔMICA 8.9.6.
+  // CAMADA 4 — REPRISE ATÔMICA 8.9.7.
   // Um fragmento musical isolado que repete lexicalmente uma performance já
   // confirmada pertence à mesma performance e não pode desaparecer só porque
   // houve diálogo no meio. Iteramos até estabilizar para encadear reprises.
@@ -4349,7 +4349,7 @@ function detectPerformanceMusicIndexes(
   };
 }
 
-// 8.9.6 — marcador de speaker pode vir como "~ fala", "~fala",
+// 8.9.7 — marcador de speaker pode vir como "~ fala", "~fala",
 // "- fala" ou "-fala". Hífen colado a número negativo NÃO é speaker.
 const DIALOGUE_TURN_START_RE =
   /^\s*(?:~\s*|[-–—](?:\s+|(?=[^\d\s])))(?=\S)/u;
@@ -4477,7 +4477,7 @@ function cleanSrtForTranslation(
       const classified = classifiedLines[classifiedIndex];
       const sourceLine = classified.raw;
 
-      // 8.9.6: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
+      // 8.9.7: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
       // é metadata, não diálogo. Só removemos quando há outra linha real no mesmo cue.
       if (
         looksLikeStandaloneCueSpeakerLabel(sourceLine) &&
@@ -5226,7 +5226,7 @@ function stripOutputAccessibilityLine(
       )
       .trim();
 
-  // 8.9.6: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
+  // 8.9.7: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
   // toda a fala silenciosamente só porque a tradução "parece" uma ação SDH.
   // SDH estruturado []/() continua sendo removido; bare SDH suspeito fica para
   // o QA semântico/Repair em vez de virar EMPTY.
@@ -5318,7 +5318,7 @@ function sanitizeFinalCue(
       "$1 "
     );
 
-  text = naturalizeVisibleSourceBleep(block, text); // 8.9.6: metadata de censura nunca fica visível.
+  text = naturalizeVisibleSourceBleep(block, text); // 8.9.7: metadata de censura nunca fica visível.
 
   const expectedDialogueTurns =
     sourceDialogueDashCount(
@@ -5578,7 +5578,7 @@ function sanitizeTranslationMap(
             Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
         }
         console.log(
-          `[LOCAL VOCALIZATION LOCK 8.9.6] cue ${block.index}: ` +
+          `[LOCAL VOCALIZATION LOCK 8.9.7] cue ${block.index}: ` +
           `${JSON.stringify(block.text)} -> ${JSON.stringify(after)} | 0 Gemini.`
         );
       }
@@ -5655,6 +5655,11 @@ function sanitizeTranslationMap(
       const orthographySafe = applyDeterministicOrthography(after);
       if (orthographySafe !== after) {
         after = orthographySafe;
+      }
+
+      const broadcastSafe = applyBroadcastAntiCalque897(block, after);
+      if (broadcastSafe !== after) {
+        after = sanitizeFinalCue(block, broadcastSafe) || broadcastSafe;
       }
     }
 
@@ -6369,7 +6374,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.6 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.9.7 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -8751,7 +8756,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.6: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 8.9.7: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -11134,7 +11139,7 @@ async function rescueEmptyMainCue({
         Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
     }
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.6] cue ${block.index}: ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.7] cue ${block.index}: ` +
       `${JSON.stringify(block.text)} -> ${JSON.stringify(localVocalization)} | 0 Gemini.`
     );
     return localVocalization;
@@ -11535,7 +11540,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.6] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.9.7] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11584,7 +11589,7 @@ async function translateMainBatch({
           const rightBatch = batch.slice(mid);
 
           console.warn(
-            `[MAIN ADAPTIVE 8.9.6] request grande recebeu limite de payload; ` +
+            `[MAIN ADAPTIVE 8.9.7] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
             `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
           );
@@ -11777,7 +11782,7 @@ async function translateAllMain(
     job.stats.mainLocalVocalizationPrefill =
       Number(job.stats.mainLocalVocalizationPrefill || 0) + localVocalizationPrefill;
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.6] ${localVocalizationPrefill} cue(s) ` +
+      `[MAIN LOCAL VOCALIZATION 8.9.7] ${localVocalizationPrefill} cue(s) ` +
       `resolvidos localmente antes do MAIN | 0 Gemini.`
     );
   }
@@ -11793,7 +11798,7 @@ async function translateAllMain(
   job.stats.mainCheckpointReused = translations.size;
 
   console.log(
-    `[MAIN 8.9.6] ${blocks.length} cues -> ${batches.length} lotes | ` +
+    `[MAIN 8.9.7] ${blocks.length} cues -> ${batches.length} lotes | ` +
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
@@ -12678,6 +12683,167 @@ function targetHasGenderMarkedHumanRole896(pt, person = "second") {
   return !EPICENE_HUMAN_ROLE_WORDS_896.has(role);
 }
 
+// ============================================================
+// GENDER V5 DEFINITIVE SAFE NEUTRALIZATION — 8.9.7 ZERO-CLOUD
+// ============================================================
+// Camada propositalmente pequena: só atua quando a SOURCE usa um frame direto
+// I/you + a/an + papel humano e existe uma reformulação PT-BR inequívoca.
+// Preserva pessoa + tempo/modo do PT atual (sou/era/fosse/seja etc.) para não
+// criar frase artificial em construções como "É como se eu fosse...".
+// Papéis sem reformulação universal segura continuam no pipeline 8.9.6 normal.
+const GENDER_V5_SAFE_ROLE_PREDICATES_897 = Object.freeze({
+  passenger: "alguém de passagem",
+  doctor: "profissional da medicina",
+  teacher: "docente",
+  nurse: "profissional de enfermagem",
+  student: "estudante",
+  journalist: "jornalista",
+  driver: "motorista",
+  scientist: "cientista",
+  lawyer: "profissional do direito"
+});
+
+const GENDER_V5_PT_ROLE_PATTERNS_897 = Object.freeze({
+  passenger: "passageir[oa]",
+  doctor: "m[eé]dic[oa]",
+  teacher: "professor(?:a)?",
+  nurse: "enfermeir[oa]",
+  student: "(?:alun[oa]|estudante)",
+  journalist: "jornalista",
+  driver: "motorista",
+  scientist: "cientista",
+  lawyer: "advogad[oa]"
+});
+
+function preserveInitialCase897(match, replacement) {
+  const raw = String(match || "");
+  const out = String(replacement || "");
+  if (!out) return out;
+  return /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(raw)
+    ? out.charAt(0).toLocaleUpperCase() + out.slice(1)
+    : out;
+}
+
+function sourceNeutralHumanRole897(block, person = "second") {
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!source) return null;
+
+  const keys = Object.keys(GENDER_V5_SAFE_ROLE_PREDICATES_897).join("|");
+  const frame = person === "first"
+    ? new RegExp(`\\bi(?:'m|’m| am| was)\\s+(?:just\\s+|only\\s+)?(?:a|an)\\s+(${keys})\\b`, "i")
+    : new RegExp(`\\byou(?:'re|’re| are| were)\\s+(?:just\\s+|only\\s+)?(?:a|an)\\s+(${keys})\\b`, "i");
+
+  const match = source.match(frame);
+  if (!match) return null;
+
+  const role = String(match[1] || "").toLocaleLowerCase();
+  if (!GENDER_V5_SAFE_ROLE_PREDICATES_897[role]) return null;
+
+  return {
+    role,
+    limited: /\b(?:just|only)\b/i.test(match[0])
+  };
+}
+
+function neutralRoleCopula897(match, person, role, limited) {
+  const raw = String(match || "");
+  const lower = raw.toLocaleLowerCase();
+  const predicate = GENDER_V5_SAFE_ROLE_PREDICATES_897[role];
+  if (!predicate) return raw;
+
+  let head;
+  if (person === "first") {
+    const explicitSubject = /\beu\b/iu.test(raw);
+    const subject = explicitSubject ? "eu " : "";
+    if (/\bfosse\b/iu.test(lower)) head = `${subject}fosse`;
+    else if (/\bseja\b/iu.test(lower)) head = `${subject}seja`;
+    else if (/\bera\b/iu.test(lower)) head = `${subject}era`;
+    else if (/\bfui\b/iu.test(lower)) head = `${subject}fui`;
+    else if (/\b(?:estou|t[oô])\b/iu.test(lower)) head = `${subject}estou`;
+    else head = `${subject}sou`;
+  } else {
+    if (/\bfosse\b/iu.test(lower)) head = "você fosse";
+    else if (/\bseja\b/iu.test(lower)) head = "você seja";
+    else if (/\bera\b/iu.test(lower)) head = "você era";
+    else if (/\bfoi\b/iu.test(lower)) head = "você foi";
+    else if (/\b(?:est[aá]|t[aá])\b/iu.test(lower)) head = "você está";
+    else head = "você é";
+  }
+
+  const limiter = limited ? " só" : "";
+  return preserveInitialCase897(raw, `${head}${limiter} ${predicate}`);
+}
+
+function applyGenderV5DefinitiveNeutralization897(block, value) {
+  let pt = String(value || "").trim();
+  if (!pt || sourceDialogueDashCount(block) >= 2) return pt;
+
+  for (const person of ["first", "second"]) {
+    const info = sourceNeutralHumanRole897(block, person);
+    if (!info) continue;
+
+    if (person === "first" && sourceExplicitlyMarksSelfGender(block)) continue;
+    if (person === "second" && sourceExplicitlyMarksSecondPersonGender(block)) continue;
+
+    const rolePattern = GENDER_V5_PT_ROLE_PATTERNS_897[info.role];
+    if (!rolePattern) continue;
+
+    const subject = person === "first"
+      ? "(?:eu\\s+)?"
+      : "(?:voc[eê]|c[eê]|tu)\\s+";
+    const copula = person === "first"
+      ? "(?:sou|era|fui|fosse|seja|estou|t[oô])"
+      : "(?:[ée]|era|foi|fosse|seja|est[aá]|t[aá])";
+
+    // Tolera qualificadores curtos do modelo ("só", "apenas", "simplesmente"),
+    // mas não atravessa pontuação/linha e só fecha no papel lexical esperado.
+    const directRole = new RegExp(
+      `\\b${subject}${copula}\\s+[^.!?\\n]{0,28}?(?:um|uma)\\s+${rolePattern}\\b`,
+      "iu"
+    );
+
+    if (!directRole.test(pt)) continue;
+
+    const beforeRole = pt;
+    pt = pt.replace(
+      directRole,
+      match => neutralRoleCopula897(match, person, info.role, info.limited)
+    );
+    if (pt !== beforeRole) {
+      console.log(
+        `[GENDER V5 LOCAL 8.9.7] cue ${block?.index}: role=${info.role} neutralizado | 0 Gemini.`
+      );
+    }
+  }
+
+  return pt.replace(/[ \t]{2,}/g, " ").trim();
+}
+
+// ============================================================
+// BROADCAST ANTI-CALQUE — 8.9.7 ZERO-CLOUD
+// ============================================================
+// Só atua quando a própria SOURCE contém "pool feed" em contexto de broadcast.
+// Assim "pool" de piscina ou outros usos nunca são tocados.
+function applyBroadcastAntiCalque897(block, value) {
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  let pt = String(value || "").trim();
+  if (!pt || !/\bpool\s+feed\b/i.test(source)) return pt;
+
+  const before = pt;
+  pt = pt
+    .replace(/\bsinal\s+(?:(?:do|da|de)\s+)?pool\b/giu, match => preserveInitialCase897(match, "sinal compartilhado"))
+    .replace(/\bfeed\s+(?:(?:do|da|de)\s+)?pool\b/giu, match => preserveInitialCase897(match, "feed compartilhado"))
+    .replace(/\bpool\s+feed\b/giu, match => preserveInitialCase897(match, "feed compartilhado"));
+
+  if (pt !== before) {
+    console.log(
+      `[BROADCAST LOCAL 8.9.7] cue ${block?.index}: pool feed naturalizado | 0 Gemini.`
+    );
+  }
+
+  return pt.replace(/[ \t]{2,}/g, " ").trim();
+}
+
 function clauseUnits896(value) {
   return String(value || "")
     .replace(/(^|\n)\s*[-–—~]\s*/gu, "$1")
@@ -12936,7 +13102,7 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
 }
 
 // ============================================================
-// GENDER POSTCONDITION LOCAL — 8.9.6
+// GENDER POSTCONDITION LOCAL — 8.9.7
 // ============================================================
 // O modelo continua responsável pela tradução. Este guard só reescreve
 // padrões de altíssima confiança quando a SOURCE é explicitamente neutra
@@ -13052,7 +13218,7 @@ function applyDeterministicGenderNeutrality(block, value) {
     }
   }
 
-  // 8.9.6 — padrões neutros adicionais observados em filme real.
+  // 8.9.7 — padrões neutros adicionais observados em filme real.
   if (!sourceExplicitlyMarksSelfGender(block)) {
     if (/\blet me be clear\b/i.test(source)) {
       pt = pt.replace(/\b(?:deixe-me|deixa eu)\s+ser\s+clar[oa]\b/iu, "deixa eu deixar isso claro");
@@ -13088,6 +13254,8 @@ function applyDeterministicGenderNeutrality(block, value) {
   if (/\byou\s+are\s+not\s+alone\b|\byou(?:'re|’re)\s+not\s+alone\b/i.test(source)) {
     pt = pt.replace(/\bvoc[eê]\s+n[aã]o\s+(?:est[aá]|t[aá])\s+sozinh[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você não tá só" : "você não tá só");
   }
+
+  pt = applyGenderV5DefinitiveNeutralization897(block, pt);
 
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
@@ -15404,7 +15572,7 @@ function rememberCompactRescueFailure(job, id, value, reason = "rejeitado") {
   if (!job.compactRescueFailedSignatures.has(signature)) {
     job.compactRescueFailedSignatures.add(signature);
     job.stats.compactMemoizedFailures = Number(job.stats.compactMemoizedFailures || 0) + 1;
-    console.log(`[COMPACT MEMORY 8.9.6] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
+    console.log(`[COMPACT MEMORY 8.9.7] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
   }
 }
 
@@ -15456,7 +15624,7 @@ async function runCompactRescue(
     const memoSkipped = detectedIssues.length - allIssues.length;
     if (memoSkipped > 0) {
       console.log(
-        `[COMPACT MEMORY 8.9.6] ${memoSkipped} overflow(s) já reprovado(s) ` +
+        `[COMPACT MEMORY 8.9.7] ${memoSkipped} overflow(s) já reprovado(s) ` +
         `com o mesmo texto; 0 nova chamada cloud.`
       );
     }
@@ -17506,7 +17674,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.6] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.9.7] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -17551,7 +17719,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.6] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.9.7] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -17581,7 +17749,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.6] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.9.7] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -17607,7 +17775,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.6] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.9.7] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -17647,7 +17815,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.6 ROUTED] fonte=${
+    `[PIPELINE 8.9.7 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -17690,7 +17858,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.6
+// HARD GUARD PRE-SAFE 8.9.7
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -17844,7 +18012,7 @@ finalTranslations = await runBoundedFinalQuality88(
   job
 );
 
-// 8.9.6: postcondition ZERO-CLOUD. Nenhuma chamada Gemini, nenhum loop, nenhum atraso de rede.
+// 8.9.7: postcondition ZERO-CLOUD. Nenhuma chamada Gemini, nenhum loop, nenhum atraso de rede.
 // Impede que um Repair tardio reintroduza bleep visível, gênero de alta confiança,
 // repetição dramática perdida ou imperativo contextual comprovadamente errado.
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
@@ -17892,7 +18060,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.6 ROUTED] FINAL OK | ${
+    `[PIPELINE 8.9.7 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -18664,7 +18832,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.6",
+    "8.9.7",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -19529,7 +19697,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.6 - CONTEXT SEMANTIC REGRESSION LOCK"
+        " STREMIO PT-BR 8.9.7 - CONTEXT SEMANTIC REGRESSION LOCK"
   );
 
   console.log(
@@ -19629,7 +19797,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.6: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.9.7: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -19682,7 +19850,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.6: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.9.7: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -19782,10 +19950,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.6: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.6: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.6: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.6: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 8.9.7: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 8.9.7: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 8.9.7: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 8.9.7: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -19797,14 +19965,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.6: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 8.9.7: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.6: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 8.9.7: chamadas de texto migradas de Interactions para REST generateContent ✅"
   );
   console.log(
-    "Structured Output REST 8.9.6: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
+    "Structured Output REST 8.9.7: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -19812,77 +19980,83 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.6 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
+    "HARD SDH 8.9.7 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
   );
 
   console.log(
-    "Spoken Vocalization Lock 8.9.6: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
+    "Spoken Vocalization Lock 8.9.7: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
   );
 
   console.log(
-    "Performance Atomic Reprise 8.9.6: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
+    "Performance Atomic Reprise 8.9.7: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
   );
 
   console.log(
-    "Dialogue Turn Restore 8.9.6: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
+    "Dialogue Turn Restore 8.9.7: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.6: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
+    "Gender Neutral 8.9.7: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
   );
 
   console.log(
-    "Absolute Ownership 8.9.6: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
+    "Absolute Ownership 8.9.7: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "Compact Memory 8.9.6: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
+    "Compact Memory 8.9.7: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.6: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Latency Contract 8.9.7: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
   );
 
   console.log(
-    "Model Router 8.9.6: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+    "Model Router 8.9.7: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
   );
 
   console.log(
-    "Model Health 8.9.6: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+    "Model Health 8.9.7: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.6: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
+    "Quota Diagnostics 8.9.7: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
   );
-  console.log("Turn Canonicalization 8.9.6: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
-  console.log("Standalone Speaker Labels 8.9.6: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
-  console.log("Short Performance Guard 8.9.6: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
-  console.log("Ownership 8.9.6: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
-  console.log("Gender Postcondition 8.9.6: right/secure/clear/late/good/not-alone cobertos localmente ✅");
-  console.log("Source Metadata 8.9.6: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
-  console.log("PT-BR Orthography 8.9.6: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
-  console.log("Dialogue Invariant 8.9.6: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
-  console.log("Bleep Naturalization 8.9.6: metadata de censura fica invisível; força pragmática vira fala PT-BR natural ✅");
-  console.log("Ownership Boundary 8.9.6: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
-  console.log("Gender Neutrality 8.9.6: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
-  console.log("Bleep Detector 8.9.6: palavra válida + reticências nunca vira censura só pelo prefixo; dots exigem stem forte/contexto ✅");
-  console.log("Hyphen Turn 8.9.6: -fala/- fala reconhecidos no início da linha; números negativos protegidos ✅");
-  console.log("Bare SDH Safety 8.9.6: fala SOURCE sobrevivente não é apagada silenciosamente por heurística de ação ✅");
+  console.log("Turn Canonicalization 8.9.7: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
+  console.log("Standalone Speaker Labels 8.9.7: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
+  console.log("Short Performance Guard 8.9.7: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
+  console.log("Ownership 8.9.7: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
+  console.log("Gender Postcondition 8.9.7: right/secure/clear/late/good/not-alone cobertos localmente ✅");
+  console.log("Source Metadata 8.9.7: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
+  console.log("PT-BR Orthography 8.9.7: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
+  console.log("Dialogue Invariant 8.9.7: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
+  console.log("Bleep Naturalization 8.9.7: metadata de censura fica invisível; força pragmática vira fala PT-BR natural ✅");
+  console.log("Ownership Boundary 8.9.7: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
+  console.log("Gender Neutrality 8.9.7: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
+  console.log("Bleep Detector 8.9.7: palavra válida + reticências nunca vira censura só pelo prefixo; dots exigem stem forte/contexto ✅");
+  console.log("Hyphen Turn 8.9.7: -fala/- fala reconhecidos no início da linha; números negativos protegidos ✅");
+  console.log("Bare SDH Safety 8.9.7: fala SOURCE sobrevivente não é apagada silenciosamente por heurística de ação ✅");
 
   console.log(
-    "Context Semantic Lock 8.9.6: before/after resolvem intenção; zero nova auditoria global / zero nova rodada cloud ✅"
+    "Context Semantic Lock 8.9.7: before/after resolvem intenção; zero nova auditoria global / zero nova rodada cloud ✅"
   );
   console.log(
-    "Gender Critical V5 8.9.6: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
+    "Gender Critical V5 8.9.7: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
   );
   console.log(
-    "Exact Repetition Lock 8.9.6: repetição dramática não pode ser compactada nem perdida por Repair ✅"
+    "Gender V5 Definitive 8.9.7: neutralizações inequívocas são ZERO-CLOUD e não reabrem Repair HIGH ✅"
   );
   console.log(
-    "Visible Censor Zero 8.9.6: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
+    "Broadcast Anti-Calque 8.9.7: pool feed/sinal pool vira formulação PT-BR natural somente com prova na SOURCE ✅"
   );
   console.log(
-    "Contextual Imperative Lock 8.9.6: referente inventado é bloqueado quando vizinhos provam sentido de parada/interrupção ✅"
+    "Exact Repetition Lock 8.9.7: repetição dramática não pode ser compactada nem perdida por Repair ✅"
+  );
+  console.log(
+    "Visible Censor Zero 8.9.7: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
+  );
+  console.log(
+    "Contextual Imperative Lock 8.9.7: referente inventado é bloqueado quando vizinhos provam sentido de parada/interrupção ✅"
   );
 
   console.log(
