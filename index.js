@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.1 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
+// STREMIO PT-BR 8.9.2 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.1-multimodel-router-hard-sdh-neutral-gender-v1";
+  "8.9.2-multimodel-router-hard-sdh-neutral-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.1.
+// mas NÃO governam mais as chamadas de texto no 8.9.2.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -89,7 +89,7 @@ const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.2;
 const GEMINI_TOKEN_ESTIMATE_MARGIN = 1.12;
 const GEMINI_TEXT_BUDGET_FILE = String(
   process.env.GEMINI_TEXT_BUDGET_FILE ||
-  path.join(process.cwd(), "gemini-text-budget-8.9.1-legacy-unused.json")
+  path.join(process.cwd(), "gemini-text-budget-8.9.2-legacy-unused.json")
 );
 
 // Multilingual Audio-Sync Adapter.
@@ -1128,6 +1128,8 @@ function createJob({
     // MAIN conclui por lote e preserva progresso em retries/failover.
     mainCheckpoint: new Map(),
     modelRouterSkip: new Set(),
+    modelRouterHealth: new Map(),
+    compactRescueFailedSignatures: new Set(),
 
     cacheKey:
       makeCacheKey(
@@ -1833,6 +1835,112 @@ function isEmptyVocalization(text) {
 }
 
 // ============================================================
+// SPOKEN VOCALIZATION LOCK — 8.9.2
+// ============================================================
+// "Hmm", "Mm-hmm", "Uh-huh", "Uhum", "Um" etc. são fala curta,
+// não descrição SDH. Quando aparecem sem colchetes/parênteses, preservamos
+// localmente e nunca gastamos Gemini HIGH para decidir se devem existir.
+function spokenVocalizationKind(value) {
+  const text = String(value || "")
+    .toLocaleLowerCase()
+    .replace(/<[^>]+>/g, " ")
+    .replace(/^[\s\-–—]+|[\s]+$/gu, "")
+    .replace(/[!?.,…]+/gu, " ")
+    .replace(/[’']/gu, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return null;
+
+  const compact = text.replace(/\s+/g, "");
+
+  if (/^(?:mm-?hmm|mmm-?hmm|mhm|uh-?huh|uhhuh|uhum|uh-hum|aham|a-ham)$/iu.test(compact)) {
+    return "affirmative";
+  }
+
+  if (/^(?:hmm+|hm+|hum+|mm+|mmm+)$/iu.test(compact)) {
+    return "ponder";
+  }
+
+  if (/^(?:uh|uhh|um|umm|ahn|ãh|ah)$/iu.test(compact)) {
+    return "hesitation";
+  }
+
+  if (/^(?:(?:uh|um|hm|hmm|hum|mm|ah|ahn|ãh)[ -]*){2,8}$/iu.test(text)) {
+    return "hesitation";
+  }
+
+  return null;
+}
+
+function looksLikeSpokenVocalization(value) {
+  return Boolean(spokenVocalizationKind(value));
+}
+
+function localizeSpokenVocalization(value) {
+  const kind = spokenVocalizationKind(value);
+  if (!kind) return "";
+
+  const raw = String(value || "").trim();
+  const exclamation = /!+\s*$/u.test(raw);
+  const question = /\?+\s*$/u.test(raw);
+  const ellipsis = /(?:…|\.{2,})\s*$/u.test(raw);
+
+  if (kind === "affirmative") {
+    return question ? "Uhum?" : exclamation ? "Uhum!" : "Uhum.";
+  }
+
+  if (kind === "ponder") {
+    return question ? "Hum?" : exclamation ? "Hum!" : ellipsis ? "Hum..." : "Hum.";
+  }
+
+  if (/^\s*ah[.!?…]*\s*$/iu.test(raw)) {
+    return question ? "Ah?" : exclamation ? "Ah!" : ellipsis ? "Ah..." : "Ah.";
+  }
+
+  return question ? "Hum?" : exclamation ? "Ah!" : "Hum...";
+}
+
+function localizePureVocalizationCue(block) {
+  const source = String(block?.text || "").replace(/\r/g, "").trim();
+  if (!source) return "";
+
+  const lines = source.split("\n").map(line => String(line || "").trim()).filter(Boolean);
+  if (!lines.length) return "";
+
+  const localized = [];
+  for (const line of lines) {
+    const hadDash = /^\s*[-–—]\s*/u.test(line);
+    const info = extractSpeaker(line);
+    const spoken = localizeSpokenVocalization(info.text);
+    if (!spoken) return "";
+    localized.push(`${hadDash ? "- " : ""}${spoken}`);
+  }
+
+  return localized.join("\n");
+}
+
+function looksLikeClearlySpokenBareLine(value) {
+  const original = stripMarkup(String(value || "")).trim();
+  const text = normalizeSdhCandidate(original);
+  if (!text) return false;
+
+  if (looksLikeSpokenVocalization(original)) return true;
+
+  // Frases com pessoa gramatical explícita / cópula são fala, não stage direction.
+  if (/\b(?:i|i'm|i’m|i am|you|you're|you’re|you are|we|we're|we’re|it's|it’s|this is|that's|that’s|there's|there’s|eu|você|vocês|nós|a gente|isso é|isto é)\b/iu.test(text)) {
+    return true;
+  }
+
+  // Imperativos curtos que foram falsos-positivos reais do classificador SDH.
+  if (/^(?:(?:just|please|só|apenas|por favor)\s+)?(?:look|breathe|dance|enter|come in|run|turn|wait|listen|go|stop|stay|olha|olhe|respira|respire|dança|dance|entra|entre|corre|corra|vira|vire|espera|espere|escuta|escute|vai|vá|para|pare|fica|fique)(?:\s+(?:here|there|at me|at this|comigo|aqui|ali|pra mim|para mim))?$/iu.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================================
 // UNIVERSAL SDH ACTION / ACCESSIBILITY CLASSIFIER
 // ============================================================
 //
@@ -2211,6 +2319,16 @@ function sdhTitleSubjectLike(
     return false;
   }
 
+  // "the whole point" / "all the time" etc. não têm sujeito de stage direction;
+  // são sintagmas nominais de fala. Exigir ao menos um token de conteúdo.
+  if (
+    words.every(word =>
+      /^(?:the|all|entire|whole|both|several|some|a|an|o|a|os|as|todo|toda|todos|todas)$/iu.test(word)
+    )
+  ) {
+    return false;
+  }
+
   return words.every(
     word =>
       /^[\p{Lu}\d][\p{L}\p{N}'’.-]*$/u.test(
@@ -2499,6 +2617,13 @@ function looksLikeBareSdhLine(
       original
     )
   ) {
+    return false;
+  }
+
+  // 8.9.2: linha curta falada nunca pode ser promovida a SDH só porque
+  // também coincide lexicalmente com um verbo de ação (Look/Breathe/Dance/Entra).
+  // Descrições estruturadas entre []/() continuam sendo removidas normalmente.
+  if (looksLikeClearlySpokenBareLine(original)) {
     return false;
   }
 
@@ -3052,9 +3177,6 @@ function cleanSourceLine(line) {
     !text ||
     /^[-–—/\\|:;\s]*$/u.test(
       text
-    ) ||
-    isEmptyVocalization(
-      text
     )
   ) {
     return "";
@@ -3201,6 +3323,11 @@ function rejectedCueIsSdhOnly(
       .map(line => line.trim())
       .filter(Boolean);
 
+  // Spoken fillers / acknowledgements are dialogue, never SDH consensus evidence.
+  if (lines.some(looksLikeSpokenVocalization)) {
+    return false;
+  }
+
   return (
     lines.length > 0 &&
     lines.every(
@@ -3325,6 +3452,13 @@ const MUSIC_SHOWCASE_REGION_GAP_MS =
 
 const MUSIC_LAUNCH_CONTEXT_MAX_GAP_MS =
   6500;
+
+// Reprises/fragmentos da MESMA performance podem voltar entre falas.
+// Se o texto musical bate lexicalmente com um cluster já confirmado,
+// a decisão é atômica para aquela performance, sem apagar o fragmento isolado.
+const MUSIC_REPRISE_MAX_GAP_MS = 90000;
+const MUSIC_REPRISE_MIN_SHARED_TOKENS = 2;
+const MUSIC_REPRISE_MIN_OVERLAP = 0.66;
 
 const PERFORMANCE_LAUNCH_RE =
   /(?:\bhit it\b|\btake it away\b|\bgive it up\b|\blet'?s hear it\b|\blet'?s hear (?:it )?for\b|\bstart the music\b|\bmusic[, ]+maestro\b|\bplay it\b|\bshowtime\b|\b(?:now|next)[, ]+(?:performing|singing)\b|\bperforming live\b|\bsinging live\b|\bon stage now\b|\bmanda ver\b|\bsolta o som\b|\bcomeça a música\b|\bvamos ouvir\b|\bvalendo\b|\bagora[, ]+(?:cantando|se apresentando)\b)/iu;
@@ -3775,6 +3909,66 @@ function clusterHasImmediatePerformanceLaunch(
   );
 }
 
+function musicLexicalTokens(value) {
+  return String(value || "")
+    .toLocaleLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[♪♫♬]/gu, " ")
+    .replace(/[^a-z0-9' ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(token => token.length >= 2);
+}
+
+function musicLexicalOverlap(a, b) {
+  const aa = musicLexicalTokens(a);
+  const bb = musicLexicalTokens(b);
+  if (!aa.length || !bb.length) return 0;
+
+  const sa = new Set(aa);
+  const sb = new Set(bb);
+  let shared = 0;
+  for (const token of sa) {
+    if (sb.has(token)) shared++;
+  }
+
+  const denominator = Math.max(1, Math.min(sa.size, sb.size));
+  const ratio = shared / denominator;
+  return shared >= MUSIC_REPRISE_MIN_SHARED_TOKENS ? ratio : 0;
+}
+
+function clusterTemporalGapMs(a, b, info) {
+  if (!a?.length || !b?.length) return Infinity;
+
+  const aStart = info[a[0]]?.startMs;
+  const aEnd = info[a[a.length - 1]]?.endMs;
+  const bStart = info[b[0]]?.startMs;
+  const bEnd = info[b[b.length - 1]]?.endMs;
+
+  if (![aStart, aEnd, bStart, bEnd].every(Number.isFinite)) return Infinity;
+  if (aEnd < bStart) return bStart - aEnd;
+  if (bEnd < aStart) return aStart - bEnd;
+  return 0;
+}
+
+function clusterRepeatsConfirmedPerformance(candidate, confirmed, info) {
+  if (clusterTemporalGapMs(candidate, confirmed, info) > MUSIC_REPRISE_MAX_GAP_MS) {
+    return false;
+  }
+
+  for (const ci of candidate) {
+    for (const ri of confirmed) {
+      if (musicLexicalOverlap(info[ci]?.text, info[ri]?.text) >= MUSIC_REPRISE_MIN_OVERLAP) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function detectPerformanceMusicIndexes(
   rawBlocks
 ) {
@@ -4085,6 +4279,36 @@ function detectPerformanceMusicIndexes(
     }
   }
 
+  // CAMADA 4 — REPRISE ATÔMICA 8.9.2.
+  // Um fragmento musical isolado que repete lexicalmente uma performance já
+  // confirmada pertence à mesma performance e não pode desaparecer só porque
+  // houve diálogo no meio. Iteramos até estabilizar para encadear reprises.
+  let reprisePromotions = 0;
+  let changedReprises = true;
+
+  while (changedReprises) {
+    changedReprises = false;
+
+    for (let clusterIndex = 0; clusterIndex < clusters.length; clusterIndex++) {
+      if (confirmedClusters.has(clusterIndex)) continue;
+
+      const candidate = clusters[clusterIndex];
+      const matchesConfirmed = [...confirmedClusters].some(confirmedIndex =>
+        clusterRepeatsConfirmedPerformance(
+          candidate,
+          clusters[confirmedIndex],
+          info
+        )
+      );
+
+      if (matchesConfirmed) {
+        confirmedClusters.add(clusterIndex);
+        reprisePromotions++;
+        changedReprises = true;
+      }
+    }
+  }
+
   for (
     const clusterIndex of
     confirmedClusters
@@ -4121,6 +4345,7 @@ function detectPerformanceMusicIndexes(
     `[MUSIC CONTEXT] cues com ♪=${musicIndexes.length} | ` +
     `clusters=${clusters.length} | âncoras fortes=${strongCount} | ` +
     `clusters confirmados=${confirmedClusters.size} | ` +
+    `reprises atômicas=${reprisePromotions} | ` +
     `cues de performance mantidos=${keep.size}.`
   );
 
@@ -4812,10 +5037,10 @@ function translatedDialogueTurns(
     return [];
   }
 
-  const pieces =
+  let pieces =
     flattened
       .split(
-        /(?:^|\s)[-–—]\s+/u
+        /(?:^|\s)[-–—]\s*/u
       )
       .map(
         part =>
@@ -4826,6 +5051,21 @@ function translatedDialogueTurns(
             )
       )
       .filter(Boolean);
+
+  // 8.9.2: alguns modelos preservam os dois turns em duas linhas, mas
+  // esquecem os hífens. Se a contagem de linhas bate EXATAMENTE com a SOURCE,
+  // restauramos os marcadores deterministicamente, sem chamada Gemini.
+  if (pieces.length !== expected) {
+    const rawLines = String(value || "")
+      .replace(/\r/g, "")
+      .split("\n")
+      .map(line => line.replace(/^\s*[-–—]\s*/u, "").trim())
+      .filter(Boolean);
+
+    if (rawLines.length === expected) {
+      pieces = rawLines;
+    }
+  }
 
   return pieces;
 }
@@ -5233,6 +5473,8 @@ function sanitizeTranslationMap(
   let emptiedAfterSanitizer = 0;
   let intentionalEmpty = 0;
   let needsLocalRecovery = 0;
+  let localVocalizationRescues = 0;
+  let localGenderPostconditions = 0;
 
   for (
     const block of blocks
@@ -5250,6 +5492,24 @@ function sanitizeTranslationMap(
         block,
         before
       );
+
+    if (!after) {
+      const localVocalization =
+        localizePureVocalizationCue(block);
+
+      if (localVocalization) {
+        after = localVocalization;
+        localVocalizationRescues++;
+        if (job) {
+          job.stats.mainLocalVocalizationRescues =
+            Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
+        }
+        console.log(
+          `[LOCAL VOCALIZATION LOCK 8.9.2] cue ${block.index}: ` +
+          `${JSON.stringify(block.text)} -> ${JSON.stringify(after)} | 0 Gemini.`
+        );
+      }
+    }
 
     if (!after) {
       after =
@@ -5294,6 +5554,27 @@ function sanitizeTranslationMap(
       }
     }
 
+    if (after) {
+      const genderSafe =
+        applyDeterministicGenderNeutrality(
+          block,
+          after
+        );
+
+      if (genderSafe !== after) {
+        localGenderPostconditions++;
+        after =
+          sanitizeFinalCue(
+            block,
+            genderSafe
+          ) ||
+          sanitizeFallbackCue(
+            genderSafe
+          ) ||
+          genderSafe;
+      }
+    }
+
     if (
       after !== before
     ) {
@@ -5325,6 +5606,10 @@ function sanitizeTranslationMap(
       intentionalEmpty
     }; rescue-local=${
       needsLocalRecovery
+    }; vocalização-local=${
+      localVocalizationRescues
+    }; gênero-local=${
+      localGenderPostconditions
     }; SDH/ruído/alongamentos controlados.`
   );
 
@@ -6001,7 +6286,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.1 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.9.2 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -7963,12 +8248,13 @@ function geminiRouteForMetric(metric) {
   const m = String(metric || "main").toLowerCase();
 
   if (["qa", "repair", "compact", "semantic", "preconfirm"].includes(m)) {
+    // Teste real 8.9.1: 3.1 HIGH foi mais estável e mais rápido no caminho
+    // crítico que 3.8/3.7, que responderam com 503/JSON inválido.
     return [
+      GEMINI_MODELS.MAIN_PRIMARY,
       GEMINI_MODELS.QA_PREMIUM,
       GEMINI_MODELS.QA_FALLBACK,
-      GEMINI_MODELS.MAIN_PRIMARY,
-      GEMINI_MODELS.MAIN_FALLBACK,
-      GEMINI_MODELS.GEMMA_QA
+      GEMINI_MODELS.MAIN_FALLBACK
     ];
   }
 
@@ -7993,8 +8279,7 @@ function geminiRouteForMetric(metric) {
     GEMINI_MODELS.MAIN_PRIMARY,
     GEMINI_MODELS.MAIN_FALLBACK,
     GEMINI_MODELS.QA_FALLBACK,
-    GEMINI_MODELS.QA_PREMIUM,
-    GEMINI_MODELS.GEMMA_MAIN
+    GEMINI_MODELS.QA_PREMIUM
   ];
 }
 
@@ -8034,11 +8319,40 @@ function modelSkippedForJob(job, modelId) {
   );
 }
 
-function skipModelForJob(job, modelId, reason) {
+function setJobModelHealth(job, modelId, status, reason = "") {
+  if (!job) return;
+  if (!(job.modelRouterHealth instanceof Map)) job.modelRouterHealth = new Map();
+
+  job.modelRouterHealth.set(modelId, {
+    status: String(status || "unknown"),
+    reason: String(reason || ""),
+    at: Date.now()
+  });
+}
+
+function skipModelForJob(job, modelId, reason, status = "unavailable") {
   if (!job) return;
   if (!(job.modelRouterSkip instanceof Set)) job.modelRouterSkip = new Set();
+  const already = job.modelRouterSkip.has(modelId);
   job.modelRouterSkip.add(modelId);
-  console.warn(`[MODEL ROUTER] ${modelId} ignorado pelo restante deste job | ${reason}.`);
+  setJobModelHealth(job, modelId, status, reason);
+
+  if (!already) {
+    console.warn(`[MODEL ROUTER] ${modelId} ignorado pelo restante deste job | ${status} | ${reason}.`);
+  }
+}
+
+function invalidateResponseModelForJob(job, response, label, error) {
+  const modelId = String(response?.modelId || "").trim();
+  if (!modelId || !job) return;
+
+  job.stats.modelInvalidResponses = Number(job.stats.modelInvalidResponses || 0) + 1;
+  skipModelForJob(
+    job,
+    modelId,
+    `${label}: ${errorMessage(error).slice(0, 220)}`,
+    "invalid_response"
+  );
 }
 
 function setModelUnavailable(modelId, waitMs, reason) {
@@ -8344,7 +8658,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.1: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 8.9.2: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -8414,11 +8728,17 @@ async function geminiRequest({
 
           if (kind === "daily") {
             if (job) job.stats.model429Daily = Number(job.stats.model429Daily || 0) + 1;
-            skipModelForJob(job, modelId, `quota diária/RPD | ${quotaDetailsText(error?.providerData || {})}`);
+            skipModelForJob(
+              job,
+              modelId,
+              `quota diária/RPD | ${quotaDetailsText(error?.providerData || {})}`,
+              "daily_exhausted"
+            );
             // Fora deste job, só fazemos um novo probe depois de um intervalo curto.
             setModelUnavailable(modelId, Math.max(wait, 60000), "RPD/quota diária");
           } else {
             if (job) job.stats.model429Rate = Number(job.stats.model429Rate || 0) + 1;
+            skipModelForJob(job, modelId, `${kind.toUpperCase()} 429`, "rate_limited");
             setModelUnavailable(modelId, wait, `${kind.toUpperCase()} 429`);
           }
 
@@ -8445,7 +8765,8 @@ async function geminiRequest({
             GEMINI_MODEL_PROFILES[modelId]?.unavailable503Ms || 60000,
             "503 high demand"
           );
-          console.warn(`[MODEL ROUTER] ${modelId} 503 persistiu -> fallback imediato.`);
+          skipModelForJob(job, modelId, "503 persistiu após retry permitido", "temporarily_unavailable");
+          console.warn(`[MODEL ROUTER] ${modelId} 503 persistiu -> fallback imediato e skip até o fim do job.`);
           break;
         }
 
@@ -8456,7 +8777,8 @@ async function geminiRequest({
             GEMINI_MODEL_PROFILES[modelId]?.family === "gemma" ? 300000 : 45000,
             "timeout"
           );
-          console.warn(`[MODEL ROUTER] ${modelId} timeout -> fallback imediato.`);
+          skipModelForJob(job, modelId, "timeout", "temporarily_unavailable");
+          console.warn(`[MODEL ROUTER] ${modelId} timeout -> fallback imediato e skip até o fim do job.`);
           break;
         }
 
@@ -8477,7 +8799,8 @@ async function geminiRequest({
 
         if (status >= 500 || [408, 409, 425].includes(status)) {
           setModelUnavailable(modelId, 30000, `HTTP ${status}`);
-          console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} -> fallback imediato.`);
+          skipModelForJob(job, modelId, `HTTP ${status}`, "temporarily_unavailable");
+          console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} -> fallback imediato e skip até o fim do job.`);
           break;
         }
 
@@ -10343,6 +10666,7 @@ function buildOwnershipPayload(
       i: block.index,
       k: ownershipKey,
       en: protectedTarget.text,
+      boundary: sourceBoundaryHint(block),
       idn: compactIdentityHint(block, plan),
       ...(turns >= 2 ? { turns } : {}),
       ...(protectedTarget.locks.length
@@ -10358,7 +10682,8 @@ function buildOwnershipPayload(
         "k pertence ao mesmo cue e deve voltar idêntico. " +
         "before/after são contexto compartilhado, nunca conteúdo do target. " +
         "idn.g só é confiável quando diferente de unknown; sem prova, neutralize gênero naturalmente. " +
-        "Não antecipe, atrase, duplique ou mova conteúdo entre IDs.",
+        "Não antecipe, atrase, duplique ou mova conteúdo entre IDs. " +
+        "boundary.startsMidSentence/endsMidSentence descreve SOMENTE a borda do target: preserve o corte sem puxar conteúdo do vizinho.",
 
       before:
         allBlocks
@@ -10705,6 +11030,21 @@ async function rescueEmptyMainCue({
   plan,
   job
 }) {
+  const localVocalization =
+    localizePureVocalizationCue(block);
+
+  if (localVocalization) {
+    if (job) {
+      job.stats.mainLocalVocalizationRescues =
+        Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
+    }
+    console.log(
+      `[MAIN LOCAL VOCALIZATION 8.9.2] cue ${block.index}: ` +
+      `${JSON.stringify(block.text)} -> ${JSON.stringify(localVocalization)} | 0 Gemini.`
+    );
+    return localVocalization;
+  }
+
   if (
     sourceCueAllowsIntentionalEmpty(
       block,
@@ -11072,13 +11412,19 @@ async function translateMainBatch({
             "main"
         });
 
-      const parsed =
-        parseMainCueTranslationRobust(
-          batch,
-          response.text,
-          locksById,
-          ownershipById
-        );
+      let parsed;
+      try {
+        parsed =
+          parseMainCueTranslationRobust(
+            batch,
+            response.text,
+            locksById,
+            ownershipById
+          );
+      } catch (parseError) {
+        invalidateResponseModelForJob(job, response, "MAIN structured output inválido", parseError);
+        throw parseError;
+      }
 
       const rescueIds = [
         ...new Set([
@@ -11094,7 +11440,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.1] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.9.2] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11143,7 +11489,7 @@ async function translateMainBatch({
           const rightBatch = batch.slice(mid);
 
           console.warn(
-            `[MAIN ADAPTIVE 8.9] request grande/rota Gemma recebeu limite de payload; ` +
+            `[MAIN ADAPTIVE 8.9.2] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
             `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
           );
@@ -11317,21 +11663,42 @@ async function translateAllMain(
     job.mainCheckpoint = new Map();
   }
 
+  let localVocalizationPrefill = 0;
   for (const block of blocks) {
+    if (!job.mainCheckpoint.has(block.index)) {
+      const localVocalization = localizePureVocalizationCue(block);
+      if (localVocalization) {
+        job.mainCheckpoint.set(block.index, localVocalization);
+        localVocalizationPrefill++;
+      }
+    }
+
     if (job.mainCheckpoint.has(block.index)) {
       translations.set(block.index, job.mainCheckpoint.get(block.index));
     }
   }
 
+  if (localVocalizationPrefill > 0) {
+    job.stats.mainLocalVocalizationPrefill =
+      Number(job.stats.mainLocalVocalizationPrefill || 0) + localVocalizationPrefill;
+    console.log(
+      `[MAIN LOCAL VOCALIZATION 8.9.2] ${localVocalizationPrefill} cue(s) ` +
+      `resolvidos localmente antes do MAIN | 0 Gemini.`
+    );
+  }
+
   const work = batches
-    .map((batch, batchIndex) => ({ batch, batchIndex }))
-    .filter(({ batch }) => !batch.every(block => job.mainCheckpoint.has(block.index)));
+    .map((batch, batchIndex) => ({
+      batch: batch.filter(block => !job.mainCheckpoint.has(block.index)),
+      batchIndex
+    }))
+    .filter(({ batch }) => batch.length > 0);
 
   job.stats.mainBatches = batches.length;
   job.stats.mainCheckpointReused = translations.size;
 
   console.log(
-    `[MAIN 8.9] ${blocks.length} cues -> ${batches.length} lotes | ` +
+    `[MAIN 8.9.2] ${blocks.length} cues -> ${batches.length} lotes | ` +
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
@@ -11646,11 +12013,16 @@ async function scanPtbrQuality(
                 "qa"
             });
 
-          parsedIssues =
-            parseQaIssues(
-              response.text,
-              allowed
-            );
+          try {
+            parsedIssues =
+              parseQaIssues(
+                response.text,
+                allowed
+              );
+          } catch (parseError) {
+            invalidateResponseModelForJob(job, response, "QA structured output inválido", parseError);
+            throw parseError;
+          }
 
           break;
         } catch (error) {
@@ -12153,14 +12525,16 @@ function blockSourceIsEnglish(block) {
 
 const FIRST_PERSON_MALE_MARKERS = [
   /\bobrigado\b/iu,
-  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|nascido|criado|preparado|acostumado)\b/iu,
-  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|preparado|acostumado)\b/iu
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|nascido|criado|preparado|acostumado|certo|ocupado|entediado|excitado|perdido|bonito)\b/iu,
+  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|preparado|acostumado|certo|ocupado|entediado|excitado|perdido|bonito)\b/iu,
+  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogado|questionado|acusado|convidado|obrigado)\b/iu
 ];
 
 const FIRST_PERSON_FEMALE_MARKERS = [
   /\bobrigada\b/iu,
-  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|nascida|criada|preparada|acostumada|gr[aá]vida)\b/iu,
-  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|preparada|acostumada|gr[aá]vida)\b/iu
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|nascida|criada|preparada|acostumada|gr[aá]vida|certa|ocupada|entediada|excitada|perdida|bonita)\b/iu,
+  /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|preparada|acostumada|gr[aá]vida|certa|ocupada|entediada|excitada|perdida|bonita)\b/iu,
+  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogada|questionada|acusada|convidada|obrigada)\b/iu
 ];
 
 function sourceExplicitlyMarksSelfGender(block) {
@@ -12240,6 +12614,119 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
   return /\byou(?:'re|’re|\s+are|\s+were)?\s+(?:(?:a|an)\s+)?(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male)\b/i.test(source) ||
     /\b(?:voc[eê]|tu)\s+(?:[ée]|era)\s+(?:uma?\s+)?(?:mulher|homem|garota|garoto|menina|menino|mãe|pai|esposa|marido|filha|filho|irmã|irmão|noiva|noivo)\b/iu.test(source) ||
     /\b(?:eres|eres\s+una?|t[uú]\s+eres)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
+}
+
+// ============================================================
+// GENDER POSTCONDITION LOCAL — 8.9.2
+// ============================================================
+// O modelo continua responsável pela tradução. Este guard só reescreve
+// padrões de altíssima confiança quando a SOURCE é explicitamente neutra
+// naquela ideia e existe uma forma brasileira natural sem gênero.
+function applyDeterministicGenderNeutrality(block, value) {
+  let pt = String(value || "").trim();
+  if (!pt || sourceDialogueDashCount(block) >= 2) return pt;
+
+  const source = String(block?.text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!source || sourceExplicitlyMarksSelfGender(block)) return pt;
+
+  const lower = source.toLocaleLowerCase();
+
+  if (/\bi(?:'m|’m| am)\s+(?:always\s+)?right\b/i.test(source)) {
+    pt = pt.replace(/\b(?:eu\s+)?sempre\s+(?:estou|t[oô]|sou)\s+cert[oa]\b/iu, "Eu sempre tenho razão");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,45}\b(?:angry|furious|mad)\b/i.test(source)) {
+    pt = pt
+      .replace(/\b(?:estou|t[oô])\s+inacreditavelmente\s+furios[oa]\b/iu, "tô com uma raiva inacreditável")
+      .replace(/\b(?:estou|t[oô])\s+(?:muito\s+|super\s+)?(?:furios[oa]|irritad[oa])\b/iu, match => /muito|super/iu.test(match) ? "tô com muita raiva" : "tô com raiva");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,35}\b(?:tired|exhausted)\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+|super\s+)?(?:cansad[oa]|exaust[oa])\b/iu, match => /muito|super/iu.test(match) ? "tô sem energia nenhuma" : "tô sem energia");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,30}\b(?:scared|afraid)\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+)?assustad[oa]\b/iu, "tô com medo");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,30}\bconfused\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+)?confus[oa]\b/iu, "não tô entendendo");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,30}\balone\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+sozinh[oa]\b/iu, "tô sem ninguém por perto");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,40}\bworried\b/i.test(source)) {
+    pt = pt.replace(
+      /\b(?:estou|t[oô])\s+(?:muito\s+)?preocupad[oa](?:\s+com\s+([^.!?]+))?/iu,
+      (_match, object) => {
+        const target = String(object || "").trim();
+        if (!target) return "isso tá me preocupando";
+        const normalized = target.charAt(0).toLocaleUpperCase() + target.slice(1);
+        return `${normalized} tá me preocupando`;
+      }
+    );
+  }
+
+  if (/\bi(?:'m|’m| am)\s+proud\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+orgulhos[oa](?:\s+de\s+([^.!?]+))?/iu, (_match, object) => {
+      const target = String(object || "").trim();
+      return target ? `tenho orgulho de ${target}` : "tenho orgulho disso";
+    });
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,25}\b(?:shocked|stunned)\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+)?chocad[oa]\b/iu, "tô em choque");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,30}\b(?:ashamed|embarrassed)\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+)?envergonhad[oa]\b/iu, "tô com vergonha");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,25}\bbored\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+|super\s+)?entediad[oa]\b/iu, "tô morrendo de tédio");
+  }
+
+  if (/\bi(?:'m|’m| am)\b[^.!?]{0,25}\bbusy\b/i.test(source)) {
+    pt = pt.replace(/\b(?:estou|t[oô])\s+(?:muito\s+|super\s+)?ocupad[oa]\b/iu, "tô sem tempo");
+  }
+
+  if (/\bi\s+was\s+interrogated\b/i.test(source)) {
+    pt = pt.replace(/\bfui\s+interrogad[oa]\b/iu, "me interrogaram");
+  }
+  if (/\bi\s+was\s+questioned\b/i.test(source)) {
+    pt = pt.replace(/\bfui\s+questionad[oa]\b/iu, "me questionaram");
+  }
+  if (/\bi\s+was\s+accused\b/i.test(source)) {
+    pt = pt.replace(/\bfui\s+acusad[oa]\b/iu, "me acusaram");
+  }
+  if (/\bi\s+was\s+invited\b/i.test(source)) {
+    pt = pt.replace(/\bfui\s+convidad[oa]\b/iu, "me convidaram");
+  }
+
+  if (/\b(?:thank you|thanks)\b/i.test(source)) {
+    pt = pt.replace(/^\s*obrigad[oa][.!]?\s*$/iu, "Valeu.");
+  }
+
+  if (!sourceExplicitlyMarksSecondPersonGender(block)) {
+    if (/\byou(?:'re|’re| are)\s+(?:crazy|insane)\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+(?:[ée]|t[aá])\s+lou[cq][oa]\b/iu, "Você perdeu a noção");
+    }
+
+    if (/\byou(?:'re|’re| are)\s+the\s+winner\b/i.test(source)) {
+      pt = pt.replace(/\b(?:voc[eê]|c[eê])\s+[ée]\s+(?:o\s+vencedor|a\s+vencedora)\b/iu, "Você venceu");
+    }
+
+    if (/^\s*welcome[.!]?\s*$/iu.test(source)) {
+      pt = pt.replace(/\bbem-vind[oa]\b/iu, "Que bom ter você aqui");
+    }
+  }
+
+  return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
 
 function unknownSpeakerGenderRisk(
@@ -12957,7 +13444,7 @@ function issuePriority(issue) {
     /FINAL_CRITICAL/i.test(joined) ||
     /GENDER_V[234]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
-    /CUE_OWNERSHIP_SHIFT/i.test(joined) ||
+    /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH)/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
     /POSSIBLE_OMISSION/i.test(joined) ||
     /POSSIBLE_CUE_SHIFT_PAIR/i.test(joined) ||
@@ -13042,6 +13529,59 @@ function logIssueSummary(label, issues) {
     `[ISSUE SUMMARY] ${label} | cues=${Array.isArray(issues) ? issues.length : 0}` +
     (summary ? ` | ${summary}` : "")
   );
+}
+
+function sourceBoundaryHint(block) {
+  const text = String(block?.text || "")
+    .replace(/@@SPK:[^@]+@@\s*/g, "")
+    .replace(/^\s*[-–—]\s*/u, "")
+    .trim();
+
+  const firstLetter = text.match(/[\p{L}]/u)?.[0] || "";
+  const startsMidSentence =
+    /^(?:\.{2,}|…)/u.test(text) ||
+    Boolean(firstLetter && firstLetter === firstLetter.toLocaleLowerCase() && firstLetter !== firstLetter.toLocaleUpperCase());
+
+  const endsMidSentence = Boolean(
+    text &&
+    !/[.!?…]["'’”)]*\s*$/u.test(text)
+  );
+
+  return { startsMidSentence, endsMidSentence };
+}
+
+function sourceLooksLikeShortReaction(value) {
+  const text = String(value || "")
+    .replace(/^\s*[-–—]\s*/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return /^(?:oh|ah|okay|ok|yeah|yes|no|right|sure|wow|huh|uh-huh|mm-hmm|well|entendi|tá|ta|sim|não|nao|certo|claro|beleza)(?:[.!?…]|\s|$)/iu.test(text);
+}
+
+function ownershipBoundaryMismatchReasons(previousBlock, block, previousPt, pt) {
+  if (!previousBlock || !block) return [];
+
+  const prevBoundary = sourceBoundaryHint(previousBlock);
+  const currentBoundary = sourceBoundaryHint(block);
+  const source = String(block.text || "").trim();
+  const target = String(pt || "").trim();
+
+  if (!source || !target) return [];
+
+  const continuationPair =
+    currentBoundary.startsMidSentence &&
+    prevBoundary.endsMidSentence;
+
+  if (
+    continuationPair &&
+    !sourceLooksLikeShortReaction(source) &&
+    sourceLooksLikeShortReaction(target)
+  ) {
+    return ["CUE_OWNERSHIP_BOUNDARY_MISMATCH"];
+  }
+
+  return [];
 }
 
 function detectLocalIssues(
@@ -13140,6 +13680,20 @@ function detectLocalIssues(
       secondEn >= 2 &&
       secondPt >=
         secondEn * 2.8 + 6;
+
+    const boundaryReasons = ownershipBoundaryMismatchReasons(
+      first,
+      second,
+      translations.get(first.index),
+      translations.get(second.index)
+    );
+
+    if (boundaryReasons.length) {
+      for (const reason of boundaryReasons) {
+        addIssue(issueMap, first.index, reason);
+        addIssue(issueMap, second.index, reason);
+      }
+    }
 
     if (
       firstTooShort &&
@@ -13405,19 +13959,24 @@ async function repairBatch(
             "repair"
         });
 
-      return parseCueTranslation(
-        issues.map(
-          issue =>
-            blocks[
-              posMap.get(
-                issue.id
-              )
-            ]
-        ),
+      try {
+        return parseCueTranslation(
+          issues.map(
+            issue =>
+              blocks[
+                posMap.get(
+                  issue.id
+                )
+              ]
+          ),
 
-        response.text,
-        locksById
-      );
+          response.text,
+          locksById
+        );
+      } catch (parseError) {
+        invalidateResponseModelForJob(job, response, "REPAIR structured output inválido", parseError);
+        throw parseError;
+      }
     } catch (error) {
       lastError =
         error;
@@ -13751,7 +14310,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isCriticalRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[234]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_SHIFT)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[234]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH))/i.test(
         reason
       );
 
@@ -14348,18 +14907,23 @@ async function compactRescueBatch(
             "compact"
         });
 
-      return parseCueTranslation(
-        issues.map(
-          issue =>
-            blocks[
-              posMap.get(
-                issue.id
-              )
-            ]
-        ),
-        response.text,
-        locksById
-      );
+      try {
+        return parseCueTranslation(
+          issues.map(
+            issue =>
+              blocks[
+                posMap.get(
+                  issue.id
+                )
+              ]
+          ),
+          response.text,
+          locksById
+        );
+      } catch (parseError) {
+        invalidateResponseModelForJob(job, response, "COMPACT structured output inválido", parseError);
+        throw parseError;
+      }
     } catch (error) {
       lastError =
         error;
@@ -14379,6 +14943,31 @@ async function compactRescueBatch(
   }
 
   throw lastError;
+}
+
+function compactRescueFailureSignature(id, value) {
+  return `${Number(id)}:${sha256(normalizeLayoutWhitespace(String(value || ""))).slice(0, 20)}`;
+}
+
+function rememberCompactRescueFailure(job, id, value, reason = "rejeitado") {
+  if (!job) return;
+  if (!(job.compactRescueFailedSignatures instanceof Set)) {
+    job.compactRescueFailedSignatures = new Set();
+  }
+
+  const signature = compactRescueFailureSignature(id, value);
+  if (!job.compactRescueFailedSignatures.has(signature)) {
+    job.compactRescueFailedSignatures.add(signature);
+    job.stats.compactMemoizedFailures = Number(job.stats.compactMemoizedFailures || 0) + 1;
+    console.log(`[COMPACT MEMORY 8.9.2] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
+  }
+}
+
+function compactRescueAlreadyFailed(job, id, value) {
+  return Boolean(
+    job?.compactRescueFailedSignatures instanceof Set &&
+    job.compactRescueFailedSignatures.has(compactRescueFailureSignature(id, value))
+  );
 }
 
 async function runCompactRescue(
@@ -14405,11 +14994,27 @@ async function runCompactRescue(
     round <= COMPACT_RESCUE_MAX_ROUNDS;
     round++
   ) {
-    const allIssues =
+    const detectedIssues =
       collectCompactRescueIssues(
         blocks,
         updated
       );
+
+    const allIssues = detectedIssues.filter(issue =>
+      !compactRescueAlreadyFailed(
+        job,
+        issue.id,
+        updated.get(issue.id) || ""
+      )
+    );
+
+    const memoSkipped = detectedIssues.length - allIssues.length;
+    if (memoSkipped > 0) {
+      console.log(
+        `[COMPACT MEMORY 8.9.2] ${memoSkipped} overflow(s) já reprovado(s) ` +
+        `com o mesmo texto; 0 nova chamada cloud.`
+      );
+    }
 
     if (!allIssues.length) {
       console.log(
@@ -14497,6 +15102,7 @@ async function runCompactRescue(
           if (!candidatePt) {
             rejectedThisRound++;
             totalRejected++;
+            rememberCompactRescueFailure(job, id, beforePt, "vazio pós-sanitizer");
 
             console.warn(
               `[COMPACT RESCUE] cue ${id} rejeitado: vazio após sanitizer.`
@@ -14518,6 +15124,7 @@ async function runCompactRescue(
           ) {
             rejectedThisRound++;
             totalRejected++;
+            rememberCompactRescueFailure(job, id, beforePt, "ainda não cabe em 2x50");
 
             console.warn(
               `[COMPACT RESCUE] cue ${id} ainda não cabe em 2x${LAYOUT_MAX_CHARS_PER_LINE} | ` +
@@ -14539,6 +15146,7 @@ async function runCompactRescue(
           if (regressions.length) {
             rejectedThisRound++;
             totalRejected++;
+            rememberCompactRescueFailure(job, id, beforePt, `regressão: ${regressions.join(",")}`);
 
             console.warn(
               `[COMPACT RESCUE REGRESSION] cue ${id} rejeitado | ` +
@@ -15638,7 +16246,7 @@ function finalCriticalIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_CRITICAL|GENDER_V[234]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_CRITICAL|GENDER_V[234]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH)|UNRESOLVED_BLEEP_TOKEN|BLEEP_CREATED_DANGLING_SENTENCE|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -15992,6 +16600,13 @@ async function scanFinalCriticalAudit(
             batch.targetIds
           );
         } catch (error) {
+          invalidateResponseModelForJob(
+            job,
+            response,
+            `FINAL AUDIT lote ${index + 1} structured output inválido`,
+            error
+          );
+
           parseFailures++;
           job.stats.finalCriticalTechnicalRetries =
             (job.stats.finalCriticalTechnicalRetries || 0) + 1;
@@ -16139,11 +16754,22 @@ async function runFinalCriticalEscalatedRepair(
           `ESCALATED REPAIR ${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1}`
         );
 
-        const repaired = parseCueTranslation(
-          batchIssues.map(issue => blocks[posMap.get(issue.id)]),
-          response.text,
-          locksById
-        );
+        let repaired;
+        try {
+          repaired = parseCueTranslation(
+            batchIssues.map(issue => blocks[posMap.get(issue.id)]),
+            response.text,
+            locksById
+          );
+        } catch (parseError) {
+          invalidateResponseModelForJob(
+            job,
+            response,
+            "FINAL REPAIR structured output inválido",
+            parseError
+          );
+          throw parseError;
+        }
 
         let accepted = 0;
 
@@ -16423,7 +17049,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.1] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.9.2] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -16468,7 +17094,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.1] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.9.2] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -16498,7 +17124,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.1] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.9.2] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -16524,7 +17150,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.1] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.9.2] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -16561,7 +17187,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.1 ROUTED] fonte=${
+    `[PIPELINE 8.9.2 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16604,7 +17230,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.1
+// HARD GUARD PRE-SAFE 8.9.2
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -16616,7 +17242,7 @@ const preSafeHardIssues = detectLocalIssues(
 ).map(issue => ({
   id: issue.id,
   reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[234]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_SHIFT)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[234]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH))/i.test(String(reason || ""))
   )
 })).filter(issue => issue.reasons.length);
 
@@ -16801,7 +17427,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.1 ROUTED] FINAL OK | ${
+    `[PIPELINE 8.9.2 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17573,7 +18199,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.1",
+    "8.9.2",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -18438,7 +19064,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.1 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
+        " STREMIO PT-BR 8.9.2 - MULTI-MODEL ROUTER + HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -18458,7 +19084,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    `QA router: ${GEMINI_MODELS.QA_PREMIUM} -> ${GEMINI_MODELS.QA_FALLBACK} -> ${GEMINI_MODELS.MAIN_PRIMARY} -> ${GEMINI_MODELS.MAIN_FALLBACK} ✅`
+    `QA/Repair router: ${GEMINI_MODELS.MAIN_PRIMARY} HIGH -> ${GEMINI_MODELS.QA_PREMIUM} -> ${GEMINI_MODELS.QA_FALLBACK} -> ${GEMINI_MODELS.MAIN_FALLBACK} ✅`
   );
 
   console.log(
@@ -18538,7 +19164,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.1: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.9.2: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -18591,7 +19217,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.1: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.9.2: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18691,10 +19317,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.1: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.1: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.1: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.1: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 8.9.2: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 8.9.2: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 8.9.2: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 8.9.2: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -18706,14 +19332,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.1: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 8.9.2: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.1: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 8.9.2: chamadas de texto migradas de Interactions para REST generateContent ✅"
   );
   console.log(
-    "Structured Output REST 8.9.1: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
+    "Structured Output REST 8.9.2: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -18721,23 +19347,47 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.1: caption/action-only eliminado ANTES do MAIN; SDH-only não aciona rescue Gemini ✅"
+    "HARD SDH 8.9.2 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.1: masculino genérico NÃO conta como neutro; 1ª/2ª pessoa recebem hard guard + repair focal ✅"
+    "Spoken Vocalization Lock 8.9.2: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.1: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Performance Atomic Reprise 8.9.2: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
   );
 
   console.log(
-    "Model Router 8.9.1: 3.1 FL -> 3.5 FL -> 3.7/3.8; QA=3.8 -> 3.7 -> 3.1 -> 3.5; Gemma só último recurso com timeout rígido ✅"
+    "Dialogue Turn Restore 8.9.2: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.1: RPD diário = skip do modelo no job; 503 = retry único só no 3.1 e depois fallback ✅"
+    "Gender Neutral 8.9.2: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
+  );
+
+  console.log(
+    "Absolute Ownership 8.9.2: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
+  );
+
+  console.log(
+    "Compact Memory 8.9.2: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
+  );
+
+  console.log(
+    "Latency Contract 8.9.2: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+  );
+
+  console.log(
+    "Model Router 8.9.2: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+  );
+
+  console.log(
+    "Model Health 8.9.2: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+  );
+
+  console.log(
+    "Quota Diagnostics 8.9.2: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
   );
 
   console.log(
