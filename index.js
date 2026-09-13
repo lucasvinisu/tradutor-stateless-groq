@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.9.8 - FINAL DETERMINISTIC CLOSURE
+// STREMIO PT-BR 9.0 - FINAL OWNERSHIP GATE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -33,7 +33,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.9.8-final-deterministic-closure-v1";
+  "9.0-final-ownership-gate-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -75,7 +75,7 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
 });
 
 // Símbolos legados mantidos porque helpers antigos de 8.8.3 continuam presentes,
-// mas NÃO governam mais as chamadas de texto no 8.9.8.
+// mas NÃO governam mais as chamadas de texto no 9.0.
 const GEMINI_FREE_RPM_LIMIT = 15;
 const GEMINI_FREE_TPM_LIMIT = 250000;
 const GEMINI_FREE_RPD_LIMIT = 500;
@@ -1835,7 +1835,7 @@ function isEmptyVocalization(text) {
 }
 
 // ============================================================
-// SPOKEN VOCALIZATION LOCK — 8.9.8
+// SPOKEN VOCALIZATION LOCK — 9.0
 // ============================================================
 // "Hmm", "Mm-hmm", "Uh-huh", "Uhum", "Um" etc. são fala curta,
 // não descrição SDH. Quando aparecem sem colchetes/parênteses, preservamos
@@ -2625,7 +2625,7 @@ function looksLikeBareSdhLine(
     return false;
   }
 
-  // 8.9.8: linha curta falada nunca pode ser promovida a SDH só porque
+  // 9.0: linha curta falada nunca pode ser promovida a SDH só porque
   // também coincide lexicalmente com um verbo de ação (Look/Breathe/Dance/Entra).
   // Descrições estruturadas entre []/() continuam sendo removidas normalmente.
   if (looksLikeClearlySpokenBareLine(original)) {
@@ -2757,7 +2757,7 @@ function collapseExtendedVocalization(
     );
 }
 
-// 8.9.8 — reticência não é censura por si só.
+// 9.0 — reticência não é censura por si só.
 // Máscara gráfica explícita (*#@%&$) continua sendo forte evidência.
 // Para "palavra...", só aceitamos stems de palavrão de alta confiança;
 // fragmentos ambíguos/completos (me..., bit..., car..., por...) permanecem fala.
@@ -4271,7 +4271,7 @@ function detectPerformanceMusicIndexes(
     }
   }
 
-  // CAMADA 4 — REPRISE ATÔMICA 8.9.8.
+  // CAMADA 4 — REPRISE ATÔMICA 9.0.
   // Um fragmento musical isolado que repete lexicalmente uma performance já
   // confirmada pertence à mesma performance e não pode desaparecer só porque
   // houve diálogo no meio. Iteramos até estabilizar para encadear reprises.
@@ -4349,7 +4349,7 @@ function detectPerformanceMusicIndexes(
   };
 }
 
-// 8.9.8 — marcador de speaker pode vir como "~ fala", "~fala",
+// 9.0 — marcador de speaker pode vir como "~ fala", "~fala",
 // "- fala" ou "-fala". Hífen colado a número negativo NÃO é speaker.
 const DIALOGUE_TURN_START_RE =
   /^\s*(?:~\s*|[-–—](?:\s+|(?=[^\d\s])))(?=\S)/u;
@@ -4477,7 +4477,7 @@ function cleanSrtForTranslation(
       const classified = classifiedLines[classifiedIndex];
       const sourceLine = classified.raw;
 
-      // 8.9.8: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
+      // 9.0: label de speaker em linha própria (HUGO / MED TECH 1 / MARGARET)
       // é metadata, não diálogo. Só removemos quando há outra linha real no mesmo cue.
       if (
         looksLikeStandaloneCueSpeakerLabel(sourceLine) &&
@@ -5226,7 +5226,7 @@ function stripOutputAccessibilityLine(
       )
       .trim();
 
-  // 8.9.8: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
+  // 9.0: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
   // toda a fala silenciosamente só porque a tradução "parece" uma ação SDH.
   // SDH estruturado []/() continua sendo removido; bare SDH suspeito fica para
   // o QA semântico/Repair em vez de virar EMPTY.
@@ -5318,7 +5318,7 @@ function sanitizeFinalCue(
       "$1 "
     );
 
-  text = naturalizeVisibleSourceBleep(block, text); // 8.9.8: metadata de censura nunca fica visível.
+  text = naturalizeVisibleSourceBleep(block, text); // 9.0: metadata de censura nunca fica visível.
 
   const expectedDialogueTurns =
     sourceDialogueDashCount(
@@ -5578,7 +5578,7 @@ function sanitizeTranslationMap(
             Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
         }
         console.log(
-          `[LOCAL VOCALIZATION LOCK 8.9.8] cue ${block.index}: ` +
+          `[LOCAL VOCALIZATION LOCK 9.0] cue ${block.index}: ` +
           `${JSON.stringify(block.text)} -> ${JSON.stringify(after)} | 0 Gemini.`
         );
       }
@@ -6374,7 +6374,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.9.8 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 9.0 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - MASCULINO GENÉRICO NÃO É CONSIDERADO NEUTRO NESTE PROJETO. "cansado", "confuso", "preocupado", "sozinho", "louco", "orgulhoso", "vencedor" etc. NÃO podem ser usados por padrão quando a SOURCE é neutra e existe reformulação natural.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
@@ -8756,7 +8756,7 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 8.9.8: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // 9.0: sem loop cego por modelo; o router troca de rota.
 
   const route = geminiRouteForMetric(metric);
   const errors = [];
@@ -11139,7 +11139,7 @@ async function rescueEmptyMainCue({
         Number(job.stats.mainLocalVocalizationRescues || 0) + 1;
     }
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.8] cue ${block.index}: ` +
+      `[MAIN LOCAL VOCALIZATION 9.0] cue ${block.index}: ` +
       `${JSON.stringify(block.text)} -> ${JSON.stringify(localVocalization)} | 0 Gemini.`
     );
     return localVocalization;
@@ -11540,7 +11540,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.9.8] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 9.0] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -11589,7 +11589,7 @@ async function translateMainBatch({
           const rightBatch = batch.slice(mid);
 
           console.warn(
-            `[MAIN ADAPTIVE 8.9.8] request grande recebeu limite de payload; ` +
+            `[MAIN ADAPTIVE 9.0] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
             `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
           );
@@ -11782,7 +11782,7 @@ async function translateAllMain(
     job.stats.mainLocalVocalizationPrefill =
       Number(job.stats.mainLocalVocalizationPrefill || 0) + localVocalizationPrefill;
     console.log(
-      `[MAIN LOCAL VOCALIZATION 8.9.8] ${localVocalizationPrefill} cue(s) ` +
+      `[MAIN LOCAL VOCALIZATION 9.0] ${localVocalizationPrefill} cue(s) ` +
       `resolvidos localmente antes do MAIN | 0 Gemini.`
     );
   }
@@ -11798,7 +11798,7 @@ async function translateAllMain(
   job.stats.mainCheckpointReused = translations.size;
 
   console.log(
-    `[MAIN 8.9.8] ${blocks.length} cues -> ${batches.length} lotes | ` +
+    `[MAIN 9.0] ${blocks.length} cues -> ${batches.length} lotes | ` +
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
@@ -12275,6 +12275,470 @@ async function scanPtbrQuality(
   return all;
 }
 
+
+// ============================================================
+// 9.0 FINAL OWNERSHIP GATE — BOUNDED / FAIL-CLOSED
+// ============================================================
+// Root cause addressed: an LLM can return the correct i/k metadata while the
+// natural-language content itself has slid into a neighboring cue. Therefore
+// metadata-only ownership is necessary but not sufficient.
+//
+// 9.0 response when QA proves a shift:
+// 1) quarantine the affected ORIGINAL MAIN batch (or a bounded local window
+//    for a single isolated signal);
+// 2) retranslate it as tiny micro-batches with cryptographic inline seals;
+// 3) re-run QA only on the quarantined region;
+// 4) any still-suspect cue is translated SOURCE-ONLY, one target per request;
+// 5) after all normal Repair/Final Bounded work, audit the quarantine again;
+// 6) a persistent ownership shift after SOURCE-ONLY isolation fails CLOSED —
+//    an incorrect SRT is never deliberately served.
+//
+// Normal episodes pay ZERO extra requests. There is no open convergence loop.
+const OWNERSHIP_MICRO_MAX_CUES_900 = 8;
+const OWNERSHIP_MICRO_CONCURRENCY_900 = 4;
+const OWNERSHIP_ISOLATED_MARGIN_900 = 12;
+
+function ownershipIssue900(issue) {
+  const joined = Array.isArray(issue?.reasons)
+    ? issue.reasons.map(String).join(" | ")
+    : String(issue?.reason || "");
+  return /POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined);
+}
+
+function ownershipSeal900(block) {
+  const id = Number(block?.index);
+  const source = String(block?.text || "");
+  const digest = crypto
+    .createHash("sha256")
+    .update(`${id}\u0000${source}`)
+    .digest("hex")
+    .slice(0, 12)
+    .toUpperCase();
+  return {
+    start: `__OWN9S_C${id}_${digest}__`,
+    end: `__OWN9E_C${id}_${digest}__`
+  };
+}
+
+function addOwnershipSeals900(payload, batch) {
+  const sealsById = new Map();
+  const blockById = new Map(batch.map(block => [Number(block.index), block]));
+  for (const cue of Array.isArray(payload?.cues) ? payload.cues : []) {
+    const block = blockById.get(Number(cue?.i));
+    if (!block) continue;
+    const seals = ownershipSeal900(block);
+    sealsById.set(Number(block.index), seals);
+    cue.en = `${seals.start} ${String(cue.en || "")} ${seals.end}`;
+  }
+  payload.rule =
+    `OWNERSHIP 9.0 HARD-SEAL: cada en começa com __OWN9S... e termina com __OWN9E.... ` +
+    `Em pt, copie o START como PRIMEIRO token e o END como ÚLTIMO token do MESMO cue. ` +
+    `Traduza somente o conteúdo que está fisicamente ENTRE os dois selos. ` +
+    `Nunca copie conteúdo de before/after nem de outro cue. ` +
+    String(payload.rule || "");
+  return sealsById;
+}
+
+function stripAndValidateOwnershipSeal900(id, value, sealsById) {
+  const raw = String(value || "").trim();
+  const seals = sealsById.get(Number(id));
+  if (!seals) return null;
+  if (!raw.startsWith(seals.start) || !raw.endsWith(seals.end)) return null;
+  const middle = raw
+    .slice(seals.start.length, raw.length - seals.end.length)
+    .trim();
+  if (!middle || /__OWN9[SE]_C\d+_/i.test(middle)) return null;
+  return middle;
+}
+
+async function translateOwnershipSourceOnly900(block, plan, job, thinkingLevel = "high", metric = "repair") {
+  const batch = [block];
+  const {
+    payload,
+    locksById,
+    ownershipById
+  } = buildOwnershipPayload(batch, positionMap(batch), batch, plan);
+
+  // SOURCE-ONLY means there is literally no neighboring cue text in the
+  // request. This is the final deterministic isolation step for ownership.
+  payload.before = [];
+  payload.after = [];
+  const sealsById = addOwnershipSeals900(payload, batch);
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await geminiRequest({
+        system: TRANSLATOR_PROMPT,
+        user:
+          `OWNERSHIP GATE 9.0 — SOURCE-ONLY ISOLATION.\n\n` +
+          `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+          `BÍBLIA EDITORIAL:\n${JSON.stringify(plan)}\n\n` +
+          `HÁ EXATAMENTE UM TARGET E NENHUM TEXTO DE VIZINHOS NESTE REQUEST.\n` +
+          `CÁPSULA SELADA:\n${JSON.stringify(payload)}\n\n` +
+          `Retorne exatamente 1 cue. Copie i/k. ` +
+          `pt DEVE começar pelo START seal e terminar pelo END seal recebidos. ` +
+          `Traduza somente a SOURCE entre os selos; não complete com conteúdo inexistente.`,
+        schema: mainCueTranslationSchema(1),
+        thinkingLevel,
+        maxOutputTokens: MAIN_EMPTY_CUE_RESCUE_MAX_OUTPUT_TOKENS,
+        timeoutMs: MAIN_TIMEOUT_MS,
+        maxRetries: 1,
+        job,
+        metric
+      });
+
+      const parsed = parseMainCueTranslationRobust(
+        batch,
+        response.text,
+        locksById,
+        ownershipById
+      );
+      const sealed = parsed.translations.get(block.index);
+      const pt = stripAndValidateOwnershipSeal900(block.index, sealed, sealsById);
+      if (!pt) throw new Error(`OWNERSHIP 9.0 cue ${block.index}: seal inválido/missing.`);
+      return pt;
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[OWNERSHIP SOURCE-ONLY 9.0] cue ${block.index} tentativa ${attempt}/2 falhou | ` +
+        `${errorMessage(error).slice(0, 260)}`
+      );
+    }
+  }
+  throw lastError || new Error(`OWNERSHIP SOURCE-ONLY 9.0 falhou no cue ${block.index}.`);
+}
+
+async function translateOwnershipMicroBatch900(blocks, posMap, batch, plan, job) {
+  const {
+    payload,
+    locksById,
+    ownershipById
+  } = buildOwnershipPayload(blocks, posMap, batch, plan);
+  const sealsById = addOwnershipSeals900(payload, batch);
+
+  try {
+    const response = await geminiRequest({
+      system: TRANSLATOR_PROMPT,
+      user:
+        `OWNERSHIP QUARANTINE 9.0 — MICRO-BATCH SELADO.\n\n` +
+        `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+        `BÍBLIA EDITORIAL:\n${JSON.stringify(plan)}\n\n` +
+        `MICRO-BATCH (máximo ${OWNERSHIP_MICRO_MAX_CUES_900} targets):\n${JSON.stringify(payload)}\n\n` +
+        `Cada pt começa/termina com os selos do MESMO en. ` +
+        `Preserve fragmentos e ownership; contexto é somente leitura.`,
+      schema: mainCueTranslationSchema(batch.length),
+      thinkingLevel: MAIN_THINKING,
+      maxOutputTokens: MAIN_MAX_OUTPUT_TOKENS,
+      timeoutMs: MAIN_TIMEOUT_MS,
+      maxRetries: MAIN_HTTP_RETRIES,
+      job,
+      metric: "main"
+    });
+
+    const parsed = parseMainCueTranslationRobust(
+      batch,
+      response.text,
+      locksById,
+      ownershipById
+    );
+
+    const out = new Map();
+    const invalidIds = new Set([
+      ...(parsed.emptyIds || []),
+      ...(parsed.missingIds || [])
+    ]);
+
+    for (const block of batch) {
+      const sealed = parsed.translations.get(block.index);
+      const pt = stripAndValidateOwnershipSeal900(block.index, sealed, sealsById);
+      if (!pt) invalidIds.add(block.index);
+      else out.set(block.index, pt);
+    }
+
+    // A micro-resposta que não prova fisicamente o seal vira SOURCE-ONLY,
+    // somente para o cue inválido; os outros resultados válidos são mantidos.
+    if (invalidIds.size) {
+      console.warn(
+        `[OWNERSHIP QUARANTINE 9.0] ${invalidIds.size} cue(s) sem seal válido; ` +
+        `isolando individualmente, sem refazer os válidos.`
+      );
+      for (const id of invalidIds) {
+        const block = batch.find(item => Number(item.index) === Number(id));
+        if (!block) continue;
+        out.set(id, await translateOwnershipSourceOnly900(block, plan, job, "high", "repair"));
+      }
+    }
+
+    if (out.size !== batch.length) {
+      throw new Error(`OWNERSHIP MICRO 9.0 incompleto ${out.size}/${batch.length}.`);
+    }
+    return out;
+  } catch (error) {
+    console.warn(
+      `[OWNERSHIP QUARANTINE 9.0] micro-batch falhou; ` +
+      `caindo para SOURCE-ONLY por cue | ${errorMessage(error).slice(0, 280)}`
+    );
+    const out = new Map();
+    for (const block of batch) {
+      out.set(block.index, await translateOwnershipSourceOnly900(block, plan, job, "high", "repair"));
+    }
+    return out;
+  }
+}
+
+function ownershipQuarantineTargets900(blocks, issues) {
+  const ownershipIds = [...new Set(
+    (Array.isArray(issues) ? issues : [])
+      .filter(ownershipIssue900)
+      .map(issue => Number(issue?.id))
+      .filter(Number.isInteger)
+  )];
+  if (!ownershipIds.length) return { ownershipIds, targetIds: new Set(), batchIndexes: [] };
+
+  const mainBatches = buildMainBatches(blocks);
+  const batchById = new Map();
+  const positionInBatch = new Map();
+  mainBatches.forEach((batch, batchIndex) => {
+    batch.forEach((block, pos) => {
+      batchById.set(Number(block.index), batchIndex);
+      positionInBatch.set(Number(block.index), pos);
+    });
+  });
+
+  const flagsByBatch = new Map();
+  for (const id of ownershipIds) {
+    const bi = batchById.get(id);
+    if (!Number.isInteger(bi)) continue;
+    if (!flagsByBatch.has(bi)) flagsByBatch.set(bi, []);
+    flagsByBatch.get(bi).push(id);
+  }
+
+  const targetIds = new Set();
+  const batchIndexes = [...flagsByBatch.keys()].sort((a, b) => a - b);
+  for (const bi of batchIndexes) {
+    const batch = mainBatches[bi];
+    const flagged = flagsByBatch.get(bi) || [];
+    // Two or more independent shift signals mean the entire original MAIN
+    // batch is untrusted. One isolated signal gets a generous local window.
+    if (flagged.length >= 2) {
+      for (const block of batch) targetIds.add(Number(block.index));
+      continue;
+    }
+    const pos = positionInBatch.get(flagged[0]);
+    const start = Math.max(0, Number(pos || 0) - OWNERSHIP_ISOLATED_MARGIN_900);
+    const end = Math.min(batch.length - 1, Number(pos || 0) + OWNERSHIP_ISOLATED_MARGIN_900);
+    for (let i = start; i <= end; i++) targetIds.add(Number(batch[i].index));
+  }
+
+  return { ownershipIds, targetIds, batchIndexes };
+}
+
+async function qaSubset900(blocks, translations, plan, job, label) {
+  if (!blocks.length) return [];
+  const oldBatches = Number(job.stats.qaBatches || 0);
+  const oldFlags = Number(job.stats.qaFlags || 0);
+  const issues = await scanPtbrQuality(blocks, translations, plan, job);
+  const newBatches = Number(job.stats.qaBatches || 0);
+  const newFlags = Number(job.stats.qaFlags || 0);
+  job.stats.qaBatches = oldBatches + newBatches;
+  job.stats.qaFlags = oldFlags + newFlags;
+  console.log(`[${label}] ${blocks.length} cue(s) reauditados | flags=${issues.length}.`);
+  return issues;
+}
+
+async function runOwnershipQuarantine900(blocks, translations, qaIssues, plan, job) {
+  const localOwnershipIssues = detectLocalIssues(blocks, translations, job.filename, plan)
+    .filter(ownershipIssue900);
+  const plan900 = ownershipQuarantineTargets900(
+    blocks,
+    mergeIssueLists(Array.isArray(qaIssues) ? qaIssues : [], localOwnershipIssues)
+  );
+
+  if (!plan900.targetIds.size) {
+    job.ownershipQuarantineIds900 = [];
+    console.log(`[OWNERSHIP GATE 9.0] nenhum shift provado; custo extra=0 requests ✅.`);
+    return { translations, qaIssues };
+  }
+
+  const posMap = positionMap(blocks);
+  const targetBlocks = blocks.filter(block => plan900.targetIds.has(Number(block.index)));
+  const updated = new Map(translations);
+  const microBatches = [];
+  for (let i = 0; i < targetBlocks.length; i += OWNERSHIP_MICRO_MAX_CUES_900) {
+    microBatches.push(targetBlocks.slice(i, i + OWNERSHIP_MICRO_MAX_CUES_900));
+  }
+
+  console.warn(
+    `[OWNERSHIP GATE 9.0] QUARANTENA | sinais=${plan900.ownershipIds.length} | ` +
+    `main-batches=${plan900.batchIndexes.join(",") || "-"} | ` +
+    `cues=${targetBlocks.length} | micro=${microBatches.length}x<=${OWNERSHIP_MICRO_MAX_CUES_900}.`
+  );
+
+  let cursor = 0;
+  async function worker(workerId) {
+    while (true) {
+      const index = cursor++;
+      if (index >= microBatches.length) return;
+      const micro = microBatches[index];
+      const translated = await translateOwnershipMicroBatch900(blocks, posMap, micro, plan, job);
+      for (const [id, pt] of translated) {
+        updated.set(id, pt);
+        if (job.mainCheckpoint instanceof Map) job.mainCheckpoint.set(id, pt);
+      }
+      console.log(`[OWNERSHIP GATE 9.0 W${workerId}] micro ${index + 1}/${microBatches.length} OK.`);
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(OWNERSHIP_MICRO_CONCURRENCY_900, microBatches.length) },
+      (_, index) => worker(index + 1)
+    )
+  );
+
+  let sanitized = sanitizeTranslationMap(blocks, updated, job);
+
+  // QA fresh only for the region whose translation changed. Old QA findings in
+  // that region are stale and are replaced below.
+  const freshIssues = await qaSubset900(targetBlocks, sanitized, plan, job, "OWNERSHIP QA FRESH 9.0");
+  const stubbornOwnership = [...new Set(
+    freshIssues.filter(ownershipIssue900).map(issue => Number(issue.id)).filter(Number.isInteger)
+  )];
+
+  if (stubbornOwnership.length) {
+    console.warn(
+      `[OWNERSHIP GATE 9.0] ${stubbornOwnership.length} cue(s) ainda suspeitos após micro-batch; ` +
+      `SOURCE-ONLY individual HIGH agora.`
+    );
+    let singleCursor = 0;
+    async function singleWorker() {
+      while (true) {
+        const idx = singleCursor++;
+        if (idx >= stubbornOwnership.length) return;
+        const id = stubbornOwnership[idx];
+        const block = blocks[posMap.get(id)];
+        if (!block) continue;
+        const pt = await translateOwnershipSourceOnly900(block, plan, job, "high", "repair");
+        sanitized.set(id, pt);
+        if (job.mainCheckpoint instanceof Map) job.mainCheckpoint.set(id, pt);
+      }
+    }
+    await Promise.all(
+      Array.from(
+        { length: Math.min(OWNERSHIP_MICRO_CONCURRENCY_900, stubbornOwnership.length) },
+        () => singleWorker()
+      )
+    );
+    sanitized = sanitizeTranslationMap(blocks, sanitized, job);
+  }
+
+  job.ownershipQuarantineIds900 = targetBlocks.map(block => Number(block.index));
+  job.forceSemanticAuditIds = [
+    ...new Set([
+      ...(Array.isArray(job.forceSemanticAuditIds) ? job.forceSemanticAuditIds : []),
+      ...job.ownershipQuarantineIds900
+    ])
+  ];
+
+  const staleIds = new Set(job.ownershipQuarantineIds900);
+  const survivingOld = (Array.isArray(qaIssues) ? qaIssues : []).filter(
+    issue => !staleIds.has(Number(issue?.id))
+  );
+  const singleSet = new Set(stubbornOwnership);
+  const survivingFresh = freshIssues.filter(
+    issue => !singleSet.has(Number(issue?.id)) && !ownershipIssue900(issue)
+  );
+
+  console.log(
+    `[OWNERSHIP GATE 9.0] quarentena reconstruída e selada | ` +
+    `cues=${targetBlocks.length} | source-only=${stubbornOwnership.length} | ` +
+    `final-audit-forçado=${job.ownershipQuarantineIds900.length} ✅.`
+  );
+
+  return {
+    translations: sanitized,
+    qaIssues: mergeIssueLists(survivingOld, survivingFresh)
+  };
+}
+
+async function enforceFinalOwnershipGate900(blocks, translations, plan, job) {
+  const ids = [...new Set(
+    (Array.isArray(job.ownershipQuarantineIds900) ? job.ownershipQuarantineIds900 : [])
+      .map(Number).filter(Number.isInteger)
+  )];
+  if (!ids.length) {
+    console.log(`[OWNERSHIP FINAL GATE 9.0] nenhuma quarentena neste job; custo extra=0 requests ✅.`);
+    return translations;
+  }
+
+  const idSet = new Set(ids);
+  const subset = blocks.filter(block => idSet.has(Number(block.index)));
+  let out = new Map(translations);
+  let audit = await qaSubset900(subset, out, plan, job, "OWNERSHIP FINAL QA 9.0");
+  let ownershipIds = [...new Set(
+    audit.filter(ownershipIssue900).map(issue => Number(issue.id)).filter(Number.isInteger)
+  )];
+
+  if (!ownershipIds.length) {
+    console.log(`[OWNERSHIP FINAL GATE 9.0] PASSOU — 0 shift(s) residuais ✅.`);
+    job.ownershipFinalResidual900 = 0;
+    return out;
+  }
+
+  console.warn(
+    `[OWNERSHIP FINAL GATE 9.0] ${ownershipIds.length} shift(s) residuais; ` +
+    `última reconstrução SOURCE-ONLY HIGH, sem vizinhos.`
+  );
+  const posMap = positionMap(blocks);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= ownershipIds.length) return;
+      const id = ownershipIds[idx];
+      const block = blocks[posMap.get(id)];
+      if (!block) continue;
+      out.set(id, await translateOwnershipSourceOnly900(block, plan, job, "high", "repair"));
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(OWNERSHIP_MICRO_CONCURRENCY_900, ownershipIds.length) },
+      () => worker()
+    )
+  );
+  out = sanitizeTranslationMap(blocks, out, job);
+
+  const verifyBlocks = blocks.filter(block => new Set(ownershipIds).has(Number(block.index)));
+  const verify = await qaSubset900(verifyBlocks, out, plan, job, "OWNERSHIP FINAL VERIFY 9.0");
+  const stillBad = verify.filter(ownershipIssue900);
+
+  // Uma única leitura QA pode gerar falso positivo. Fail-closed exige consenso
+  // de DUAS auditorias independentes depois do SOURCE-ONLY.
+  if (stillBad.length) {
+    const firstIds = new Set(stillBad.map(issue => Number(issue.id)).filter(Number.isInteger));
+    const verify2 = await qaSubset900(verifyBlocks, out, plan, job, "OWNERSHIP FINAL CONSENSUS 9.0");
+    const persistent = verify2.filter(issue =>
+      ownershipIssue900(issue) && firstIds.has(Number(issue.id))
+    );
+    job.ownershipFinalResidual900 = persistent.length;
+    if (persistent.length) {
+      const idsText = persistent.map(issue => issue.id).join(",");
+      const error = new Error(
+        `OWNERSHIP GATE 9.0 FAIL-CLOSED: ${persistent.length} cue(s) confirmados por 2 auditorias continuam deslocados (${idsText}).`
+      );
+      error.noJobRetry = true;
+      throw error;
+    }
+    console.log(`[OWNERSHIP FINAL GATE 9.0] falso positivo isolado descartado por consenso; 0 shift persistente ✅.`);
+    return out;
+  }
+
+  job.ownershipFinalResidual900 = 0;
+  console.log(`[OWNERSHIP FINAL GATE 9.0] PASSOU após SOURCE-ONLY — 0 shift(s) residuais ✅.`);
+  return out;
+}
+
 // ============================================================
 // DETECTOR / REPAIR
 // ============================================================
@@ -12684,7 +13148,7 @@ function targetHasGenderMarkedHumanRole896(pt, person = "second") {
 }
 
 // ============================================================
-// GENDER V5 DEFINITIVE SAFE NEUTRALIZATION — 8.9.8 ZERO-CLOUD
+// GENDER V5 DEFINITIVE SAFE NEUTRALIZATION — 9.0 ZERO-CLOUD
 // ============================================================
 // Camada propositalmente pequena: só atua quando a SOURCE usa um frame direto
 // I/you + a/an + papel humano e existe uma reformulação PT-BR inequívoca.
@@ -12811,7 +13275,7 @@ function applyGenderV5DefinitiveNeutralization897(block, value) {
     );
     if (pt !== beforeRole) {
       console.log(
-        `[GENDER V5 LOCAL 8.9.8] cue ${block?.index}: role=${info.role} neutralizado | 0 Gemini.`
+        `[GENDER V5 LOCAL 9.0] cue ${block?.index}: role=${info.role} neutralizado | 0 Gemini.`
       );
     }
   }
@@ -12820,7 +13284,7 @@ function applyGenderV5DefinitiveNeutralization897(block, value) {
 }
 
 // ============================================================
-// BROADCAST ANTI-CALQUE — 8.9.8 ZERO-CLOUD
+// BROADCAST ANTI-CALQUE — 9.0 ZERO-CLOUD
 // ============================================================
 // Só atua quando a própria SOURCE contém "pool feed" em contexto de broadcast.
 // Assim "pool" de piscina ou outros usos nunca são tocados.
@@ -12837,7 +13301,7 @@ function applyBroadcastAntiCalque897(block, value) {
 
   if (pt !== before) {
     console.log(
-      `[BROADCAST LOCAL 8.9.8] cue ${block?.index}: pool feed naturalizado | 0 Gemini.`
+      `[BROADCAST LOCAL 9.0] cue ${block?.index}: pool feed naturalizado | 0 Gemini.`
     );
   }
 
@@ -12845,7 +13309,7 @@ function applyBroadcastAntiCalque897(block, value) {
 }
 
 // ============================================================
-// FINAL DETERMINISTIC CLOSURE — 8.9.8 ZERO-CLOUD
+// FINAL DETERMINISTIC CLOSURE — 9.0 ZERO-CLOUD
 // ============================================================
 // Esta camada NÃO muda modelo, batch, concorrência, thinking, QA ou Repair.
 // Ela fecha classes mecânicas/semânticas de alta confiança antes de servir:
@@ -12898,7 +13362,7 @@ function applyGenderV5ModalNeutralization898(block, value) {
     }
 
     if (pt !== before) {
-      console.log(`[GENDER V5 MODAL LOCAL 8.9.8] cue ${block?.index}: role=${role} neutralizado | 0 Gemini.`);
+      console.log(`[GENDER V5 MODAL LOCAL 9.0] cue ${block?.index}: role=${role} neutralizado | 0 Gemini.`);
     }
   }
 
@@ -13147,7 +13611,7 @@ function applyBroadcastControlRoom898(block, value) {
   }
 
   if (pt !== before) {
-    console.log(`[BROADCAST CONTROL LOCAL 8.9.8] cue ${block?.index}: comando naturalizado | 0 Gemini.`);
+    console.log(`[BROADCAST CONTROL LOCAL 9.0] cue ${block?.index}: comando naturalizado | 0 Gemini.`);
   }
   return pt;
 }
@@ -13261,7 +13725,7 @@ function compactExactRepetitionLayout898(block, value) {
   if (targetRepeatCount896(block, candidate) < sourceRepeatNeed896(block)) return original;
   if (!layoutCueResult(block, candidate).fits) return original;
 
-  console.log(`[REPETITION LAYOUT LOCAL 8.9.8] cue ${block?.index}: repetição íntegra compactada para 2x50 | 0 Gemini.`);
+  console.log(`[REPETITION LAYOUT LOCAL 9.0] cue ${block?.index}: repetição íntegra compactada para 2x50 | 0 Gemini.`);
   return candidate;
 }
 
@@ -13406,7 +13870,7 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
 
       out.set(prev.index, candPrev);
       out.set(curr.index, candCurr);
-      console.log(`[OWNERSHIP FALLBACK LOCAL 8.9.8] cues ${prev.index}/${curr.index}: ${label} eliminou duplicação de fronteira | 0 Gemini.`);
+      console.log(`[OWNERSHIP FALLBACK LOCAL 9.0] cues ${prev.index}/${curr.index}: ${label} eliminou duplicação de fronteira | 0 Gemini.`);
       resolved = true;
       break;
     }
@@ -13426,7 +13890,7 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
           .some(r => /^CUE_OWNERSHIP_/i.test(String(r || "")))
       ) {
         out.set(curr.index, trimmed);
-        console.log(`[OWNERSHIP DEDUPE LOCAL 8.9.8] cues ${prev.index}/${curr.index}: prefixo duplicado removido | 0 Gemini.`);
+        console.log(`[OWNERSHIP DEDUPE LOCAL 9.0] cues ${prev.index}/${curr.index}: prefixo duplicado removido | 0 Gemini.`);
       }
     }
   }
@@ -13454,7 +13918,7 @@ function applyFinalStrictLayoutFallback898(blocks, finalTranslations, mainTransl
       !repairCandidateRegressionReasons(block, current, main, filename, plan).length
     ) {
       out.set(block.index, main);
-      console.log(`[LAYOUT FALLBACK LOCAL 8.9.8] cue ${block.index}: candidato MAIN íntegro recuperado | 0 Gemini.`);
+      console.log(`[LAYOUT FALLBACK LOCAL 9.0] cue ${block.index}: candidato MAIN íntegro recuperado | 0 Gemini.`);
     }
   }
 
@@ -13742,13 +14206,13 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
 
   if (!source) return false;
 
-  return /\byou(?:'re|’re|\s+are|\s+were)?\s+(?:(?:a|an)\s+)?(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male|nun|monk|king|queen|prince|princess|gentleman|lady|widow|widower|actress|actor|waitress|waiter|aunt|uncle|niece|nephew|girlfriend|boyfriend|grandmother|grandfather|grandma|grandpa|businessman|businesswoman|policeman|policewoman|salesman|saleswoman|chairman|chairwoman|congressman|congresswoman|spokesman|spokeswoman)\b/i.test(source) ||
+  return /\byou(?:'re|’re|\s+are|\s+were)?\s+(?:(?:a|an)\s+)?(?:[a-z0-9'’-]+\s+){0,4}(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male|nun|monk|king|queen|prince|princess|gentleman|lady|widow|widower|actress|actor|waitress|waiter|aunt|uncle|niece|nephew|girlfriend|boyfriend|grandmother|grandfather|grandma|grandpa|businessman|businesswoman|policeman|policewoman|salesman|saleswoman|chairman|chairwoman|congressman|congresswoman|spokesman|spokeswoman)\b/i.test(source) ||
     /\b(?:voc[eê]|tu)\s+(?:[ée]|era)\s+(?:uma?\s+)?(?:mulher|homem|garota|garoto|menina|menino|mãe|pai|esposa|marido|filha|filho|irmã|irmão|noiva|noivo)\b/iu.test(source) ||
     /\b(?:eres|eres\s+una?|t[uú]\s+eres)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
 }
 
 // ============================================================
-// GENDER POSTCONDITION LOCAL — 8.9.8
+// GENDER POSTCONDITION LOCAL — 9.0
 // ============================================================
 // O modelo continua responsável pela tradução. Este guard só reescreve
 // padrões de altíssima confiança quando a SOURCE é explicitamente neutra
@@ -13864,7 +14328,7 @@ function applyDeterministicGenderNeutrality(block, value) {
     }
   }
 
-  // 8.9.8 — padrões neutros adicionais observados em filme real.
+  // 9.0 — padrões neutros adicionais observados em filme real.
   if (!sourceExplicitlyMarksSelfGender(block)) {
     if (/\blet me be clear\b/i.test(source)) {
       pt = pt.replace(/\b(?:deixe-me|deixa eu)\s+ser\s+clar[oa]\b/iu, "deixa eu deixar isso claro");
@@ -14826,7 +15290,7 @@ function ownershipBoundaryMismatchReasons(previousBlock, block, previousPt, pt) 
     const sourceSemanticOverlap = boundarySemanticOverlap898(previousBlock.text, block.text);
 
     // Só acusa duplicação criada pela tradução. Além da sequência literal,
-    // 8.9.8 compara tokens de conteúdo e ignora conectivos/preposições.
+    // 9.0 compara tokens de conteúdo e ignora conectivos/preposições.
     // Isso captura "sem graça ... 22 graus" -> "sem graça ... 22 graus e sol"
     // sem hardcode de título, e preserva repetição que já existe na SOURCE.
     if (
@@ -16232,7 +16696,7 @@ function rememberCompactRescueFailure(job, id, value, reason = "rejeitado") {
   if (!job.compactRescueFailedSignatures.has(signature)) {
     job.compactRescueFailedSignatures.add(signature);
     job.stats.compactMemoizedFailures = Number(job.stats.compactMemoizedFailures || 0) + 1;
-    console.log(`[COMPACT MEMORY 8.9.8] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
+    console.log(`[COMPACT MEMORY 9.0] cue ${id} memorizado (${reason}); mesmo texto não gastará Gemini de novo neste job.`);
   }
 }
 
@@ -16284,7 +16748,7 @@ async function runCompactRescue(
     const memoSkipped = detectedIssues.length - allIssues.length;
     if (memoSkipped > 0) {
       console.log(
-        `[COMPACT MEMORY 8.9.8] ${memoSkipped} overflow(s) já reprovado(s) ` +
+        `[COMPACT MEMORY 9.0] ${memoSkipped} overflow(s) já reprovado(s) ` +
         `com o mesmo texto; 0 nova chamada cloud.`
       );
     }
@@ -18334,7 +18798,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.9.8] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 9.0] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -18379,7 +18843,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.9.8] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 9.0] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -18409,7 +18873,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.9.8] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 9.0] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -18435,7 +18899,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.9.8] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 9.0] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -18475,7 +18939,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.9.8 ROUTED] fonte=${
+    `[PIPELINE 9.0 ROUTED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -18518,7 +18982,7 @@ mainTranslations =
   });
 
 // ============================================================
-// HARD GUARD PRE-SAFE 8.9.8
+// HARD GUARD PRE-SAFE 9.0
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
@@ -18599,13 +19063,31 @@ console.log(
 // QA
 // ============================================================
 
-const qaIssues =
+let qaIssues =
   await scanPtbrQuality(
     blocks,
     mainTranslations,
     plan,
     job
   );
+
+// ============================================================
+// OWNERSHIP QUARANTINE — 9.0
+// ============================================================
+// O QA global já existe e já pagou o custo de detectar possíveis shifts.
+// Em vez de reparar IDs esparsos, 9.0 reconstrói a região original como
+// micro-batches selados e troca os findings antigos por QA fresco.
+{
+  const ownershipGate900 = await runOwnershipQuarantine900(
+    blocks,
+    mainTranslations,
+    qaIssues,
+    plan,
+    job
+  );
+  mainTranslations = ownershipGate900.translations;
+  qaIssues = ownershipGate900.qaIssues;
+}
 
 // ============================================================
 // REPAIR
@@ -18672,7 +19154,16 @@ finalTranslations = await runBoundedFinalQuality88(
   job
 );
 
-// 8.9.8: FINAL DETERMINISTIC CLOSURE — ZERO-CLOUD.
+// 9.0: FINAL OWNERSHIP GATE. Só existe custo cloud quando o QA global
+// provou uma corrupção de ownership e houve quarentena neste job.
+finalTranslations = await enforceFinalOwnershipGate900(
+  blocks,
+  finalTranslations,
+  plan,
+  job
+);
+
+// 9.0: FINAL DETERMINISTIC CLOSURE — ZERO-CLOUD.
 // Nenhuma chamada Gemini, nenhum loop e nenhum atraso de rede.
 // Fecha gênero, broadcast, repetição/layout e ownership com fallback para o
 // candidato MAIN quando ele for objetivamente mais seguro.
@@ -18690,10 +19181,10 @@ const finalClosure898 = finalClosureResidualSummary898(
   blocks, finalTranslations, job.filename, plan
 );
 console.log(
-  `[FINAL CLOSURE 8.9.8] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.0] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
-  `censor=${finalClosure898.censor} | zero-cloud ✅`
+  `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ✅`
 );
 
 const authorizedLayoutTranslations =
@@ -18739,7 +19230,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.9.8 ROUTED] FINAL OK | ${
+    `[PIPELINE 9.0 ROUTED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -19511,7 +20002,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "8.9.8",
+    "9.0",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -20376,7 +20867,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.9.8 - FINAL DETERMINISTIC CLOSURE"
+        " STREMIO PT-BR 9.0 - FINAL OWNERSHIP GATE"
   );
 
   console.log(
@@ -20476,7 +20967,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.9.8: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 9.0: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -20529,7 +21020,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.9.8: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 9.0: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -20629,10 +21120,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.9.8: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 8.9.8: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
-  console.log("MAIN Fail-Fast 8.9.8: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
-  console.log("Final Bounded 8.9.8: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
+  console.log("Final 9.0: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
+  console.log("MAIN 9.0: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN Fail-Fast 9.0: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
+  console.log("Final Bounded 9.0: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -20644,14 +21135,14 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.9.8: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
+    "Pre-Repair 9.0: QA HIGH continua autoridade semântica; HARD GUARDS locais autorizam repair focal antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "GenerateContent 8.9.8: chamadas de texto migradas de Interactions para REST generateContent ✅"
+    "GenerateContent 9.0: chamadas de texto migradas de Interactions para REST generateContent ✅"
   );
   console.log(
-    "Structured Output REST 8.9.8: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
+    "Structured Output REST 9.0: responseMimeType + responseJsonSchema; responseFormat incompatível removido ✅"
   );
 
   console.log(
@@ -20659,98 +21150,107 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.9.8 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
+    "HARD SDH 9.0 SAFE-BARE: descrições estruturadas saem; Look/Breathe/Dance/Entra e vocalizações faladas não viram SDH ✅"
   );
 
   console.log(
-    "Spoken Vocalization Lock 8.9.8: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
+    "Spoken Vocalization Lock 9.0: Mm-hmm/Hmm/Uhum/Um são resolvidos localmente; 0 rescue HIGH desnecessário ✅"
   );
 
   console.log(
-    "Performance Atomic Reprise 8.9.8: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
+    "Performance Atomic Reprise 9.0: fragmentos que repetem performance confirmada permanecem no mesmo cluster lógico ✅"
   );
 
   console.log(
-    "Dialogue Turn Restore 8.9.8: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
+    "Dialogue Turn Restore 9.0: turn count correto + hífens ausentes/colados são restaurados localmente ✅"
   );
 
   console.log(
-    "Gender Neutral 8.9.8: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
+    "Gender Neutral 9.0: hard guard + pós-condição local para padrões neutros seguros; gênero explícito da SOURCE é preservado ✅"
   );
 
   console.log(
-    "Absolute Ownership 8.9.8: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
+    "Absolute Ownership 9.0: boundary hints no MAIN + detector local de continuação/reação deslocada antes do SAFE DRAFT ✅"
   );
 
   console.log(
-    "Compact Memory 8.9.8: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
+    "Compact Memory 9.0: mesmo cue/texto rejeitado não consome Compact Rescue novamente no mesmo job ✅"
   );
 
   console.log(
-    "Latency Contract 8.9.8: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
+    "Latency Contract 9.0: MAIN MEDIUM, concorrência restaurada e nenhum 429 cria cooldown global ✅"
   );
 
   console.log(
-    "Model Router 8.9.8: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+    "Model Router 9.0: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
   );
 
   console.log(
-    "Model Health 8.9.8: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+    "Model Health 9.0: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
   );
 
   console.log(
-    "Quota Diagnostics 8.9.8: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
+    "Quota Diagnostics 9.0: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
   );
-  console.log("Turn Canonicalization 8.9.8: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
-  console.log("Standalone Speaker Labels 8.9.8: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
-  console.log("Short Performance Guard 8.9.8: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
-  console.log("Ownership 8.9.8: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
-  console.log("Gender Postcondition 8.9.8: right/secure/clear/late/good/not-alone cobertos localmente ✅");
-  console.log("Source Metadata 8.9.8: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
-  console.log("PT-BR Orthography 8.9.8: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
-  console.log("Dialogue Invariant 8.9.8: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
-  console.log("Bleep Naturalization 8.9.8: metadata de censura fica invisível; força pragmática vira fala PT-BR natural ✅");
-  console.log("Ownership Boundary 8.9.8: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
-  console.log("Gender Neutrality 8.9.8: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
-  console.log("Bleep Detector 8.9.8: palavra válida + reticências nunca vira censura só pelo prefixo; dots exigem stem forte/contexto ✅");
-  console.log("Hyphen Turn 8.9.8: -fala/- fala reconhecidos no início da linha; números negativos protegidos ✅");
-  console.log("Bare SDH Safety 8.9.8: fala SOURCE sobrevivente não é apagada silenciosamente por heurística de ação ✅");
+  console.log("Turn Canonicalization 9.0: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
+  console.log("Standalone Speaker Labels 9.0: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
+  console.log("Short Performance Guard 9.0: clusters líricos densos + launch até 20s preservados; letras narrativas não somem ✅");
+  console.log("Ownership 9.0: short-reaction exata + semantic consensus + boundary QA reforçado ✅");
+  console.log("Gender Postcondition 9.0: right/secure/clear/late/good/not-alone cobertos localmente ✅");
+  console.log("Source Metadata 9.0: notas técnicas/credits de subtitle removidos antes do MAIN ✅");
+  console.log("PT-BR Orthography 9.0: emituiu/agüenta corrigidos localmente + calques reais entram no Repair focal ✅");
+  console.log("Dialogue Invariant 9.0: ~ anexado/espacado reconhecido; SOURCE multi-turn termina canônica em hífens ✅");
+  console.log("Bleep Naturalization 9.0: metadata de censura fica invisível; força pragmática vira fala PT-BR natural ✅");
+  console.log("Ownership Boundary 9.0: overlap substancial criado no PT, ausente na SOURCE, aciona repair focal ✅");
+  console.log("Gender Neutrality 9.0: estados emocionais neutros ampliados em 1ª/2ª pessoa sem listas por título ✅");
+  console.log("Bleep Detector 9.0: palavra válida + reticências nunca vira censura só pelo prefixo; dots exigem stem forte/contexto ✅");
+  console.log("Hyphen Turn 9.0: -fala/- fala reconhecidos no início da linha; números negativos protegidos ✅");
+  console.log("Bare SDH Safety 9.0: fala SOURCE sobrevivente não é apagada silenciosamente por heurística de ação ✅");
 
   console.log(
-    "Context Semantic Lock 8.9.8: before/after resolvem intenção; zero nova auditoria global / zero nova rodada cloud ✅"
+    "Context Semantic Lock 9.0: before/after resolvem intenção; zero nova auditoria global / zero nova rodada cloud ✅"
   );
   console.log(
-    "Gender Critical V5 8.9.8: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
+    "Gender Critical V5 9.0: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
   );
   console.log(
-    "Gender V5 Definitive 8.9.8: neutralizações inequívocas são ZERO-CLOUD e não reabrem Repair HIGH ✅"
+    "Gender V5 Definitive 9.0: neutralizações inequívocas são ZERO-CLOUD e não reabrem Repair HIGH ✅"
   );
   console.log(
-    "Broadcast Anti-Calque 8.9.8: pool feed/sinal pool vira formulação PT-BR natural somente com prova na SOURCE ✅"
+    "Broadcast Anti-Calque 9.0: pool feed/sinal pool vira formulação PT-BR natural somente com prova na SOURCE ✅"
   );
   console.log(
-    "Exact Repetition Lock 8.9.8: repetição dramática não pode ser compactada nem perdida por Repair ✅"
+    "Exact Repetition Lock 9.0: repetição dramática não pode ser compactada nem perdida por Repair ✅"
   );
   console.log(
-    "Visible Censor Zero 8.9.8: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
+    "Visible Censor Zero 9.0: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
   );
   console.log(
-    "Contextual Imperative Lock 8.9.8: referente inventado é bloqueado quando vizinhos provam sentido de parada/interrupção ✅"
+    "Contextual Imperative Lock 9.0: referente inventado é bloqueado quando vizinhos provam sentido de parada/interrupção ✅"
   );
   console.log(
-    "Final Deterministic Closure 8.9.8: gênero por turno + layout estrito + ownership semântico + broadcast commands | ZERO-CLOUD ✅"
+    "Final Deterministic Closure 9.0: gênero por turno + layout estrito + ownership semântico + broadcast commands | ZERO-CLOUD ✅"
   );
   console.log(
-    "Gender Multi-Turn 8.9.8: neutralização roda por speaker; cues com dois speakers não pulam mais o guard ✅"
+    "Gender Multi-Turn 9.0: neutralização roda por speaker; cues com dois speakers não pulam mais o guard ✅"
   );
   console.log(
-    "Strict Repetition Layout 8.9.8: repetição completa nunca autoriza linha >50; contração sem perda semântica ✅"
+    "Strict Repetition Layout 9.0: repetição completa nunca autoriza linha >50; contração sem perda semântica ✅"
   );
   console.log(
-    "Ownership Semantic Boundary 8.9.8: overlap de conteúdo criado no PT é detectado mesmo com preposições diferentes ✅"
+    "Ownership Semantic Boundary 9.0: overlap de conteúdo criado no PT é detectado mesmo com preposições diferentes ✅"
   );
   console.log(
-    "Broadcast/English Closure 8.9.8: Take/Roll/Okay/Move só são localizados quando a SOURCE prova o uso ✅"
+    "Broadcast/English Closure 9.0: Take/Roll/Okay/Move só são localizados quando a SOURCE prova o uso ✅"
+  );
+  console.log(
+    "Ownership Gate 9.0: QA shift => quarentena do MAIN + micro-batches selados + SOURCE-ONLY fallback ✅"
+  );
+  console.log(
+    "Ownership Fail-Closed 9.0: shift persistente após isolamento nunca é servido como SRT final ✅"
+  );
+  console.log(
+    "Explicit Gender Evidence 9.0: modifiers como ten-year-old girl preservam gênero declarado pela SOURCE ✅"
   );
 
   console.log(
