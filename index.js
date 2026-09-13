@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.8.1 - HARD SDH + NEUTRAL GENDER
-// SAME BOUNDED PIPELINE; ZERO EXTRA GEMINI STAGES; SDH EARLY-DROP + GENDER-NEUTRAL DEFAULT
+// STREMIO PT-BR 8.8.2 - QUOTA-SAFE HARD SDH + NEUTRAL GENDER
+// SAME QUALITY PIPELINE; GLOBAL 429 BARRIER; ZERO EXTRA GEMINI STAGES
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,13 +22,17 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.8.1-hard-sdh-neutral-gender-v1";
+  "8.8.2-hard-sdh-neutral-quota-safe-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
 const FETCH_TIMEOUT_MS = 25000;
 
 const GEMINI_MIN_START_INTERVAL_MS = 4300;
+// 8.8.2: a 429 is a PROJECT-WIDE signal, not a worker-local error.
+// Clean runs keep the exact same 4.3s pacing; this barrier adds ZERO wait
+// unless Google actually returns 429.
+const GEMINI_429_GLOBAL_BUFFER_MS = 1500;
 
 // Multilingual Audio-Sync Adapter.
 // A Ponte usa este endpoint SOMENTE para construir texto-proxy lexical
@@ -249,6 +253,7 @@ const jobs = new Map();
 
 let lastGeminiRequestStart = 0;
 let geminiGate = Promise.resolve();
+let geminiGlobalCooldownUntil = 0;
 
 let transcribeGate = Promise.resolve();
 let lastTranscribeRequestStart = 0;
@@ -2148,7 +2153,7 @@ function looksLikeUniversalSdhAction(
 }
 
 // ============================================================
-// HARD SDH STRUCTURE 8.8.1
+// HARD SDH STRUCTURE 8.8.2
 // ============================================================
 // Bracket/parenthetical captions are accessibility metadata far more often
 // than dialogue. The older lexical classifier missed perfectly normal CC
@@ -4123,7 +4128,7 @@ function cleanSrtForTranslation(
       speakers.size >= 1 &&
       explicitDialogueTurns >= 2
     ) {
-      // 8.8.1: a label de um turno NÃO vira identidade do cue inteiro.
+      // 8.8.2: a label de um turno NÃO vira identidade do cue inteiro.
       // Isso impede "-I'm tired / -SARAH: ..." de atribuir Sarah ao 1º turno.
       speakerHintsSuppressedMultiTurn++;
     }
@@ -4699,7 +4704,7 @@ function stripOutputAccessibilityLine(
       `${hadDash ? "- " : ""}${info.text}`.trim();
   }
 
-  // Fallback 8.8.1: speaker labels must never be visible in the final SRT.
+  // Fallback 8.8.2: speaker labels must never be visible in the final SRT.
   // Conservative: removes only a prefix that itself passes looksLikeSpeakerLabel.
   text = text.replace(
     /^(\s*[-–—]\s*)?([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 #.'’_-]{0,45})\s*:\s*(?=\S)/u,
@@ -5770,7 +5775,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.8.1 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.8.2 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
 - Prefira SEMPRE a formulação naturalmente neutra: "I'm scared" -> "Tô com medo"; "I'm confused" -> "Não tô entendendo"; "I'm alone" -> "Tô sem ninguém por perto"; "I'm worried" -> "Isso tá me preocupando".
@@ -7482,6 +7487,38 @@ function extractInteractionText(
   return out.trim();
 }
 
+function raiseGeminiGlobalCooldown(
+  waitMs,
+  job,
+  metric
+) {
+  const safeWait =
+    Math.max(
+      1000,
+      Number(waitMs || 0) +
+      GEMINI_429_GLOBAL_BUFFER_MS
+    );
+
+  const candidate =
+    Date.now() + safeWait;
+
+  if (candidate > geminiGlobalCooldownUntil) {
+    geminiGlobalCooldownUntil =
+      candidate;
+
+    console.warn(
+      `[GEMINI QUOTA BARRIER 8.8.2] 429 em ${String(metric || "gemini").toUpperCase()} | ` +
+      `TODOS os workers pausados por ~${(safeWait / 1000).toFixed(1)}s; ` +
+      `nenhuma nova chamada consumirá a janela enquanto a cota se recompõe.`
+    );
+  }
+
+  if (job) {
+    job.stats.global429Barriers =
+      (job.stats.global429Barriers || 0) + 1;
+  }
+}
+
 async function acquireGeminiSlot(
   job
 ) {
@@ -7498,21 +7535,44 @@ async function acquireGeminiSlot(
   await previous;
 
   try {
-    const wait =
-      Math.max(
-        0,
+    // Reavalia depois de CADA espera. Um 429 pode chegar de outro worker
+    // enquanto este já aguardava o gate de 4.3s. Sem o loop, ele ainda
+    // dispararia durante o cooldown e recriaria a tempestade de 429.
+    while (true) {
+      const now =
+        Date.now();
 
-        GEMINI_MIN_START_INTERVAL_MS -
-        (
-          Date.now() -
-          lastGeminiRequestStart
-        )
-      );
+      const pacerWait =
+        Math.max(
+          0,
+          GEMINI_MIN_START_INTERVAL_MS -
+          (now - lastGeminiRequestStart)
+        );
 
-    if (wait > 0) {
+      const quotaWait =
+        Math.max(
+          0,
+          geminiGlobalCooldownUntil - now
+        );
+
+      const wait =
+        Math.max(
+          pacerWait,
+          quotaWait
+        );
+
+      if (wait <= 0) {
+        break;
+      }
+
       if (job) {
         job.stats.pacerWaitMs +=
           wait;
+
+        if (quotaWait >= pacerWait && quotaWait > 0) {
+          job.stats.global429CooldownWaitMs =
+            (job.stats.global429CooldownWaitMs || 0) + wait;
+        }
       }
 
       await sleep(wait);
@@ -7899,13 +7959,6 @@ async function geminiRequest({
           metric
         );
 
-        if (
-          attempt ===
-          maxRetries
-        ) {
-          throw error;
-        }
-
         const wait =
           retryDelayMs(
             response,
@@ -7913,15 +7966,27 @@ async function geminiRequest({
             attempt
           );
 
+        error.retryAfterMs =
+          wait;
+
+        raiseGeminiGlobalCooldown(
+          wait,
+          job,
+          metric
+        );
+
+        if (
+          attempt ===
+          maxRetries
+        ) {
+          throw error;
+        }
+
         console.warn(
           `[GEMINI ${
             metric.toUpperCase()
-          }] 429; mesmo lote em ${
-            (wait / 1000).toFixed(1)
-          }s.`
+          }] 429; retry do mesmo lote será feito pelo gate GLOBAL após a janela segura.`
         );
-
-        await sleep(wait);
 
         continue;
       }
@@ -10203,7 +10268,7 @@ function parseMainCueTranslationRobust(
 
   if (ignoredExtras || ignoredDuplicates || badOwnership) {
     console.warn(
-      `[MAIN ROBUST PARSER 8.8.1] extras=${ignoredExtras} | ` +
+      `[MAIN ROBUST PARSER 8.8.2] extras=${ignoredExtras} | ` +
       `duplicados=${ignoredDuplicates} | ownership-inválido=${badOwnership}; ` +
       `cues válidos foram preservados, sem retraduzir o lote.`
     );
@@ -10243,6 +10308,7 @@ async function rescueEmptyMainCue({
   ];
 
   let lastError = null;
+  let quotaDeferred = false;
   const rejectedCandidates = [];
   const rejectedSdhCandidates = [];
 
@@ -10427,6 +10493,19 @@ async function rescueEmptyMainCue({
       } catch (error) {
         lastError = error;
 
+        if (error?.status === 429) {
+          quotaDeferred = true;
+          job.stats.mainEmptyCueQuotaDefers =
+            (job.stats.mainEmptyCueQuotaDefers || 0) + 1;
+
+          console.warn(
+            `[MAIN EMPTY-CUE QUOTA DEFER 8.8.2] cue ${block.index}: ` +
+            `quota continuou indisponível após os retries HTTP internos; ` +
+            `NÃO haverá uma nova rodada 3x3. Conteúdo seguro segue para QA/Repair.`
+          );
+          break;
+        }
+
         if (
           parseAttempt <
           MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS
@@ -10449,6 +10528,10 @@ async function rescueEmptyMainCue({
       }
     }
 
+    if (quotaDeferred) {
+      break;
+    }
+
     job.stats.mainEmptyCueRescueFailures++;
   }
 
@@ -10469,11 +10552,16 @@ async function rescueEmptyMainCue({
       ) + 1;
 
     console.warn(
-      `[MAIN EMPTY-CUE SAFE FALLBACK] cue ${block.index} encerrou ` +
-      `${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) sem consenso SDH; ` +
-      `conteúdo preservado para QA/Repair | ${
-        errorMessage(lastError).slice(0, 260)
-      }`
+      quotaDeferred
+        ? `[MAIN EMPTY-CUE SAFE FALLBACK] cue ${block.index}: quota-defer; ` +
+          `conteúdo preservado imediatamente para QA/Repair, sem martelar a API | ${
+            errorMessage(lastError).slice(0, 260)
+          }`
+        : `[MAIN EMPTY-CUE SAFE FALLBACK] cue ${block.index} encerrou ` +
+          `${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) sem consenso SDH; ` +
+          `conteúdo preservado para QA/Repair | ${
+            errorMessage(lastError).slice(0, 260)
+          }`
     );
 
     return fallback;
@@ -10589,7 +10677,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.8.1] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.8.2] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -15942,7 +16030,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.8.1] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.8.2] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -15987,7 +16075,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.8.1] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.8.2] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -16017,7 +16105,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-88-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.8.1] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.8.2] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -16043,7 +16131,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.8.1] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.8.2] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -16080,7 +16168,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.8.1 BOUNDED] fonte=${
+    `[PIPELINE 8.8.2 BOUNDED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16281,7 +16369,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.8.1 BOUNDED] FINAL OK | ${
+    `[PIPELINE 8.8.2 BOUNDED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17903,7 +17991,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.8.1 - HARD SDH + NEUTRAL GENDER"
+        " STREMIO PT-BR 8.8.2 - HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -17999,7 +18087,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.8.1: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.8.2: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -18016,7 +18104,7 @@ console.log(
 
   console.log(
     `Main Empty-Cue Rescue: ${MAIN_EMPTY_CUE_RESCUE_ENABLED ? "ATIVO" : "DESATIVADO"} | ` +
-    `somente cue vazio é refeito | ${MAIN_EMPTY_CUE_RESCUE_PARSE_ATTEMPTS} tentativa(s) | consenso SDH=${MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN} | zero loop ✅`
+    `somente cue vazio é refeito | parse inválido pode repetir; 429 NÃO multiplica 3x3 | consenso SDH=${MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN} ✅`
   );
 
   console.log(
@@ -18052,7 +18140,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.8.1: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.8.2: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18152,10 +18240,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.8.1: mesmo pipeline bounded 8.8; HARD SDH early-drop + neutral gender default; zero estágio Gemini novo ✅");
-  console.log("MAIN Robust 8.8.1: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
-  console.log("MAIN Fail-Fast 8.8.1: erro determinístico não vira loop; payload compacto + rescue focal ✅");
-  console.log("Final Bounded 8.8.1: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
+  console.log("Final 8.8.2: mesmo pipeline bounded 8.8; HARD SDH early-drop + neutral gender default; zero estágio Gemini novo ✅");
+  console.log("MAIN Robust 8.8.2: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
+  console.log("MAIN Fail-Fast 8.8.2: erro determinístico não vira loop; payload compacto + rescue focal ✅");
+  console.log("Final Bounded 8.8.2: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -18167,7 +18255,7 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.8.1: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
+    "Pre-Repair 8.8.2: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
   );
 
   console.log(
@@ -18179,15 +18267,23 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.8.1: caption/action-only é eliminado ANTES do MAIN; SDH-only não pode acionar Gemini rescue ✅"
+    "HARD SDH 8.8.2: caption/action-only é eliminado ANTES do MAIN; SDH-only não pode acionar Gemini rescue ✅"
   );
 
   console.log(
-    "Gender Neutral Default 8.8.1: SOURCE neutra => PT-BR neutro natural; speaker label nunca atravessa turno ✅"
+    "Gender Neutral Default 8.8.2: SOURCE neutra => PT-BR neutro natural; speaker label nunca atravessa turno ✅"
   );
 
   console.log(
-    "Latency Contract 8.8.1: zero etapa Gemini nova; mesmos MAIN/QA/REPAIR/FINAL bounded; SDH early-drop reduz trabalho ✅"
+    "Latency Contract 8.8.2: zero etapa Gemini nova; mesmos MAIN/QA/REPAIR/FINAL bounded; SDH early-drop reduz trabalho ✅"
+  );
+
+  console.log(
+    `Quota-Safe 8.8.2: primeiro 429 abre barreira GLOBAL; todos os workers respeitam RetryInfo; clean run mantém gate=${GEMINI_MIN_START_INTERVAL_MS}ms ✅`
+  );
+
+  console.log(
+    "Quota Rescue 8.8.2: 429 persistente em empty-cue faz DEFER para QA/Repair; zero tempestade 3x3 ✅"
   );
 
   console.log(
