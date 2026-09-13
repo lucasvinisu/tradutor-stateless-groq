@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 8.8.2 - QUOTA-SAFE HARD SDH + NEUTRAL GENDER
-// SAME QUALITY PIPELINE; GLOBAL 429 BARRIER; ZERO EXTRA GEMINI STAGES
+// STREMIO PT-BR 8.8.3 - FREE-TIER GOVERNOR + HARD SDH + NEUTRAL GENDER
+// PROACTIVE FREE-TIER GOVERNOR; SINGLE-FLIGHT; ZERO EXTRA GEMINI STAGES
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -22,17 +22,34 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "8.8.2-hard-sdh-neutral-quota-safe-v1";
+  "8.8.3-free-tier-governor-hard-sdh-neutral-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
 const FETCH_TIMEOUT_MS = 25000;
 
-const GEMINI_MIN_START_INTERVAL_MS = 4300;
-// 8.8.2: a 429 is a PROJECT-WIDE signal, not a worker-local error.
-// Clean runs keep the exact same 4.3s pacing; this barrier adds ZERO wait
-// unless Google actually returns 429.
-const GEMINI_429_GLOBAL_BUFFER_MS = 1500;
+// Gemini 3.5 Flash-Lite FREE TIER — limites confirmados no AI Studio do projeto:
+// 15 RPM / 250k INPUT TPM / 500 RPD.
+// 8.8.3 trabalha MUITO abaixo do teto e reserva orçamento ANTES de chamar a API.
+// O objetivo é evitar 429, não reagir a eles depois que já ocorreram.
+const GEMINI_FREE_RPM_LIMIT = 15;
+const GEMINI_FREE_TPM_LIMIT = 250000;
+const GEMINI_FREE_RPD_LIMIT = 500;
+
+// Contrato operacional conservador. 5 RPM + ~100k input TPM deixam grande margem
+// para capacidade efetiva variável do Free Tier, sem reduzir thinking/qualidade.
+const GEMINI_SAFE_RPM = 5;
+const GEMINI_SAFE_TPM = 90000;
+const GEMINI_SAFE_RPD = 450;
+const GEMINI_MIN_START_INTERVAL_MS = 12000; // 5 RPM no máximo, em qualquer janela curta.
+const GEMINI_429_GLOBAL_BUFFER_MS = 2000;
+const GEMINI_BUDGET_WINDOW_MS = 60000;
+const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.2;
+const GEMINI_TOKEN_ESTIMATE_MARGIN = 1.12;
+const GEMINI_TEXT_BUDGET_FILE = String(
+  process.env.GEMINI_TEXT_BUDGET_FILE ||
+  path.join(process.cwd(), "gemini-text-budget-8.8.3.json")
+);
 
 // Multilingual Audio-Sync Adapter.
 // A Ponte usa este endpoint SOMENTE para construir texto-proxy lexical
@@ -84,15 +101,15 @@ const PLAN_FALLBACK_THINKING = "low";
 const PLAN_FALLBACK_MAX_OUTPUT_TOKENS = 5000;
 const PLAN_FALLBACK_RETRIES = 1;
 
-const MAIN_BATCH_MAX_CUES = 160;
-const MAIN_BATCH_MAX_CHARS = 36000;
-const MAIN_CONCURRENCY = 4;
+const MAIN_BATCH_MAX_CUES = 250;
+const MAIN_BATCH_MAX_CHARS = 56000;
+const MAIN_CONCURRENCY = 1;
 const CAPSULE_CONTEXT_BEFORE = 2;
 const CAPSULE_CONTEXT_AFTER = 2;
 const MAIN_THINKING = "high";
 const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 120000;
-const MAIN_HTTP_RETRIES = 4;
+const MAIN_HTTP_RETRIES = 2;
 const MAIN_PARSE_ATTEMPTS = 2;
 
 // MAIN EMPTY-CUE RESCUE
@@ -113,26 +130,26 @@ const MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN = 2;
 
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 120;
-const REPAIR_BATCH_MAX_CUES = 32;
+const REPAIR_BATCH_MAX_CUES = 60;
 const REPAIR_THINKING = "high";
 const REPAIR_MAX_OUTPUT_TOKENS = 10000;
 const REPAIR_TIMEOUT_MS = 90000;
-const REPAIR_HTTP_RETRIES = 3;
+const REPAIR_HTTP_RETRIES = 2;
 const REPAIR_PARSE_ATTEMPTS = 2;
-const REPAIR_CONCURRENCY = 3;
+const REPAIR_CONCURRENCY = 1;
 
 // QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 420;
+const QA_BATCH_MAX_CUES = 650;
 const QA_BATCH_MAX_CHARS = 90000;
 const QA_THINKING = "high";
 const QA_MAX_OUTPUT_TOKENS = 9000;
 const QA_TIMEOUT_MS = 120000;
-const QA_HTTP_RETRIES = 3;
+const QA_HTTP_RETRIES = 2;
 const QA_PARSE_ATTEMPTS = 2;
 const QA_MAX_FLAGS_TOTAL = 120;
-const QA_CONCURRENCY = 4;
+const QA_CONCURRENCY = 1;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
 
@@ -252,14 +269,167 @@ const translationCache = new Map();
 const jobs = new Map();
 
 let lastGeminiRequestStart = 0;
-let geminiGate = Promise.resolve();
+let geminiFlightGate = Promise.resolve();
 let geminiGlobalCooldownUntil = 0;
+let geminiTextLedger = { calls: [] };
+let geminiSafeRpmActive = GEMINI_SAFE_RPM;
+let geminiSafeTpmActive = GEMINI_SAFE_TPM;
 
 let transcribeGate = Promise.resolve();
 let lastTranscribeRequestStart = 0;
 let transcribeLedger = { calls: [] };
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// ============================================================
+// GEMINI TEXT FREE-TIER GOVERNOR 8.8.3
+// ============================================================
+
+function pruneGeminiTextLedger(now = Date.now()) {
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  geminiTextLedger.calls = Array.isArray(geminiTextLedger.calls)
+    ? geminiTextLedger.calls.filter(item => Number(item?.ts || 0) >= dayAgo)
+    : [];
+}
+
+function loadGeminiTextLedger() {
+  try {
+    if (!fs.existsSync(GEMINI_TEXT_BUDGET_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(GEMINI_TEXT_BUDGET_FILE, "utf8"));
+    if (Array.isArray(parsed?.calls)) geminiTextLedger = { calls: parsed.calls };
+  } catch (error) {
+    console.warn(`[GEMINI FREE-TIER GOVERNOR] ledger não pôde ser lido: ${String(error?.message || error).slice(0, 220)}`);
+  }
+  pruneGeminiTextLedger();
+}
+
+function persistGeminiTextLedger() {
+  try {
+    const dir = path.dirname(GEMINI_TEXT_BUDGET_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${GEMINI_TEXT_BUDGET_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(geminiTextLedger), "utf8");
+    fs.renameSync(tmp, GEMINI_TEXT_BUDGET_FILE);
+  } catch (error) {
+    console.warn(`[GEMINI FREE-TIER GOVERNOR] ledger não pôde ser salvo: ${String(error?.message || error).slice(0, 220)}`);
+  }
+}
+
+function estimateGeminiInputTokens(system, user, schema) {
+  let schemaText = "";
+  try { schemaText = JSON.stringify(schema || {}); } catch {}
+  const chars = Buffer.byteLength(String(system || ""), "utf8") +
+    Buffer.byteLength(String(user || ""), "utf8") +
+    Buffer.byteLength(schemaText, "utf8") + 1200;
+  return Math.max(256, Math.ceil((chars / GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN) * GEMINI_TOKEN_ESTIMATE_MARGIN));
+}
+
+function geminiTextTokenCost(item) {
+  // Reserva conservadora: se o uso real vier menor, mantemos a maior estimativa.
+  return Math.max(Number(item?.estimatedInputTokens || 0), Number(item?.actualInputTokens || 0));
+}
+
+function geminiTextBudgetSnapshot(now = Date.now()) {
+  pruneGeminiTextLedger(now);
+  const minuteAgo = now - GEMINI_BUDGET_WINDOW_MS;
+  const minuteCalls = geminiTextLedger.calls.filter(item => Number(item?.ts || 0) >= minuteAgo);
+  return {
+    calls60s: minuteCalls.length,
+    tokens60s: minuteCalls.reduce((sum, item) => sum + geminiTextTokenCost(item), 0),
+    calls24h: geminiTextLedger.calls.length
+  };
+}
+
+function nextGeminiBudgetWait(now, estimate) {
+  pruneGeminiTextLedger(now);
+  const minuteAgo = now - GEMINI_BUDGET_WINDOW_MS;
+  const minuteCalls = geminiTextLedger.calls
+    .filter(item => Number(item?.ts || 0) >= minuteAgo)
+    .sort((a, b) => Number(a.ts) - Number(b.ts));
+
+  let rpmWait = 0;
+  if (minuteCalls.length >= geminiSafeRpmActive) {
+    const idx = Math.max(0, minuteCalls.length - geminiSafeRpmActive);
+    rpmWait = Math.max(0, Number(minuteCalls[idx].ts) + GEMINI_BUDGET_WINDOW_MS - now + 300);
+  }
+
+  const minuteTokens = minuteCalls.reduce((sum, item) => sum + geminiTextTokenCost(item), 0);
+  let tpmWait = 0;
+  if (minuteTokens + estimate > geminiSafeTpmActive && minuteCalls.length) {
+    let rolling = minuteTokens;
+    for (const item of minuteCalls) {
+      rolling -= geminiTextTokenCost(item);
+      if (rolling + estimate <= geminiSafeTpmActive) {
+        tpmWait = Math.max(0, Number(item.ts) + GEMINI_BUDGET_WINDOW_MS - now + 300);
+        break;
+      }
+    }
+    if (!tpmWait) {
+      tpmWait = Math.max(0, Number(minuteCalls[minuteCalls.length - 1].ts) + GEMINI_BUDGET_WINDOW_MS - now + 300);
+    }
+  }
+
+  const pacerWait = Math.max(0, lastGeminiRequestStart + GEMINI_MIN_START_INTERVAL_MS - now);
+  const cooldownWait = Math.max(0, geminiGlobalCooldownUntil - now);
+  return { waitMs: Math.max(rpmWait, tpmWait, pacerWait, cooldownWait), rpmWait, tpmWait, pacerWait, cooldownWait, minuteTokens, minuteCalls: minuteCalls.length };
+}
+
+async function acquireGeminiFlight() {
+  const previous = geminiFlightGate;
+  let release;
+  geminiFlightGate = new Promise(resolve => { release = resolve; });
+  await previous;
+  return release;
+}
+
+async function reserveGeminiTextBudget({ system, user, schema, job, metric }) {
+  const estimate = estimateGeminiInputTokens(system, user, schema);
+
+  while (true) {
+    const now = Date.now();
+    pruneGeminiTextLedger(now);
+
+    if (geminiTextLedger.calls.length >= GEMINI_SAFE_RPD) {
+      const error = new Error(`GEMINI FREE-TIER GOVERNOR: teto interno diário ${GEMINI_SAFE_RPD}/${GEMINI_FREE_RPD_LIMIT} atingido; nenhuma nova chamada será enviada.`);
+      error.nonRetryable = true;
+      error.code = "GEMINI_SAFE_RPD_LOCK";
+      throw error;
+    }
+
+    const state = nextGeminiBudgetWait(now, estimate);
+    if (state.waitMs > 0) {
+      const reason = state.cooldownWait >= state.waitMs ? "429-COOLDOWN" : state.tpmWait >= state.waitMs ? "TPM" : state.rpmWait >= state.waitMs ? "RPM" : "PACER";
+      if (state.waitMs >= 1000) {
+        console.log(`[GEMINI FREE-TIER GOVERNOR 8.8.3] ${reason} aguardando ${(state.waitMs / 1000).toFixed(1)}s | uso60s=${state.minuteCalls}/${geminiSafeRpmActive} req, ${state.minuteTokens}/${geminiSafeTpmActive} input-tokens | próximo≈${estimate}.`);
+      }
+      if (job) {
+        job.stats.pacerWaitMs += state.waitMs;
+        job.stats.freeTierGovernorWaitMs = (job.stats.freeTierGovernorWaitMs || 0) + state.waitMs;
+      }
+      await sleep(state.waitMs);
+      continue;
+    }
+
+    const id = `${now}-${crypto.randomBytes(4).toString("hex")}`;
+    lastGeminiRequestStart = Date.now();
+    geminiTextLedger.calls.push({ id, ts: lastGeminiRequestStart, metric: String(metric || "main"), estimatedInputTokens: estimate, actualInputTokens: 0 });
+    persistGeminiTextLedger();
+    const snap = geminiTextBudgetSnapshot();
+    console.log(`[GEMINI FREE-TIER GOVERNOR 8.8.3] reserva ${snap.calls60s}/${geminiSafeRpmActive} RPM-soft | ${snap.tokens60s}/${geminiSafeTpmActive} TPM-soft | diário=${snap.calls24h}/${GEMINI_SAFE_RPD}.`);
+    return id;
+  }
+}
+
+function commitGeminiTextUsage(id, usage = {}) {
+  const item = geminiTextLedger.calls.find(call => call.id === id);
+  if (!item) return;
+  item.actualInputTokens = Number(usage?.total_input_tokens || usage?.input_tokens || 0);
+  item.updatedAt = Date.now();
+  persistGeminiTextLedger();
+}
+
+loadGeminiTextLedger();
+pruneGeminiTextLedger();
 
 // ============================================================
 // TRANSCRIBE BUDGET
@@ -1009,6 +1179,7 @@ function createJob({
       jobRetries: 0,
 
       pacerWaitMs: 0,
+      freeTierGovernorWaitMs: 0,
 
       inputTokens: 0,
       outputTokens: 0,
@@ -2153,7 +2324,7 @@ function looksLikeUniversalSdhAction(
 }
 
 // ============================================================
-// HARD SDH STRUCTURE 8.8.2
+// HARD SDH STRUCTURE 8.8.3
 // ============================================================
 // Bracket/parenthetical captions are accessibility metadata far more often
 // than dialogue. The older lexical classifier missed perfectly normal CC
@@ -4128,7 +4299,7 @@ function cleanSrtForTranslation(
       speakers.size >= 1 &&
       explicitDialogueTurns >= 2
     ) {
-      // 8.8.2: a label de um turno NÃO vira identidade do cue inteiro.
+      // 8.8.3: a label de um turno NÃO vira identidade do cue inteiro.
       // Isso impede "-I'm tired / -SARAH: ..." de atribuir Sarah ao 1º turno.
       speakerHintsSuppressedMultiTurn++;
     }
@@ -4704,7 +4875,7 @@ function stripOutputAccessibilityLine(
       `${hadDash ? "- " : ""}${info.text}`.trim();
   }
 
-  // Fallback 8.8.2: speaker labels must never be visible in the final SRT.
+  // Fallback 8.8.3: speaker labels must never be visible in the final SRT.
   // Conservative: removes only a prefix that itself passes looksLikeSpeakerLabel.
   text = text.replace(
     /^(\s*[-–—]\s*)?([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 #.'’_-]{0,45})\s*:\s*(?=\S)/u,
@@ -5775,7 +5946,7 @@ CONTEXT + IDENTITY LOCK — REGRA INVIOLÁVEL
 - Um nome/pronome no target deve ser resolvido com before/after + Character Ledger; se ainda houver ambiguidade, preserve a ambiguidade de forma natural.
 - Não invente parentesco, identidade, pronome, título ou nome ausente da evidência.
 
-GENDER-NEUTRAL DEFAULT 8.8.2 — REGRA ABSOLUTA
+GENDER-NEUTRAL DEFAULT 8.8.3 — REGRA ABSOLUTA
 - Se a SOURCE não expressa gênero naquela ideia, o PT-BR NÃO deve introduzir gênero desnecessariamente, MESMO quando a identidade do speaker é conhecida.
 - O Character Ledger protege contra contradição; ele NÃO obriga "cansado/cansada", "sozinho/sozinha", "confuso/confusa" etc. quando existe formulação neutra natural.
 - Prefira SEMPRE a formulação naturalmente neutra: "I'm scared" -> "Tô com medo"; "I'm confused" -> "Não tô entendendo"; "I'm alone" -> "Tô sem ninguém por perto"; "I'm worried" -> "Isso tá me preocupando".
@@ -7487,6 +7658,39 @@ function extractInteractionText(
   return out.trim();
 }
 
+function extractGeminiQuotaDetails(data) {
+  const out = [];
+  const details = Array.isArray(data?.error?.details)
+    ? data.error.details
+    : Array.isArray(data?.details)
+      ? data.details
+      : [];
+
+  for (const detail of details) {
+    const violations = Array.isArray(detail?.violations) ? detail.violations : [];
+    for (const v of violations) {
+      out.push({
+        metric: String(v?.quotaMetric || v?.metric || ""),
+        id: String(v?.quotaId || v?.quota_id || ""),
+        value: v?.quotaValue ?? v?.quota_value ?? null,
+        dimensions: v?.quotaDimensions || v?.quota_dimensions || null
+      });
+    }
+  }
+
+  return out;
+}
+
+function quotaDetailsText(data) {
+  const rows = extractGeminiQuotaDetails(data);
+  if (!rows.length) return "quota-detail=indisponível";
+  return rows.map(row => {
+    let dims = "";
+    try { dims = row.dimensions ? JSON.stringify(row.dimensions) : ""; } catch {}
+    return `metric=${row.metric || "?"} | id=${row.id || "?"} | limit=${row.value ?? "?"}${dims ? ` | dims=${dims}` : ""}`;
+  }).join(" || ").slice(0, 1800);
+}
+
 function raiseGeminiGlobalCooldown(
   waitMs,
   job,
@@ -7502,86 +7706,26 @@ function raiseGeminiGlobalCooldown(
   const candidate =
     Date.now() + safeWait;
 
+  // 429 deveria ser excepcional no 8.8.3. Se ocorrer por capacidade efetiva
+  // variável do serviço, o governor aprende imediatamente um perfil ainda
+  // mais conservador para o restante da vida do processo.
+  geminiSafeRpmActive = Math.min(geminiSafeRpmActive, 4);
+  geminiSafeTpmActive = Math.min(geminiSafeTpmActive, 75000);
+
   if (candidate > geminiGlobalCooldownUntil) {
     geminiGlobalCooldownUntil =
       candidate;
 
     console.warn(
-      `[GEMINI QUOTA BARRIER 8.8.2] 429 em ${String(metric || "gemini").toUpperCase()} | ` +
-      `TODOS os workers pausados por ~${(safeWait / 1000).toFixed(1)}s; ` +
-      `nenhuma nova chamada consumirá a janela enquanto a cota se recompõe.`
+      `[GEMINI QUOTA BARRIER 8.8.3] 429 em ${String(metric || "gemini").toUpperCase()} | ` +
+      `single-flight pausado por ~${(safeWait / 1000).toFixed(1)}s; ` +
+      `perfil adaptativo=${geminiSafeRpmActive} RPM/${geminiSafeTpmActive} TPM.`
     );
   }
 
   if (job) {
     job.stats.global429Barriers =
       (job.stats.global429Barriers || 0) + 1;
-  }
-}
-
-async function acquireGeminiSlot(
-  job
-) {
-  let release;
-
-  const previous =
-    geminiGate;
-
-  geminiGate =
-    new Promise(resolve => {
-      release = resolve;
-    });
-
-  await previous;
-
-  try {
-    // Reavalia depois de CADA espera. Um 429 pode chegar de outro worker
-    // enquanto este já aguardava o gate de 4.3s. Sem o loop, ele ainda
-    // dispararia durante o cooldown e recriaria a tempestade de 429.
-    while (true) {
-      const now =
-        Date.now();
-
-      const pacerWait =
-        Math.max(
-          0,
-          GEMINI_MIN_START_INTERVAL_MS -
-          (now - lastGeminiRequestStart)
-        );
-
-      const quotaWait =
-        Math.max(
-          0,
-          geminiGlobalCooldownUntil - now
-        );
-
-      const wait =
-        Math.max(
-          pacerWait,
-          quotaWait
-        );
-
-      if (wait <= 0) {
-        break;
-      }
-
-      if (job) {
-        job.stats.pacerWaitMs +=
-          wait;
-
-        if (quotaWait >= pacerWait && quotaWait > 0) {
-          job.stats.global429CooldownWaitMs =
-            (job.stats.global429CooldownWaitMs || 0) + wait;
-        }
-      }
-
-      await sleep(wait);
-    }
-
-    lastGeminiRequestStart =
-      Date.now();
-  } finally {
-    release();
   }
 }
 
@@ -7715,9 +7859,17 @@ async function geminiRequest({
       metric
     );
 
-    await acquireGeminiSlot(
-      job
-    );
+    const releaseGeminiFlight = await acquireGeminiFlight();
+    let geminiBudgetReservationId = null;
+
+    try {
+      geminiBudgetReservationId = await reserveGeminiTextBudget({
+        system, user, schema, job, metric
+      });
+    } catch (budgetError) {
+      releaseGeminiFlight();
+      throw budgetError;
+    }
 
     const controller =
       new AbortController();
@@ -7890,6 +8042,11 @@ async function geminiRequest({
   );
 }
 
+        commitGeminiTextUsage(
+          geminiBudgetReservationId,
+          data?.usage || {}
+        );
+
         markSuccess(
           job,
           metric,
@@ -7983,9 +8140,8 @@ async function geminiRequest({
         }
 
         console.warn(
-          `[GEMINI ${
-            metric.toUpperCase()
-          }] 429; retry do mesmo lote será feito pelo gate GLOBAL após a janela segura.`
+          `[GEMINI ${metric.toUpperCase()}] 429 EXCEPCIONAL após governor | ${quotaDetailsText(data)} | ` +
+          `retry do mesmo lote somente após RetryInfo + orçamento local.`
         );
 
         continue;
@@ -8069,6 +8225,7 @@ async function geminiRequest({
       );
     } finally {
       clearTimeout(timer);
+      releaseGeminiFlight();
     }
   }
 
@@ -10268,7 +10425,7 @@ function parseMainCueTranslationRobust(
 
   if (ignoredExtras || ignoredDuplicates || badOwnership) {
     console.warn(
-      `[MAIN ROBUST PARSER 8.8.2] extras=${ignoredExtras} | ` +
+      `[MAIN ROBUST PARSER 8.8.3] extras=${ignoredExtras} | ` +
       `duplicados=${ignoredDuplicates} | ownership-inválido=${badOwnership}; ` +
       `cues válidos foram preservados, sem retraduzir o lote.`
     );
@@ -10499,7 +10656,7 @@ async function rescueEmptyMainCue({
             (job.stats.mainEmptyCueQuotaDefers || 0) + 1;
 
           console.warn(
-            `[MAIN EMPTY-CUE QUOTA DEFER 8.8.2] cue ${block.index}: ` +
+            `[MAIN EMPTY-CUE QUOTA DEFER 8.8.3] cue ${block.index}: ` +
             `quota continuou indisponível após os retries HTTP internos; ` +
             `NÃO haverá uma nova rodada 3x3. Conteúdo seguro segue para QA/Repair.`
           );
@@ -10677,7 +10834,7 @@ async function translateMainBatch({
       job.stats.mainEmptyCueRescueCues += rescueIds.length;
 
       console.warn(
-        `[MAIN FOCAL RESCUE 8.8.2] preservando ${parsed.translations.size}/${batch.length} ` +
+        `[MAIN FOCAL RESCUE 8.8.3] preservando ${parsed.translations.size}/${batch.length} ` +
         `cues válidos; refazendo SOMENTE ${rescueIds.length} cue(s): ` +
         `${rescueIds.join(", ")}.`
       );
@@ -10715,7 +10872,12 @@ async function translateMainBatch({
       lastError = error;
 
       if (isDeterministicGeminiRequestError(error)) {
-        if (batch.length > 90 && splitDepth < 1) {
+        const deterministicStatus = Number(error?.status || 0);
+        const deterministicText = String(error?.message || error || "");
+        const explicitSize400 = deterministicStatus === 400 &&
+          /(?:request|payload|input|context).{0,40}(?:too large|too long|size|limit|max(?:imum)?|tokens?)|(?:too large|too long).{0,40}(?:request|payload|input|context)/i.test(deterministicText);
+        const mayShrinkRequest = [413, 422].includes(deterministicStatus) || explicitSize400;
+        if (mayShrinkRequest && batch.length > 90 && splitDepth < 1) {
           const mid = Math.ceil(batch.length / 2);
           const leftBatch = batch.slice(0, mid);
           const rightBatch = batch.slice(mid);
@@ -10726,10 +10888,8 @@ async function translateMainBatch({
             `sem repetir o mesmo request e sem reiniciar o job.`
           );
 
-          const [left, right] = await Promise.all([
-            translateMainBatch({ blocks, posMap, batch: leftBatch, plan, job, splitDepth: splitDepth + 1 }),
-            translateMainBatch({ blocks, posMap, batch: rightBatch, plan, job, splitDepth: splitDepth + 1 })
-          ]);
+          const left = await translateMainBatch({ blocks, posMap, batch: leftBatch, plan, job, splitDepth: splitDepth + 1 });
+          const right = await translateMainBatch({ blocks, posMap, batch: rightBatch, plan, job, splitDepth: splitDepth + 1 });
           return new Map([...left, ...right]);
         }
 
@@ -16030,7 +16190,7 @@ async function runBoundedFinalQuality88(
   for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
 
   console.log(
-    `[FINAL BOUNDED 8.8.2] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
+    `[FINAL BOUNDED 8.8.3] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
     `zero convergência aberta.`
   );
 
@@ -16075,7 +16235,7 @@ async function runBoundedFinalQuality88(
 
   if (verifyFocus.size) {
     console.log(
-      `[FINAL BOUNDED 8.8.2] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
+      `[FINAL BOUNDED 8.8.3] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
       `esta é a última auditoria Gemini do job.`
     );
 
@@ -16105,7 +16265,7 @@ async function runBoundedFinalQuality88(
     if (issues2.length) {
       logIssueSummary("FINAL-88-LAST-REPAIR", issues2);
       console.warn(
-        `[FINAL BOUNDED 8.8.2] ${issues2.length} blocker(s) residuais; ` +
+        `[FINAL BOUNDED 8.8.3] ${issues2.length} blocker(s) residuais; ` +
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
@@ -16131,7 +16291,7 @@ async function runBoundedFinalQuality88(
 
   if (finalLocal.length) {
     console.warn(
-      `[FINAL BOUNDED 8.8.2] ${finalLocal.length} guard(s) local(is) residual(is) ` +
+      `[FINAL BOUNDED 8.8.3] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
     job.qualityStatus = "bounded_best_candidate";
@@ -16168,7 +16328,7 @@ async function translateSrt(
     blocks.length;
 
   console.log(
-    `[PIPELINE 8.8.2 BOUNDED] fonte=${
+    `[PIPELINE 8.8.3 BOUNDED] fonte=${
       job.sourceKind
     } | ${
       blocks.length
@@ -16369,7 +16529,7 @@ auditTimestamps(
     );
 
   console.log(
-    `[PIPELINE 8.8.2 BOUNDED] FINAL OK | ${
+    `[PIPELINE 8.8.3 BOUNDED] FINAL OK | ${
       blocks.length
     } source cues | pipeline=${
       pipelineElapsedSeconds.toFixed(1)
@@ -17991,7 +18151,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 8.8.2 - HARD SDH + NEUTRAL GENDER"
+        " STREMIO PT-BR 8.8.3 - FREE-TIER GOVERNOR + HARD SDH + NEUTRAL GENDER"
   );
 
   console.log(
@@ -18087,7 +18247,7 @@ console.log(
 );
 
   console.log(
-  "Post-Rewrite 8.8.2: auditoria redundante fundida no Final Bounded focal HIGH ✅"
+  "Post-Rewrite 8.8.3: auditoria redundante fundida no Final Bounded focal HIGH ✅"
 );
 
 console.log(
@@ -18116,7 +18276,7 @@ console.log(
   );
 
   console.log(
-    `Gate global: ${GEMINI_MIN_START_INTERVAL_MS}ms entre inícios ✅`
+    `Free-Tier pacing: ${GEMINI_MIN_START_INTERVAL_MS}ms mínimo entre inícios + orçamento rolling RPM/TPM antes de CADA request ✅`
   );
 
   console.log(
@@ -18140,7 +18300,7 @@ console.log(
   );
 
   console.log(
-    "Cue Ownership 8.8.2: ID + key por cue, contexto compartilhado ✅"
+    "Cue Ownership 8.8.3: ID + key por cue, contexto compartilhado ✅"
   );
 
   console.log(
@@ -18188,7 +18348,7 @@ console.log(
   );
 
   console.log(
-    `Concurrency Efficiency 8.4.5: MAIN=${MAIN_CONCURRENCY} | QA=${QA_CONCURRENCY} | Semantic=${SEMANTIC_REWRITE_AUDIT_CONCURRENCY} | gate global=${GEMINI_MIN_START_INTERVAL_MS}ms INALTERADO ✅`
+    `Free-Tier execution: MAIN=${MAIN_CONCURRENCY} | QA=${QA_CONCURRENCY} | REPAIR=${REPAIR_CONCURRENCY} | single-flight global=ATIVO ✅`
   );
 
   console.log(
@@ -18240,10 +18400,10 @@ console.log(
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
-  console.log("Final 8.8.2: mesmo pipeline bounded 8.8; HARD SDH early-drop + neutral gender default; zero estágio Gemini novo ✅");
-  console.log("MAIN Robust 8.8.2: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
-  console.log("MAIN Fail-Fast 8.8.2: erro determinístico não vira loop; payload compacto + rescue focal ✅");
-  console.log("Final Bounded 8.8.2: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
+  console.log("Final 8.8.3: mesmo pipeline bounded 8.8; HARD SDH early-drop + neutral gender default; zero estágio Gemini novo ✅");
+  console.log("MAIN Robust 8.8.3: extras/duplicatas não derrubam lote; somente cues ausentes são refeitos ✅");
+  console.log("MAIN Fail-Fast 8.8.3: erro determinístico não vira loop; payload compacto + rescue focal ✅");
+  console.log("Final Bounded 8.8.3: zero loop de convergência; no máximo 2 auditorias focais + repairs focais ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
 
   console.log(
@@ -18255,11 +18415,11 @@ console.log(
   );
 
   console.log(
-    "Pre-Repair 8.8.2: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
+    "Pre-Repair 8.8.3: rodada Gemini redundante removida; QA HIGH global é a autoridade semântica ✅"
   );
 
   console.log(
-    "Concurrency 8.4.5: more in-flight work without increasing Gemini start rate. OK"
+    "Single-Flight 8.8.3: no Free Tier nunca existem duas GenerateContent em voo ao mesmo tempo ✅"
   );
 
   console.log(
@@ -18267,23 +18427,23 @@ console.log(
   );
 
   console.log(
-    "HARD SDH 8.8.2: caption/action-only é eliminado ANTES do MAIN; SDH-only não pode acionar Gemini rescue ✅"
+    "HARD SDH 8.8.3: caption/action-only é eliminado ANTES do MAIN; SDH-only não pode acionar Gemini rescue ✅"
   );
 
   console.log(
-    "Gender Neutral Default 8.8.2: SOURCE neutra => PT-BR neutro natural; speaker label nunca atravessa turno ✅"
+    "Gender Neutral Default 8.8.3: SOURCE neutra => PT-BR neutro natural; speaker label nunca atravessa turno ✅"
   );
 
   console.log(
-    "Latency Contract 8.8.2: zero etapa Gemini nova; mesmos MAIN/QA/REPAIR/FINAL bounded; SDH early-drop reduz trabalho ✅"
+    "Latency Contract 8.8.3: zero etapa Gemini nova; mesmos MAIN/QA/REPAIR/FINAL bounded; SDH early-drop reduz trabalho ✅"
   );
 
   console.log(
-    `Quota-Safe 8.8.2: primeiro 429 abre barreira GLOBAL; todos os workers respeitam RetryInfo; clean run mantém gate=${GEMINI_MIN_START_INTERVAL_MS}ms ✅`
+    `Free-Tier Governor 8.8.3: limites AI Studio=15 RPM / 250k input TPM / 500 RPD; operação interna=${GEMINI_SAFE_RPM} RPM / ${GEMINI_SAFE_TPM} input TPM / ${GEMINI_SAFE_RPD} RPD ✅`
   );
 
   console.log(
-    "Quota Rescue 8.8.2: 429 persistente em empty-cue faz DEFER para QA/Repair; zero tempestade 3x3 ✅"
+    "Quota Diagnostics 8.8.3: 429 é excepcional; métrica/quotaId/limit do Google são logados e o governor cai para 4 RPM/75k TPM ✅"
   );
 
   console.log(
