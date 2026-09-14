@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2 - SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY
+// STREMIO PT-BR 9.2.1 - ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -8584,11 +8584,30 @@ function invalidateResponseModelForJob(job, response, label, error) {
   if (!modelId || !job) return;
 
   job.stats.modelInvalidResponses = Number(job.stats.modelInvalidResponses || 0) + 1;
-  skipModelForJob(
-    job,
-    modelId,
-    `${label}: ${errorMessage(error).slice(0, 220)}`,
-    "invalid_response"
+
+  const reason = `${label}: ${errorMessage(error).slice(0, 220)}`;
+  const now = Date.now();
+  const hasEligibleAlternative = geminiRouteForMetric("main").some(otherModelId => {
+    if (otherModelId === modelId) return false;
+    if (modelSkippedForJob(job, otherModelId)) return false;
+    return Number(runtimeForGeminiModel(otherModelId).unavailableUntil || 0) <= now;
+  });
+
+  if (hasEligibleAlternative) {
+    // 9.2.1: uma resposta estruturalmente inválida pode justificar trocar de modelo
+    // quando ainda existe outra rota saudável, mas isso NÃO é uma indisponibilidade
+    // global. O modelo atual só é evitado dentro deste job.
+    skipModelForJob(job, modelId, reason, "invalid_response");
+    return;
+  }
+
+  // 9.2.1: nunca envenene a última rota disponível por um erro de conteúdo
+  // localizado (ex.: um __LOCK_C...__ omitido). O caller já possui retries
+  // de parse estritamente limitados, então podemos repetir de forma bounded.
+  setJobModelHealth(job, modelId, "invalid_response_retryable", reason);
+  console.warn(
+    `[MODEL ROUTER] ${modelId} resposta inválida localizada | ${reason} | ` +
+    `nenhuma rota alternativa saudável; modelo permanece elegível para retry bounded.`
   );
 }
 
@@ -11987,12 +12006,22 @@ async function translateAllMain(
     }
   }
 
-  await Promise.all(
+  const workerResults = await Promise.allSettled(
     Array.from(
       { length: Math.min(MAIN_CONCURRENCY, work.length) },
       (_, index) => worker(index + 1)
     )
   );
+
+  const failedWorker = workerResults.find(result => result.status === "rejected");
+  if (failedWorker) {
+    job.stats.mainWorkerDrainFailures = Number(job.stats.mainWorkerDrainFailures || 0) + 1;
+    console.warn(
+      `[MAIN DRAIN 9.2.1] falha localizada detectada; todos os workers em voo ` +
+      `foram drenados antes do retry/job terminal | checkpoint=${job.mainCheckpoint.size}/${blocks.length}.`
+    );
+    throw failedWorker.reason;
+  }
 
   if (translations.size !== blocks.length) {
     throw new Error(
@@ -21039,7 +21068,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2 - SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY"
+        " STREMIO PT-BR 9.2.1 - ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY"
   );
 
   console.log(
@@ -21439,6 +21468,10 @@ console.log(
 
   console.log(
     "Concrete Referent Lock 9.2: contexto textual não autoriza inventar objetos invisíveis ao modelo ✅"
+  );
+
+  console.log(
+    "Router Resilience 9.2.1: invalid_response não envenena a última rota; MAIN drena workers antes de retry/terminal ✅"
   );
 
   console.log(
