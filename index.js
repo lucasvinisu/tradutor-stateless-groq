@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.1 - LATENCY + EMPTY-CUE + GENDER LOCK
+// STREMIO PT-BR 9.2 - SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.1-latency-empty-gender-v1";
+  "9.2-subtitle-hygiene-music-relevance-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -3070,6 +3070,63 @@ function looksLikeFinalGarbageCue(value) {
   );
 }
 
+
+// ============================================================
+// SUBTITLE HYGIENE 9.2 — NON-SEMANTIC VOCALIZATIONS
+// ============================================================
+// Legenda profissional não precisa transcrever todo ruído produzido pela boca.
+// Removemos SOMENTE linhas puramente não semânticas. Acknowledgements que
+// realmente respondem à conversa (mm-hmm/uh-huh) continuam protegidos.
+function looksLikeEditoriallyDroppableVocalization(value) {
+  const text = String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[♪♫♬]/gu, " ")
+    .replace(/^\s*[-–—~]\s*/u, "")
+    .toLocaleLowerCase()
+    .replace(/[!?.,…:;"“”'’()\[\]]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return false;
+  const compact = text.replace(/[\s-]+/g, "");
+
+  // Respostas afirmativas carregam significado; não apagar.
+  if (/^(?:mmhmm|mhm|uhhuh|uhum|aham)$/iu.test(compact)) return false;
+
+  // Hesitação isolada e sinais vocais sem conteúdo lexical.
+  if (/^(?:u+h+|u+m+|e+r+m*|a+h+n*|ã+h+)$/iu.test(compact)) return true;
+  if (/^(?:sh+|ps+t+|tsk+|tch+|tss+|ss+h+)$/iu.test(compact)) return true;
+
+  const parts = text.split(/\s+/).filter(Boolean);
+  return parts.length > 1 && parts.length <= 8 && parts.every(part =>
+    /^(?:uh+|um+|er+|erm+|ahn+|ãh+|sh+|ps+t+|tsk+|tch+|tss+)$/iu.test(part)
+  );
+}
+
+function musicVocalizationTokens(value) {
+  return String(value || "")
+    .toLocaleLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[♪♫♬]/gu, " ")
+    .replace(/[^a-z0-9' -]+/g, " ")
+    .replace(/[-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+}
+
+function looksLikeNonSemanticMusicVocalization(value) {
+  const tokens = musicVocalizationTokens(value);
+  if (!tokens.length || tokens.length > 18) return false;
+  const phonetic = new Set([
+    "woo","wooh","hoo","yee","yeeh","ooh","oooh","oh","ohh","ah","ahh",
+    "uhu","ihu","uh","ha","hey","ho","la","na","da","doo","du","dum","bam"
+  ]);
+  return tokens.every(token => phonetic.has(token));
+}
+
 function cleanSourceLine(line) {
   let text =
     stripMarkup(
@@ -3089,6 +3146,10 @@ function cleanSourceLine(line) {
     stripPseudoMusicOcrWrappers(
       text
     );
+
+  if (looksLikeEditoriallyDroppableVocalization(text)) {
+    return "";
+  }
 
   if (
     looksLikeSourceGarbageLine(
@@ -3464,6 +3525,9 @@ const MUSIC_REPRISE_MIN_OVERLAP = 0.66;
 
 const PERFORMANCE_LAUNCH_RE =
   /(?:\bhit it\b|\btake it away\b|\bgive it up\b|\blet'?s hear it\b|\blet'?s hear (?:it )?for\b|\bstart the music\b|\bmusic[, ]+maestro\b|\bplay it\b|\bshowtime\b|\b(?:now|next)[, ]+(?:performing|singing)\b|\bperforming live\b|\bsinging live\b|\bon stage now\b|\bi sang my song\b|\bi (?:wrote|made) (?:this|my) song\b|\b(?:here(?:'s| is)|this is) (?:my|our) song\b|\bi(?:'m| am) (?:going to|gonna) sing\b|\bi(?:'ll| will) sing\b|\bsing (?:my|our) song\b|\bmanda ver\b|\bsolta o som\b|\bcomeça a música\b|\bvamos ouvir\b|\bvalendo\b|\bagora[, ]+(?:cantando|se apresentando)\b|\beu cantei minha música\b|\beu (?:escrevi|fiz) (?:essa|esta|minha) música\b|\b(?:essa|esta) é (?:a )?minha música\b|\beu vou cantar\b)/iu;
+
+const PERFORMANCE_RELEVANCE_CONTEXT_RE =
+  /(?:\blip\s*sync\b|\brusical\b|\bperformance\b|\bperforming\s+live\b|\bsinging\s+live\b|\bon\s+stage\b|\bkaraoke\b|\bconcert\b|\bchoir\b|\bband\b|\baudition\b|\bshowtime\b|\bmusical\s+(?:number|performance)\b|\bi\s+sang\s+my\s+song\b|\bi\s+(?:wrote|made)\s+(?:this|my)\s+song\b|\b(?:here(?:'s| is)|this is)\s+(?:my|our)\s+song\b|\bi(?:'m| am)\s+(?:going to|gonna)\s+sing\b|\bi(?:'ll| will)\s+sing\b|\bsing\s+(?:my|our)\s+song\b|\bapresenta(?:ção|ndo|r)\s+(?:ao vivo)?\b|\bno\s+palco\b|\beu\s+cantei\s+minha\s+música\b|\beu\s+(?:escrevi|fiz)\s+(?:essa|esta|minha)\s+música\b|\b(?:essa|esta)\s+é\s+(?:a\s+)?minha\s+música\b|\beu\s+vou\s+cantar\b)/iu
 
 function rawCueVisibleLines(
   raw
@@ -3911,6 +3975,34 @@ function clusterHasImmediatePerformanceLaunch(
   );
 }
 
+function clusterHasNarrativePerformanceEvidence(cluster, info, rawBlocks) {
+  if (!cluster?.length) return false;
+  const first = info[cluster[0]];
+  const last = info[cluster[cluster.length - 1]];
+  if (!Number.isFinite(first?.startMs) || !Number.isFinite(last?.endMs)) return false;
+
+  const windowStart = first.startMs - 30000;
+  const windowEnd = last.endMs + 30000;
+  const clusterSet = new Set(cluster);
+  const nearby = [];
+
+  for (let i = 0; i < info.length; i++) {
+    const item = info[i];
+    if (!Number.isFinite(item?.startMs) || !Number.isFinite(item?.endMs)) continue;
+    if (item.endMs < windowStart || item.startMs > windowEnd) continue;
+    if (clusterSet.has(i)) continue;
+
+    const visible = rawCueVisibleLines(rawBlocks[i])
+      .filter(line => !looksLikeBareSdhLine(line) && !/[♪♫♬]/u.test(line))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (visible) nearby.push(visible);
+  }
+
+  return PERFORMANCE_RELEVANCE_CONTEXT_RE.test(nearby.join(" "));
+}
+
 function musicLexicalTokens(value) {
   return String(value || "")
     .toLocaleLowerCase()
@@ -3921,7 +4013,8 @@ function musicLexicalTokens(value) {
     .replace(/\s+/g, " ")
     .trim()
     .split(" ")
-    .filter(token => token.length >= 2);
+    .filter(token => token.length >= 2)
+    .filter(token => !new Set(["woo","wooh","hoo","yee","yeeh","ooh","oooh","ohh","ahh","uhu","ihu","la","na","doo"]).has(token));
 }
 
 function musicLexicalOverlap(a, b) {
@@ -4064,8 +4157,8 @@ function detectPerformanceMusicIndexes(
   const confirmedClusters =
     new Set();
 
-  // CAMADA 1 — regra segura original:
-  // 4+ cues distribuídos por 25+ segundos.
+  // CAMADA 1 — 9.2: duração/densidade sozinhas NÃO provam relevância.
+  // Cluster longo só é performance quando o contexto narrativo também prova isso.
   for (
     let clusterIndex = 0;
     clusterIndex <
@@ -4094,12 +4187,22 @@ function detectPerformanceMusicIndexes(
       spanMs >= MUSIC_DENSE_MIN_SPAN_MS &&
       current.every(rawIndex => musicLexicalTokens(info[rawIndex]?.text).length >= 2);
 
+    const narrativePerformanceEvidence =
+      clusterHasNarrativePerformanceEvidence(
+        current,
+        info,
+        rawBlocks
+      );
+
     if (
       (
-        current.length >= MUSIC_STRONG_MIN_CUES &&
-        spanMs >= MUSIC_STRONG_MIN_SPAN_MS
-      ) ||
-      denseLexicalPerformance
+        (
+          current.length >= MUSIC_STRONG_MIN_CUES &&
+          spanMs >= MUSIC_STRONG_MIN_SPAN_MS
+        ) ||
+        denseLexicalPerformance
+      ) &&
+      narrativePerformanceEvidence
     ) {
       if (!terminalOutro) {
         confirmedClusters.add(clusterIndex);
@@ -4138,6 +4241,11 @@ function detectPerformanceMusicIndexes(
 
     if (
       clusterHasImmediatePerformanceLaunch(
+        current,
+        info,
+        rawBlocks
+      ) ||
+      clusterHasNarrativePerformanceEvidence(
         current,
         info,
         rawBlocks
@@ -4422,6 +4530,8 @@ function cleanSrtForTranslation(
   let sdhLinesRemoved = 0;
   let backgroundLyricLinesRemoved = 0;
   let performanceLyricLinesKept = 0;
+  let nonSemanticMusicVocalizationsRemoved = 0;
+  let pureVocalizationsRemoved = 0;
 
   for (
     let rawIndex = 0;
@@ -4503,6 +4613,14 @@ function cleanSrtForTranslation(
       }
 
       if (
+        classified.kind !== "lyric" &&
+        looksLikeEditoriallyDroppableVocalization(classified.visible)
+      ) {
+        pureVocalizationsRemoved++;
+        continue;
+      }
+
+      if (
         classified.kind ===
         "sdh"
       ) {
@@ -4518,6 +4636,14 @@ function cleanSrtForTranslation(
         )
       ) {
         backgroundLyricLinesRemoved++;
+        continue;
+      }
+
+      if (
+        classified.kind === "lyric" &&
+        looksLikeNonSemanticMusicVocalization(classified.visible)
+      ) {
+        nonSemanticMusicVocalizationsRemoved++;
         continue;
       }
 
@@ -4635,6 +4761,10 @@ function cleanSrtForTranslation(
       backgroundLyricLinesRemoved
     }; letra-performance-linhas=${
       performanceLyricLinesKept
+    }; vocal-musical-removida=${
+      nonSemanticMusicVocalizationsRemoved
+    }; vocal-pura-removida=${
+      pureVocalizationsRemoved
     }; speakerHints=${
       speakerHints
     }; speakerHints-multiturno-suprimidos=${
@@ -6440,6 +6570,8 @@ EXEMPLOS DE DEFEITO DE NATURALIDADE
   MELHOR: reconstrua a transição naturalmente: "Dito isso...", "Mas...", "Só que..." etc.
 - RUIM: "O Maxi Desafio desta semana é uma reviravolta no Snatch Game chamada..."
   MELHOR: prefira uma formulação enxuta e brasileira como "O Maxi Desafio desta semana é uma versão do Snatch Game..." quando esse for o sentido.
+- "We need to move now" em fuga/urgência muitas vezes pede "Precisamos sair daqui agora", não o calque "precisamos nos mover agora"; escolha pelo contexto.
+- "Sweep everything into the backpack" no sentido de recolher/empurrar itens pede algo como "Coloca tudo dentro da mochila", não "vire/varra tudo" mecanicamente.
 - Os exemplos ensinam o TIPO de correção; não os copie mecanicamente em contextos diferentes.
 
 CONCISÃO AUDIOVISUAL
@@ -6711,6 +6843,21 @@ REVISÃO ORTOGRÁFICA E NATURALIDADE — ANTES DE DEVOLVER CADA CUE
 - Evite calques sem sentido como "tomar consistência" quando um brasileiro diria a ideia de outro modo.
 - Leia a frase PT-BR inteira mentalmente: se parecer tradução mecânica, REESCREVA preservando sentido, identidade e cue.
 
+HIGIENE EDITORIAL DE FALA — LEGENDA NÃO É TRANSCRIÇÃO VERBATIM
+- Inglês falado contém hesitações, vícios, falsos começos e repetições mecânicas que podem soar naturais no áudio e AMADORAS quando copiadas para a legenda.
+- Omita fillers sem valor semântico como "uh", "um", "er" e equivalentes quando forem apenas hesitação.
+- Suavize falsos começos e duplicações involuntárias: "I, I think...", "we, we need..." normalmente viram uma frase PT-BR limpa.
+- NÃO apague repetição intencional que comunica pânico, insistência, humor, ritmo, gag, emoção ou caracterização. "No, no, no!" em pânico continua repetido quando a repetição é a intenção.
+- Preserve acknowledgements que realmente respondem à conversa (por exemplo, um "uh-huh" que significa sim).
+- Vocalização pura sem conteúdo lexical/semântico — inclusive "shh/shhhh", "psst", hesitação isolada e ruído vocal — normalmente NÃO precisa aparecer como legenda.
+- Regra decisiva: se retirar a vocalização/repetição não muda informação, intenção, emoção relevante, speaker turn ou timing narrativo, prefira a legenda limpa.
+
+MÚSICA — RELEVÂNCIA NARRATIVA, NÃO TRANSCRIÇÃO AUTOMÁTICA
+- Performance/lip sync/Rusical/número musical/letra que conta a história ou produz humor/emoção relevante: PRESERVE e traduza.
+- Música incidental, trilha, montagem ou canção ao fundo cuja letra não acrescenta compreensão da cena: NÃO exiba a letra.
+- Vocalizações musicais puramente fonéticas (woo-hoo, yee-hoo, ooh, la-la etc.) não devem virar Uhu/Ihu/etc. só porque estão audíveis.
+- Não mantenha letra apenas porque o cluster musical é longo. Relevância vem do contexto narrativo/performance.
+
 ACESSIBILIDADE / SDH
 - O texto recebido já passou por limpeza, mas se escapar qualquer descrição de som, ação, voz ou speaker label, NÃO a reproduza.
 - Não devolva NOME:, [NOME], (ofegante), [porta fechando], (ao longe), descrição sonora, indicação de voz ou comentário de acessibilidade.
@@ -6813,8 +6960,9 @@ CHECKLIST SILENCIOSO OBRIGATÓRIO ANTES DE CADA pt:
 11. Se o resultado estiver correto porém literal, NÃO devolva ainda: reescreva.
 12. Antes de resolver uma fala ambígua, LEIA os cues imediatamente anteriores e seguintes disponíveis. Traduza a intenção daquela cena, não a sentença isolada.
 13. Imperativos/expressões como "hold it", "get out", "come on", "give me a break", "you know" e equivalentes dependem do contexto. NÃO invente objeto/referente que a conversa não sustenta.
-14. Se a SOURCE repetir deliberadamente a mesma pergunta/frase N vezes, preserve N repetições. Concisão nunca autoriza apagar repetição dramática/intencional.
-15. GÊNERO É HARD PRIORITY: "you/I + papel/estado" sem evidência explícita não autoriza passageiro/passageira, convidado/convidada, pronto/pronta etc. Prefira uma formulação genuinamente neutra.
+14. Se a SOURCE repetir deliberadamente a mesma pergunta/frase N vezes, preserve N repetições. Se for apenas vício de fala/falso começo ("I, I...", "we, we..."), limpe naturalmente em PT-BR sem apagar intenção.
+15. Você NÃO VÊ a imagem do vídeo. Contexto significa SOURCE + before/after + Character Ledger. Nunca invente objeto concreto (arma, carro, porta, pessoa etc.) que só faria sentido se você tivesse visto a imagem.
+16. GÊNERO É HARD PRIORITY: "you/I + papel/estado" sem evidência explícita não autoriza passageiro/passageira, convidado/convidada, pronto/pronta etc. Prefira uma formulação genuinamente neutra.
 
 Devolva exatamente um objeto por target, mantendo o mesmo id em i.
 `;
@@ -6828,6 +6976,8 @@ Você receberá somente cues sinalizados por detectores locais e/ou pelo QA PT-B
 
 NATURALNESS REPAIR
 - Se o motivo incluir QA_PTBR, LITERAL, FALSE_COGNATE, IDIOM, UNNATURAL ou SUBTITLE_TOO_DENSE, não faça uma correção superficial.
+- Remova filler, falso começo e repetição mecânica quando não carregarem intenção; preserve repetição deliberada/emocional.
+- Você NÃO vê o vídeo: não invente arma, objeto, pessoa ou ação visual que SOURCE + contexto textual não sustentem.
 - Releia EN + contexto + Character Ledger e reconstrua a fala em PT-BR espontâneo.
 - NÃO preserve a sintaxe inglesa só porque a primeira tradução estava compreensível.
 - O resultado reparado deve soar melhor que o MAIN, não apenas diferente.
@@ -6966,8 +7116,10 @@ Para cada cue, pergunte silenciosamente:
 4. O registro corresponde à idade, personalidade, classe, época, gênero da obra e comunidade do falante?
 5. Identidade, gênero, pronome e referente estão realmente sustentados pelo Character Ledger/contexto?
 6. Eu li o cue anterior e o seguinte antes de decidir o sentido de uma expressão/imperativo ambíguo?
-7. Se a SOURCE repete deliberadamente a mesma fala/pergunta, o PT preservou a mesma quantidade?
-8. Um papel humano neutro em inglês ganhou gênero em PT sem prova explícita? Se sim, é defeito prioritário.
+7. Se a SOURCE repete deliberadamente a mesma fala/pergunta, o PT preservou a mesma quantidade? Se a repetição era só vício/falso começo, o PT limpou isso naturalmente?
+8. O PT copiou fillers/vocalizações sem conteúdo (uh/um/shh etc.) que poderiam desaparecer sem perda de informação? Se sim, sinalize naturalidade/higiene.
+9. O PT inventou objeto concreto que SOURCE + before/after NÃO sustentam? Lembre: você NÃO vê o vídeo.
+10. Um papel humano neutro em inglês ganhou gênero em PT sem prova explícita? Se sim, é defeito prioritário.
 
 MARQUE quando houver:
 - sentido errado: pessoa verbal, sujeito, objeto, negação, tempo, intensidade ou referente;
@@ -6983,6 +7135,8 @@ MARQUE quando houver:
 - ortografia, digitação, concordância, palavra inventada/corrompida;
 - palavrão censurado/suavizado sem motivo quando a SOURCE é explícita; se a SOURCE contém ${BLEEP_TOKEN}, o PT deve naturalizar a FORÇA pelo contexto e NUNCA exibir token/[censurado]/asteriscos. Não exija identidade lexical exata do trecho oculto; exija fala brasileira plausível.
 - speaker labels, SDH/CC, descrição sonora, créditos, símbolos, placeholders, gagueira gráfica/alongamento;
+- filler/vício de fala ou repetição mecânica preservados no PT sem função narrativa/emocional;
+- vocalização pura não-semântica que polui a legenda sem acrescentar informação;
 - quebra de continuidade audiovisual, palavras/letras exibidas na tela.
 
 NAMED / CULTURAL ENTITY INTEGRITY — PRIORITÁRIO
@@ -13780,7 +13934,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -14025,6 +14179,21 @@ function sourceExactRepetitionLost896(block, pt) {
   const needed = sourceRepeatNeed896(block);
   if (needed < 3) return false;
   return targetRepeatCount896(block, pt) < needed;
+}
+
+function bareImperativeConcreteReferentRisk92(block, pt) {
+  const source = String(block?.text || "")
+    .replace(/^\s*[-–—~]\s*/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const target = String(pt || "");
+
+  // "Get down!/Duck!" permite Abaixem-se/Se abaixem/No chão, mas não
+  // autoriza inventar uma arma que a SOURCE/contexto textual não menciona.
+  if (/^(?:get\s+down|duck)\s*[!.?]*$/iu.test(source)) {
+    if (/\b(?:arma|pistola|rev[oó]lver|rifle|fuzil|espingarda)\b/iu.test(target)) return true;
+  }
+  return false;
 }
 
 function contextualHaltImperativeRisk896(block, pt) {
@@ -14749,6 +14918,20 @@ function localReasonsForCue(
   }
 
   if (
+    /\b(?:we|you|they|i)\s+(?:need|have|got)\s+to\s+move(?:\s+now|\s+right\s+now)?\b/iu.test(en) &&
+    /\b(?:precisamos|temos|precisa|precisam|tenho|t[eê]m)\s+(?:que\s+)?(?:nos\s+)?mover\b/iu.test(translated)
+  ) {
+    reasons.push("LITERALITY_MOVE_ACTION");
+  }
+
+  if (
+    /\bsweep\s+(?:everything|it|all of it)\s+into\b/iu.test(en) &&
+    /\b(?:varr(?:a|e|am|em|eu)|vir(?:a|e|am|em|ou))\b/iu.test(translated)
+  ) {
+    reasons.push("LITERALITY_SWEEP_GATHER");
+  }
+
+  if (
   cueNeedsConciseRepair(
     block,
     translated
@@ -14769,6 +14952,10 @@ function localReasonsForCue(
 
   if (contextualHaltImperativeRisk896(block, translated)) {
     reasons.push("CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION");
+  }
+
+  if (bareImperativeConcreteReferentRisk92(block, translated)) {
+    reasons.push("BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION");
   }
 
   for (
@@ -16022,7 +16209,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-6]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-6]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -17980,7 +18167,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -18979,7 +19166,7 @@ const preSafeHardIssues = detectLocalIssues(
 ).map(issue => ({
   id: issue.id,
   reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   )
 })).filter(issue => issue.reasons.length);
 
@@ -19987,7 +20174,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "9.1",
+    "9.2",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -20852,7 +21039,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.1 - LATENCY + EMPTY-CUE + GENDER LOCK"
+        " STREMIO PT-BR 9.2 - SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY"
   );
 
   console.log(
@@ -21167,7 +21354,7 @@ console.log(
   );
 
   console.log(
-    "Model Router 9.0: MAIN=3.1 MEDIUM -> 3.5 -> 3.7 -> 3.8; QA/Repair=3.1 HIGH -> 3.8 -> 3.7 -> 3.5; Gemma fora do hot path ✅"
+    "Model Router 9.2: MAIN=3.1 MEDIUM -> 3.5; QA/Repair=3.1 HIGH -> 3.5 HIGH; 3.7/3.8 fora do projeto ✅"
   );
 
   console.log(
@@ -21240,6 +21427,18 @@ console.log(
 
   console.log(
     "Empty-Cue Hygiene 9.1: SDH/ruído puro pode ficar vazio | fala real continua protegida | 0 rescue cloud para lixo ✅"
+  );
+
+  console.log(
+    "Subtitle Hygiene 9.2: hesitação/vocalização não-semântica pura sai; repetição dramática continua protegida ✅"
+  );
+
+  console.log(
+    "Music Relevance Gate 9.2: performance/narrativa fica; música incidental e vocalização fonética não poluem a legenda ✅"
+  );
+
+  console.log(
+    "Concrete Referent Lock 9.2: contexto textual não autoriza inventar objetos invisíveis ao modelo ✅"
   );
 
   console.log(
