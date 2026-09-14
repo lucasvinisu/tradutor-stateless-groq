@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.0 - FINAL OWNERSHIP GATE
+// STREMIO PT-BR 9.1 - LATENCY + EMPTY-CUE + GENDER LOCK
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -22,8 +22,6 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_MODELS = Object.freeze({
   MAIN_PRIMARY: "gemini-3.1-flash-lite",
   MAIN_FALLBACK: "gemini-3.5-flash-lite",
-  QA_PREMIUM: "gemini-3.8-flash",
-  QA_FALLBACK: "gemini-3.7-flash",
   GEMMA_MAIN: "gemma-4-26b-a4b-it",
   GEMMA_QA: "gemma-4-31b-it"
 });
@@ -33,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.0-final-ownership-gate-v1";
+  "9.1-latency-empty-gender-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -50,16 +48,6 @@ const GEMINI_MODEL_PROFILES = Object.freeze({
   [GEMINI_MODELS.MAIN_FALLBACK]: {
     rpm: 15, rpmSoft: 14, tpm: 250000, tpmSoft: 235000, rpd: 500,
     minStartMs: 4300, timeoutCapMs: 120000, unavailable503Ms: 20000,
-    supportsStructuredOutput: true, family: "gemini"
-  },
-  [GEMINI_MODELS.QA_PREMIUM]: {
-    rpm: 5, rpmSoft: 5, tpm: 250000, tpmSoft: 235000, rpd: 20,
-    minStartMs: 12500, timeoutCapMs: 90000, unavailable503Ms: 120000,
-    supportsStructuredOutput: true, family: "gemini"
-  },
-  [GEMINI_MODELS.QA_FALLBACK]: {
-    rpm: 5, rpmSoft: 5, tpm: 250000, tpmSoft: 235000, rpd: 20,
-    minStartMs: 12500, timeoutCapMs: 90000, unavailable503Ms: 120000,
     supportsStructuredOutput: true, family: "gemini"
   },
   [GEMINI_MODELS.GEMMA_MAIN]: {
@@ -214,33 +202,33 @@ const PRE_REPAIR_CONFIRM_HTTP_RETRIES = 3;
 
 
 // ============================================================
-// FINAL CRITICAL CONVERGENCE — 8.4.2 SCHEMA-SAFE
+// FINAL PRIORITY CONVERGENCE — 8.4.2 SCHEMA-SAFE
 // ============================================================
 // Um problema de QUALIDADE não encerra o job. O gate audita a legenda
 // que seria realmente servida e corrige somente os cues reprovados
-// até que não reste defeito crítico. Falhas transitórias de Gemini
+// até que não reste defeito prioritário. Falhas transitórias de Gemini
 // também entram em retry; não viram "failed" por conveniência.
-const FINAL_CRITICAL_GATE_ENABLED = true;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES = 200;
-const FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS = 56000;
-const FINAL_CRITICAL_AUDIT_CONCURRENCY = 3;
-const FINAL_CRITICAL_AUDIT_THINKING = "high";
-const FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS = 10000;
-const FINAL_CRITICAL_AUDIT_TIMEOUT_MS = 120000;
-const FINAL_CRITICAL_AUDIT_HTTP_RETRIES = 4;
-const FINAL_CRITICAL_MAX_ISSUES = 80;
-const FINAL_CRITICAL_RETRY_BASE_MS = 4300;
-const FINAL_CRITICAL_RETRY_MAX_MS = 60000;
-const FINAL_CRITICAL_CONTEXT_RADIUS = 1;
-const FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER = 2;
-const FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
-const FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES = 24;
-const FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
-const FINAL_CRITICAL_ESCALATED_TIMEOUT_MS = 120000;
-const FINAL_CRITICAL_REQUEST_MAX_FAILURES = 3;
-const FINAL_CRITICAL_PARSE_MAX_FAILURES = 3;
-const FINAL_CRITICAL_ESCALATED_MAX_FAILURES = 3;
-const FINAL_CRITICAL_MAX_ROUNDS = 2;
+const FINAL_PRIORITY_GATE_ENABLED = true;
+const FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES = 200;
+const FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS = 56000;
+const FINAL_PRIORITY_AUDIT_CONCURRENCY = 3;
+const FINAL_PRIORITY_AUDIT_THINKING = "high";
+const FINAL_PRIORITY_AUDIT_MAX_OUTPUT_TOKENS = 10000;
+const FINAL_PRIORITY_AUDIT_TIMEOUT_MS = 120000;
+const FINAL_PRIORITY_AUDIT_HTTP_RETRIES = 4;
+const FINAL_PRIORITY_MAX_ISSUES = 80;
+const FINAL_PRIORITY_RETRY_BASE_MS = 4300;
+const FINAL_PRIORITY_RETRY_MAX_MS = 60000;
+const FINAL_PRIORITY_CONTEXT_RADIUS = 1;
+const FINAL_PRIORITY_NO_PROGRESS_ESCALATE_AFTER = 2;
+const FINAL_PRIORITY_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
+const FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES = 24;
+const FINAL_PRIORITY_ESCALATED_MAX_OUTPUT_TOKENS = 7000;
+const FINAL_PRIORITY_ESCALATED_TIMEOUT_MS = 120000;
+const FINAL_PRIORITY_REQUEST_MAX_FAILURES = 3;
+const FINAL_PRIORITY_PARSE_MAX_FAILURES = 3;
+const FINAL_PRIORITY_ESCALATED_MAX_FAILURES = 3;
+const FINAL_PRIORITY_MAX_ROUNDS = 2;
 const JOB_RETRY_BASE_MS = 5000;
 const JOB_RETRY_MAX_MS = 60000;
 const JOB_MAX_ATTEMPTS = 2;
@@ -1218,14 +1206,14 @@ function createJob({
       preRepairConfirmConfirmed: 0,
       preRepairConfirmTechnicalFallback: 0,
 
-      finalCriticalRounds: 0,
-      finalCriticalAuditCalls: 0,
-      finalCriticalFlags: 0,
-      finalCriticalRepairRounds: 0,
-      finalCriticalBoundedReleases: 0,
+      finalPriorityRounds: 0,
+      finalPriorityAuditCalls: 0,
+      finalPriorityFlags: 0,
+      finalPriorityRepairRounds: 0,
+      finalPriorityBoundedReleases: 0,
       boundedSafeDraftReleases: 0,
-      finalCriticalTechnicalRetries: 0,
-      finalCriticalNoProgressEscalations: 0,
+      finalPriorityTechnicalRetries: 0,
+      finalPriorityNoProgressEscalations: 0,
       jobRetries: 0,
 
       pacerWaitMs: 0,
@@ -2679,6 +2667,30 @@ function looksLikeBareSdhLine(
   );
 }
 
+// ============================================================
+// EMPTY-CUE HYGIENE 9.1 — PURE NON-SPEECH = INTENTIONAL EMPTY
+// ============================================================
+// Só aceita descrições/vocalizações NÃO verbais inteiras. Não inclui Hmm,
+// Mm-hmm, Uhum, Um, palavras, números, bleep ou qualquer fala real.
+function looksLikePureNonSpeechSdhLine(value) {
+  const original = stripMarkup(String(value || "")).trim();
+  if (!original) return true;
+
+  // Segmentos explicitamente marcados como acessibilidade continuam sendo lixo visual.
+  const bracketed = original.match(/^\s*[\[(]([\s\S]{1,180})[\])]\s*[.!…]?\s*$/u);
+  if (bracketed && looksLikeSdhDescriptor(bracketed[1])) {
+    return true;
+  }
+
+  const text = normalizeSdhCandidate(original)
+    .replace(/[.!…]+$/gu, "")
+    .trim();
+
+  if (!text || /[?!]/u.test(original)) return false;
+
+  return /^(?:sighs?|sighing|gasps?|gasping|pants?|panting|heavy breathing|breathing heavily|coughs?|coughing|sneezes?|sneezing|sniffs?|sniffing|sobs?|sobbing|cries|crying|laughs?|laughing|chuckles?|chuckling|giggles?|giggling|groans?|groaning|grunts?|grunting|whimpers?|whimpering|suspira|suspiro|suspirando|ofega|ofegando|respiração ofegante|respirando ofegante|tosse|tossindo|espirra|espirrando|fungada|fungando|soluça|soluçando|chora|chorando|risos?|rindo|gargalhada|gargalhando|geme|gemendo|grunhe|grunhindo)$/iu.test(text);
+}
+
 function removeSdhSegments(text) {
   return String(text || "")
     .replace(
@@ -3137,6 +3149,9 @@ function cleanSourceLine(line) {
 
   if (
     looksLikeBareSdhLine(
+      text
+    ) ||
+    looksLikePureNonSpeechSdhLine(
       text
     ) ||
     looksLikeCaptionCredit(
@@ -6799,7 +6814,7 @@ CHECKLIST SILENCIOSO OBRIGATÓRIO ANTES DE CADA pt:
 12. Antes de resolver uma fala ambígua, LEIA os cues imediatamente anteriores e seguintes disponíveis. Traduza a intenção daquela cena, não a sentença isolada.
 13. Imperativos/expressões como "hold it", "get out", "come on", "give me a break", "you know" e equivalentes dependem do contexto. NÃO invente objeto/referente que a conversa não sustenta.
 14. Se a SOURCE repetir deliberadamente a mesma pergunta/frase N vezes, preserve N repetições. Concisão nunca autoriza apagar repetição dramática/intencional.
-15. GÊNERO É HARD CRITICAL: "you/I + papel/estado" sem evidência explícita não autoriza passageiro/passageira, convidado/convidada, pronto/pronta etc. Prefira uma formulação genuinamente neutra.
+15. GÊNERO É HARD PRIORITY: "you/I + papel/estado" sem evidência explícita não autoriza passageiro/passageira, convidado/convidada, pronto/pronta etc. Prefira uma formulação genuinamente neutra.
 
 Devolva exatamente um objeto por target, mantendo o mesmo id em i.
 `;
@@ -6952,7 +6967,7 @@ Para cada cue, pergunte silenciosamente:
 5. Identidade, gênero, pronome e referente estão realmente sustentados pelo Character Ledger/contexto?
 6. Eu li o cue anterior e o seguinte antes de decidir o sentido de uma expressão/imperativo ambíguo?
 7. Se a SOURCE repete deliberadamente a mesma fala/pergunta, o PT preservou a mesma quantidade?
-8. Um papel humano neutro em inglês ganhou gênero em PT sem prova explícita? Se sim, é defeito crítico.
+8. Um papel humano neutro em inglês ganhou gênero em PT sem prova explícita? Se sim, é defeito prioritário.
 
 MARQUE quando houver:
 - sentido errado: pessoa verbal, sujeito, objeto, negação, tempo, intensidade ou referente;
@@ -6970,7 +6985,7 @@ MARQUE quando houver:
 - speaker labels, SDH/CC, descrição sonora, créditos, símbolos, placeholders, gagueira gráfica/alongamento;
 - quebra de continuidade audiovisual, palavras/letras exibidas na tela.
 
-NAMED / CULTURAL ENTITY INTEGRITY — CRÍTICO
+NAMED / CULTURAL ENTITY INTEGRITY — PRIORITÁRIO
 
 Compare as entidades nomeadas do EN com o PT.
 
@@ -6992,12 +7007,12 @@ reason deve começar com:
 
 ENTITY_IDENTITY_SUBSTITUTION: identidade cultural alterada.
 
-CUE OWNERSHIP / SEMANTIC SYNC — CRÍTICO
+CUE OWNERSHIP / SEMANTIC SYNC — PRIORITÁRIO
 
 Para CADA cue, compare exclusivamente o EN daquele ID
 com o PT daquele MESMO ID.
 
-É ERRO CRÍTICO se:
+É ERRO PRIORITÁRIO se:
 - o PT traduz claramente o EN do cue anterior;
 - o PT traduz claramente o EN do cue seguinte;
 - o PT repete a tradução do cue anterior enquanto o EN mudou;
@@ -8343,41 +8358,11 @@ function extractLastValidJsonObject(value) {
 }
 
 function geminiRouteForMetric(metric) {
-  const m = String(metric || "main").toLowerCase();
-
-  if (["qa", "repair", "compact", "semantic", "preconfirm"].includes(m)) {
-    // Teste real 8.9.1: 3.1 HIGH foi mais estável e mais rápido no caminho
-    // crítico que 3.8/3.7, que responderam com 503/JSON inválido.
-    return [
-      GEMINI_MODELS.MAIN_PRIMARY,
-      GEMINI_MODELS.QA_PREMIUM,
-      GEMINI_MODELS.QA_FALLBACK,
-      GEMINI_MODELS.MAIN_FALLBACK
-    ];
-  }
-
-  if (["syncproxy", "syncalign"].includes(m)) {
-    return [
-      GEMINI_MODELS.MAIN_PRIMARY,
-      GEMINI_MODELS.MAIN_FALLBACK,
-      GEMINI_MODELS.QA_FALLBACK
-    ];
-  }
-
-  if (m === "plan") {
-    return [
-      GEMINI_MODELS.MAIN_PRIMARY,
-      GEMINI_MODELS.MAIN_FALLBACK,
-      GEMINI_MODELS.QA_FALLBACK,
-      GEMINI_MODELS.QA_PREMIUM
-    ];
-  }
-
+  // Render 9.1: somente os dois modelos que se provaram úteis neste projeto.
+  // MAIN preserva MEDIUM; QA/Repair preservam HIGH. A rota muda, a qualidade não.
   return [
     GEMINI_MODELS.MAIN_PRIMARY,
-    GEMINI_MODELS.MAIN_FALLBACK,
-    GEMINI_MODELS.QA_FALLBACK,
-    GEMINI_MODELS.QA_PREMIUM
+    GEMINI_MODELS.MAIN_FALLBACK
   ];
 }
 
@@ -11154,7 +11139,7 @@ async function rescueEmptyMainCue({
     markIntentionalEmptyCue(
       job,
       block,
-      "SOURCE descartável; nenhuma chamada Gemini extra"
+      "SOURCE SDH/ruído puro descartável; vazio intencional, 0 Gemini"
     );
 
     return "";
@@ -13793,7 +13778,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
   return [...new Set(reasons.filter(r => /^CUE_OWNERSHIP_/i.test(String(r || ""))))];
 }
 
-function criticalLocalReasons898(block, pt, filename, plan) {
+function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
     /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
@@ -13862,8 +13847,8 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
     for (const [candPrev, candCurr, label] of options) {
       if (!candPrev || !candCurr) continue;
       if (!layoutCueResult(prev, candPrev).fits || !layoutCueResult(curr, candCurr).fits) continue;
-      if (criticalLocalReasons898(prev, candPrev, filename, plan).length) continue;
-      if (criticalLocalReasons898(curr, candCurr, filename, plan).length) continue;
+      if (priorityLocalReasons898(prev, candPrev, filename, plan).length) continue;
+      if (priorityLocalReasons898(curr, candCurr, filename, plan).length) continue;
       const remains = ownershipBoundaryMismatchReasons(prev, curr, candPrev, candCurr)
         .some(r => /^CUE_OWNERSHIP_/i.test(String(r || "")));
       if (remains) continue;
@@ -13885,7 +13870,7 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
       if (
         trimmed && trimmed !== nowCurr &&
         layoutCueResult(curr, trimmed).fits &&
-        !criticalLocalReasons898(curr, trimmed, filename, plan).length &&
+        !priorityLocalReasons898(curr, trimmed, filename, plan).length &&
         !ownershipBoundaryMismatchReasons(prev, curr, nowPrev, trimmed)
           .some(r => /^CUE_OWNERSHIP_/i.test(String(r || "")))
       ) {
@@ -13914,7 +13899,7 @@ function applyFinalStrictLayoutFallback898(blocks, finalTranslations, mainTransl
     if (
       main &&
       layoutCueResult(block, main).fits &&
-      !criticalLocalReasons898(block, main, filename, plan).length &&
+      !priorityLocalReasons898(block, main, filename, plan).length &&
       !repairCandidateRegressionReasons(block, current, main, filename, plan).length
     ) {
       out.set(block.index, main);
@@ -15098,13 +15083,13 @@ function issuePriority(issue) {
   const joined = reasons.join(" | ");
 
   // ==========================================================
-  // PRIORIDADE 0 — CRÍTICO
+  // PRIORIDADE 0 — PRIORITÁRIO
   // Sentido, identidade, gênero, speaker/referente, omissão,
   // cue ownership e censura quebrada.
   // ==========================================================
 
   if (
-    /FINAL_CRITICAL/i.test(joined) ||
+    /FINAL_PRIORITY/i.test(joined) ||
     /GENDER_V[2-6]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
     /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined) ||
@@ -15943,15 +15928,15 @@ async function preConfirmAmbiguousRepairIssues(
     suppressedIds.add(id);
 
     const issue = candidateById.get(id);
-    if (!job.finalCriticalConsensusState || typeof job.finalCriticalConsensusState !== "object") {
-      job.finalCriticalConsensusState = Object.create(null);
+    if (!job.finalPriorityConsensusState || typeof job.finalPriorityConsensusState !== "object") {
+      job.finalPriorityConsensusState = Object.create(null);
     }
 
     for (const reason of Array.isArray(issue?.reasons) ? issue.reasons : []) {
       if (!preRepairAmbiguousHeuristicReason(reason)) continue;
       const key = `${id}::${String(reason)}`;
-      job.finalCriticalConsensusState[key] = Math.max(
-        Number(job.finalCriticalConsensusState[key] || 0),
+      job.finalPriorityConsensusState[key] = Math.max(
+        Number(job.finalPriorityConsensusState[key] || 0),
         PRE_REPAIR_CONFIRM_ROUNDS
       );
     }
@@ -15973,7 +15958,7 @@ async function preConfirmAmbiguousRepairIssues(
   if (suppressedIds.size) {
     console.log(
       `[PRE-REPAIR CONFIRM] ${suppressedIds.size} cue(s) preservados SEM rewrite; ` +
-      `Final Critical global continua com autoridade para contradizer esta decisão.`
+      `Final Priority global continua com autoridade para contradizer esta decisão.`
     );
   }
 
@@ -16036,13 +16021,13 @@ function repairCandidateRegressionReasons(
   }
 
   for (const reason of afterReasons) {
-    const isCriticalRegression =
+    const isPriorityRegression =
       /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-6]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION)/i.test(
         reason
       );
 
     if (
-      isCriticalRegression &&
+      isPriorityRegression &&
       !beforeReasons.has(reason)
     ) {
       regressions.push(reason);
@@ -16192,11 +16177,11 @@ if (
 if (!extraOnly) job.stats.localFlags = localOnlyCount;
 
   if (!issues.length) {
-    console.log(extraOnly ? "[FINAL CRITICAL REPAIR] 0 blockers." : "[LOCAL GUARD] 0 suspeitos.");
+    console.log(extraOnly ? "[FINAL PRIORITY REPAIR] 0 blockers." : "[LOCAL GUARD] 0 suspeitos.");
     return translations;
   }
 
-  logIssueSummary(extraOnly ? "FINAL-CRITICAL-REPAIR" : "PRÉ-REPAIR", issues);
+  logIssueSummary(extraOnly ? "FINAL-PRIORITY-REPAIR" : "PRÉ-REPAIR", issues);
 
   issues.sort((a, b) => {
     const priorityDiff =
@@ -16219,7 +16204,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
       REPAIR_MAX_CUES_TOTAL
     );
 
-  const selectedCritical =
+  const selectedPriority =
     selected.filter(
       issue =>
         issuePriority(issue) === 0
@@ -16239,7 +16224,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
 
   console.log(
     `[REPAIR PRIORITY] selecionados=${selected.length} | ` +
-    `críticos=${selectedCritical} | ` +
+    `prioritários=${selectedPriority} | ` +
     `qualidade=${selectedQuality} | ` +
     `mecânicos=${selectedMechanical}.`
   );
@@ -16249,7 +16234,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
 
   console.log(
     extraOnly
-      ? `[FINAL CRITICAL REPAIR] ${issues.length} blocker(s) desta rodada; reparando somente ${selected.length} cue(s).`
+      ? `[FINAL PRIORITY REPAIR] ${issues.length} blocker(s) desta rodada; reparando somente ${selected.length} cue(s).`
       : `[LOCAL GUARD] ${issues.length} suspeitos combinados (local+QA); reparando até ${selected.length}.`
   );
 
@@ -17833,32 +17818,32 @@ if (
 }
 
 // ============================================================
-// FINAL CRITICAL GATE 8.4.0
+// FINAL PRIORITY GATE 8.4.0
 // ============================================================
 // IMPORTANTE: SOURCE pode ser inglês, espanhol, francês, italiano,
 // alemão, neerlandês ou qualquer outro idioma que a Ponte tenha
 // escolhido. Inglês é preferência de seleção, NÃO pré-condição.
-const FINAL_CRITICAL_AUDIT_PROMPT = `
-Você é o FINAL CRITICAL AUDITOR de legendas SOURCE→PT-BR.
+const FINAL_PRIORITY_AUDIT_PROMPT = `
+Você é o FINAL PRIORITY AUDITOR de legendas SOURCE→PT-BR.
 
 SOURCE é a legenda-fonte REAL escolhida pelo orquestrador e pode estar
 em QUALQUER idioma. O rótulo EN usado em partes antigas do sistema é
 apenas legado interno. NUNCA presuma inglês.
 
-Sua função é encontrar SOMENTE defeitos CRÍTICOS. Não faça revisão
+Sua função é encontrar SOMENTE defeitos PRIORITÁRIOS. Não faça revisão
 cosmética e não marque uma alternativa apenas porque você escreveria diferente.
 
 Para cada cue, compare primeiro SOURCE[i] com PT[i]. Os cues aparecem em
 ordem cronológica e os vizinhos servem apenas para contexto.
 
-1) CUE OWNERSHIP — CRÍTICO
+1) CUE OWNERSHIP — PRIORITÁRIO
 - PT[i] precisa traduzir SOURCE[i], não SOURCE[i-1] nem SOURCE[i+1].
 - Se PT[i] traduz claramente o vizinho, marque category=CUE_OWNERSHIP_SHIFT.
 - Se houver uma cadeia deslocada +1/-1, marque TODOS os IDs afetados.
 - Continuação legítima de frase entre cues não é shift: cada ID preserva
   somente a parte pertencente ao SOURCE daquele mesmo ID.
 
-2) GENDER / REFERENT — CRÍTICO
+2) GENDER / REFERENT — PRIORITÁRIO
 - Respeite identidade_lock e evidência real da cena.
 - Speaker é quem fala; mentions são pessoas citadas.
 - Não transfira gênero entre speaker e pessoa mencionada.
@@ -17866,10 +17851,10 @@ ordem cronológica e os vizinhos servem apenas para contexto.
 - Se PT marcar gênero sem evidência segura quando seria possível neutralizar,
   marque category=GENDER_OR_REFERENT.
 - Isso inclui PAPÉIS HUMANOS: source "you/I am a/an ..." sem sexo/gênero explícito não autoriza artigo/substantivo marcado como "um passageiro/uma passageira", "convidado/convidada" etc. Exija neutralidade natural.
-- Contradição dentro do mesmo speaker no mesmo cue é sempre crítica,
+- Contradição dentro do mesmo speaker no mesmo cue é sempre prioritária,
   por exemplo masculino em uma palavra e feminino em outra sem mudança de referente.
 
-3) MEANING INTEGRITY — CRÍTICO
+3) MEANING INTEGRITY — PRIORITÁRIO
 Marque somente perda/troca/invenção real de informação importante:
 negação, ação, sujeito, objeto, quantidade, relação, causa, condição,
 contraste, intensidade, insulto, referente ou informação narrativa.
@@ -17877,18 +17862,18 @@ REPETIÇÃO INTENCIONAL também é informação: se SOURCE repete deliberadament
 EXPRESSÃO AMBÍGUA exige contexto: leia vizinhos antes de aceitar uma tradução literal. Não aceite objeto/referente inventado por um imperativo idiomático.
 category=MEANING_INTEGRITY.
 
-4) GARBAGE / EMPTY — CRÍTICO
+4) GARBAGE / EMPTY — PRIORITÁRIO
 - PT vazio para SOURCE verbal não vazio;
 - lixo isolado como Ff, ff, J..., J-, J'j', reticências/pontuação sem fala;
 - placeholder ou resíduo evidente de OCR que não comunica fala.
 category=GARBAGE_OR_EMPTY.
 
-5) DIALOGUE / SDH — CRÍTICO
+5) DIALOGUE / SDH — PRIORITÁRIO
 - speaker/turn perdido ou unido quando SOURCE tem múltiplos turns;
 - descrição SDH inventada no lugar da fala.
 category=DIALOGUE_OR_SDH.
 
-6) SOURCE CENSORSHIP NATURALIZATION — CRÍTICO
+6) SOURCE CENSORSHIP NATURALIZATION — PRIORITÁRIO
 - ${BLEEP_TOKEN} é metadata invisível: PT FINAL NUNCA pode conter ${BLEEP_TOKEN}, [censurado], [bleep], asteriscos ou placeholder equivalente.
 - Compare a situação e os cues vizinhos: a fala precisa preservar naturalmente surpresa/raiva/medo/insulto/humor e a intensidade pragmática.
 - É aceitável usar um palavrão brasileiro plausível para reconstruir a FUNÇÃO da fala; não é necessário conhecer a palavra exata escondida.
@@ -17903,12 +17888,12 @@ NÃO marque:
 A saída contém somente issues reais. reason deve explicar brevemente a prova.
 `;
 
-const FINAL_CRITICAL_REPAIR_PROMPT = `
-Você é o RESCUE CRÍTICO FINAL de legendas SOURCE→PT-BR.
+const FINAL_PRIORITY_REPAIR_PROMPT = `
+Você é o RESCUE PRIORITÁRIO FINAL de legendas SOURCE→PT-BR.
 
 SOURCE pode estar em QUALQUER idioma. O idioma real do campo source é a
 autoridade. Você NÃO está editando por estilo: está reconstruindo do zero
-somente cues que falharam num gate crítico.
+somente cues que falharam num gate prioritário.
 
 Para cada item:
 - traduza EXCLUSIVAMENTE source daquele mesmo i;
@@ -17942,7 +17927,7 @@ remover informação.
 Devolva exatamente um objeto por cue recebido.
 `;
 
-const FINAL_CRITICAL_AUDIT_SCHEMA = {
+const FINAL_PRIORITY_AUDIT_SCHEMA = {
   // 8.4.2: deliberadamente simples.
   // O Interactions structured-output pode rejeitar schemas cujo limite
   // de array expanda demais a gramática/constraint. O limite real aqui
@@ -17965,9 +17950,9 @@ const FINAL_CRITICAL_AUDIT_SCHEMA = {
   required: ["issues"]
 };
 
-const FINAL_CRITICAL_AUDIT_FALLBACK_SCHEMA = {
+const FINAL_PRIORITY_AUDIT_FALLBACK_SCHEMA = {
   // Fallback ainda menor para um eventual HTTP 400 de validação.
-  // category pode ser omitido; parseFinalCriticalAudit usa "CRITICAL".
+  // category pode ser omitido; parseFinalPriorityAudit usa "PRIORITY".
   type: "object",
   properties: {
     issues: {
@@ -17985,7 +17970,7 @@ const FINAL_CRITICAL_AUDIT_FALLBACK_SCHEMA = {
   required: ["issues"]
 };
 
-function finalCriticalIssueSignature(issues) {
+function finalPriorityIssueSignature(issues) {
   return (Array.isArray(issues) ? issues : [])
     .map(issue => `${Number(issue.id)}:${(issue.reasons || []).join("|")}`)
     .sort()
@@ -17995,20 +17980,20 @@ function finalCriticalIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_CRITICAL|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
 
 
-function finalCriticalHeuristicReason(reason) {
+function finalPriorityHeuristicReason(reason) {
   return /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_BOUNDARY_MISMATCH)$/i.test(String(reason || "").trim());
 }
 
-function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, job) {
+function applyFinalPriorityConsensus(localIssues, semanticIssues, auditedIds, job) {
   const semanticIds = new Set((Array.isArray(semanticIssues) ? semanticIssues : []).map(x => Number(x && x.id)).filter(Number.isInteger));
-  if (!job.finalCriticalConsensusState || typeof job.finalCriticalConsensusState !== "object") job.finalCriticalConsensusState = Object.create(null);
-  const state = job.finalCriticalConsensusState;
+  if (!job.finalPriorityConsensusState || typeof job.finalPriorityConsensusState !== "object") job.finalPriorityConsensusState = Object.create(null);
+  const state = job.finalPriorityConsensusState;
   const active = new Set();
   const out = [];
   let suppressed = 0;
@@ -18020,7 +18005,7 @@ function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, jo
     const kept = [];
     for (const raw of Array.isArray(issue.reasons) ? issue.reasons : []) {
       const reason = String(raw || "");
-      if (!finalCriticalHeuristicReason(reason)) { kept.push(reason); continue; }
+      if (!finalPriorityHeuristicReason(reason)) { kept.push(reason); continue; }
       const key = id + "::" + reason;
       active.add(key);
       const audited = !auditedIds || auditedIds.has(id);
@@ -18028,9 +18013,9 @@ function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, jo
       if (semanticIds.has(id)) { state[key] = 0; kept.push(reason); waiting++; continue; }
       const clean = Number(state[key] || 0) + 1;
       state[key] = clean;
-      if (clean >= FINAL_CRITICAL_HEURISTIC_CONSENSUS_CLEAN_AUDITS) {
+      if (clean >= FINAL_PRIORITY_HEURISTIC_CONSENSUS_CLEAN_AUDITS) {
         suppressed++;
-        job.stats.finalCriticalConsensusSuppressions = (job.stats.finalCriticalConsensusSuppressions || 0) + 1;
+        job.stats.finalPriorityConsensusSuppressions = (job.stats.finalPriorityConsensusSuppressions || 0) + 1;
       } else {
         kept.push(reason);
         waiting++;
@@ -18040,8 +18025,8 @@ function applyFinalCriticalConsensus(localIssues, semanticIssues, auditedIds, jo
   }
 
   for (const key of Object.keys(state)) if (!active.has(key)) delete state[key];
-  if (suppressed) console.log(`[FINAL CRITICAL CONSENSUS] ${suppressed} heuristic flag(s) had 2 clean semantic audits and will not block alone. OK`);
-  if (waiting) console.log(`[FINAL CRITICAL CONSENSUS] ${waiting} heuristic flag(s) still awaiting semantic consensus.`);
+  if (suppressed) console.log(`[FINAL PRIORITY CONSENSUS] ${suppressed} heuristic flag(s) had 2 clean semantic audits and will not block alone. OK`);
+  if (waiting) console.log(`[FINAL PRIORITY CONSENSUS] ${waiting} heuristic flag(s) still awaiting semantic consensus.`);
   return out;
 }
 
@@ -18059,7 +18044,7 @@ function blockingLocalIssues(blocks, translations, job, plan) {
     .filter(issue => issue.reasons.length);
 }
 
-function finalCriticalAuditItem(block, translations, plan) {
+function finalPriorityAuditItem(block, translations, plan) {
   return {
     i: block.index,
     source: String(block.text || ""),
@@ -18069,7 +18054,7 @@ function finalCriticalAuditItem(block, translations, plan) {
   };
 }
 
-function buildFinalCriticalAuditBatches(
+function buildFinalPriorityAuditBatches(
   blocks,
   translations,
   plan,
@@ -18116,11 +18101,11 @@ function buildFinalCriticalAuditBatches(
     const lastPos = posMap.get(current[current.length - 1].i);
 
     const before = Number.isInteger(firstPos) && firstPos > 0
-      ? finalCriticalAuditItem(blocks[firstPos - 1], translations, plan)
+      ? finalPriorityAuditItem(blocks[firstPos - 1], translations, plan)
       : null;
 
     const after = Number.isInteger(lastPos) && lastPos + 1 < blocks.length
-      ? finalCriticalAuditItem(blocks[lastPos + 1], translations, plan)
+      ? finalPriorityAuditItem(blocks[lastPos + 1], translations, plan)
       : null;
 
     batches.push({
@@ -18137,14 +18122,14 @@ function buildFinalCriticalAuditBatches(
   };
 
   for (const block of targets) {
-    const item = finalCriticalAuditItem(block, translations, plan);
+    const item = finalPriorityAuditItem(block, translations, plan);
     const size = JSON.stringify(item).length;
 
     if (
       current.length &&
       (
-        current.length >= FINAL_CRITICAL_AUDIT_BATCH_MAX_CUES ||
-        chars + size > FINAL_CRITICAL_AUDIT_BATCH_MAX_CHARS
+        current.length >= FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES ||
+        chars + size > FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS
       )
     ) {
       flush();
@@ -18158,7 +18143,7 @@ function buildFinalCriticalAuditBatches(
   return batches;
 }
 
-async function finalCriticalGeminiRequest(args, job, label) {
+async function finalPriorityGeminiRequest(args, job, label) {
   let failures = 0;
   let schemaFallbackUsed = false;
   let activeArgs = { ...args };
@@ -18168,8 +18153,8 @@ async function finalCriticalGeminiRequest(args, job, label) {
       return await geminiRequest(activeArgs);
     } catch (error) {
       failures++;
-      job.stats.finalCriticalTechnicalRetries =
-        (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+      job.stats.finalPriorityTechnicalRetries =
+        (job.stats.finalPriorityTechnicalRetries || 0) + 1;
 
       const message = errorMessage(error);
       const status = Number(error?.status || 0);
@@ -18185,12 +18170,12 @@ async function finalCriticalGeminiRequest(args, job, label) {
       ) {
         schemaFallbackUsed = true;
 
-        job.stats.finalCriticalSchemaFallbacks =
-          (job.stats.finalCriticalSchemaFallbacks || 0) + 1;
+        job.stats.finalPrioritySchemaFallbacks =
+          (job.stats.finalPrioritySchemaFallbacks || 0) + 1;
 
         activeArgs = {
           ...activeArgs,
-          schema: FINAL_CRITICAL_AUDIT_FALLBACK_SCHEMA,
+          schema: FINAL_PRIORITY_AUDIT_FALLBACK_SCHEMA,
           thinkingLevel: "medium",
           maxOutputTokens: Math.min(
             Number(activeArgs.maxOutputTokens || 7000),
@@ -18209,7 +18194,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
         job.updatedAt = Date.now();
 
         console.warn(
-          `[FINAL CRITICAL SCHEMA FALLBACK] ${label}: HTTP 400/INVALID_ARGUMENT; ` +
+          `[FINAL PRIORITY SCHEMA FALLBACK] ${label}: HTTP 400/INVALID_ARGUMENT; ` +
           `trocando para schema mínimo sem liberar a legenda.`
         );
 
@@ -18219,10 +18204,10 @@ async function finalCriticalGeminiRequest(args, job, label) {
 
       if (
         failures >=
-        FINAL_CRITICAL_REQUEST_MAX_FAILURES
+        FINAL_PRIORITY_REQUEST_MAX_FAILURES
       ) {
         throw new Error(
-          `FINAL CRITICAL ${label}: ${failures} falhas técnicas consecutivas; ` +
+          `FINAL PRIORITY ${label}: ${failures} falhas técnicas consecutivas; ` +
           `encerrando esta etapa para o fallback seguro do job | ${
             message.slice(0, 320)
           }`
@@ -18230,8 +18215,8 @@ async function finalCriticalGeminiRequest(args, job, label) {
       }
 
       const waitMs = Math.min(
-        FINAL_CRITICAL_RETRY_MAX_MS,
-        FINAL_CRITICAL_RETRY_BASE_MS * Math.pow(1.65, Math.min(failures - 1, 8))
+        FINAL_PRIORITY_RETRY_MAX_MS,
+        FINAL_PRIORITY_RETRY_BASE_MS * Math.pow(1.65, Math.min(failures - 1, 8))
       );
 
       job.error =
@@ -18241,7 +18226,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
       job.updatedAt = Date.now();
 
       console.warn(
-        `[FINAL CRITICAL RETRY] ${label} falhou (${failures}); ` +
+        `[FINAL PRIORITY RETRY] ${label} falhou (${failures}); ` +
         `nova tentativa limitada em ${(waitMs / 1000).toFixed(1)}s | ` +
         `${message.slice(0, 320)}`
       );
@@ -18251,7 +18236,7 @@ async function finalCriticalGeminiRequest(args, job, label) {
   }
 }
 
-function parseFinalCriticalAudit(text, allowedIds) {
+function parseFinalPriorityAudit(text, allowedIds) {
   const parsed = JSON.parse(stripCodeFences(text));
   const raw = Array.isArray(parsed?.issues) ? parsed.issues : [];
   const out = [];
@@ -18262,15 +18247,15 @@ function parseFinalCriticalAudit(text, allowedIds) {
     if (!Number.isInteger(id) || !allowedIds.has(id) || seen.has(id)) continue;
     seen.add(id);
 
-    const category = String(issue?.category || "CRITICAL").trim().slice(0, 80);
-    const reason = String(issue?.reason || "defeito crítico").trim().slice(0, 260);
+    const category = String(issue?.category || "PRIORITY").trim().slice(0, 80);
+    const reason = String(issue?.reason || "defeito prioritário").trim().slice(0, 260);
 
     out.push({
       id,
-      reasons: [`FINAL_CRITICAL:${category}: ${reason}`]
+      reasons: [`FINAL_PRIORITY:${category}: ${reason}`]
     });
 
-    if (out.length >= FINAL_CRITICAL_MAX_ISSUES) {
+    if (out.length >= FINAL_PRIORITY_MAX_ISSUES) {
       break;
     }
   }
@@ -18278,16 +18263,16 @@ function parseFinalCriticalAudit(text, allowedIds) {
   return out;
 }
 
-async function scanFinalCriticalAudit(
+async function scanFinalPriorityAudit(
   blocks,
   translations,
   plan,
   job,
   focusIds = null
 ) {
-  if (!FINAL_CRITICAL_GATE_ENABLED) return [];
+  if (!FINAL_PRIORITY_GATE_ENABLED) return [];
 
-  const batches = buildFinalCriticalAuditBatches(
+  const batches = buildFinalPriorityAuditBatches(
     blocks,
     translations,
     plan,
@@ -18300,7 +18285,7 @@ async function scanFinalCriticalAudit(
   let cursor = 0;
 
   console.log(
-    `[FINAL CRITICAL AUDIT] ${batches.length} lote(s) | ` +
+    `[FINAL PRIORITY AUDIT] ${batches.length} lote(s) | ` +
     `fonte=${job.sourceLang || "auto"} | ` +
     `escopo=${focusIds instanceof Set ? `${focusIds.size} cue(s) focais` : "episódio completo"}.`
   );
@@ -18317,22 +18302,22 @@ async function scanFinalCriticalAudit(
       while (
         !parsed &&
         parseFailures <
-          FINAL_CRITICAL_PARSE_MAX_FAILURES
+          FINAL_PRIORITY_PARSE_MAX_FAILURES
       ) {
-        const response = await finalCriticalGeminiRequest(
+        const response = await finalPriorityGeminiRequest(
           {
-            system: FINAL_CRITICAL_AUDIT_PROMPT,
+            system: FINAL_PRIORITY_AUDIT_PROMPT,
             user:
               `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
               `IMPORTANTE: use o idioma REAL encontrado em SOURCE; não presuma inglês.\n\n` +
               `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
               `CUES EM ORDEM CRONOLÓGICA:\n${JSON.stringify(batch.cues)}\n\n` +
               `Audite SOMENTE context_only=false. context_only=true existe apenas para comparar vizinhos.`,
-            schema: FINAL_CRITICAL_AUDIT_SCHEMA,
-            thinkingLevel: FINAL_CRITICAL_AUDIT_THINKING,
-            maxOutputTokens: FINAL_CRITICAL_AUDIT_MAX_OUTPUT_TOKENS,
-            timeoutMs: FINAL_CRITICAL_AUDIT_TIMEOUT_MS,
-            maxRetries: FINAL_CRITICAL_AUDIT_HTTP_RETRIES,
+            schema: FINAL_PRIORITY_AUDIT_SCHEMA,
+            thinkingLevel: FINAL_PRIORITY_AUDIT_THINKING,
+            maxOutputTokens: FINAL_PRIORITY_AUDIT_MAX_OUTPUT_TOKENS,
+            timeoutMs: FINAL_PRIORITY_AUDIT_TIMEOUT_MS,
+            maxRetries: FINAL_PRIORITY_AUDIT_HTTP_RETRIES,
             job,
             metric: "qa"
           },
@@ -18340,11 +18325,11 @@ async function scanFinalCriticalAudit(
           `AUDIT W${workerId} lote ${index + 1}`
         );
 
-        job.stats.finalCriticalAuditCalls =
-          (job.stats.finalCriticalAuditCalls || 0) + 1;
+        job.stats.finalPriorityAuditCalls =
+          (job.stats.finalPriorityAuditCalls || 0) + 1;
 
         try {
-          parsed = parseFinalCriticalAudit(
+          parsed = parseFinalPriorityAudit(
             response.text,
             batch.targetIds
           );
@@ -18357,19 +18342,19 @@ async function scanFinalCriticalAudit(
           );
 
           parseFailures++;
-          job.stats.finalCriticalTechnicalRetries =
-            (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+          job.stats.finalPriorityTechnicalRetries =
+            (job.stats.finalPriorityTechnicalRetries || 0) + 1;
 
           console.warn(
-            `[FINAL CRITICAL AUDIT] JSON inválido no lote ${index + 1} ` +
+            `[FINAL PRIORITY AUDIT] JSON inválido no lote ${index + 1} ` +
             `(tentativa ${parseFailures}); repetindo sem matar job | ` +
             `${errorMessage(error).slice(0, 220)}`
           );
 
           await sleep(
             Math.min(
-              FINAL_CRITICAL_RETRY_MAX_MS,
-              FINAL_CRITICAL_RETRY_BASE_MS * Math.max(1, parseFailures)
+              FINAL_PRIORITY_RETRY_MAX_MS,
+              FINAL_PRIORITY_RETRY_BASE_MS * Math.max(1, parseFailures)
             )
           );
         }
@@ -18377,33 +18362,33 @@ async function scanFinalCriticalAudit(
 
       if (!parsed) {
         throw new Error(
-          `FINAL CRITICAL AUDIT lote ${index + 1}: ` +
-          `${FINAL_CRITICAL_PARSE_MAX_FAILURES} respostas inválidas consecutivas.`
+          `FINAL PRIORITY AUDIT lote ${index + 1}: ` +
+          `${FINAL_PRIORITY_PARSE_MAX_FAILURES} respostas inválidas consecutivas.`
         );
       }
 
       results[index] = parsed;
 
       console.log(
-        `[FINAL CRITICAL AUDIT W${workerId}] lote ${index + 1}/${batches.length}: ` +
-        `${parsed.length} crítico(s).`
+        `[FINAL PRIORITY AUDIT W${workerId}] lote ${index + 1}/${batches.length}: ` +
+        `${parsed.length} prioritário(s).`
       );
     }
   }
 
   await Promise.all(
     Array.from(
-      { length: Math.min(FINAL_CRITICAL_AUDIT_CONCURRENCY, batches.length) },
+      { length: Math.min(FINAL_PRIORITY_AUDIT_CONCURRENCY, batches.length) },
       (_, index) => worker(index + 1)
     )
   );
 
   const merged = mergeIssueLists(...results.map(x => Array.isArray(x) ? x : []));
-  job.stats.finalCriticalFlags = merged.length;
+  job.stats.finalPriorityFlags = merged.length;
   return merged;
 }
 
-function idsFromIssues(issues, blocks, radius = FINAL_CRITICAL_CONTEXT_RADIUS) {
+function idsFromIssues(issues, blocks, radius = FINAL_PRIORITY_CONTEXT_RADIUS) {
   const posMap = positionMap(blocks);
   const ids = new Set();
 
@@ -18420,7 +18405,7 @@ function idsFromIssues(issues, blocks, radius = FINAL_CRITICAL_CONTEXT_RADIUS) {
   return ids;
 }
 
-async function runFinalCriticalEscalatedRepair(
+async function runFinalPriorityEscalatedRepair(
   blocks,
   translations,
   issues,
@@ -18434,11 +18419,11 @@ async function runFinalCriticalEscalatedRepair(
   for (
     let offset = 0;
     offset < selected.length;
-    offset += FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES
+    offset += FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES
   ) {
     const batchIssues = selected.slice(
       offset,
-      offset + FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES
+      offset + FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES
     );
 
     let completed = false;
@@ -18447,7 +18432,7 @@ async function runFinalCriticalEscalatedRepair(
     while (
       !completed &&
       parseFailures <
-        FINAL_CRITICAL_ESCALATED_MAX_FAILURES
+        FINAL_PRIORITY_ESCALATED_MAX_FAILURES
     ) {
       const locksById = new Map();
 
@@ -18483,24 +18468,24 @@ async function runFinalCriticalEscalatedRepair(
       });
 
       try {
-        const response = await finalCriticalGeminiRequest(
+        const response = await finalPriorityGeminiRequest(
           {
-            system: FINAL_CRITICAL_REPAIR_PROMPT,
+            system: FINAL_PRIORITY_REPAIR_PROMPT,
             user:
               `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
               `Use o idioma REAL de source.\n\n` +
               `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
-              `CUES CRÍTICOS PARA RECONSTRUÇÃO:\n${JSON.stringify({ cues })}`,
+              `CUES PRIORITÁRIOS PARA RECONSTRUÇÃO:\n${JSON.stringify({ cues })}`,
             schema: cueTranslationSchema(batchIssues.length),
             thinkingLevel: "high",
-            maxOutputTokens: FINAL_CRITICAL_ESCALATED_MAX_OUTPUT_TOKENS,
-            timeoutMs: FINAL_CRITICAL_ESCALATED_TIMEOUT_MS,
+            maxOutputTokens: FINAL_PRIORITY_ESCALATED_MAX_OUTPUT_TOKENS,
+            timeoutMs: FINAL_PRIORITY_ESCALATED_TIMEOUT_MS,
             maxRetries: REPAIR_HTTP_RETRIES,
             job,
             metric: "repair"
           },
           job,
-          `ESCALATED REPAIR ${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1}`
+          `ESCALATED REPAIR ${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1}`
         );
 
         let repaired;
@@ -18537,7 +18522,7 @@ async function runFinalCriticalEscalatedRepair(
 
           if (regressions.length) {
             console.warn(
-              `[FINAL CRITICAL ESCALATED] cue ${id} rejeitado localmente | ` +
+              `[FINAL PRIORITY ESCALATED] cue ${id} rejeitado localmente | ` +
               `${regressions.join(", ")}.`
             );
             continue;
@@ -18548,24 +18533,24 @@ async function runFinalCriticalEscalatedRepair(
         }
 
         console.log(
-          `[FINAL CRITICAL ESCALATED] lote ` +
-          `${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1} | ` +
+          `[FINAL PRIORITY ESCALATED] lote ` +
+          `${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1} | ` +
           `aceitos=${accepted}/${batchIssues.length}.`
         );
 
         completed = true;
       } catch (error) {
         parseFailures++;
-        job.stats.finalCriticalTechnicalRetries =
-          (job.stats.finalCriticalTechnicalRetries || 0) + 1;
+        job.stats.finalPriorityTechnicalRetries =
+          (job.stats.finalPriorityTechnicalRetries || 0) + 1;
 
         const waitMs = Math.min(
-          FINAL_CRITICAL_RETRY_MAX_MS,
-          FINAL_CRITICAL_RETRY_BASE_MS * Math.max(1, parseFailures)
+          FINAL_PRIORITY_RETRY_MAX_MS,
+          FINAL_PRIORITY_RETRY_BASE_MS * Math.max(1, parseFailures)
         );
 
         console.warn(
-          `[FINAL CRITICAL ESCALATED] lote não foi descartado; ` +
+          `[FINAL PRIORITY ESCALATED] lote não foi descartado; ` +
           `repetindo em ${(waitMs / 1000).toFixed(1)}s | ` +
           `${errorMessage(error).slice(0, 320)}`
         );
@@ -18576,9 +18561,9 @@ async function runFinalCriticalEscalatedRepair(
 
     if (!completed) {
       console.warn(
-        `[FINAL CRITICAL ESCALATED] lote ` +
-        `${Math.floor(offset / FINAL_CRITICAL_ESCALATED_BATCH_MAX_CUES) + 1} ` +
-        `atingiu o limite de ${FINAL_CRITICAL_ESCALATED_MAX_FAILURES} falhas; ` +
+        `[FINAL PRIORITY ESCALATED] lote ` +
+        `${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1} ` +
+        `atingiu o limite de ${FINAL_PRIORITY_ESCALATED_MAX_FAILURES} falhas; ` +
         `candidato anterior preservado sem loop.`
       );
     }
@@ -18587,14 +18572,14 @@ async function runFinalCriticalEscalatedRepair(
   return updated;
 }
 
-async function convergeFinalCriticalQuality(
+async function convergeFinalPriorityQuality(
   blocks,
   translations,
   plan,
   job,
   initialFocusIds = null
 ) {
-  if (!FINAL_CRITICAL_GATE_ENABLED) return translations;
+  if (!FINAL_PRIORITY_GATE_ENABLED) return translations;
 
   let current = new Map(translations);
   let previousSignature = "";
@@ -18619,15 +18604,15 @@ async function convergeFinalCriticalQuality(
 
   while (
     roundsThisRun <
-    FINAL_CRITICAL_MAX_ROUNDS
+    FINAL_PRIORITY_MAX_ROUNDS
   ) {
     roundsThisRun++;
 
-    job.stats.finalCriticalRounds =
-      (job.stats.finalCriticalRounds || 0) + 1;
+    job.stats.finalPriorityRounds =
+      (job.stats.finalPriorityRounds || 0) + 1;
 
     current = sanitizeTranslationMap(blocks, current, job);
-    current = applySubtitleLayout(blocks, current, "FINAL-CRITICAL-CANDIDATE");
+    current = applySubtitleLayout(blocks, current, "FINAL-PRIORITY-CANDIDATE");
 
     const local = blockingLocalIssues(
       blocks,
@@ -18645,7 +18630,7 @@ async function convergeFinalCriticalQuality(
         ? null
         : new Set(focusIds);
 
-    const semantic = await scanFinalCriticalAudit(
+    const semantic = await scanFinalPriorityAudit(
       blocks,
       current,
       plan,
@@ -18655,23 +18640,23 @@ async function convergeFinalCriticalQuality(
 
     firstAudit = false;
 
-    const consensusLocal = applyFinalCriticalConsensus(local, semantic, auditFocusIds, job);
+    const consensusLocal = applyFinalPriorityConsensus(local, semantic, auditFocusIds, job);
     let issues = mergeIssueLists(consensusLocal, semantic);
 
     if (!issues.length) {
       console.log(
-        `[FINAL CRITICAL GATE] PASSOU ✅ | ` +
-        `rounds=${job.stats.finalCriticalRounds} | ` +
-        `0 defeitos críticos; resultado autorizado para cache/serve.`
+        `[FINAL PRIORITY GATE] PASSOU ✅ | ` +
+        `rounds=${job.stats.finalPriorityRounds} | ` +
+        `0 defeitos prioritários; resultado autorizado para cache/serve.`
       );
 
       job.error = null;
       return current;
     }
 
-    logIssueSummary("FINAL-CRITICAL", issues);
+    logIssueSummary("FINAL-PRIORITY", issues);
 
-    const signature = finalCriticalIssueSignature(issues);
+    const signature = finalPriorityIssueSignature(issues);
     if (signature === previousSignature) {
       stagnantRounds++;
     } else {
@@ -18679,25 +18664,25 @@ async function convergeFinalCriticalQuality(
       previousSignature = signature;
     }
 
-    if (stagnantRounds >= FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER) {
-      job.stats.finalCriticalNoProgressEscalations =
-        (job.stats.finalCriticalNoProgressEscalations || 0) + 1;
+    if (stagnantRounds >= FINAL_PRIORITY_NO_PROGRESS_ESCALATE_AFTER) {
+      job.stats.finalPriorityNoProgressEscalations =
+        (job.stats.finalPriorityNoProgressEscalations || 0) + 1;
 
       console.warn(
-        `[FINAL CRITICAL ESCALATION] mesmos defeitos persistiram por ` +
-        `${stagnantRounds + 1} rodada(s); repair hiperfocado nos IDs críticos.`
+        `[FINAL PRIORITY ESCALATION] mesmos defeitos persistiram por ` +
+        `${stagnantRounds + 1} rodada(s); repair hiperfocado nos IDs prioritários.`
       );
     }
 
-    job.stats.finalCriticalRepairRounds =
-      (job.stats.finalCriticalRepairRounds || 0) + 1;
+    job.stats.finalPriorityRepairRounds =
+      (job.stats.finalPriorityRepairRounds || 0) + 1;
 
     const before = new Map(current);
 
     if (
-      stagnantRounds >= FINAL_CRITICAL_NO_PROGRESS_ESCALATE_AFTER
+      stagnantRounds >= FINAL_PRIORITY_NO_PROGRESS_ESCALATE_AFTER
     ) {
-      current = await runFinalCriticalEscalatedRepair(
+      current = await runFinalPriorityEscalatedRepair(
         blocks,
         current,
         issues,
@@ -18741,15 +18726,15 @@ async function convergeFinalCriticalQuality(
     job.updatedAt = Date.now();
 
     console.log(
-      `[FINAL CRITICAL GATE] rodada ${job.stats.finalCriticalRounds} ` +
+      `[FINAL PRIORITY GATE] rodada ${job.stats.finalPriorityRounds} ` +
       `reprovou ${issues.length} cue(s); ` +
       `${changedIds.size} cue(s) alterado(s); reauditoria focada continuará.`
     );
   }
 
-  job.stats.finalCriticalBoundedReleases =
+  job.stats.finalPriorityBoundedReleases =
     (
-      job.stats.finalCriticalBoundedReleases ||
+      job.stats.finalPriorityBoundedReleases ||
       0
     ) + 1;
 
@@ -18757,7 +18742,7 @@ async function convergeFinalCriticalQuality(
     "bounded_best_candidate";
 
   console.warn(
-    `[FINAL CRITICAL GATE] limite de ${FINAL_CRITICAL_MAX_ROUNDS} rodada(s) ` +
+    `[FINAL PRIORITY GATE] limite de ${FINAL_PRIORITY_MAX_ROUNDS} rodada(s) ` +
     `atingido; melhor candidato protegido pelos guards locais será finalizado ` +
     `em vez de manter o job eternamente em processing.`
   );
@@ -18802,7 +18787,7 @@ async function runBoundedFinalQuality88(
     `zero convergência aberta.`
   );
 
-  const semantic1 = await scanFinalCriticalAudit(
+  const semantic1 = await scanFinalPriorityAudit(
     blocks,
     current,
     plan,
@@ -18817,7 +18802,7 @@ async function runBoundedFinalQuality88(
     logIssueSummary("FINAL-89-REPAIR", issues1);
     const beforeRepair = new Map(current);
 
-    current = await runFinalCriticalEscalatedRepair(
+    current = await runFinalPriorityEscalatedRepair(
       blocks,
       current,
       issues1,
@@ -18860,7 +18845,7 @@ async function runBoundedFinalQuality88(
       plan
     ).filter(issue => verifyFocus.has(Number(issue.id)));
 
-    const semantic2 = await scanFinalCriticalAudit(
+    const semantic2 = await scanFinalPriorityAudit(
       blocks,
       current,
       plan,
@@ -18877,7 +18862,7 @@ async function runBoundedFinalQuality88(
         `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
       );
 
-      current = await runFinalCriticalEscalatedRepair(
+      current = await runFinalPriorityEscalatedRepair(
         blocks,
         current,
         issues2,
@@ -19297,7 +19282,7 @@ async function processJob(
         job
       );
 
-      // Só chega aqui depois do FINAL CRITICAL GATE PASSAR.
+      // Só chega aqui depois do FINAL PRIORITY GATE PASSAR.
       setCache(
         job.cacheKey,
         finalSrt,
@@ -20002,7 +19987,7 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "9.0",
+    "9.1",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
@@ -20057,8 +20042,8 @@ app.get(
       models: {
         mainPrimary: GEMINI_MODELS.MAIN_PRIMARY,
         mainFallback: GEMINI_MODELS.MAIN_FALLBACK,
-        qaPremium: GEMINI_MODELS.QA_PREMIUM,
-        qaFallback: GEMINI_MODELS.QA_FALLBACK
+        qaPrimary: GEMINI_MODELS.MAIN_PRIMARY,
+        qaFallback: GEMINI_MODELS.MAIN_FALLBACK
       },
 
       mode:
@@ -20867,7 +20852,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.0 - FINAL OWNERSHIP GATE"
+        " STREMIO PT-BR 9.1 - LATENCY + EMPTY-CUE + GENDER LOCK"
   );
 
   console.log(
@@ -20887,7 +20872,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    `QA/Repair router: ${GEMINI_MODELS.MAIN_PRIMARY} HIGH -> ${GEMINI_MODELS.QA_PREMIUM} -> ${GEMINI_MODELS.QA_FALLBACK} -> ${GEMINI_MODELS.MAIN_FALLBACK} ✅`
+    `QA/Repair router: ${GEMINI_MODELS.MAIN_PRIMARY} HIGH -> ${GEMINI_MODELS.MAIN_FALLBACK} HIGH | 3.7/3.8 removidos ✅`
   );
 
   console.log(
@@ -21096,7 +21081,7 @@ console.log(
   );
 
   console.log(
-    "SAFE DRAFT: ATIVO ✅ (diagnóstico interno; nunca substitui FINAL crítico reprovado)"
+    "SAFE DRAFT: ATIVO ✅ (diagnóstico interno; nunca substitui FINAL prioritário reprovado)"
   );
 
   console.log(
@@ -21115,7 +21100,7 @@ console.log(
     "Final Audit 8.4.2: lotes <=80 + schema sem maxItems + fallback adaptativo para HTTP 400 ✅"
   );
 
-  console.log("Focused Repair 8.4.3: Final Critical repairs only current-round blockers. OK");
+  console.log("Focused Repair 8.4.3: Final Priority repairs only current-round blockers. OK");
 
   console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
@@ -21211,7 +21196,7 @@ console.log(
     "Context Semantic Lock 9.0: before/after resolvem intenção; zero nova auditoria global / zero nova rodada cloud ✅"
   );
   console.log(
-    "Gender Critical V5 9.0: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
+    "Gender Priority V5 9.0: papel humano 1ª/2ª pessoa sem prova explícita não pode ganhar gênero por Repair ✅"
   );
   console.log(
     "Gender V5 Definitive 9.0: neutralizações inequívocas são ZERO-CLOUD e não reabrem Repair HIGH ✅"
@@ -21251,6 +21236,14 @@ console.log(
   );
   console.log(
     "Explicit Gender Evidence 9.0: modifiers como ten-year-old girl preservam gênero declarado pela SOURCE ✅"
+  );
+
+  console.log(
+    "Empty-Cue Hygiene 9.1: SDH/ruído puro pode ficar vazio | fala real continua protegida | 0 rescue cloud para lixo ✅"
+  );
+
+  console.log(
+    "Gender Lock 9.1: proteções de gênero preservadas integralmente; ambiguidade humana continua fail-closed ✅"
   );
 
   console.log(
