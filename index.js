@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.4 - TRANSIENT ROUTE RESILIENCE + STRUCTURAL GENDER + REPAIR PERSISTENCE
+// STREMIO PT-BR 9.2.5 - TARGET-ELIMINATION GENDER GATE + TRANSIENT ROUTE RESILIENCE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2.4-transient-route-resilience-v1";
+  "9.2.5-target-elimination-gender-gate-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -18886,12 +18886,56 @@ function idsFromIssues(issues, blocks, radius = FINAL_PRIORITY_CONTEXT_RADIUS) {
   return ids;
 }
 
+
+function genderTargetReasons925(block, pt, filename, plan) {
+  return localReasonsForCue(block, pt, filename, plan)
+    .filter(reason => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
+}
+
+function genderTargetIssues925(blocks, translations, filename, plan) {
+  const issues = [];
+  for (const block of blocks) {
+    const pt = String(translations.get(block.index) || "").trim();
+    const reasons = [...new Set(genderTargetReasons925(block, pt, filename, plan))];
+    if (reasons.length) issues.push({ id: block.index, reasons });
+  }
+  return issues;
+}
+
+function closeGenderCandidateLocally925(block, candidatePt) {
+  let value = String(candidatePt || "").trim();
+  if (!value) return value;
+  value = sanitizeFinalCue(block, value) || sanitizeFallbackCue(value) || value;
+  value = applyDeterministicGenderClosure898(block, value);
+  value = sanitizeFinalCue(block, value) || sanitizeFallbackCue(value) || value;
+  return String(value || "").trim();
+}
+
+function strictGenderCandidateCheck925(block, beforePt, candidatePt, filename, plan) {
+  const closed = closeGenderCandidateLocally925(block, candidatePt);
+  const regressions = repairCandidateRegressionReasons(
+    block,
+    beforePt,
+    closed,
+    filename,
+    plan
+  );
+  const remainingGender = genderTargetReasons925(block, closed, filename, plan);
+  return {
+    candidate: closed,
+    regressions: [...new Set(regressions)],
+    remainingGender: [...new Set(remainingGender)],
+    ok: regressions.length === 0 && remainingGender.length === 0
+  };
+}
+
 async function runFinalPriorityEscalatedRepair(
   blocks,
   translations,
   issues,
   plan,
-  job
+  job,
+  options = {}
 ) {
   const posMap = positionMap(blocks);
   const updated = new Map(translations);
@@ -18991,15 +19035,35 @@ async function runFinalPriorityEscalatedRepair(
         for (const [id, candidate] of repaired) {
           const block = blocks[posMap.get(id)];
           const beforePt = String(updated.get(id) || "");
-          const candidatePt = String(candidate || "").trim();
+          let candidatePt = String(candidate || "").trim();
 
-          const regressions = repairCandidateRegressionReasons(
-            block,
-            beforePt,
-            candidatePt,
-            job.filename,
-            plan
-          );
+          let regressions = [];
+          if (options?.requireGenderZero) {
+            const target = strictGenderCandidateCheck925(
+              block,
+              beforePt,
+              candidatePt,
+              job.filename,
+              plan
+            );
+            candidatePt = target.candidate;
+            regressions = [...target.regressions];
+            if (target.remainingGender.length) {
+              console.warn(
+                `[GENDER TARGET ACCEPTANCE 9.2.5] cue ${id} REJEITADO: ` +
+                `candidato ainda contém ${target.remainingGender.join(", ")}.`
+              );
+              continue;
+            }
+          } else {
+            regressions = repairCandidateRegressionReasons(
+              block,
+              beforePt,
+              candidatePt,
+              job.filename,
+              plan
+            );
+          }
 
           if (regressions.length) {
             console.warn(
@@ -19653,39 +19717,95 @@ let finalClosure898 = finalClosureResidualSummary898(
   blocks, finalTranslations, job.filename, plan
 );
 
-// 9.2.3 STRICT GENDER FINAL GATE. One bounded, focal reconstruction only.
-// No global re-audit and no open convergence loop.
+// 9.2.5 STRICT TARGET-ELIMINATION GENDER FINAL GATE.
+// A candidate is NOT "accepted" merely because it introduced no new regressions.
+// For this gate, the repaired cue must locally prove ZERO remaining gender blockers.
+// At most TWO tiny focal passes are allowed; there is no global re-audit and no open loop.
 if (finalClosure898.gender > 0) {
-  const genderIssues923=[];
-  for (const block of blocks) {
-    const pt=String(finalTranslations.get(block.index) || "").trim();
-    const reasons=localReasonsForCue(block,pt,job.filename,plan)
-      .filter(reason => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
-    if (reasons.length) genderIssues923.push({id:block.index,reasons:[...new Set(reasons)]});
-  }
-  console.warn(`[GENDER FINAL GATE 9.2.3] residual=${genderIssues923.length}; executando UMA reconstrução focal estrutural, sem reauditoria global.`);
-  if (genderIssues923.length) {
-    finalTranslations = await runFinalPriorityEscalatedRepair(
-      blocks, finalTranslations, genderIssues923, plan, job
+  const maxGenderPasses925 = 2;
+
+  for (let genderPass925 = 1; genderPass925 <= maxGenderPasses925; genderPass925++) {
+    let genderIssues925 = genderTargetIssues925(
+      blocks,
+      finalTranslations,
+      job.filename,
+      plan
     );
+
+    if (!genderIssues925.length) break;
+
+    const ids925 = genderIssues925.map(issue => Number(issue.id)).filter(Number.isInteger);
+    console.warn(
+      `[GENDER TARGET GATE 9.2.5] pass=${genderPass925}/${maxGenderPasses925} | ` +
+      `residual=${genderIssues925.length} | ids=[${ids925.join(",")}].`
+    );
+
+    // The model sees an explicit postcondition in addition to the concrete local reasons.
+    // This is generic: no title/character/release-specific wording.
+    genderIssues925 = genderIssues925.map(issue => ({
+      id: issue.id,
+      reasons: [
+        ...issue.reasons,
+        "STRICT_GENDER_POSTCONDITION_9_2_5: a resposta deste cue só será aceita se a checagem local terminar com ZERO flexão humana de gênero não exigida pela SOURCE; reformule naturalmente em PT-BR, sem parênteses, x/@ ou masculino genérico."
+      ]
+    }));
+
+    finalTranslations = await runFinalPriorityEscalatedRepair(
+      blocks,
+      finalTranslations,
+      genderIssues925,
+      plan,
+      job,
+      { requireGenderZero: true }
+    );
+
     finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
     finalTranslations = applyRepairPersistenceLock923(
       blocks, finalTranslations, job, job.filename, plan
     );
     finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
-    finalClosure898 = finalClosureResidualSummary898(
-      blocks, finalTranslations, job.filename, plan
+
+    const afterIssues925 = genderTargetIssues925(
+      blocks,
+      finalTranslations,
+      job.filename,
+      plan
+    );
+
+    if (!afterIssues925.length) {
+      console.log(
+        `[GENDER TARGET GATE 9.2.5] PASSOU ✅ | pass=${genderPass925} | residual=0.`
+      );
+      break;
+    }
+
+    const detail925 = afterIssues925
+      .map(issue => `${issue.id}:${issue.reasons.join("+")}`)
+      .join(" | ");
+
+    console.warn(
+      `[GENDER TARGET GATE 9.2.5] após pass=${genderPass925}: ` +
+      `residual=${afterIssues925.length} | ${detail925}`
     );
   }
+
+  finalClosure898 = finalClosureResidualSummary898(
+    blocks,
+    finalTranslations,
+    job.filename,
+    plan
+  );
 }
+
+
 
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "gender_residual_uncached";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER FINAL GATE 9.2.3] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; resultado poderá ser servido para disponibilidade, mas NÃO recebe FINAL OK nem cache.`);
+  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; resultado poderá ser servido para disponibilidade, mas NÃO recebe FINAL OK nem cache.`);
 }
 console.log(
-  `[FINAL CLOSURE 9.2.3] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.2.5] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
   `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ` +
@@ -19736,7 +19856,7 @@ auditTimestamps(
 
   if (finalClosure898.gender === 0) {
     console.log(
-      `[PIPELINE 9.2.4 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.2.5 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -19749,7 +19869,7 @@ auditTimestamps(
     if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate") job.qualityStatus = "final_pass";
   } else {
     console.warn(
-      `[PIPELINE 9.2.4 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.2.5 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | pipeline=${pipelineElapsedSeconds.toFixed(1)}s | ` +
       `job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
     );
@@ -19816,7 +19936,7 @@ async function processJob(
       if (!job.noCacheFinal923) {
         setCache(job.cacheKey, finalSrt, job);
       } else {
-        console.warn(`[CACHE 9.2.4] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
+        console.warn(`[CACHE 9.2.5] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
       }
 
       job.result = finalSrt;
@@ -21382,7 +21502,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.4 - TRANSIENT ROUTE RESILIENCE + STRUCTURAL GENDER + REPAIR PERSISTENCE"
+        " STREMIO PT-BR 9.2.5 - TARGET-ELIMINATION GENDER GATE + TRANSIENT ROUTE RESILIENCE"
   );
 
   console.log(
@@ -21791,7 +21911,7 @@ console.log(
     "Structural Gender 9.2.3: predicativos/artigos humanos 1ª/2ª/plural são auditados pela estrutura; SOURCE explícita continua autoridade ✅",
     "Repair Persistence 9.2.3: repair FINAL aceito não pode ser revertido silenciosamente para candidato antigo ✅",
     "Strict Gender Final Gate 9.2.3: gender>0 bloqueia FINAL OK/cache; uma reconstrução focal bounded é tentada antes ✅",
-    "Transient Route Resilience 9.2.4: ultima rota saudavel recebe 1 retry curto para 500/502/503/408/425 antes de skip; zero loop ✅"
+    "Transient Route Resilience 9.2.4: ultima rota saudavel recebe 1 retry curto para 500/502/503/408/425 antes de skip; zero loop ✅ Target-Elimination Gender Gate 9.2.5: repair final só é aceito com ZERO blocker local de gênero; no máximo 2 passes focais ✅"
   );
 
   console.log(
