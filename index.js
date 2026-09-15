@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.2 - GENDER NEUTRALITY CLOSURE + ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE
+// STREMIO PT-BR 9.2.3 - STRUCTURAL GENDER + REPAIR PERSISTENCE + STRICT FINAL GATE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2.2-gender-neutrality-closure-v1";
+  "9.2.3-structural-gender-repair-persistence-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -13287,10 +13287,12 @@ function sourceExplicitlyMarksSelfGender(block) {
     /\b(?:soy|era|como)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
 }
 
+// Nouns whose grammatical article does NOT identify the person's sex/gender.
+// Common-gender roles such as artista/jornalista/motorista are deliberately
+// NOT exempt: "um/uma artista" introduces avoidable human gender.
 const EPICENE_HUMAN_ROLE_WORDS_896 = new Set([
   "pessoa", "gente", "criança", "vitima", "vítima", "testemunha", "autoridade",
-  "celebridade", "estrela", "figura", "criatura", "colega", "agente", "cliente",
-  "artista", "jornalista", "motorista", "especialista", "profissional"
+  "celebridade", "estrela", "figura", "criatura"
 ]);
 
 function sourceHasNeutralHumanRoleFrame896(block, person = "second") {
@@ -14099,7 +14101,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -14143,7 +14145,39 @@ function removeLeadingSemanticDuplicate898(previousValue, currentValue) {
   return lines.join("\n").trim();
 }
 
-function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslations, filename, plan) {
+
+function isFinalRepairLocked923(job, id) {
+  return Boolean(job?.finalRepairLockedText923 instanceof Map && job.finalRepairLockedText923.has(Number(id)));
+}
+
+function applyRepairPersistenceLock923(blocks, translations, job, filename, plan) {
+  const out=new Map(translations);
+  if (!(job?.finalRepairLockedText923 instanceof Map) || !job.finalRepairLockedText923.size) return out;
+  const byId=new Map(blocks.map(block=>[Number(block.index),block]));
+  let restored=0;
+  for (const [id, acceptedRaw] of job.finalRepairLockedText923.entries()) {
+    const block=byId.get(Number(id));
+    if (!block) continue;
+    const accepted=String(acceptedRaw || "").trim();
+    const current=String(out.get(Number(id)) || "").trim();
+    if (!accepted || current===accepted) continue;
+    const acceptedReasons=priorityLocalReasons898(block, accepted, filename, plan);
+    const currentReasons=priorityLocalReasons898(block, current, filename, plan);
+    const acceptedFits=layoutCueResult(block,accepted).fits;
+    // Never resurrect a candidate that is objectively worse. Restore only
+    // when the accepted FINAL repair remains locally safe and the later text
+    // reintroduced at least as many blockers (the exact bug seen in 9.2.2).
+    if (acceptedFits && acceptedReasons.length <= currentReasons.length) {
+      out.set(Number(id),accepted);
+      restored++;
+      console.warn(`[REPAIR PERSISTENCE 9.2.3] cue ${id}: repair FINAL aceito restaurado; fallback posterior não pode ressuscitar candidato reprovado.`);
+    }
+  }
+  if (restored) console.warn(`[REPAIR PERSISTENCE 9.2.3] restaurados=${restored} cue(s). ✅`);
+  return out;
+}
+
+function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslations, filename, plan, job = null) {
   const out = new Map(finalTranslations);
   if (!(mainTranslations instanceof Map)) return out;
 
@@ -14165,6 +14199,8 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
     let resolved = false;
     for (const [candPrev, candCurr, label] of options) {
       if (!candPrev || !candCurr) continue;
+      if (isFinalRepairLocked923(job, prev.index) && candPrev !== finalPrev) continue;
+      if (isFinalRepairLocked923(job, curr.index) && candCurr !== finalCurr) continue;
       if (!layoutCueResult(prev, candPrev).fits || !layoutCueResult(curr, candCurr).fits) continue;
       if (priorityLocalReasons898(prev, candPrev, filename, plan).length) continue;
       if (priorityLocalReasons898(curr, candCurr, filename, plan).length) continue;
@@ -14182,7 +14218,7 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
     // Último recurso determinístico: se final e MAIN ainda repetem uma cauda
     // que a SOURCE não repete, remove SOMENTE o prefixo semântico duplicado do
     // cue de continuação. Nunca inventa conteúdo nem move timestamps.
-    if (!resolved) {
+    if (!resolved && !isFinalRepairLocked923(job, curr.index)) {
       const nowPrev = String(out.get(prev.index) || "").trim();
       const nowCurr = String(out.get(curr.index) || "").trim();
       const trimmed = removeLeadingSemanticDuplicate898(nowPrev, nowCurr);
@@ -14201,12 +14237,13 @@ function applyFinalOwnershipFallback898(blocks, finalTranslations, mainTranslati
   return out;
 }
 
-function applyFinalStrictLayoutFallback898(blocks, finalTranslations, mainTranslations, filename, plan) {
+function applyFinalStrictLayoutFallback898(blocks, finalTranslations, mainTranslations, filename, plan, job = null) {
   const out = new Map(finalTranslations);
 
   for (const block of blocks) {
     let current = String(out.get(block.index) || "").trim();
     if (!current || layoutCueResult(block, current).fits) continue;
+    if (isFinalRepairLocked923(job, block.index)) continue;
 
     const compacted = compactExactRepetitionLayout898(block, current);
     if (compacted !== current && layoutCueResult(block, compacted).fits) {
@@ -14235,7 +14272,7 @@ function finalClosureResidualSummary898(blocks, translations, filename, plan) {
     const pt = String(translations.get(block.index) || "").trim();
     if (!layoutCueResult(block, pt).fits) layout++;
     const reasons = localReasonsForCue(block, pt, filename, plan);
-    if (reasons.some(r => /GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
+    if (reasons.some(r => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
     if (reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
     if (/\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
     const source = String(block?.text || "");
@@ -14444,6 +14481,77 @@ function applyContextSemanticPostconditions896(block, value) {
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
 
+
+// ============================================================
+// STRUCTURAL GENDER NEUTRALITY — 9.2.3
+// ============================================================
+// Title/model agnostic: asks whether SOURCE requires human gender in the
+// proposition and whether PT-BR introduced a marked predicate/article anyway.
+const PT_STRUCTURAL_GENDER_WORD_923 = /^(?:(?:ad|id|os|iv|ári|eir|ent|ud|ic|at|ot|izad|ficad|ecid|endid)[oa]s?|(?:lou[cq]|put|pront|surd|tol|lind|bonit|cert|sozinh|inteir|amig|doid|maluc|gratid|choc|confus|exaust|orgulhos|aliviad|animad|decepcionad|desesperad|irritad|furios|envergonhad|surpres|cansad|preocupad|nervos|assustad|apavorad|aterrorizad|amedrontad|ocupad|entediad|excitad|perdid|apaixonad|lisonjead|destinad|colocad|marcad)[oa]s?)$/iu;
+
+function ptWordLooksStructurallyGenderMarked923(word) {
+  const w = String(word || "").toLocaleLowerCase("pt-BR").replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
+  if (!w) return false;
+  return PT_STRUCTURAL_GENDER_WORD_923.test(w);
+}
+
+function targetStructuralPredicateGender923(pt, person = "first") {
+  const text = String(pt || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  const frames = person === "first"
+    ? [
+        /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|era|estava|fui|pare[cç]o|(?:estou|t[oô])\s+parecendo)\s+([^.!?]{1,80})/giu,
+        /\b(?:eu\s+)?me\s+sinto\s+([^.!?]{1,70})/giu
+      ]
+    : person === "second"
+      ? [/\b(?:voc[eê]|c[eê]|tu)\s+(?:[ée]|est[aá]|t[aá]|ficou|era|estava|parece|parecia|ficou\s+parecendo)\s+([^.!?]{1,80})/giu]
+      : [/\b(?:n[oó]s\s+)?(?:estamos|ficamos|fomos|[eé]ramos|est[aá]vamos)\s+([^.!?]{1,80})/giu];
+
+  for (const re of frames) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      const tail = String(m[1] || "").trim();
+      const tokens = tail.split(/\s+/).slice(0, 8);
+      for (const token of tokens) {
+        if (/^(?:muito|muita|muitos|muitas|bem|super|t[aã]o|meio|meia|um|uma|uns|umas|pouco|pouca|s[oó]|apenas)$/iu.test(token.replace(/[,;:]/g, ""))) continue;
+        if (ptWordLooksStructurallyGenderMarked923(token)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function sourceNeutralPredicateFrame923(block, person = "first") {
+  if (!blockSourceIsEnglish(block)) return false;
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!source) return false;
+  if (person === "first") {
+    if (sourceExplicitlyMarksSelfGender(block)) return false;
+    return /\bi(?:'m|’m| am| was| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
+  }
+  if (person === "second") {
+    if (sourceExplicitlyMarksSecondPersonGender(block)) return false;
+    return /\byou(?:'re|’re| are| were| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
+  }
+  if (/\b(?:men|women|boys|girls|male|female)\b/iu.test(source)) return false;
+  return /\bwe(?:'re|’re| are| were| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
+}
+
+function structuralGenderReasons923(block, pt) {
+  const reasons=[];
+  if (sourceNeutralPredicateFrame923(block,"first") && targetStructuralPredicateGender923(pt,"first")) {
+    reasons.push("GENDER_V8_STRUCTURAL_FIRST_PERSON_PREDICATE");
+  }
+  if (sourceNeutralPredicateFrame923(block,"second") && targetStructuralPredicateGender923(pt,"second")) {
+    reasons.push("GENDER_V8_STRUCTURAL_SECOND_PERSON_PREDICATE");
+  }
+  if (sourceNeutralPredicateFrame923(block,"plural") && targetStructuralPredicateGender923(pt,"plural")) {
+    reasons.push("GENDER_V8_STRUCTURAL_PLURAL_PREDICATE");
+  }
+  return reasons;
+}
+
 function genderIntegrityV2Reasons(block, pt, plan) {
   const text = String(pt || "");
   if (!text.trim()) return [];
@@ -14504,6 +14612,9 @@ function genderIntegrityV2Reasons(block, pt, plan) {
   }
 
   for (const reason of genderClosureResidualReasons898(block, text)) {
+    reasons.push(reason);
+  }
+  for (const reason of structuralGenderReasons923(block, text)) {
     reasons.push(reason);
   }
 
@@ -15442,7 +15553,7 @@ function issuePriority(issue) {
 
   if (
     /FINAL_PRIORITY/i.test(joined) ||
-    /GENDER_V[2-7]_/i.test(joined) ||
+    /GENDER_V[2-8]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
     /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
@@ -16374,7 +16485,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-7]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-8]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -18254,6 +18365,7 @@ Para cada item:
 - reasons dizem exatamente por que o cue foi reprovado;
 - identity_lock é obrigatório;
 - se a SOURCE não marcar gênero, neutralize naturalmente; masculino genérico NÃO conta como neutro; papéis humanos em 1ª/2ª pessoa também precisam ser neutros sem prova explícita;
+- REGRA ESTRUTURAL 9.2.3: I/you/we + estado, adjetivo, particípio ou papel humano neutro NÃO autoriza PT-BR com -o/-a, -os/-as ou artigo um/uma que marque a pessoa. Reformule a FRASE, não troque apenas a desinência; preserve integralmente o significado;
 - leia before/after para resolver intenção de expressões e imperativos ambíguos, mas nunca copie conteúdo deles para o target;
 - preserve a CONTAGEM de repetições deliberadas da mesma frase/pergunta da SOURCE;
 - nunca produza lixo/placeholder/reticências para preencher vazio;
@@ -18332,7 +18444,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -18881,6 +18993,8 @@ async function runFinalPriorityEscalatedRepair(
           }
 
           updated.set(id, candidatePt);
+          if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
+          job.finalRepairLockedText923.set(Number(id), candidatePt);
           accepted++;
         }
 
@@ -19331,7 +19445,7 @@ const preSafeHardIssues = detectLocalIssues(
 ).map(issue => ({
   id: issue.id,
   reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   )
 })).filter(issue => issue.reasons.length);
 
@@ -19506,22 +19620,59 @@ finalTranslations = await enforceFinalOwnershipGate900(
 // candidato MAIN quando ele for objetivamente mais seguro.
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 finalTranslations = applyFinalOwnershipFallback898(
-  blocks, finalTranslations, mainTranslations, job.filename, plan
+  blocks, finalTranslations, mainTranslations, job.filename, plan, job
 );
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 finalTranslations = applyFinalStrictLayoutFallback898(
-  blocks, finalTranslations, mainTranslations, job.filename, plan
+  blocks, finalTranslations, mainTranslations, job.filename, plan, job
+);
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+finalTranslations = applyRepairPersistenceLock923(
+  blocks, finalTranslations, job, job.filename, plan
 );
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
-const finalClosure898 = finalClosureResidualSummary898(
+let finalClosure898 = finalClosureResidualSummary898(
   blocks, finalTranslations, job.filename, plan
 );
+
+// 9.2.3 STRICT GENDER FINAL GATE. One bounded, focal reconstruction only.
+// No global re-audit and no open convergence loop.
+if (finalClosure898.gender > 0) {
+  const genderIssues923=[];
+  for (const block of blocks) {
+    const pt=String(finalTranslations.get(block.index) || "").trim();
+    const reasons=localReasonsForCue(block,pt,job.filename,plan)
+      .filter(reason => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
+    if (reasons.length) genderIssues923.push({id:block.index,reasons:[...new Set(reasons)]});
+  }
+  console.warn(`[GENDER FINAL GATE 9.2.3] residual=${genderIssues923.length}; executando UMA reconstrução focal estrutural, sem reauditoria global.`);
+  if (genderIssues923.length) {
+    finalTranslations = await runFinalPriorityEscalatedRepair(
+      blocks, finalTranslations, genderIssues923, plan, job
+    );
+    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+    finalTranslations = applyRepairPersistenceLock923(
+      blocks, finalTranslations, job, job.filename, plan
+    );
+    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+    finalClosure898 = finalClosureResidualSummary898(
+      blocks, finalTranslations, job.filename, plan
+    );
+  }
+}
+
+if (finalClosure898.gender > 0) {
+  job.qualityStatus = "gender_residual_uncached";
+  job.noCacheFinal923 = true;
+  console.error(`[GENDER FINAL GATE 9.2.3] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; resultado poderá ser servido para disponibilidade, mas NÃO recebe FINAL OK nem cache.`);
+}
 console.log(
-  `[FINAL CLOSURE 9.0] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.2.3] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
-  `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ✅`
+  `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ` +
+  `${finalClosure898.gender === 0 ? "✅" : "⛔"}`
 );
 
 const authorizedLayoutTranslations =
@@ -19566,17 +19717,26 @@ auditTimestamps(
       1000
     );
 
-  console.log(
-    `[PIPELINE 9.0 ROUTED] FINAL OK | ${
-      blocks.length
-    } source cues | pipeline=${
-      pipelineElapsedSeconds.toFixed(1)
-    }s | job-total=${
-      jobElapsedSeconds.toFixed(1)
-    }s | full-job-retries=${
-      job.stats.jobRetries || 0
-    }.`
-  );
+  if (finalClosure898.gender === 0) {
+    console.log(
+      `[PIPELINE 9.2.3 ROUTED] FINAL OK | ${
+        blocks.length
+      } source cues | pipeline=${
+        pipelineElapsedSeconds.toFixed(1)
+      }s | job-total=${
+        jobElapsedSeconds.toFixed(1)
+      }s | full-job-retries=${
+        job.stats.jobRetries || 0
+      }.`
+    );
+    if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate") job.qualityStatus = "final_pass";
+  } else {
+    console.warn(
+      `[PIPELINE 9.2.3 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
+      `gender-residual=${finalClosure898.gender} | pipeline=${pipelineElapsedSeconds.toFixed(1)}s | ` +
+      `job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
+    );
+  }
 
   return finalSrt;
 }
@@ -19634,12 +19794,13 @@ async function processJob(
         job
       );
 
-      // Só chega aqui depois do FINAL PRIORITY GATE PASSAR.
-      setCache(
-        job.cacheKey,
-        finalSrt,
-        job
-      );
+      // 9.2.3: strict final gate may allow availability without freezing a
+      // residual as canonical. Such results are served but never cached.
+      if (!job.noCacheFinal923) {
+        setCache(job.cacheKey, finalSrt, job);
+      } else {
+        console.warn(`[CACHE 9.2.3] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
+      }
 
       job.result = finalSrt;
       job.status = "completed";
@@ -21204,7 +21365,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.2 - GENDER NEUTRALITY CLOSURE + ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE"
+        " STREMIO PT-BR 9.2.3 - STRUCTURAL GENDER + REPAIR PERSISTENCE + STRICT FINAL GATE"
   );
 
   console.log(
@@ -21610,7 +21771,9 @@ console.log(
     "Router Resilience 9.2.1: invalid_response não envenena a última rota; MAIN drena workers antes de retry/terminal ✅"
   );
   console.log(
-    "Gender Neutrality Closure 9.2.2: gênero humano evitável é reescrito localmente; residual vira blocker GENDER_V7 e não pode fechar gender=0 ✅"
+    "Structural Gender 9.2.3: predicativos/artigos humanos 1ª/2ª/plural são auditados pela estrutura; SOURCE explícita continua autoridade ✅",
+    "Repair Persistence 9.2.3: repair FINAL aceito não pode ser revertido silenciosamente para candidato antigo ✅",
+    "Strict Gender Final Gate 9.2.3: gender>0 bloqueia FINAL OK/cache; uma reconstrução focal bounded é tentada antes ✅"
   );
 
   console.log(
