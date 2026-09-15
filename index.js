@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.3 - STRUCTURAL GENDER + REPAIR PERSISTENCE + STRICT FINAL GATE
+// STREMIO PT-BR 9.2.4 - TRANSIENT ROUTE RESILIENCE + STRUCTURAL GENDER + REPAIR PERSISTENCE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2.3-structural-gender-repair-persistence-v1";
+  "9.2.4-transient-route-resilience-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1220,6 +1220,7 @@ function createJob({
       freeTierGovernorWaitMs: 0,
 
       modelFallbacks: 0,
+      modelTransientRetries: 0,
       model503: 0,
       model429Daily: 0,
       model429Rate: 0,
@@ -8934,8 +8935,16 @@ async function geminiRequest({
 
     const primaryShort503Retry =
       modelId === GEMINI_MODELS.MAIN_PRIMARY ? 1 : 0;
+    // 9.2.4: if no later route is currently healthy, the last usable model gets
+    // one bounded transient retry too. A single 502/503 must not poison the only
+    // remaining route for the rest of the job.
+    const laterHealthyRoute = route.slice(routeIndex + 1).some(candidate => {
+      if (modelSkippedForJob(job, candidate)) return false;
+      return runtimeForGeminiModel(candidate).unavailableUntil <= Date.now();
+    });
+    const sameModelRetryBudget = Math.max(primaryShort503Retry, laterHealthyRoute ? 0 : 1);
 
-    for (let sameModelAttempt = 0; sameModelAttempt <= primaryShort503Retry; sameModelAttempt++) {
+    for (let sameModelAttempt = 0; sameModelAttempt <= sameModelRetryBudget; sameModelAttempt++) {
       markAttempt(job, metric);
       recordRouterModelCall(job, modelId);
 
@@ -8947,7 +8956,7 @@ async function geminiRequest({
         console.log(
           `[MODEL ROUTER ${String(metric).toUpperCase()}] ${modelId} | ` +
           `route=${routeIndex + 1}/${route.length} | thinking=${thinkingLevel} | ` +
-          `attempt=${sameModelAttempt + 1}/${primaryShort503Retry + 1}.`
+          `attempt=${sameModelAttempt + 1}/${sameModelRetryBudget + 1}.`
         );
 
         const result = await callGenerateContentModel({
@@ -9008,10 +9017,11 @@ async function geminiRequest({
         if (status === 503) {
           if (job) job.stats.model503 = Number(job.stats.model503 || 0) + 1;
 
-          if (sameModelAttempt < primaryShort503Retry) {
+          if (sameModelAttempt < sameModelRetryBudget) {
             console.warn(
-              `[MODEL ROUTER] ${modelId} 503 HIGH DEMAND -> 1 retry curto e único antes do fallback.`
+              `[MODEL ROUTER] ${modelId} 503 HIGH DEMAND -> retry curto bounded antes do fallback/skip.`
             );
+            if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
             await sleep(900);
             continue;
           }
@@ -9054,9 +9064,16 @@ async function geminiRequest({
         }
 
         if (status >= 500 || [408, 409, 425].includes(status)) {
+          const shortTransient = [500, 502, 408, 425].includes(status);
+          if (shortTransient && sameModelAttempt < sameModelRetryBudget) {
+            if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
+            console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} transitório -> 1 retry curto bounded antes de skip.`);
+            await sleep(800);
+            continue;
+          }
           setModelUnavailable(modelId, 30000, `HTTP ${status}`);
-          skipModelForJob(job, modelId, `HTTP ${status}`, "temporarily_unavailable");
-          console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} -> fallback imediato e skip até o fim do job.`);
+          skipModelForJob(job, modelId, `HTTP ${status} persistiu após retry permitido`, "temporarily_unavailable");
+          console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} persistiu -> fallback/skip até o fim do job.`);
           break;
         }
 
@@ -11993,10 +12010,10 @@ async function translateAllMain(
       }
 
       completed++;
-      job.progress = Math.min(
+      job.progress = Math.max(Number(job.progress || 0), Math.min(
         90,
         5 + Math.round(85 * completed / batches.length)
-      );
+      ));
       job.updatedAt = Date.now();
 
       console.log(
@@ -18654,7 +18671,7 @@ async function finalPriorityGeminiRequest(args, job, label) {
         job.error =
           `SCHEMA FALLBACK ${label}: ${message.slice(0, 260)}`;
         job.status = "processing";
-        job.progress = Math.min(99, Math.max(94, job.progress || 0));
+        job.progress = Math.max(Number(job.progress || 0), Math.min(99, Math.max(94, job.progress || 0)));
         job.updatedAt = Date.now();
 
         console.warn(
@@ -18686,7 +18703,7 @@ async function finalPriorityGeminiRequest(args, job, label) {
       job.error =
         `RETRY ${label}: ${message.slice(0, 260)}`;
       job.status = "processing";
-      job.progress = Math.min(99, Math.max(94, job.progress || 0));
+      job.progress = Math.max(Number(job.progress || 0), Math.min(99, Math.max(94, job.progress || 0)));
       job.updatedAt = Date.now();
 
       console.warn(
@@ -19403,7 +19420,7 @@ async function translateSrt(
       job
     );
 
-  job.progress = 5;
+  job.progress = Math.max(5, Number(job.progress || 0));
 
   let mainTranslations =
   await translateAllMain(
@@ -19719,7 +19736,7 @@ auditTimestamps(
 
   if (finalClosure898.gender === 0) {
     console.log(
-      `[PIPELINE 9.2.3 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.2.4 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -19732,7 +19749,7 @@ auditTimestamps(
     if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate") job.qualityStatus = "final_pass";
   } else {
     console.warn(
-      `[PIPELINE 9.2.3 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.2.4 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | pipeline=${pipelineElapsedSeconds.toFixed(1)}s | ` +
       `job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
     );
@@ -19799,7 +19816,7 @@ async function processJob(
       if (!job.noCacheFinal923) {
         setCache(job.cacheKey, finalSrt, job);
       } else {
-        console.warn(`[CACHE 9.2.3] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
+        console.warn(`[CACHE 9.2.4] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
       }
 
       job.result = finalSrt;
@@ -19847,7 +19864,7 @@ async function processJob(
       // Mantemos o job vivo e repetimos. SafeDraft continua apenas como
       // proteção interna/diagnóstico; nunca ganha selo FINAL por erro.
       job.status = "processing";
-      job.progress = Math.min(99, Math.max(1, job.progress || 1));
+      job.progress = Math.max(Number(job.progress || 0), Math.min(99, Math.max(1, job.progress || 1)));
       job.error =
         `RETRYING (${attempt}): ${errorMessage(error).slice(0, 500)}`;
       job.updatedAt = Date.now();
@@ -21365,7 +21382,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.3 - STRUCTURAL GENDER + REPAIR PERSISTENCE + STRICT FINAL GATE"
+        " STREMIO PT-BR 9.2.4 - TRANSIENT ROUTE RESILIENCE + STRUCTURAL GENDER + REPAIR PERSISTENCE"
   );
 
   console.log(
@@ -21773,7 +21790,8 @@ console.log(
   console.log(
     "Structural Gender 9.2.3: predicativos/artigos humanos 1ª/2ª/plural são auditados pela estrutura; SOURCE explícita continua autoridade ✅",
     "Repair Persistence 9.2.3: repair FINAL aceito não pode ser revertido silenciosamente para candidato antigo ✅",
-    "Strict Gender Final Gate 9.2.3: gender>0 bloqueia FINAL OK/cache; uma reconstrução focal bounded é tentada antes ✅"
+    "Strict Gender Final Gate 9.2.3: gender>0 bloqueia FINAL OK/cache; uma reconstrução focal bounded é tentada antes ✅",
+    "Transient Route Resilience 9.2.4: ultima rota saudavel recebe 1 retry curto para 500/502/503/408/425 antes de skip; zero loop ✅"
   );
 
   console.log(
