@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.1 - ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY
+// STREMIO PT-BR 9.2.2 - GENDER NEUTRALITY CLOSURE + ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2-subtitle-hygiene-music-relevance-v1";
+  "9.2.2-gender-neutrality-closure-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -13262,16 +13262,16 @@ function blockSourceIsEnglish(block) {
 
 const FIRST_PERSON_MALE_MARKERS = [
   /\bobrigado\b/iu,
-  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|nascido|criado|preparado|acostumado|certo|ocupado|entediado|excitado|perdido|bonito)\b/iu,
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|nascido|criado|preparado|acostumado|certo|ocupado|entediado|excitado|perdido|bonito|surdo|tolo|indisposto|amigo|apaixonado|lisonjeado|destinado|colocado|marcado)\b/iu,
   /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustado|cansado|preocupado|nervoso|sozinho|pronto|louco|chocado|confuso|exausto|orgulhoso|aliviado|animado|decepcionado|desesperado|irritado|furioso|envergonhado|surpreso|separado|inteiro|casado|solteiro|preparado|acostumado|certo|ocupado|entediado|excitado|perdido|bonito)\b/iu,
-  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogado|questionado|acusado|convidado|obrigado)\b/iu
+  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogado|questionado|acusado|convidado|obrigado|destinado|colocado|marcado)\b/iu
 ];
 
 const FIRST_PERSON_FEMALE_MARKERS = [
   /\bobrigada\b/iu,
-  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|nascida|criada|preparada|acostumada|gr[aá]vida|certa|ocupada|entediada|excitada|perdida|bonita)\b/iu,
+  /\b(?:eu\s+)?(?:sou|estou|t[oô]|fiquei|estava|ando)\s+(?:muito\s+|super\s+|inacreditavelmente\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|nascida|criada|preparada|acostumada|gr[aá]vida|certa|ocupada|entediada|excitada|perdida|bonita|surda|tola|indisposta|amiga|apaixonada|lisonjeada|destinada|colocada|marcada)\b/iu,
   /\bme\s+(?:fez|fazer|deixou|deixar|tornou|tornar|manteve|manter)\s+(?:muito\s+)?(?:assustada|cansada|preocupada|nervosa|sozinha|pronta|louca|chocada|confusa|exausta|orgulhosa|aliviada|animada|decepcionada|desesperada|irritada|furiosa|envergonhada|surpresa|separada|inteira|casada|solteira|preparada|acostumada|gr[aá]vida|certa|ocupada|entediada|excitada|perdida|bonita)\b/iu,
-  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogada|questionada|acusada|convidada|obrigada)\b/iu
+  /\b(?:fui|era|estava\s+sendo)\s+(?:interrogada|questionada|acusada|convidada|obrigada|destinada|colocada|marcada)\b/iu
 ];
 
 function sourceExplicitlyMarksSelfGender(block) {
@@ -13643,6 +13643,139 @@ function applyAdditionalGenderNeutrality898(block, value) {
     .trim();
 }
 
+// ============================================================
+// GENDER NEUTRALITY CLOSURE — 9.2.2 ZERO-CLOUD
+// ============================================================
+// Não tenta adivinhar sexo/gênero. Atua apenas quando a SOURCE é neutra naquela
+// ideia e há uma reformulação PT-BR inequívoca, natural e semanticamente estável.
+function applyGenderNeutralityClosure922(block, value) {
+  let pt = String(value || "").trim();
+  if (!pt) return pt;
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!source) return pt;
+
+  // I am in love -> Eu me apaixonei. Evita apaixonado/apaixonada inteiramente.
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+in\s+love\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:eu\s+)?(?:estou|t[oô])\s+apaixonad[oa](?=\b|\s|[,.;!?])/giu,
+      match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Eu me apaixonei" : "eu me apaixonei");
+  }
+
+  // I'm flattered (that...) -> Isso é uma honra / Fico feliz que...
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+flattered\b/iu.test(source)) {
+    pt = pt
+      .replace(/\b(?:eu\s+)?(?:estou|t[oô]|fico|fiquei)\s+lisonjead[oa]\s+que\b/giu, "Fico feliz que")
+      .replace(/\b(?:eu\s+)?(?:estou|t[oô]|fico|fiquei)\s+lisonjead[oa]\s+por\b/giu, "É uma honra")
+      .replace(/\b(?:eu\s+)?(?:estou|t[oô]|fico|fiquei)\s+lisonjead[oa]\b/giu, "Isso é uma honra");
+  }
+
+  // I was [never] destined to... -> [Nunca] foi meu destino...
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi\s+was\s+(?:never\s+)?destined\s+to\b/iu.test(source)) {
+    pt = pt
+      .replace(/\b(?:eu\s+)?nunca\s+fui\s+destinad[oa]\s+a\b/giu, "Nunca foi meu destino")
+      .replace(/\b(?:eu\s+)?fui\s+destinad[oa]\s+a\b/giu, "Meu destino era");
+  }
+
+  // I was put/placed here -> me colocaram aqui. Preserva causa/contexto sem gênero.
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi\s+was\s+(?:put|placed)\s+here\b/iu.test(source)) {
+    pt = pt
+      .replace(/\bpor\s+que\s+(?:eu\s+)?fui\s+colocad[oa]\s+aqui\b/giu, "por que me colocaram aqui")
+      .replace(/\b(?:eu\s+)?fui\s+colocad[oa]\s+aqui\b/giu, "me colocaram aqui");
+  }
+
+  // Don't play the indignant card with me -> não transforma "indignant" em
+  // substantivo humano masculino/feminino no target.
+  if (/\bdon't\s+play\s+the\s+indignant\s+card\s+with\s+me\b/iu.test(source)) {
+    pt = pt.replace(/\bn[aã]o\s+venha\s+com\s+esse\s+papo\s+de\s+indignad[oa]\s+comigo\b/giu,
+      "Não venha com esse papo de indignação pra cima de mim");
+  }
+
+  // AHS real-world closures: mesmas classes que escapavam do Gender V2-V6.
+  // Cada regra exige SOURCE lexicalmente inequívoca e só remove gênero evitável.
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+not\s+deaf\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:eu\s+)?n[aã]o\s+sou\s+surd[oa]\b/giu, "eu escuto muito bem");
+  }
+
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bam\s+i\s+(?:a\s+)?fool\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:ser[aá]\s+que\s+)?(?:eu\s+)?sou\s+tol[oa]\b/giu, match =>
+      /^ser[aá]\s+que/iu.test(match) ? "Será que estou sendo idiota" : "estou sendo idiota");
+  }
+
+  if (/\bwe\s+(?:haven't|have\s+not)\s+been\s+beaten\b/iu.test(source) &&
+      /\bnor\s+are\s+we\s+bound\s+by\s+chains\b/iu.test(source)) {
+    pt = pt.replace(/\bn[aã]o\s+fomos\s+espancad[oa]s\s*,?\s*nem\s+estamos\s+pres[oa]s\s+por\s+correntes\b/giu,
+      "Não nos espancaram, nem nos prenderam com correntes");
+  }
+
+  if (/\bwe\s+were\s+(?:very\s+)?impressed\s+with\b/iu.test(source)) {
+    pt = pt.replace(/\bficamos\s+(?:muito\s+)?impressionad[oa]s\s+com\b/giu, "nos impressionamos muito com");
+  }
+
+  if (/\byou(?:'re|’re| are)\s+making\s+me\s+angry\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:voc[eê]\s+)?(?:est[aá]|t[aá])\s+me\s+deixando\s+irritad[oa]\b/giu, match =>
+      /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você está me irritando" : "você está me irritando");
+  }
+
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+just\s+a\s+bit\s+dodgy\s+tonight\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:eu\s+)?(?:estou|t[oô])\s+meio\s+indispost[oa]\s+hoje\s+[aà]\s+noite\b/giu,
+      "eu não tô muito bem hoje à noite");
+  }
+
+  if (!sourceExplicitlyMarksSecondPersonGender(block) && /\byou(?:'re|’re| are)\s+beautiful\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:voc[eê]\s+)?(?:[ée]|est[aá]|t[aá])\s+lind[oa]\b/giu, match =>
+      /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você está incrível" : "você está incrível");
+  }
+
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+(?:a\s+)?friend\s+of\s+his\b/iu.test(source)) {
+    pt = pt.replace(/\b(?:eu\s+)?sou\s+amig[oa]\s+dele\b/giu, match =>
+      /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Ele é meu amigo" : "ele é meu amigo");
+  }
+
+  if (/\beverybody(?:'s|’s| is)\s+just\s+worried\s+about\s+them\b/iu.test(source)) {
+    pt = pt.replace(/\btodo\s+mundo\s+s[oó]\s+est[aá]\s+preocupad[oa]\s+com\b/giu, "todo mundo só se preocupa com");
+  }
+
+  if (/\byou(?:'re|’re| are)\s+the\s+(?:true\s+)?hero\b/iu.test(source) && !sourceExplicitlyMarksSecondPersonGender(block)) {
+    pt = pt.replace(/\b(?:voc[eê]\s+)?[ée]\s+(?:a\s+verdadeira\s+hero[ií]na|o\s+verdadeiro\s+her[oó]i|a\s+hero[ií]na|o\s+her[oó]i)\b/giu,
+      match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Foi você quem salvou o dia" : "foi você quem salvou o dia");
+  }
+
+  // Vocativos "darling" são neutros em inglês; "meu bem" preserva afeto sem inventar sexo.
+  if (/\bdarling\b/iu.test(source)) {
+    pt = pt.replace(/\bquerid[oa]\b/giu, "meu bem");
+  }
+
+  return pt.replace(/[ \t]{2,}/g, " ").trim();
+}
+
+function avoidableGenderResidual922(block, value) {
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  const pt = String(value || "").trim();
+  if (!source || !pt) return false;
+
+  if (!sourceExplicitlyMarksSelfGender(block)) {
+    if (/\bi(?:'m|’m| am)\s+in\s+love\b/iu.test(source) && /\b(?:estou|t[oô])\s+apaixonad[oa]\b/iu.test(pt)) return true;
+    if (/\bi(?:'m|’m| am)\s+flattered\b/iu.test(source) && /\blisonjead[oa]\b/iu.test(pt)) return true;
+    if (/\bi\s+was\s+(?:never\s+)?destined\s+to\b/iu.test(source) && /\bfui\s+destinad[oa]\b/iu.test(pt)) return true;
+    if (/\bi\s+was\s+(?:put|placed)\s+here\b/iu.test(source) && /\bfui\s+colocad[oa]\s+aqui\b/iu.test(pt)) return true;
+  }
+  if (/\bdon't\s+play\s+the\s+indignant\s+card\s+with\s+me\b/iu.test(source) && /\bpapo\s+de\s+indignad[oa]\b/iu.test(pt)) return true;
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+not\s+deaf\b/iu.test(source) && /\bn[aã]o\s+sou\s+surd[oa]\b/iu.test(pt)) return true;
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bam\s+i\s+(?:a\s+)?fool\b/iu.test(source) && /\bsou\s+tol[oa]\b/iu.test(pt)) return true;
+  if (/\bwe\s+(?:haven't|have\s+not)\s+been\s+beaten\b/iu.test(source) && /\bfomos\s+espancad[oa]s\b/iu.test(pt)) return true;
+  if (/\bwe\s+were\s+(?:very\s+)?impressed\s+with\b/iu.test(source) && /\bimpressionad[oa]s\b/iu.test(pt)) return true;
+  if (/\byou(?:'re|’re| are)\s+making\s+me\s+angry\b/iu.test(source) && /\bme\s+deixando\s+irritad[oa]\b/iu.test(pt)) return true;
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+just\s+a\s+bit\s+dodgy\s+tonight\b/iu.test(source) && /\bindispost[oa]\b/iu.test(pt)) return true;
+  if (!sourceExplicitlyMarksSecondPersonGender(block) && /\byou(?:'re|’re| are)\s+beautiful\b/iu.test(source) && /\b(?:voc[eê]\s+)?[ée]\s+lind[oa]\b/iu.test(pt)) return true;
+  if (!sourceExplicitlyMarksSelfGender(block) && /\bi(?:'m|’m| am)\s+(?:a\s+)?friend\s+of\s+his\b/iu.test(source) && /\bsou\s+amig[oa]\s+dele\b/iu.test(pt)) return true;
+  if (/\beverybody(?:'s|’s| is)\s+just\s+worried\s+about\s+them\b/iu.test(source) && /\btodo\s+mundo\s+s[oó]\s+est[aá]\s+preocupad[oa]\b/iu.test(pt)) return true;
+  if (/\byou(?:'re|’re| are)\s+the\s+(?:true\s+)?hero\b/iu.test(source) && !sourceExplicitlyMarksSecondPersonGender(block) && /\b(?:hero[ií]na|her[oó]i)\b/iu.test(pt)) return true;
+  if (/\bdarling\b/iu.test(source) && /\bquerid[oa]\b/iu.test(pt)) return true;
+  // O substantivo inglês "twin" não prova gênero; se a tradução do headline
+  // ainda introduzir uma cadeia feminina/masculina, força Repair contextual.
+  if (/\bsiamese\s+twin\b/iu.test(source) && /\bg[eê]me[oa]\s+siam[eê]s[oa].{0,45}\b(?:separad[oa]|sozinh[oa])\b/iu.test(pt)) return true;
+  return false;
+}
+
 function applyDeterministicGenderClosure898(block, value) {
   let pt = String(value || "").trim();
   if (!pt) return pt;
@@ -13668,6 +13801,7 @@ function applyDeterministicGenderClosure898(block, value) {
         let safe = applyContextualPassengerNeutralization898(pseudo, body);
         safe = applyDeterministicGenderNeutrality(pseudo, safe);
         safe = applyAdditionalGenderNeutrality898(pseudo, safe);
+        safe = applyGenderNeutralityClosure922(pseudo, safe);
         return `${prefix}${safe}`.trimEnd();
       });
 
@@ -13679,6 +13813,7 @@ function applyDeterministicGenderClosure898(block, value) {
   pt = applyContextualPassengerNeutralization898(block, pt);
   pt = applyDeterministicGenderNeutrality(block, pt);
   pt = applyAdditionalGenderNeutrality898(block, pt);
+  pt = applyGenderNeutralityClosure922(block, pt);
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
 
@@ -13743,6 +13878,7 @@ function genderClosureResidualReasons898(block, value) {
   if (/\bwe\s+(?:weren't|were\s+not)\s+alone\b/iu.test(source) && /\bsozinh[oa]s\b/iu.test(pt)) reasons.push("GENDER_V6_WE_ALONE_MARKED");
   if (/\bsweetie\b/iu.test(source) && /\bquerid[oa]\b/iu.test(pt)) reasons.push("GENDER_V6_SWEETIE_MARKED");
   if (/\byou\b/iu.test(source) && !sourceHasExplicitSecondPersonHonorificGender898(block) && /\b(?:senhora|senhor)\b/iu.test(pt)) reasons.push("GENDER_V6_HONORIFIC_INFERRED");
+  if (avoidableGenderResidual922(block, pt)) reasons.push("GENDER_V7_AVOIDABLE_MARKING_9_2_2");
 
   return [...new Set(reasons)];
 }
@@ -13963,7 +14099,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -14099,7 +14235,7 @@ function finalClosureResidualSummary898(blocks, translations, filename, plan) {
     const pt = String(translations.get(block.index) || "").trim();
     if (!layoutCueResult(block, pt).fits) layout++;
     const reasons = localReasonsForCue(block, pt, filename, plan);
-    if (reasons.some(r => /GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
+    if (reasons.some(r => /GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
     if (reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
     if (/\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
     const source = String(block?.text || "");
@@ -14379,7 +14515,7 @@ const UNKNOWN_SPEAKER_GENDERED_STATE_RE =
 
 
 const SECOND_PERSON_GENDERED_STATE_RE =
-  /\b(?:voc[eê]|vc|c[eê])\s+(?:[ée]|est[aá]|t[aá]|ficou|parece|anda)\s+(?:muito\s+)?(?:assustad[oa]s?|apavorad[oa]s?|aterrorizad[oa]s?|amedrontad[oa]s?|cansad[oa]s?|preocupad[oa]s?|nervos[oa]s?|sozinh[oa]s?|pront[oa]s?|lou[cq][oa]s?|chocad[oa]s?|confus[oa]s?|exaust[oa]s?|orgulhos[oa]s?|aliviad[oa]s?|animad[oa]s?|decepcionad[oa]s?|desesperad[oa]s?|irritad[oa]s?|furios[oa]s?|envergonhad[oa]s?|surpres[oa]s?)\b|\b(?:voc[eê]|vc|c[eê])\s+[ée]\s+(?:o\s+vencedor|a\s+vencedora)\b/iu;
+  /\b(?:voc[eê]|vc|c[eê])\s+(?:[ée]|est[aá]|t[aá]|ficou|parece|anda)\s+(?:muito\s+)?(?:assustad[oa]s?|apavorad[oa]s?|aterrorizad[oa]s?|amedrontad[oa]s?|cansad[oa]s?|preocupad[oa]s?|nervos[oa]s?|sozinh[oa]s?|pront[oa]s?|lou[cq][oa]s?|chocad[oa]s?|confus[oa]s?|exaust[oa]s?|orgulhos[oa]s?|aliviad[oa]s?|animad[oa]s?|decepcionad[oa]s?|desesperad[oa]s?|irritad[oa]s?|furios[oa]s?|envergonhad[oa]s?|surpres[oa]s?|bonit[oa]s?|lind[oa]s?)\b|\b(?:voc[eê]|vc|c[eê])\s+[ée]\s+(?:o\s+vencedor|a\s+vencedora)\b/iu;
 
 function sourceExplicitlyMarksSecondPersonGender(block) {
   const source = String(block?.text || "")
@@ -15306,7 +15442,7 @@ function issuePriority(issue) {
 
   if (
     /FINAL_PRIORITY/i.test(joined) ||
-    /GENDER_V[2-6]_/i.test(joined) ||
+    /GENDER_V[2-7]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
     /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
@@ -16238,7 +16374,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-6]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-7]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -18196,7 +18332,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -19195,7 +19331,7 @@ const preSafeHardIssues = detectLocalIssues(
 ).map(issue => ({
   id: issue.id,
   reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-6]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-7]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   )
 })).filter(issue => issue.reasons.length);
 
@@ -21068,7 +21204,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.1 - ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE + READABILITY"
+        " STREMIO PT-BR 9.2.2 - GENDER NEUTRALITY CLOSURE + ROUTER RESILIENCE + SUBTITLE HYGIENE + MUSIC RELEVANCE"
   );
 
   console.log(
@@ -21472,6 +21608,9 @@ console.log(
 
   console.log(
     "Router Resilience 9.2.1: invalid_response não envenena a última rota; MAIN drena workers antes de retry/terminal ✅"
+  );
+  console.log(
+    "Gender Neutrality Closure 9.2.2: gênero humano evitável é reescrito localmente; residual vira blocker GENDER_V7 e não pode fechar gender=0 ✅"
   );
 
   console.log(
