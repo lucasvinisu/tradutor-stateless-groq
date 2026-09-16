@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.5 - TARGET-ELIMINATION GENDER GATE + TRANSIENT ROUTE RESILIENCE
+// STREMIO PT-BR 9.2.7 - QUALITY ESCALATION + BEST CANDIDATE + DELIVERY GUARANTEE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2.5-target-elimination-gender-gate-v1";
+  "9.2.7-quality-escalation-delivery-first-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -297,6 +297,7 @@ const RECOVERY_SIGNING_KEY =
   "stremio-ptbr-8.3.0";
 
 const translationCache = new Map();
+const provisionalTranslationCache = new Map();
 const jobs = new Map();
 
 let lastGeminiRequestStart = 0;
@@ -1033,6 +1034,7 @@ function setCache(
   srt,
   job = null
 ) {
+  provisionalTranslationCache.delete(key);
   translationCache.set(
     key,
     {
@@ -1048,6 +1050,32 @@ function setCache(
         CACHE_TTL_MS
     }
   );
+}
+
+function getProvisionalCache927(key) {
+  const item = provisionalTranslationCache.get(key);
+  if (!item) return null;
+  if (item.expiresAt <= Date.now()) {
+    provisionalTranslationCache.delete(key);
+    return null;
+  }
+  return item;
+}
+
+function setProvisionalCache927(key, srt, job = null, label = "best_available") {
+  const value = String(srt || "").trim();
+  if (!value || !/-->/m.test(value)) return false;
+  provisionalTranslationCache.set(key, {
+    srt: value,
+    qualityStatus: String(job?.qualityStatus || label || "best_available"),
+    residualIssues: Array.isArray(job?.finalTargetResidual927)
+      ? job.finalTargetResidual927.map(issue => ({ id: Number(issue?.id), reasons: [...(issue?.reasons || [])] }))
+      : [],
+    createdAt: Date.now(),
+    expiresAt: Date.now() + CACHE_TTL_MS
+  });
+  console.warn(`[PROVISIONAL CACHE 9.2.7] salvo | quality=${String(job?.qualityStatus || label)} | key=${String(key).slice(0,18)}...`);
+  return true;
 }
 
 function restoreIntentionalEmptyIdsFromCache(
@@ -1136,6 +1164,11 @@ function createJob({
 
     result: null,
     safeDraft: null,
+    bestAvailableSrt927: null,
+    bestAvailableLabel927: "",
+    bestCandidateScore927: null,
+    bestCandidateTranslations927: null,
+    finalTargetResidual927: [],
     error: null,
     qualityStatus: "pending",
 
@@ -1355,6 +1388,10 @@ setInterval(
           key
         );
       }
+    }
+
+    for (const [key, item] of provisionalTranslationCache.entries()) {
+      if (item.expiresAt <= now) provisionalTranslationCache.delete(key);
     }
 
     for (
@@ -2606,11 +2643,20 @@ function looksLikeBareSdhLine(
       )
     ).trim();
 
-  if (
-    /^[-–—]\s+/u.test(
-      original
-    )
-  ) {
+  const dashedBare = original.match(/^[-–—]\s+(.+)$/u);
+  if (dashedBare) {
+    const dashedBody = String(dashedBare[1] || "").trim();
+    // Dialogue dashes are preserved, but a dash before a pure accessibility
+    // event ("- LAUGHTER", "- APPLAUSE") is still SDH, not a speaker turn.
+    if (
+      dashedBody &&
+      (
+        (sdhAllCapsLike(dashedBody) && looksLikeUniversalSdhAction(dashedBody, { bare: true })) ||
+        looksLikePureNonSpeechSdhLine(dashedBody)
+      )
+    ) {
+      return true;
+    }
     return false;
   }
 
@@ -3565,6 +3611,22 @@ function rawCueVisibleLines(
     .filter(Boolean);
 }
 
+function hasSubtitleLyricMarker(value) {
+  const text = stripMarkup(String(value || "")).trim();
+  if (!text) return false;
+  // # is a lyric marker only at subtitle line boundaries with whitespace; #1/#tag stay speech.
+  return /[♪♫♬]/u.test(text) || /^#\s+\S/u.test(text) || /\S\s+#$/u.test(text);
+}
+
+function stripSubtitleLyricMarkers(value) {
+  return String(value || "")
+    .replace(/[♪♫♬]/gu, " ")
+    .replace(/^\s*#\s+(?=\S)/u, "")
+    .replace(/\s+#\s*$/u, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
 function classifyMusicAwareLines(
   rawLines
 ) {
@@ -3593,7 +3655,7 @@ function classifyMusicAwareLines(
   const hasAnyMusicMarker =
     lines.some(
       item =>
-        /[♪♫♬]/u.test(
+        hasSubtitleLyricMarker(
           item.visible
         )
     );
@@ -3641,7 +3703,7 @@ function classifyMusicAwareLines(
     }
 
     if (
-      /[♪♫♬]/u.test(
+      hasSubtitleLyricMarker(
         visible
       )
     ) {
@@ -3793,7 +3855,9 @@ function rawMusicInfo(
         )
         .map(
           item =>
-            item.visible
+            item.kind === "lyric"
+              ? stripSubtitleLyricMarkers(item.visible)
+              : item.visible
         )
         .join(" ")
         .trim()
@@ -3957,7 +4021,7 @@ function clusterHasImmediatePerformanceLaunch(
           !looksLikeBareSdhLine(
             line
           ) &&
-          !/[♪♫♬]/u.test(
+          !hasSubtitleLyricMarker(
             line
           )
       )
@@ -3994,7 +4058,7 @@ function clusterHasNarrativePerformanceEvidence(cluster, info, rawBlocks) {
     if (clusterSet.has(i)) continue;
 
     const visible = rawCueVisibleLines(rawBlocks[i])
-      .filter(line => !looksLikeBareSdhLine(line) && !/[♪♫♬]/u.test(line))
+      .filter(line => !looksLikeBareSdhLine(line) && !hasSubtitleLyricMarker(line))
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
@@ -4010,6 +4074,7 @@ function musicLexicalTokens(value) {
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[♪♫♬]/gu, " ")
+    .replace(/^#\s+|\s+#$/g, " ")
     .replace(/[^a-z0-9' ]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -4458,7 +4523,7 @@ function detectPerformanceMusicIndexes(
     ).length;
 
   console.log(
-    `[MUSIC CONTEXT] cues com ♪=${musicIndexes.length} | ` +
+    `[MUSIC CONTEXT 9.2.6] cues com marcador musical=${musicIndexes.length} | ` +
     `clusters=${clusters.length} | âncoras fortes=${strongCount} | ` +
     `clusters confirmados=${confirmedClusters.size} | ` +
     `reprises atômicas=${reprisePromotions} | ` +
@@ -4655,9 +4720,14 @@ function cleanSrtForTranslation(
         performanceLyricLinesKept++;
       }
 
+      const sourceForDialogue =
+        classified.kind === "lyric"
+          ? stripSubtitleLyricMarkers(sourceLine)
+          : sourceLine;
+
       const info =
         extractSpeaker(
-          sourceLine
+          sourceForDialogue
         );
 
       if (
@@ -5372,6 +5442,16 @@ function stripOutputAccessibilityLine(
       )
       .trim();
 
+  // 9.2.6 UNIVERSAL FINAL HYGIENE. Pure accessibility events never belong
+  // in the visible final subtitle, even when a model recreated them without []/().
+  // This is structural (event-only / ALL-CAPS accessibility), never title-specific.
+  if (
+    looksLikePureNonSpeechSdhLine(text) ||
+    (sdhAllCapsLike(text) && looksLikeUniversalSdhAction(text, { bare: true }))
+  ) {
+    return "";
+  }
+
   // 9.0: um cue que já sobreviveu ao cleaner da SOURCE não pode perder
   // toda a fala silenciosamente só porque a tradução "parece" uma ação SDH.
   // SDH estruturado []/() continua sendo removido; bare SDH suspeito fica para
@@ -5448,6 +5528,8 @@ function sanitizeFinalCue(
         /[♪♫♬]/gu,
         " "
       )
+      .replace(/(^|\n)\s*#\s+(?=\S)/gu, "$1")
+      .replace(/\s+#\s*(?=$|\n)/gu, "")
       .replace(
         /\\+/gu,
         " "
@@ -5616,6 +5698,8 @@ function sanitizeFallbackCue(
         /[♪♫♬]/gu,
         " "
       )
+      .replace(/(^|\n)\s*#\s+(?=\S)/gu, "$1")
+      .replace(/\s+#\s*(?=$|\n)/gu, "")
       .replace(
         STANDALONE_SYMBOL_CLUSTER_RE,
         "$1 "
@@ -8909,7 +8993,8 @@ async function geminiRequest({
   timeoutMs,
   maxRetries,
   job = null,
-  metric = "main"
+  metric = "main",
+  routeOverride = null
 }) {
   if (!GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY não configurada.");
@@ -8917,7 +9002,10 @@ async function geminiRequest({
 
   void maxRetries; // 9.0: sem loop cego por modelo; o router troca de rota.
 
-  const route = geminiRouteForMetric(metric);
+  const defaultRoute = geminiRouteForMetric(metric);
+  const route = Array.isArray(routeOverride) && routeOverride.length
+    ? [...new Set(routeOverride.filter(modelId => GEMINI_MODEL_PROFILES[modelId]))]
+    : defaultRoute;
   const errors = [];
   let routeIndex = 0;
 
@@ -19297,6 +19385,235 @@ async function convergeFinalPriorityQuality(
   return current;
 }
 
+
+
+function finalIssueWeight927(issue) {
+  const reasons = (issue?.reasons || []).map(x => String(x || ""));
+  const joined = reasons.join(" | ");
+  if (/GENDER|MEANING_INTEGRITY|NEGATION|CUE_OWNERSHIP|OMISSION|REFERENT|DIALOGUE|CENSOR|BLEEP|GARBAGE|EMPTY|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|REPETITION_LOST|IDENTITY/i.test(joined)) return 100;
+  if (/LITERALITY|FORCED_OR_DATED_SLANG|SUBTITLE_TOO_DENSE|POSSIBLE_UNTRANSLATED/i.test(joined)) return 25;
+  return /FINAL_PRIORITY/i.test(joined) ? 60 : 40;
+}
+
+function issueScore927(issues) {
+  const list = Array.isArray(issues) ? issues : [];
+  let hard = 0;
+  let weighted = 0;
+  for (const issue of list) {
+    const weight = finalIssueWeight927(issue);
+    weighted += weight;
+    if (weight >= 60) hard++;
+  }
+  return { hard, weighted, count: list.length };
+}
+
+function betterScore927(a, b) {
+  if (!b) return true;
+  for (const key of ["hard", "weighted", "count"]) {
+    if (Number(a?.[key] || 0) !== Number(b?.[key] || 0)) return Number(a?.[key] || 0) < Number(b?.[key] || 0);
+  }
+  return false;
+}
+
+function recordBestCandidate927(blocks, translations, residual, job, label) {
+  const laidOut = applySubtitleLayout(blocks, translations, `BEST-CANDIDATE-9.2.7-${label}`);
+  const local = blockingLocalIssues(blocks, laidOut, job, job?.episodePlan || null);
+  const merged = mergeIssueLists(local, Array.isArray(residual) ? residual : []);
+  const score = issueScore927(merged);
+  if (!betterScore927(score, job.bestCandidateScore927)) return false;
+  const srt = buildSrt(blocks, laidOut);
+  job.bestCandidateScore927 = score;
+  job.bestCandidateTranslations927 = new Map(translations);
+  job.bestAvailableSrt927 = srt;
+  job.bestAvailableLabel927 = String(label || "candidate");
+  job.bestCandidateIssues927 = merged;
+  console.log(`[BEST CANDIDATE LEDGER 9.2.7] ${job.bestAvailableLabel927} | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} ✅`);
+  return true;
+}
+
+const SOURCE_ONLY_SURGERY_PROMPT_927 = `
+Você é o SOURCE-ONLY CUE SURGERY de uma legenda SOURCE→PT-BR.
+
+A tradução anterior NÃO é mostrada porque esta estratégia existe justamente para quebrar
+ancoragem em um candidato defeituoso. Reconstrua o target DIRETAMENTE da SOURCE.
+
+REGRAS:
+- traduza somente o cue alvo;
+- before_source/after_source servem apenas de contexto, nunca doe conteúdo ao alvo;
+- reasons são pós-condições obrigatórias que precisam desaparecer;
+- preserve negação, identidade, referente, ação, modalidade, intensidade, repetição e ownership;
+- SOURCE sem gênero explícito não autoriza gênero humano em PT-BR;
+- preserve hard_locks exatamente;
+- dialogue_turn_count deve permanecer semanticamente equivalente;
+- não invente SDH, marcador musical ou fala;
+- PT-BR natural e oral, sem calque desnecessário;
+- não altere timestamps.
+
+Retorne somente a tradução do cue solicitado no schema fornecido.
+`;
+
+const CONTRASTIVE_SURGERY_PROMPT_927 = `
+Você é o CONTRASTIVE CUE SURGERY final de uma legenda SOURCE→PT-BR.
+
+Você recebe SOURCE, current_pt e blockers residuais. Não faça edição cosmética.
+Primeiro identifique silenciosamente por que current_pt ainda viola cada blocker; depois
+reescreva o cue do zero para que TODOS desapareçam sem criar um novo defeito.
+
+Preserve: significado, negação, identidade/referente, ownership, repetição, diálogo,
+registro, força pragmática, hard_locks e neutralidade de gênero quando a SOURCE não prova gênero.
+Nunca mova conteúdo de before/after para o target. Não altere timestamps.
+`;
+
+async function runCueSurgery927(blocks, translations, issues, plan, job, mode = "source_only", options = {}) {
+  const posMap = positionMap(blocks);
+  const updated = new Map(translations);
+  const selected = [...new Map((Array.isArray(issues) ? issues : []).map(issue => [Number(issue?.id), issue])).values()]
+    .filter(issue => Number.isInteger(Number(issue?.id)) && posMap.has(Number(issue?.id)));
+  if (!selected.length) return updated;
+
+  const system = mode === "contrastive" ? CONTRASTIVE_SURGERY_PROMPT_927 : SOURCE_ONLY_SURGERY_PROMPT_927;
+  const routeOverride = mode === "source_only"
+    ? [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY]
+    : [GEMINI_MODELS.MAIN_PRIMARY, GEMINI_MODELS.MAIN_FALLBACK];
+  let cursor = 0;
+  const concurrency = Math.min(2, selected.length);
+
+  async function worker(workerId) {
+    while (true) {
+      const at = cursor++;
+      if (at >= selected.length) return;
+      const issue = selected[at];
+      const id = Number(issue.id);
+      const pos = posMap.get(id);
+      const block = blocks[pos];
+      const protectedTarget = protectCulturalLocks(block.text, block.index);
+      const locksById = new Map([[id, protectedTarget.locks]]);
+      const payload = {
+        i: id,
+        source: protectedTarget.text,
+        reasons: issue.reasons || [],
+        identity_lock: identityLockForCapsule(block, plan),
+        dialogue_turn_count: sourceDialogueDashCount(block),
+        hard_locks: protectedTarget.locks.map(lock => lock.token),
+        before_source: blocks.slice(Math.max(0, pos - 2), pos).map(x => ({ i: x.index, source: x.text })),
+        after_source: blocks.slice(pos + 1, Math.min(blocks.length, pos + 3)).map(x => ({ i: x.index, source: x.text }))
+      };
+      if (mode === "contrastive") payload.current_pt = String(updated.get(id) || "");
+
+      try {
+        const response = await finalPriorityGeminiRequest({
+          system,
+          user: `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\nBÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\nCUE:\n${JSON.stringify(payload)}`,
+          schema: cueTranslationSchema(1),
+          thinkingLevel: "high",
+          maxOutputTokens: 1800,
+          timeoutMs: 90000,
+          maxRetries: 1,
+          routeOverride,
+          job,
+          metric: "repair"
+        }, job, `${mode.toUpperCase()} SURGERY W${workerId} cue ${id}`);
+
+        const repaired = parseCueTranslation([block], response.text, locksById);
+        let candidate = String(repaired.get(id) || "").trim();
+        const beforePt = String(updated.get(id) || "");
+        let regressions = [];
+        if (options?.requireGenderZero) {
+          const target = strictGenderCandidateCheck925(block, beforePt, candidate, job.filename, plan);
+          candidate = target.candidate;
+          regressions = [...target.regressions, ...target.remainingGender];
+        } else {
+          candidate = sanitizeFinalCue(block, candidate) || sanitizeFallbackCue(candidate) || candidate;
+          regressions = repairCandidateRegressionReasons(block, beforePt, candidate, job.filename, plan);
+        }
+        if (regressions.length) {
+          console.warn(`[CUE SURGERY 9.2.7] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
+          continue;
+        }
+        updated.set(id, candidate);
+        if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
+        job.finalRepairLockedText923.set(id, candidate);
+        console.log(`[CUE SURGERY 9.2.7] mode=${mode} cue=${id} candidato produzido e protegido.`);
+      } catch (error) {
+        console.warn(`[CUE SURGERY 9.2.7] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i + 1)));
+  return updated;
+}
+
+async function auditTargetSet927(blocks, translations, targetIds, plan, job, label) {
+  const laidOut = applySubtitleLayout(blocks, translations, `FINAL-TARGET-9.2.7-${label}`);
+  const local = blockingLocalIssues(blocks, laidOut, job, plan)
+    .filter(issue => targetIds.has(Number(issue?.id)));
+  let semantic = [];
+  try {
+    semantic = await scanFinalPriorityAudit(blocks, translations, plan, job, targetIds);
+  } catch (error) {
+    console.warn(`[FINAL TARGET AUDIT 9.2.7] ${label} falhou tecnicamente; selo canônico fica bloqueado e candidato não é degradado | ${errorMessage(error).slice(0,300)}`);
+    semantic = [...targetIds].map(id => ({
+      id,
+      reasons: ["FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: a reauditoria focal não ficou disponível; preservar o melhor candidato e nunca declarar FINAL_PASS sem prova."]
+    }));
+    job.finalTargetAuditTechnicalFailure927 = true;
+  }
+  return mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
+}
+
+async function verifyFinalTargets927(blocks, translations, targetIssues, plan, job) {
+  const targetIds = new Set((Array.isArray(targetIssues) ? targetIssues : [])
+    .map(issue => Number(issue?.id)).filter(Number.isInteger));
+  if (!targetIds.size) return { translations: new Map(translations), residual: [] };
+
+  let current = new Map(translations);
+  let residual = await auditTargetSet927(blocks, current, targetIds, plan, job, "initial");
+  let best = new Map(current);
+  let bestResidual = residual;
+  let bestScore = issueScore927(residual);
+  recordBestCandidate927(blocks, current, residual, job, "target-initial");
+  if (!residual.length) {
+    console.log(`[FINAL TARGET VERIFICATION 9.2.7] PASSOU ✅ | strategy=initial | residual=0.`);
+    return { translations: current, residual: [] };
+  }
+
+  const strategies = ["source_only", "contrastive"];
+  for (const strategy of strategies) {
+    console.warn(`[QUALITY ESCALATION 9.2.7] strategy=${strategy} | residual=${residual.length} | ids=[${residual.map(x => x.id).join(",")}].`);
+    const candidate = await runCueSurgery927(blocks, best, residual, plan, job, strategy);
+    const candidateResidual = await auditTargetSet927(blocks, candidate, targetIds, plan, job, strategy);
+    const score = issueScore927(candidateResidual);
+    recordBestCandidate927(blocks, candidate, candidateResidual, job, `target-${strategy}`);
+
+    if (betterScore927(score, bestScore)) {
+      best = new Map(candidate);
+      bestResidual = candidateResidual;
+      bestScore = score;
+      console.log(`[QUALITY ESCALATION 9.2.7] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count}.`);
+    } else {
+      console.warn(`[QUALITY ESCALATION 9.2.7] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger.`);
+    }
+    residual = bestResidual;
+    if (!residual.length) {
+      console.log(`[FINAL TARGET VERIFICATION 9.2.7] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+      return { translations: best, residual: [] };
+    }
+  }
+
+  console.warn(`[FINAL TARGET VERIFICATION 9.2.7] estratégias bounded esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue e persistido como PROVISIONAL, nunca descartado.`);
+  return { translations: best, residual: bestResidual };
+}
+
+
+function sourceNegationRisk926(block) {
+  const text = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  // Audit focus only, never an automatic rewrite. Covers common explicit negation
+  // across the source languages the project already accepts.
+  return /(?:\bnot\b|n['’]t\b|\bnever\b|\bno\s+one\b|\bnothing\b|\bwithout\b|\bn[aã]o\b|\bnunca\b|\bjamais\b|\bno\b|\bnon\b|\bnicht\b|\bkein(?:e|en|er|es)?\b|\bniet\b|\bpas\b)/iu.test(text);
+}
+
 async function runBoundedFinalQuality88(
   blocks,
   translations,
@@ -19312,6 +19629,17 @@ async function runBoundedFinalQuality88(
   );
 
   const initialFocus = idsFromIssues(qaIssues, blocks);
+
+  let negationFocus926 = 0;
+  for (const block of blocks) {
+    if (sourceNegationRisk926(block)) {
+      if (!initialFocus.has(block.index)) negationFocus926++;
+      initialFocus.add(block.index);
+    }
+  }
+  if (negationFocus926) {
+    console.log(`[NEGATION INTEGRITY FOCUS 9.2.7] +${negationFocus926} cue(s) com negacao explicita entram na auditoria final; foco, nao rewrite automatico.`);
+  }
 
   for (const block of blocks) {
     const before = String(mainTranslations.get(block.index) || "")
@@ -19419,6 +19747,26 @@ async function runBoundedFinalQuality88(
       current = sanitizeTranslationMap(blocks, current, job);
       current = await runCompactRescue(blocks, current, plan, job);
       current = sanitizeTranslationMap(blocks, current, job);
+
+      const target927 = await verifyFinalTargets927(
+        blocks,
+        current,
+        issues2,
+        plan,
+        job
+      );
+      current = target927.translations;
+      if (target927.residual.length) {
+        job.finalTargetResidual927 = target927.residual;
+        job.qualityStatus = "best_available";
+        job.noCacheFinal923 = true;
+        console.error(
+          `[FINAL TARGET VERIFICATION 9.2.7] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `residual=${target927.residual.length}.`
+        );
+      } else {
+        job.finalTargetResidual927 = [];
+      }
     }
   }
 
@@ -19434,8 +19782,8 @@ async function runBoundedFinalQuality88(
       `[FINAL BOUNDED 9.0] ${finalLocal.length} guard(s) local(is) residual(is) ` +
       `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
     );
-    job.qualityStatus = "bounded_best_candidate";
-  } else {
+    if (job.qualityStatus === "pending" || job.qualityStatus === "final_pass") job.qualityStatus = "best_available";
+  } else if (!Array.isArray(job.finalTargetResidual927) || job.finalTargetResidual927.length === 0) {
     job.qualityStatus = "final_pass";
   }
 
@@ -19579,6 +19927,8 @@ auditTimestamps(
 
 job.safeDraft =
   mainSrt;
+job.bestAvailableSrt927 = mainSrt;
+job.bestAvailableLabel927 = "SAFE_DRAFT";
 
 job.progress =
   92;
@@ -19677,6 +20027,7 @@ finalTranslations =
 // 2) uma auditoria HIGH focal;
 // 3) no máximo uma reconstrução focal + uma verificação HIGH final.
 // Não existe convergência aberta, reabertura por layout nem ciclo de rounds.
+job.episodePlan = plan;
 finalTranslations = await runBoundedFinalQuality88(
   blocks,
   finalTranslations,
@@ -19797,15 +20148,31 @@ if (finalClosure898.gender > 0) {
   );
 }
 
-
+// 9.2.7: if the normal target-elimination gender gate still has a residual,
+// change strategy instead of merely giving up. First source-only, then contrastive.
+if (finalClosure898.gender > 0) {
+  let genderResidual927 = genderTargetIssues925(blocks, finalTranslations, job.filename, plan);
+  for (const strategy927 of ["source_only", "contrastive"]) {
+    if (!genderResidual927.length) break;
+    console.warn(`[QUALITY ESCALATION 9.2.7][GENDER] strategy=${strategy927} | residual=${genderResidual927.length}.`);
+    finalTranslations = await runCueSurgery927(
+      blocks, finalTranslations, genderResidual927, plan, job, strategy927, { requireGenderZero: true }
+    );
+    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+    finalTranslations = applyRepairPersistenceLock923(blocks, finalTranslations, job, job.filename, plan);
+    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+    genderResidual927 = genderTargetIssues925(blocks, finalTranslations, job.filename, plan);
+  }
+  finalClosure898 = finalClosureResidualSummary898(blocks, finalTranslations, job.filename, plan);
+}
 
 if (finalClosure898.gender > 0) {
-  job.qualityStatus = "gender_residual_uncached";
+  job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; resultado poderá ser servido para disponibilidade, mas NÃO recebe FINAL OK nem cache.`);
+  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro SERÁ entregue; selo canônico bloqueado e cache PROVISIONAL será usado.`);
 }
 console.log(
-  `[FINAL CLOSURE 9.2.5] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.2.7] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
   `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ` +
@@ -19854,9 +20221,13 @@ auditTimestamps(
       1000
     );
 
-  if (finalClosure898.gender === 0) {
+  const semanticResidual927 = Array.isArray(job.finalTargetResidual927)
+    ? job.finalTargetResidual927.length
+    : 0;
+
+  if (finalClosure898.gender === 0 && semanticResidual927 === 0) {
     console.log(
-      `[PIPELINE 9.2.5 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.2.7 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -19866,15 +20237,19 @@ auditTimestamps(
         job.stats.jobRetries || 0
       }.`
     );
-    if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate") job.qualityStatus = "final_pass";
+    if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate" || job.qualityStatus === "best_available") job.qualityStatus = "final_pass";
   } else {
     console.warn(
-      `[PIPELINE 9.2.5 ROUTED] SERVE UNCACHED | ${blocks.length} source cues | ` +
-      `gender-residual=${finalClosure898.gender} | pipeline=${pipelineElapsedSeconds.toFixed(1)}s | ` +
-      `job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
+      `[PIPELINE 9.2.7 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
+      `gender-residual=${finalClosure898.gender} | semantic-residual=${semanticResidual927} | ` +
+      `pipeline=${pipelineElapsedSeconds.toFixed(1)}s | job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
     );
+    job.noCacheFinal923 = true;
+    job.qualityStatus = "best_available";
   }
 
+  job.bestAvailableSrt927 = finalSrt;
+  job.bestAvailableLabel927 = job.qualityStatus === "final_pass" ? "FINAL_PASS" : "BEST_AVAILABLE_FINAL";
   return finalSrt;
 }
 
@@ -19903,6 +20278,10 @@ async function processJob(
   ) {
     try {
       const cached = getCache(job.cacheKey);
+      const previousProvisional927 = getProvisionalCache927(job.cacheKey);
+      if (previousProvisional927 && !job.previousProvisionalSrt927) {
+        job.previousProvisionalSrt927 = previousProvisional927.srt;
+      }
 
       if (cached) {
         restoreIntentionalEmptyIdsFromCache(
@@ -19935,8 +20314,10 @@ async function processJob(
       // residual as canonical. Such results are served but never cached.
       if (!job.noCacheFinal923) {
         setCache(job.cacheKey, finalSrt, job);
+        console.log(`[CACHE 9.2.7] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
       } else {
-        console.warn(`[CACHE 9.2.5] FINAL não cacheado | quality=${job.qualityStatus || "degraded"}.`);
+        setProvisionalCache927(job.cacheKey, finalSrt, job, "best_available");
+        console.warn(`[CACHE 9.2.7] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
       }
 
       job.result = finalSrt;
@@ -19958,6 +20339,17 @@ async function processJob(
         console.warn(
           `[JOB ${job.id}] router esgotado DEPOIS do SAFE DRAFT hard-guarded; ` +
           `não haverá full-job retry inútil. Liberando melhor candidato íntegro.`
+        );
+        break;
+      }
+
+      // 9.2.7: after an integral SAFE DRAFT exists, a late-stage exception must
+      // never restart PLAN+MAIN from zero. Final/QA/repair stages already have their
+      // own bounded strategy escalation. Preserve and deliver the best known result.
+      if (job.safeDraft && Number(job.progress || 0) >= 92) {
+        console.warn(
+          `[DELIVERY GUARANTEE 9.2.7] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
+          `Melhor candidato será entregue/provisionado | ${errorMessage(error).slice(0,320)}`
         );
         break;
       }
@@ -20005,43 +20397,37 @@ async function processJob(
     }
   }
 
-  if (job.safeDraft) {
-    auditTimestamps(
-      job.sourceSrt,
-      job.safeDraft,
-      "BOUNDED-SAFE-DRAFT",
-      job
-    );
+  const deliveryCandidate927 =
+    job.bestAvailableSrt927 ||
+    job.safeDraft ||
+    job.previousProvisionalSrt927 ||
+    getProvisionalCache927(job.cacheKey)?.srt ||
+    null;
 
-    job.result =
-      job.safeDraft;
-    job.status =
-      "completed";
+  if (deliveryCandidate927) {
+    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.2.7", job);
+    job.result = deliveryCandidate927;
+    job.status = "completed";
     job.progress = 100;
     job.error = null;
-    job.qualityStatus =
-      "bounded_safe_draft";
-    job.stats.boundedSafeDraftReleases =
-      (
-        job.stats.boundedSafeDraftReleases ||
-        0
-      ) + 1;
+    job.qualityStatus = "best_available_technical";
+    job.noCacheFinal923 = true;
     job.updatedAt = Date.now();
-
+    setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "best_available_technical");
+    job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
     console.warn(
-      `[JOB ${job.id}] ${JOB_MAX_ATTEMPTS} tentativa(s) encerradas; ` +
-      `SAFE DRAFT íntegro liberado sem cache e sem loop ✅ | ${
-        errorMessage(lastJobError).slice(0, 360)
-      }`
+      `[DELIVERY GUARANTEE 9.2.7] cloud/estratégias encerradas sem selo canônico; ` +
+      `melhor candidato íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) ` +
+      `foi ENTREGUE e preservado como PROVISIONAL. Job não foi morto. ✅ | ${errorMessage(lastJobError).slice(0,360)}`
     );
-
     return;
   }
+
 
   job.status = "failed";
   job.progress = 100;
   job.error =
-    `Falha terminal antes da criação do SAFE DRAFT: ${
+    `Falha terminal somente porque nenhum candidato SRT íntegro chegou a existir: ${
       errorMessage(lastJobError).slice(0, 500)
     }`;
   job.qualityStatus =
@@ -20090,6 +20476,12 @@ function jobResponse(
 
     qualityStatus:
       job.qualityStatus,
+
+    residualBlockers:
+      Array.isArray(job.finalTargetResidual927) ? job.finalTargetResidual927.length : 0,
+
+    bestCandidateLabel:
+      job.bestAvailableLabel927 || "",
 
     progress:
       job.progress,
@@ -21502,7 +21894,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.5 - TARGET-ELIMINATION GENDER GATE + TRANSIENT ROUTE RESILIENCE"
+        " STREMIO PT-BR 9.2.7 - QUALITY ESCALATION + BEST CANDIDATE + DELIVERY GUARANTEE"
   );
 
   console.log(
@@ -21911,7 +22303,7 @@ console.log(
     "Structural Gender 9.2.3: predicativos/artigos humanos 1ª/2ª/plural são auditados pela estrutura; SOURCE explícita continua autoridade ✅",
     "Repair Persistence 9.2.3: repair FINAL aceito não pode ser revertido silenciosamente para candidato antigo ✅",
     "Strict Gender Final Gate 9.2.3: gender>0 bloqueia FINAL OK/cache; uma reconstrução focal bounded é tentada antes ✅",
-    "Transient Route Resilience 9.2.4: ultima rota saudavel recebe 1 retry curto para 500/502/503/408/425 antes de skip; zero loop ✅ Target-Elimination Gender Gate 9.2.5: repair final só é aceito com ZERO blocker local de gênero; no máximo 2 passes focais ✅"
+    "Transient Route Resilience 9.2.4: ultima rota saudavel recebe 1 retry curto para 500/502/503/408/425 antes de skip; zero loop ✅ Target-Elimination Gender Gate 9.2.5 preservado ✅ Final Target Verification 9.2.6: blocker final reparado é re-auditado em no máximo 2 passes focais; residual => sem FINAL OK/cache ✅ Universal Hygiene 9.2.6: #/♪ lyric markers são metadata; SDH puro com dash também é removido ✅"
   );
 
   console.log(
