@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.2.9 - CANDIDATE BEAM FIX + BOUNDED TIMING COMPACT + DELIVERY GUARANTEE
+// STREMIO PT-BR 9.2.10 - POST-CLOSURE VERIFY + COMPACT SALVAGE + DELIVERY GUARANTEE
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.2.9-candidate-beam-fix-bounded-timing-compact-v1";
+  "9.2.10-postclosure-compact-salvage-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -169,7 +169,7 @@ const REPAIR_HTTP_RETRIES = 2;
 const REPAIR_PARSE_ATTEMPTS = 2;
 const REPAIR_CONCURRENCY = 2;
 
-// 9.2.9 — REPAIR ISOLATION. Um único cue estruturalmente inválido nunca
+// 9.2.10 — REPAIR ISOLATION. Um único cue estruturalmente inválido nunca
 // invalida dezenas de repairs bons. Primeiro fazemos salvage item-a-item;
 // somente o residual entra em micro-batches bounded e, por último, cue surgery.
 const REPAIR_ISOLATION_MICRO_MAX_CUES_928 = 8;
@@ -273,7 +273,7 @@ const COMPACT_RESCUE_HTTP_RETRIES = 3;
 // Não é truncamento; é objetivo editorial para o Gemini.
 const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
 
-// 9.2.9 — TIMING-AWARE COMPACT SURGERY. A Ponte chama SOMENTE quando a
+// 9.2.10 — TIMING-AWARE COMPACT SURGERY. A Ponte chama SOMENTE quando a
 // geometria final prova que não existe janela física suficiente para leitura.
 // Este endpoint reescreve TEXTO, jamais timestamps, e passa por auditoria
 // semântica independente antes de devolver qualquer mudança.
@@ -1090,7 +1090,7 @@ function setProvisionalCache927(key, srt, job = null, label = "best_available") 
     createdAt: Date.now(),
     expiresAt: Date.now() + CACHE_TTL_MS
   });
-  console.warn(`[PROVISIONAL CACHE 9.2.9] salvo | quality=${String(job?.qualityStatus || label)} | key=${String(key).slice(0,18)}...`);
+  console.warn(`[PROVISIONAL CACHE 9.2.10] salvo | quality=${String(job?.qualityStatus || label)} | key=${String(key).slice(0,18)}...`);
   return true;
 }
 
@@ -16312,7 +16312,7 @@ async function repairBatch(
           job.stats.repairSalvagedCues928 =
             Number(job.stats.repairSalvagedCues928 || 0) + salvagedCount;
           console.warn(
-            `[REPAIR ISOLATION 9.2.9] salvage=${salvagedCount}/${issues.length} | ` +
+            `[REPAIR ISOLATION 9.2.10] salvage=${salvagedCount}/${issues.length} | ` +
             `residual=${salvaged.unresolvedIds.length} | ids=[${salvaged.unresolvedIds.join(",")}].`
           );
         }
@@ -16948,7 +16948,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     }
     if (microBatches.length > REPAIR_ISOLATION_MAX_MICRO_BATCHES_928) {
       console.warn(
-        `[REPAIR ISOLATION 9.2.9] residual grande demais para micro-batch bounded; ` +
+        `[REPAIR ISOLATION 9.2.10] residual grande demais para micro-batch bounded; ` +
         `micro=${microBatches.length}/${REPAIR_ISOLATION_MAX_MICRO_BATCHES_928}.`
       );
       return residualIssues;
@@ -16971,13 +16971,13 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
           if (missing.has(Number(issue.id))) still.push(issue);
         }
         console.log(
-          `[REPAIR ISOLATION 9.2.9][W${workerId}] micro ${mi + 1}/${microBatches.length} | ` +
+          `[REPAIR ISOLATION 9.2.10][W${workerId}] micro ${mi + 1}/${microBatches.length} | ` +
           `targets=${micro.length} | residual=${missing.size}.`
         );
       } catch (error) {
         still.push(...micro);
         console.warn(
-          `[REPAIR ISOLATION 9.2.9][W${workerId}] micro ${mi + 1}/${microBatches.length} ` +
+          `[REPAIR ISOLATION 9.2.10][W${workerId}] micro ${mi + 1}/${microBatches.length} ` +
           `falhou estruturalmente; somente estes ${micro.length} cue(s) escalam | ${errorMessage(error).slice(0,260)}`
         );
       }
@@ -17041,7 +17041,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   if (uniqueResidual.length) {
     job.stats.repairIsolationCueSurgery928 = uniqueResidual.length;
     console.warn(
-      `[REPAIR ISOLATION 9.2.9] micro-repair esgotado | ` +
+      `[REPAIR ISOLATION 9.2.10] micro-repair esgotado | ` +
       `cue-surgery SOURCE-ONLY=${uniqueResidual.length} | ids=[${uniqueResidual.map(x => x.id).join(",")}].`
     );
     const surgicallyRepaired = await runCueSurgery927(
@@ -17059,7 +17059,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   }
 
   console.log(
-    `[REPAIR 9.2.9] FINAL | lotes OK=${successfulBatches}/${totalBatches} | ` +
+    `[REPAIR 9.2.10] FINAL | lotes OK=${successfulBatches}/${totalBatches} | ` +
     `lotes isolados=${failedBatches} | cues aceitos=${acceptedCues} | ` +
     `salvaged=${Number(job.stats.repairSalvagedCues928 || 0)} | ` +
     `micro=${Number(job.stats.repairIsolationMicroBatches928 || 0)} | ` +
@@ -19641,7 +19641,7 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
           routeOverride: [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY],
           job,
           metric: "repair"
-        }, job, `CANDIDATE BEAM 9.2.9 W${workerId} cue ${id}`);
+        }, job, `CANDIDATE BEAM 9.2.10 W${workerId} cue ${id}`);
         const parsed = JSON.parse(stripCodeFences(response.text));
         const list = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
         let winner = "";
@@ -19670,12 +19670,12 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
           updated.set(id, winner);
           if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
           job.finalRepairLockedText923.set(id, winner);
-          console.log(`[CANDIDATE BEAM 9.2.9] cue=${id} vencedor local seguro selecionado.`);
+          console.log(`[CANDIDATE BEAM 9.2.10] cue=${id} vencedor local seguro selecionado.`);
         } else {
-          console.warn(`[CANDIDATE BEAM 9.2.9] cue=${id} sem candidata localmente segura; melhor anterior preservado.`);
+          console.warn(`[CANDIDATE BEAM 9.2.10] cue=${id} sem candidata localmente segura; melhor anterior preservado.`);
         }
       } catch (error) {
-        console.warn(`[CANDIDATE BEAM 9.2.9] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CANDIDATE BEAM 9.2.10] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19723,7 +19723,7 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
           thinkingLevel:"high", maxOutputTokens:1800, timeoutMs:90000, maxRetries:1,
           routeOverride:[GEMINI_MODELS.MAIN_PRIMARY,GEMINI_MODELS.MAIN_FALLBACK],
           job, metric:"repair"
-        },job,`CONSTRAINED 9.2.9 W${workerId} cue ${id}`);
+        },job,`CONSTRAINED 9.2.10 W${workerId} cue ${id}`);
         const repaired = parseCueTranslation([block],response.text,locksById);
         let candidate=String(repaired.get(id)||"").trim();
         const beforePt=String(updated.get(id)||"");
@@ -19738,15 +19738,15 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
         const layout=layoutCueResult(block,candidate);
         if(!layout.fits||layout.lines>LAYOUT_MAX_LINES) regressions.push("SUBTITLE_TOO_DENSE");
         if(regressions.length){
-          console.warn(`[CONSTRAINED 9.2.9] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CONSTRAINED 9.2.10] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
           continue;
         }
         updated.set(id,candidate);
         if(!job.finalRepairLockedText923) job.finalRepairLockedText923=new Map();
         job.finalRepairLockedText923.set(id,candidate);
-        console.log(`[CONSTRAINED 9.2.9] cue=${id} candidato produzido e protegido.`);
+        console.log(`[CONSTRAINED 9.2.10] cue=${id} candidato produzido e protegido.`);
       } catch(error){
-        console.warn(`[CONSTRAINED 9.2.9] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CONSTRAINED 9.2.10] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19783,7 +19783,7 @@ function betterScore927(a, b) {
 }
 
 function recordBestCandidate927(blocks, translations, residual, job, label) {
-  const laidOut = applySubtitleLayout(blocks, translations, `BEST-CANDIDATE-9.2.9-${label}`);
+  const laidOut = applySubtitleLayout(blocks, translations, `BEST-CANDIDATE-9.2.10-${label}`);
   const local = blockingLocalIssues(blocks, laidOut, job, job?.episodePlan || null);
   const merged = mergeIssueLists(local, Array.isArray(residual) ? residual : []);
   const score = issueScore927(merged);
@@ -19794,7 +19794,7 @@ function recordBestCandidate927(blocks, translations, residual, job, label) {
   job.bestAvailableSrt927 = srt;
   job.bestAvailableLabel927 = String(label || "candidate");
   job.bestCandidateIssues927 = merged;
-  console.log(`[BEST CANDIDATE LEDGER 9.2.9] ${job.bestAvailableLabel927} | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} ✅`);
+  console.log(`[BEST CANDIDATE LEDGER 9.2.10] ${job.bestAvailableLabel927} | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} ✅`);
   return true;
 }
 
@@ -19895,15 +19895,15 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
           regressions = repairCandidateRegressionReasons(block, beforePt, candidate, job.filename, plan);
         }
         if (regressions.length) {
-          console.warn(`[CUE SURGERY 9.2.9] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CUE SURGERY 9.2.10] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
           continue;
         }
         updated.set(id, candidate);
         if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
         job.finalRepairLockedText923.set(id, candidate);
-        console.log(`[CUE SURGERY 9.2.9] mode=${mode} cue=${id} candidato produzido e protegido.`);
+        console.log(`[CUE SURGERY 9.2.10] mode=${mode} cue=${id} candidato produzido e protegido.`);
       } catch (error) {
-        console.warn(`[CUE SURGERY 9.2.9] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CUE SURGERY 9.2.10] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19913,14 +19913,14 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
 }
 
 async function auditTargetSet927(blocks, translations, targetIds, plan, job, label) {
-  const laidOut = applySubtitleLayout(blocks, translations, `FINAL-TARGET-9.2.9-${label}`);
+  const laidOut = applySubtitleLayout(blocks, translations, `FINAL-TARGET-9.2.10-${label}`);
   const local = blockingLocalIssues(blocks, laidOut, job, plan)
     .filter(issue => targetIds.has(Number(issue?.id)));
   let semantic = [];
   try {
     semantic = await scanFinalPriorityAudit(blocks, translations, plan, job, targetIds);
   } catch (error) {
-    console.warn(`[FINAL TARGET AUDIT 9.2.9] ${label} falhou tecnicamente; selo canônico fica bloqueado e candidato não é degradado | ${errorMessage(error).slice(0,300)}`);
+    console.warn(`[FINAL TARGET AUDIT 9.2.10] ${label} falhou tecnicamente; selo canônico fica bloqueado e candidato não é degradado | ${errorMessage(error).slice(0,300)}`);
     semantic = [...targetIds].map(id => ({
       id,
       reasons: ["FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: a reauditoria focal não ficou disponível; preservar o melhor candidato e nunca declarar FINAL_PASS sem prova."]
@@ -19935,25 +19935,49 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
     .map(issue => Number(issue?.id)).filter(Number.isInteger));
   if (!targetIds.size) return { translations: new Map(translations), residual: [] };
 
+  const posMap = positionMap(blocks);
+  const expandChangedIds9210 = changedIds => {
+    const expanded = new Set();
+    for (const id of changedIds) {
+      const pos = posMap.get(Number(id));
+      if (!Number.isInteger(pos)) continue;
+      for (let p = Math.max(0, pos - 1); p <= Math.min(blocks.length - 1, pos + 1); p++) {
+        expanded.add(Number(blocks[p].index));
+      }
+    }
+    return expanded;
+  };
+
+  const mergeResidualPatch9210 = (baseResidual, patchResidual, patchIds) => {
+    const byId = new Map((Array.isArray(baseResidual) ? baseResidual : []).map(issue => [Number(issue?.id), issue]));
+    for (const id of patchIds) byId.delete(Number(id));
+    for (const issue of (Array.isArray(patchResidual) ? patchResidual : [])) {
+      const id = Number(issue?.id);
+      if (Number.isInteger(id)) byId.set(id, issue);
+    }
+    return [...byId.values()].sort((a,b)=>Number(a.id)-Number(b.id));
+  };
+
   let current = new Map(translations);
-  let residual = await auditTargetSet927(blocks, current, targetIds, plan, job, "initial-928");
+  let residual = await auditTargetSet927(blocks, current, targetIds, plan, job, "initial-9210");
   let best = new Map(current);
   let bestResidual = residual;
   let bestScore = issueScore927(residual);
-  recordBestCandidate927(blocks, current, residual, job, "target-initial-928");
+  recordBestCandidate927(blocks, current, residual, job, "target-initial-9210");
   if (!residual.length) {
-    console.log(`[FINAL TARGET VERIFICATION 9.2.9] PASSOU ✅ | strategy=initial | residual=0.`);
+    console.log(`[FINAL TARGET VERIFICATION 9.2.10] PASSOU ✅ | strategy=initial | residual=0.`);
     return { translations: current, residual: [] };
   }
 
   const strategies = ["source_only", "contrastive", "candidate_beam", "constrained"];
   for (const strategy of strategies) {
-    const eligible = eligibleForStrategy928(job, residual, strategy);
+    const eligible = eligibleForStrategy928(job, bestResidual, strategy);
     if (!eligible.length) {
-      console.log(`[UNIFIED ESCALATION 9.2.9] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.2.10] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.2.9] strategy=${strategy} | eligible=${eligible.length}/${residual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+    console.warn(`[UNIFIED ESCALATION 9.2.10] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+
     let candidate;
     if (strategy === "candidate_beam") {
       candidate = await runCandidateBeam928(blocks, best, eligible, plan, job);
@@ -19962,25 +19986,40 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
     } else {
       candidate = await runCueSurgery927(blocks, best, eligible, plan, job, strategy);
     }
-    const candidateResidual = await auditTargetSet927(blocks, candidate, targetIds, plan, job, strategy + "-928");
+
+    const changedIds = new Set();
+    for (const issue of eligible) {
+      const id = Number(issue?.id);
+      if (!Number.isInteger(id)) continue;
+      if (String(candidate.get(id) || "") !== String(best.get(id) || "")) changedIds.add(id);
+    }
+    if (!changedIds.size) {
+      console.warn(`[UNIFIED ESCALATION 9.2.10] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
+      continue;
+    }
+
+    // Qualidade preservada com custo menor: reaudita somente o que realmente mudou
+    // e seus vizinhos imediatos, pois ownership pode cruzar a fronteira do cue.
+    const auditIds = expandChangedIds9210(changedIds);
+    const patchResidual = await auditTargetSet927(blocks, candidate, auditIds, plan, job, strategy + "-changed-9210");
+    const candidateResidual = mergeResidualPatch9210(bestResidual, patchResidual, auditIds);
     const score = issueScore927(candidateResidual);
-    recordBestCandidate927(blocks, candidate, candidateResidual, job, `target-${strategy}-928`);
+    recordBestCandidate927(blocks, candidate, candidateResidual, job, `target-${strategy}-9210`);
     if (betterScore927(score, bestScore)) {
       best = new Map(candidate);
       bestResidual = candidateResidual;
       bestScore = score;
-      console.log(`[UNIFIED ESCALATION 9.2.9] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count}.`);
+      console.log(`[UNIFIED ESCALATION 9.2.10] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
     } else {
-      console.warn(`[UNIFIED ESCALATION 9.2.9] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger.`);
+      console.warn(`[UNIFIED ESCALATION 9.2.10] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
     }
-    residual = bestResidual;
-    if (!residual.length) {
-      console.log(`[FINAL TARGET VERIFICATION 9.2.9] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+    if (!bestResidual.length) {
+      console.log(`[FINAL TARGET VERIFICATION 9.2.10] PASSOU ✅ | strategy=${strategy} | residual=0.`);
       return { translations: best, residual: [] };
     }
   }
 
-  console.warn(`[FINAL TARGET VERIFICATION 9.2.9] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue como PROVISIONAL.`);
+  console.warn(`[FINAL TARGET VERIFICATION 9.2.10] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue como PROVISIONAL.`);
   return { translations: best, residual: bestResidual };
 }
 
@@ -20016,7 +20055,7 @@ async function runBoundedFinalQuality88(
     }
   }
   if (negationFocus926) {
-    console.log(`[NEGATION INTEGRITY FOCUS 9.2.9] +${negationFocus926} cue(s) com negacao explicita entram na auditoria final; foco, nao rewrite automatico.`);
+    console.log(`[NEGATION INTEGRITY FOCUS 9.2.10] +${negationFocus926} cue(s) com negacao explicita entram na auditoria final; foco, nao rewrite automatico.`);
   }
 
   for (const block of blocks) {
@@ -20136,14 +20175,18 @@ async function runBoundedFinalQuality88(
       current = target927.translations;
       if (target927.residual.length) {
         job.finalTargetResidual927 = target927.residual;
+        job.finalTargetResidualSnapshot9210 = new Map(
+          target927.residual.map(issue => [Number(issue?.id), String(current.get(Number(issue?.id)) || "")])
+        );
         job.qualityStatus = "best_available";
         job.noCacheFinal923 = true;
         console.error(
-          `[FINAL TARGET VERIFICATION 9.2.9] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `[FINAL TARGET VERIFICATION 9.2.10] FAIL-CLOSED PARA SELO/CACHE | ` +
           `residual=${target927.residual.length}.`
         );
       } else {
         job.finalTargetResidual927 = [];
+        job.finalTargetResidualSnapshot9210 = new Map();
       }
     }
   }
@@ -20526,7 +20569,7 @@ if (finalClosure898.gender > 0) {
   );
 }
 
-// 9.2.9 UNIFIED ESCALATION: não reinicia source_only/contrastive cegamente.
+// 9.2.10 UNIFIED ESCALATION: não reinicia source_only/contrastive cegamente.
 // A ledger por cue + família de blocker sabe o que já foi tentado. Se houver uma
 // estratégia realmente nova (beam/constrained), ela pode entrar; repetição não.
 if (finalClosure898.gender > 0) {
@@ -20535,10 +20578,10 @@ if (finalClosure898.gender > 0) {
     if (!genderResidual928.length) break;
     const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928);
     if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.2.9][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.2.10][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.2.9][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
+    console.warn(`[UNIFIED ESCALATION 9.2.10][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
     if (strategy928 === "candidate_beam") {
       finalTranslations = await runCandidateBeam928(
         blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true }
@@ -20560,13 +20603,47 @@ if (finalClosure898.gender > 0) {
   finalClosure898 = finalClosureResidualSummary898(blocks, finalTranslations, job.filename, plan);
 }
 
+// 9.2.10 POST-CLOSURE FOCAL REAUDIT.
+// finalTargetResidual927 foi medido antes do Gender Target Gate / deterministic closure.
+// Se algum desses cues mudou depois, a evidência antiga ficou stale. Reaudita UMA vez
+// somente esses IDs alterados; cues intocados mantêm o veredito anterior sem custo extra.
+if (Array.isArray(job.finalTargetResidual927) && job.finalTargetResidual927.length) {
+  const previousSnapshot9210 = job.finalTargetResidualSnapshot9210 instanceof Map
+    ? job.finalTargetResidualSnapshot9210
+    : new Map();
+  const residualById9210 = new Map(job.finalTargetResidual927.map(issue => [Number(issue?.id), issue]));
+  const changedResidualIds9210 = new Set();
+  for (const id of residualById9210.keys()) {
+    if (!Number.isInteger(id)) continue;
+    const before = String(previousSnapshot9210.get(id) ?? "");
+    const after = String(finalTranslations.get(id) || "");
+    if (before !== after) changedResidualIds9210.add(id);
+  }
+
+  if (changedResidualIds9210.size) {
+    console.log(`[POST-CLOSURE VERIFY 9.2.10] residual antigo=${job.finalTargetResidual927.length} | cues realmente alterados=${changedResidualIds9210.size}; UMA reauditoria focal HIGH.`);
+    const postResidual9210 = await auditTargetSet927(
+      blocks, finalTranslations, changedResidualIds9210, plan, job, "post-closure-9210"
+    );
+    for (const id of changedResidualIds9210) residualById9210.delete(id);
+    for (const issue of postResidual9210) residualById9210.set(Number(issue.id), issue);
+    job.finalTargetResidual927 = [...residualById9210.values()].sort((a,b)=>Number(a.id)-Number(b.id));
+    job.finalTargetResidualSnapshot9210 = new Map(
+      job.finalTargetResidual927.map(issue => [Number(issue?.id), String(finalTranslations.get(Number(issue?.id)) || "")])
+    );
+    console.log(`[POST-CLOSURE VERIFY 9.2.10] residual atualizado=${job.finalTargetResidual927.length}. ${job.finalTargetResidual927.length ? "⛔ selo continua bloqueado" : "✅ evidência stale eliminada"}`);
+  } else {
+    console.log(`[POST-CLOSURE VERIFY 9.2.10] nenhum cue residual mudou após a verificação anterior; 0 chamada QA repetida. ✅`);
+  }
+}
+
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
   console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro SERÁ entregue; selo canônico bloqueado e cache PROVISIONAL será usado.`);
 }
 console.log(
-  `[FINAL CLOSURE 9.2.9] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.2.10] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
   `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ` +
@@ -20621,7 +20698,7 @@ auditTimestamps(
 
   if (finalClosure898.gender === 0 && semanticResidual927 === 0) {
     console.log(
-      `[PIPELINE 9.2.9 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.2.10 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -20634,7 +20711,7 @@ auditTimestamps(
     if (job.qualityStatus === "pending" || job.qualityStatus === "bounded_best_candidate" || job.qualityStatus === "best_available") job.qualityStatus = "final_pass";
   } else {
     console.warn(
-      `[PIPELINE 9.2.9 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.2.10 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | semantic-residual=${semanticResidual927} | ` +
       `pipeline=${pipelineElapsedSeconds.toFixed(1)}s | job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
     );
@@ -20708,10 +20785,10 @@ async function processJob(
       // residual as canonical. Such results are served but never cached.
       if (!job.noCacheFinal923) {
         setCache(job.cacheKey, finalSrt, job);
-        console.log(`[CACHE 9.2.9] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
+        console.log(`[CACHE 9.2.10] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
       } else {
         setProvisionalCache927(job.cacheKey, finalSrt, job, "best_available");
-        console.warn(`[CACHE 9.2.9] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
+        console.warn(`[CACHE 9.2.10] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
       }
 
       job.result = finalSrt;
@@ -20742,7 +20819,7 @@ async function processJob(
       // own bounded strategy escalation. Preserve and deliver the best known result.
       if (job.safeDraft && Number(job.progress || 0) >= 92) {
         console.warn(
-          `[DELIVERY GUARANTEE 9.2.9] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
+          `[DELIVERY GUARANTEE 9.2.10] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
           `Melhor candidato será entregue/provisionado | ${errorMessage(error).slice(0,320)}`
         );
         break;
@@ -20799,7 +20876,7 @@ async function processJob(
     null;
 
   if (deliveryCandidate927) {
-    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.2.9", job);
+    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.2.10", job);
     job.result = deliveryCandidate927;
     job.status = "completed";
     job.progress = 100;
@@ -20810,7 +20887,7 @@ async function processJob(
     setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "best_available_technical");
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
     console.warn(
-      `[DELIVERY GUARANTEE 9.2.9] cloud/estratégias encerradas sem selo canônico; ` +
+      `[DELIVERY GUARANTEE 9.2.10] cloud/estratégias encerradas sem selo canônico; ` +
       `melhor candidato íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) ` +
       `foi ENTREGUE e preservado como PROVISIONAL. Job não foi morto. ✅ | ${errorMessage(lastJobError).slice(0,360)}`
     );
@@ -21731,6 +21808,75 @@ function timingCompactFitsWindow928(text, availableDisplayMs) {
   return Number(availableDisplayMs || 0) + 60 >= target;
 }
 
+function parseStructuredArraySalvage9210(raw, fieldName) {
+  const text = stripCodeFences(String(raw || ""));
+  try {
+    const parsed = JSON.parse(text);
+    return { items: Array.isArray(parsed?.[fieldName]) ? parsed[fieldName] : [], complete: true };
+  } catch {}
+
+  const key = `"${String(fieldName)}"`;
+  const keyAt = text.indexOf(key);
+  if (keyAt < 0) return { items: [], complete: false };
+  const colonAt = text.indexOf(":", keyAt + key.length);
+  if (colonAt < 0) return { items: [], complete: false };
+  const arrayStart = text.indexOf("[", colonAt + 1);
+  if (arrayStart < 0) return { items: [], complete: false };
+
+  const items = [];
+  let depth = 0;
+  let objectStart = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = arrayStart + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === "{") {
+      if (depth === 0) objectStart = i;
+      depth++;
+      continue;
+    }
+    if (ch === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && objectStart >= 0) {
+        const fragment = text.slice(objectStart, i + 1);
+        try { items.push(JSON.parse(fragment)); } catch {}
+        objectStart = -1;
+      }
+      continue;
+    }
+    if (ch === "]" && depth === 0) return { items, complete: false };
+  }
+  return { items, complete: false };
+}
+
+function chunks9210(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function runBoundedTasks9210(tasks, concurrency = 2) {
+  const results = new Array(tasks.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const at = cursor++;
+      if (at >= tasks.length) return;
+      try { results[at] = await tasks[at](); }
+      catch (error) { results[at] = { error }; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, tasks.length)) }, () => worker()));
+  return results;
+}
+
 async function timingAwareCompactSurgery928(items) {
   const clean = (Array.isArray(items) ? items : [])
     .map(item => ({
@@ -21780,8 +21926,39 @@ async function timingAwareCompactSurgery928(items) {
     job:null,
     metric:"repair"
   });
-  const parsed=JSON.parse(stripCodeFences(generation.text));
-  const returned=new Map((Array.isArray(parsed?.cues)?parsed.cues:[]).map(x=>[Number(x?.i),String(x?.pt||"").trim()]));
+  const generationParsed9210 = parseStructuredArraySalvage9210(generation.text, "cues");
+  const returned = new Map((generationParsed9210.items || []).map(x => [Number(x?.i), String(x?.pt || "").trim()]));
+  let generationMissing9210 = protectedItems.filter(item => !returned.has(Number(item.i)));
+  if (generationMissing9210.length) {
+    console.warn(`[TIMING COMPACT 9.2.10] geração principal incompleta | salvaged=${returned.size}/${protectedItems.length} | micro=${generationMissing9210.length}.`);
+    const microBatches9210 = chunks9210(generationMissing9210, 6);
+    const microResults9210 = await runBoundedTasks9210(
+      microBatches9210.map((micro, idx) => async () => {
+        const response = await geminiRequest({
+          system:`Você faz TIMING-AWARE COMPACT SURGERY de legendas SOURCE→PT-BR.\n`+
+            `A janela disponível foi medida no áudio real e NÃO pode ser aumentada movendo START.\n`+
+            `Reescreva somente a FORMA do PT para caber fisicamente na janela, preservando 100% do significado, negação, referente, predicado, identidade, ownership, força pragmática, nomes e hard_locks.\n`+
+            `Não invente, não resuma informação essencial, não mova conteúdo entre cues, não altere timestamps.\n`+
+            `PT-BR natural. No máximo 2 linhas de 50 caracteres. Se impossível sem perda semântica, devolva current_pt inalterado.`,
+          user:JSON.stringify({cues:micro}), schema:TIMING_COMPACT_SCHEMA_928,
+          thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:Math.max(1800, 450 * micro.length),
+          timeoutMs:90000, maxRetries:1,
+          routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],
+          job:null, metric:"repair"
+        });
+        return parseStructuredArraySalvage9210(response.text, "cues").items || [];
+      }), 2
+    );
+    for (const result of microResults9210) {
+      if (result?.error) continue;
+      for (const x of (Array.isArray(result) ? result : [])) {
+        const id = Number(x?.i); const pt = String(x?.pt || "").trim();
+        if (Number.isInteger(id) && pt) returned.set(id, pt);
+      }
+    }
+    generationMissing9210 = protectedItems.filter(item => !returned.has(Number(item.i)));
+    console.log(`[TIMING COMPACT 9.2.10] geração após micro | resolved=${protectedItems.length-generationMissing9210.length}/${protectedItems.length} | unresolved=${generationMissing9210.length}.`);
+  }
   const candidates=[];
   for(const item of clean){
     let candidate=returned.get(item.i)||"";
@@ -21815,8 +21992,37 @@ async function timingAwareCompactSurgery928(items) {
     job:null,
     metric:"qa"
   });
-  const auditParsed=JSON.parse(stripCodeFences(audit.text));
-  const auditById=new Map((Array.isArray(auditParsed?.items)?auditParsed.items:[]).map(x=>[Number(x?.i),x]));
+  const auditParsed9210 = parseStructuredArraySalvage9210(audit.text, "items");
+  const auditById = new Map((auditParsed9210.items || []).map(x => [Number(x?.i), x]));
+  let auditMissing9210 = candidates.filter(x => !auditById.has(Number(x.i)));
+  if (auditMissing9210.length) {
+    console.warn(`[TIMING COMPACT 9.2.10] auditoria principal incompleta | salvaged=${auditById.size}/${candidates.length} | micro=${auditMissing9210.length}.`);
+    const microBatches9210 = chunks9210(auditMissing9210, 6);
+    const microResults9210 = await runBoundedTasks9210(
+      microBatches9210.map((micro, idx) => async () => {
+        const response = await geminiRequest({
+          system:`Você é o auditor final de Meaning Integrity de uma compactação PT-BR.\n`+
+            `Compare SOURCE, BEFORE_PT e CANDIDATE_PT. ok=true SOMENTE se CANDIDATE_PT preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e não inventar conteúdo.\n`+
+            `Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
+          user:JSON.stringify({items:micro.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pt:x.candidate,before:x.before,after:x.after}))}),
+          schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high",
+          maxOutputTokens:Math.max(1400, 300 * micro.length), timeoutMs:90000, maxRetries:1,
+          routeOverride:[GEMINI_MODELS.MAIN_PRIMARY,GEMINI_MODELS.MAIN_FALLBACK],
+          job:null, metric:"qa"
+        });
+        return parseStructuredArraySalvage9210(response.text, "items").items || [];
+      }), 2
+    );
+    for (const result of microResults9210) {
+      if (result?.error) continue;
+      for (const x of (Array.isArray(result) ? result : [])) {
+        const id = Number(x?.i);
+        if (Number.isInteger(id) && typeof x?.ok === "boolean") auditById.set(id, x);
+      }
+    }
+    auditMissing9210 = candidates.filter(x => !auditById.has(Number(x.i)));
+    console.log(`[TIMING COMPACT 9.2.10] auditoria após micro | resolved=${candidates.length-auditMissing9210.length}/${candidates.length} | unresolved=${auditMissing9210.length}.`);
+  }
   const candidateById=new Map(candidates.map(x=>[x.i,x]));
   return clean.map(item=>{
     const c=candidateById.get(item.i); const a=auditById.get(item.i);
@@ -21848,7 +22054,7 @@ app.post(
     )
 );
 
-// 9.2.9 — compactação semântica acionada somente por impossibilidade física
+// 9.2.10 — compactação semântica acionada somente por impossibilidade física
 // comprovada pela geometria final local. Render NÃO recebe nem devolve timestamps.
 app.post(
   "/api/timing-compact",
@@ -21857,10 +22063,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.2.9] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.2.9",items:compacted});
+      console.log(`[TIMING COMPACT API 9.2.10] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.2.10",items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.2.9] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.2.10] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -22460,7 +22666,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.2.9 - CANDIDATE BEAM FIX + BOUNDED TIMING COMPACT + DELIVERY GUARANTEE"
+        " STREMIO PT-BR 9.2.10 - POST-CLOSURE VERIFY + COMPACT SALVAGE + DELIVERY GUARANTEE"
   );
 
   console.log(
@@ -22722,8 +22928,8 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-  console.log("Candidate Beam 9.2.9: ledger usa literal candidate_beam; zero identificador livre mode ✅");
-  console.log("Timing Compact 9.2.9: até 48 parents por chamada; Meaning Integrity independente preservada ✅");
+  console.log("Candidate Beam 9.2.10: ledger usa literal candidate_beam; zero identificador livre mode ✅");
+  console.log("Timing Compact 9.2.10: até 48 parents por chamada; salvage + micro-isolation de JSON quebrado; Meaning Integrity independente preservada ✅");
 
   console.log(
     "Multilingual Audio-Sync API: /api/sync-align + /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
@@ -22877,6 +23083,8 @@ console.log(
   console.log(
     "Gender Lock 9.1: proteções de gênero preservadas integralmente; ambiguidade humana continua fail-closed ✅"
   );
+  console.log("Post-Closure Verify 9.2.10: residual semântico stale é re-auditado UMA vez somente nos cues que realmente mudaram ✅");
+  console.log("Changed-Cue Audit 9.2.10: estratégias reauditam apenas cues alterados + vizinhos; thinking HIGH preservado ✅");
 
   console.log(
     "Status: ONLINE"
