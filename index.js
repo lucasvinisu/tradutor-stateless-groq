@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.0 - INVARIANT CORE + FAST FAIL-CLOSED DELIVERY
+// STREMIO PT-BR 9.4.1 - TIMING CLOSURE + INVARIANT CORE + FAST FAIL-CLOSED DELIVERY
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -21854,7 +21854,7 @@ async function localTranslateHandler(
 }
 
 
-const TIMING_COMPACT_VARIANTS_940 = 3;
+const TIMING_COMPACT_VARIANTS_940 = 5;
 const TIMING_COMPACT_SCHEMA_928 = {
   type: "object",
   additionalProperties: false,
@@ -21910,6 +21910,20 @@ function timingCompactFitsWindow928(text, availableDisplayMs) {
   if (chars <= 3) return true;
   const target = chars <= 6 ? 420 : chars <= 10 ? 600 : Math.min(2800, Math.max(700, (chars / 22) * 1000));
   return Number(availableDisplayMs || 0) + 60 >= target;
+}
+
+// 9.4.1 — the timing budget is a HARD generation contract, not merely metadata.
+// Keep a small safety margin below the local 22 cps admission law so the text that
+// passes cloud QA is also more likely to survive the final child geometry locally.
+function timingCompactHardVisibleChars941(availableDisplayMs) {
+  const ms = Math.max(1, Number(availableDisplayMs || 0));
+  return Math.min(96, Math.max(3, Math.floor(((ms + 20) / 1000) * 21.5)));
+}
+
+function timingCompactVariantCaps941(availableDisplayMs) {
+  const hard = timingCompactHardVisibleChars941(availableDisplayMs);
+  const factors = [1.00, 0.94, 0.88, 0.82, 0.76];
+  return factors.map(f => Math.max(3, Math.min(hard, Math.floor(hard * f))));
 }
 
 function parseStructuredArraySalvage9210(raw, fieldName) {
@@ -22001,7 +22015,9 @@ async function timingAwareCompactSurgery928(items) {
     return {
       i:item.i, source:protectedSource.text, current_pt:item.pt,
       available_display_ms:Math.round(item.availableDisplayMs),
-      target_visible_chars:Math.min(96,Math.max(3,Math.floor((item.availableDisplayMs/1000)*22))),
+      current_visible_chars:timingCompactVisibleChars928(item.pt),
+      target_visible_chars:timingCompactHardVisibleChars941(item.availableDisplayMs),
+      variant_caps:timingCompactVariantCaps941(item.availableDisplayMs),
       hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after
     };
   });
@@ -22013,10 +22029,13 @@ async function timingAwareCompactSurgery928(items) {
     const response = await geminiRequest({
       system:`Você faz TIMING-AWARE COMPACT SURGERY de legendas SOURCE→PT-BR.\n`+
         `A janela disponível foi medida no áudio real e NÃO pode ser aumentada movendo START.\n`+
-        `Para CADA cue, gere EXATAMENTE ${TIMING_COMPACT_VARIANTS_940} alternativas diferentes e concisas, ordenadas da mais fiel/natural para a mais agressiva.\n`+
-        `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes e hard_locks.\n`+
+        `target_visible_chars é LIMITE DURO, não sugestão. variant_caps[k] é o máximo ABSOLUTO de caracteres visíveis permitido em candidates[k].\n`+
+        `Para CADA cue, gere EXATAMENTE ${TIMING_COMPACT_VARIANTS_940} alternativas diferentes. Cada candidates[k] DEVE caber em variant_caps[k], contando letras, espaços e pontuação visíveis.\n`+
+        `Candidate 0 deve ser a formulação mais natural que já caiba; as seguintes devem ficar progressivamente mais curtas SEM virar fragmento.\n`+
+        `Comprima por redação idiomática, contração natural e remoção apenas de hesitações/redundâncias sem valor semântico. Nunca apague uma unidade de sentido para cumprir o limite.\n`+
+        `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes, turnos de diálogo e hard_locks.\n`+
         `Não invente, não mova conteúdo entre cues, não altere timestamps. PT-BR natural, máximo 2x50.\n`+
-        `Se não houver forma segura de reduzir, repita current_pt nas alternativas necessárias.`,
+        `Se for semanticamente impossível cumprir um cap, repita current_pt naquela posição; o filtro local a rejeitará com segurança. JSON somente.`,
       user:JSON.stringify({cues:group}), schema:TIMING_COMPACT_SCHEMA_928,
       thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:22000,
       timeoutMs:60000, maxRetries:1,
@@ -22053,7 +22072,10 @@ async function timingAwareCompactSurgery928(items) {
       if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
       safe.push(candidate);
     }
-    if(safe.length) candidates.push({...item,variants:safe.slice(0,TIMING_COMPACT_VARIANTS_940)});
+    if(safe.length) {
+      safe.sort((a,b)=>timingCompactVisibleChars928(a)-timingCompactVisibleChars928(b));
+      candidates.push({...item,variants:safe.slice(0,TIMING_COMPACT_VARIANTS_940)});
+    }
   }
   if(!candidates.length) return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false}));
 
@@ -22064,8 +22086,9 @@ async function timingAwareCompactSurgery928(items) {
     const response=await geminiRequest({
       system:`Você é o auditor final de Meaning Integrity de compactações PT-BR.\n`+
         `Para cada item, compare SOURCE, BEFORE_PT e cada CANDIDATE_PT.\n`+
+        `candidate_pts já chega ordenado do MAIS CURTO para o MAIS LONGO entre os candidatos que passaram pelos guards locais.\n`+
         `chosen_index deve ser o índice 0-based da PRIMEIRA candidata totalmente segura, ou -1 se nenhuma preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e conteúdo.\n`+
-        `Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
+        `Portanto escolha o texto MAIS CURTO que ainda seja semanticamente completo. Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
       user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after}))}),
       schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
       timeoutMs:60000, maxRetries:1,
@@ -22092,7 +22115,7 @@ async function timingAwareCompactSurgery928(items) {
     }
     return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"semantic_audit_not_passed").slice(0,240)};
   });
-  console.log(`[TIMING COMPACT 9.4.0] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  console.log(`[TIMING COMPACT 9.4.1] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
   return out;
 }
 
@@ -22117,7 +22140,7 @@ app.post(
     )
 );
 
-// 9.4.0 — compactação semântica acionada somente por impossibilidade física
+// 9.4.1 — compactação semântica acionada somente por impossibilidade física
 // comprovada pela geometria final local. Render NÃO recebe nem devolve timestamps.
 app.post(
   "/api/timing-compact",
@@ -22126,10 +22149,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.0] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.0",items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.1",items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.0] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.1] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -22729,7 +22752,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.0 - INVARIANT CORE + FAST FAIL-CLOSED DELIVERY"
+        " STREMIO PT-BR 9.4.1 - TIMING CLOSURE + INVARIANT CORE + FAST FAIL-CLOSED DELIVERY"
   );
 
   console.log(
@@ -23151,7 +23174,8 @@ console.log(
   console.log("Canonical Cache Closure 9.4.0: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
   console.log("Semantic Authority 9.4.0: auditoria HIGH invalida Repair Persistence reprovado; strategy lock só nasce após QA limpa ✅");
   console.log("Target JSON Budget 9.4.0: source-only/candidate-beam com budget anti-truncamento + Candidate Beam salvage sem retry ✅");
-  console.log("Timing Compact Beam 9.4.0: 3 alternativas por parent na mesma chamada; auditor escolhe 1; zero micro-loop ✅");
+  console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
+  console.log("Timing Closure 9.4.1: target_visible_chars agora é contrato DURO; cache principal 9.4.0 preservado para não retraduzir sem necessidade ✅");
 
   console.log(
     "Status: ONLINE"
