@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3 - SPECIALIST-FIRST + COMBINED REPAIR + TURN-AWARE COMPACT
+// STREMIO PT-BR 9.4.3.1 - TIMING-COMPACT PATH ISOLATION (SEMANTIC 9.4.3 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -22309,7 +22309,131 @@ function timingCompactDialogueTurns943(text) {
   return turns;
 }
 
-async function timingAwareCompactSurgery928(items) {
+async function timingAwareCompactSingle942(items) {
+  const clean = (Array.isArray(items) ? items : [])
+    .map(item => ({
+      i:Number(item?.i), source:String(item?.source || "").trim(), pt:String(item?.pt || "").trim(),
+      availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs || 0))),
+      before:String(item?.before || "").slice(0,900), after:String(item?.after || "").slice(0,900)
+    }))
+    .filter(item => Number.isInteger(item.i) && item.source && item.pt && item.availableDisplayMs > 0);
+  if (!clean.length) throw new Error("TIMING COMPACT sem itens válidos.");
+  if (clean.length > TIMING_COMPACT_MAX_ITEMS_928) throw new Error(`TIMING COMPACT excede ${TIMING_COMPACT_MAX_ITEMS_928} itens.`);
+  const chars = clean.reduce((sum,item)=>sum+item.source.length+item.pt.length,0);
+  if (chars > TIMING_COMPACT_MAX_CHARS_928) throw new Error(`TIMING COMPACT excede ${TIMING_COMPACT_MAX_CHARS_928} caracteres.`);
+
+  const locksById = new Map();
+  const protectedItems = clean.map(item => {
+    const protectedSource = protectCulturalLocks(item.source,item.i);
+    locksById.set(item.i,protectedSource.locks);
+    return {
+      i:item.i, source:protectedSource.text, current_pt:item.pt,
+      available_display_ms:Math.round(item.availableDisplayMs),
+      current_visible_chars:timingCompactVisibleChars928(item.pt),
+      target_visible_chars:timingCompactHardVisibleChars941(item.availableDisplayMs),
+      variant_caps:timingCompactVariantCaps941(item.availableDisplayMs),
+      hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after
+    };
+  });
+
+  // 9.4.0: 3 alternativas distintas são geradas NA MESMA chamada por parent.
+  // Isso aumenta a chance de caber com fidelidade sem criar retries/micro-loops.
+  const generationGroups = chunks9210(protectedItems, 24);
+  const generationResults = await runBoundedTasks9210(generationGroups.map(group => async () => {
+    const response = await geminiRequest({
+      system:`Você faz TIMING-AWARE COMPACT SURGERY de legendas SOURCE→PT-BR.\n`+
+        `A janela disponível foi medida no áudio real e NÃO pode ser aumentada movendo START.\n`+
+        `target_visible_chars é LIMITE DURO, não sugestão. variant_caps[k] é o máximo ABSOLUTO de caracteres visíveis permitido em candidates[k].\n`+
+        `Para CADA cue, gere EXATAMENTE ${TIMING_COMPACT_VARIANTS_940} alternativas diferentes. Cada candidates[k] DEVE caber em variant_caps[k], contando letras, espaços e pontuação visíveis.\n`+
+        `Candidate 0 deve ser a formulação mais natural que já caiba; as seguintes devem ficar progressivamente mais curtas SEM virar fragmento.\n`+
+        `Comprima por redação idiomática, contração natural e remoção apenas de hesitações/redundâncias sem valor semântico. Nunca apague uma unidade de sentido para cumprir o limite.\n`+
+        `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes, turnos de diálogo e hard_locks.\n`+
+        `Não invente, não mova conteúdo entre cues, não altere timestamps. PT-BR natural, máximo 2x50.\n`+
+        `Se for semanticamente impossível cumprir um cap, repita current_pt naquela posição; o filtro local a rejeitará com segurança. JSON somente.`,
+      user:JSON.stringify({cues:group}), schema:TIMING_COMPACT_SCHEMA_928,
+      thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:22000,
+      timeoutMs:60000, maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"repair"
+    });
+    return parseStructuredArraySalvage9210(response.text,"cues").items || [];
+  }),2);
+
+  const returned = new Map();
+  for (const result of generationResults) {
+    if (result?.error) continue;
+    for (const x of (Array.isArray(result)?result:[])) {
+      const id=Number(x?.i);
+      const variants=Array.isArray(x?.candidates)?x.candidates.map(v=>String(v||"").trim()).filter(Boolean):[];
+      if (Number.isInteger(id) && variants.length) returned.set(id,variants);
+    }
+  }
+
+  const candidates=[];
+  for (const item of clean) {
+    const rawVariants=returned.get(item.i)||[];
+    const safe=[]; const seen=new Set();
+    for (const raw of rawVariants) {
+      let candidate=String(raw||"").trim();
+      if(!candidate) continue;
+      try { candidate=restoreCulturalLocks(candidate,locksById.get(item.i)||[],item.i); } catch { continue; }
+      const block={index:item.i,text:item.source};
+      candidate=sanitizeFinalCue(block,candidate)||sanitizeFallbackCue(candidate)||candidate;
+      const key=semanticTextKey940(candidate);
+      if(!key || seen.has(key) || key===semanticTextKey940(item.pt)) continue;
+      seen.add(key);
+      const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
+      const layout=layoutCueResult(block,candidate);
+      if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
+      safe.push(candidate);
+    }
+    if(safe.length) {
+      safe.sort((a,b)=>timingCompactVisibleChars928(a)-timingCompactVisibleChars928(b));
+      candidates.push({...item,variants:safe.slice(0,TIMING_COMPACT_VARIANTS_940)});
+    }
+  }
+  if(!candidates.length) return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false,reason:"no_locally_safe_candidate"}));
+
+  // Auditoria independente escolhe UMA das alternativas já validadas localmente.
+  // Mesmo número de itens de auditoria do 9.3.1; não há round extra.
+  const auditGroups=chunks9210(candidates,16);
+  const auditResults=await runBoundedTasks9210(auditGroups.map(group=>async()=>{
+    const response=await geminiRequest({
+      system:`Você é o auditor final de Meaning Integrity de compactações PT-BR.\n`+
+        `Para cada item, compare SOURCE, BEFORE_PT e cada CANDIDATE_PT.\n`+
+        `candidate_pts já chega ordenado do MAIS CURTO para o MAIS LONGO entre os candidatos que passaram pelos guards locais.\n`+
+        `chosen_index deve ser o índice 0-based da PRIMEIRA candidata totalmente segura, ou -1 se nenhuma preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e conteúdo.\n`+
+        `Portanto escolha o texto MAIS CURTO que ainda seja semanticamente completo. Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
+      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after}))}),
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
+      timeoutMs:60000, maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
+    });
+    return parseStructuredArraySalvage9210(response.text,"items").items || [];
+  }),3);
+
+  const auditById=new Map();
+  for(const result of auditResults){
+    if(result?.error) continue;
+    for(const x of (Array.isArray(result)?result:[])){
+      const id=Number(x?.i), chosen=Number(x?.chosen_index);
+      if(Number.isInteger(id)&&Number.isInteger(chosen)) auditById.set(id,{...x,chosen_index:chosen});
+    }
+  }
+  const candidateById=new Map(candidates.map(x=>[x.i,x]));
+  const out=clean.map(item=>{
+    const c=candidateById.get(item.i), a=auditById.get(item.i);
+    const idx=Number(a?.chosen_index);
+    if(c&&Number.isInteger(idx)&&idx>=0&&idx<c.variants.length){
+      const chosen=c.variants[idx];
+      return {i:item.i,pt:chosen,changed:chosen!==item.pt,verified:true};
+    }
+    return {i:item.i,pt:item.pt,changed:false,verified:false,reason:c?String(a?.reason||"semantic_audit_not_passed").slice(0,240):"no_locally_safe_candidate"};
+  });
+  console.log(`[TIMING COMPACT SINGLE 9.4.3.1] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  return out;
+}
+
+async function timingAwareCompactTurnAware943(items) {
   const clean = (Array.isArray(items) ? items : [])
     .map(item => {
       const source = String(item?.source || "").trim();
@@ -22406,7 +22530,7 @@ async function timingAwareCompactSurgery928(items) {
       candidates.push({...item,variants:safe.slice(0,TIMING_COMPACT_VARIANTS_940)});
     }
   }
-  if(!candidates.length) return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false}));
+  if(!candidates.length) return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false,reason:"no_locally_safe_candidate_or_turn_mismatch"}));
 
   // Auditoria independente escolhe UMA das alternativas já validadas localmente.
   // Mesmo número de itens de auditoria do 9.3.1; não há round extra.
@@ -22443,9 +22567,58 @@ async function timingAwareCompactSurgery928(items) {
       const chosen=c.variants[idx];
       return {i:item.i,pt:chosen,changed:chosen!==item.pt,verified:true};
     }
-    return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"semantic_audit_not_passed").slice(0,240)};
+    return {i:item.i,pt:item.pt,changed:false,verified:false,reason:c?String(a?.reason||"semantic_audit_not_passed").slice(0,240):"no_locally_safe_candidate_or_turn_mismatch"};
   });
-  console.log(`[TIMING COMPACT 9.4.3] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  console.log(`[TIMING COMPACT MULTI 9.4.3.1] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  return out;
+}
+
+async function timingAwareCompactSurgery928(items) {
+  const raw = Array.isArray(items) ? items : [];
+  const single = [];
+  const multi = [];
+  for (const item of raw) {
+    const sourceTurns = timingCompactDialogueTurns943(String(item?.source || ""));
+    const ptTurns = timingCompactDialogueTurns943(String(item?.pt || ""));
+    const isMulti = Boolean(item?.turnAwareRescue) || sourceTurns.length > 1 || ptTurns.length > 1;
+    (isMulti ? multi : single).push(item);
+  }
+
+  const tasks = [];
+  if (single.length) tasks.push(
+    timingAwareCompactSingle942(single).then(items => ({kind:"single",items}))
+  );
+  if (multi.length) tasks.push(
+    timingAwareCompactTurnAware943(multi).then(items => ({kind:"multi",items}))
+  );
+
+  const groups = await Promise.all(tasks);
+  const byId = new Map();
+  for (const group of groups) {
+    for (const item of (Array.isArray(group?.items) ? group.items : [])) {
+      byId.set(Number(item?.i), {...item, compactPath9431:group.kind});
+    }
+  }
+
+  const out = raw.map(item => {
+    const id = Number(item?.i);
+    return byId.get(id) || {
+      i:id, pt:String(item?.pt || ""), changed:false, verified:false,
+      reason:"compact_path_no_result", compactPath9431:"none"
+    };
+  });
+
+  const rejected = out.filter(x => x?.verified !== true);
+  console.log(
+    `[TIMING COMPACT ROUTER 9.4.3.1] single=${single.length} | multi=${multi.length} | ` +
+    `verified=${out.filter(x=>x?.verified===true).length}/${out.length}.`
+  );
+  if (rejected.length) {
+    console.warn(
+      `[TIMING COMPACT REJECTIONS 9.4.3.1] ` +
+      rejected.map(x => `i=${x.i}:${x.compactPath9431||"?"}:${String(x.reason||"unknown").replace(/\s+/g," ").slice(0,120)}`).join(" | ")
+    );
+  }
   return out;
 }
 
@@ -22479,10 +22652,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.3] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.3",items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.3.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.3.1",semanticNamespace:CACHE_VERSION,items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.3] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.3.1] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -23090,7 +23263,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3 - SPECIALIST-FIRST + COMBINED REPAIR + TURN-AWARE COMPACT"
+        " STREMIO PT-BR 9.4.3.1 - TIMING-COMPACT PATH ISOLATION | SEMANTIC 9.4.3 PRESERVED"
   );
 
   console.log(
@@ -23522,6 +23695,8 @@ console.log(
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
   console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
+  console.log("Timing Compact Path Isolation 9.4.3.1: single-turn usa exatamente o algoritmo 9.4.2; somente multi-turn entra no caminho turn-aware ✅");
+  console.log("Timing Compact Diagnostics 9.4.3.1: cada parent não verificado reporta path + motivo; semantic namespace permanece 9.4.3 ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
