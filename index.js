@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3.5 - SEMANTIC CONSTRAINT MEMORY + INTERSECTION CLOSURE (TIMING 9.4.3.4 PRESERVED)
+// STREMIO PT-BR 9.5.0 - SINGLE SEMANTIC CLOSURE + UNIVERSAL IDENTITY NORMALIZER (TIMING 9.4.3.4 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -267,7 +267,7 @@ const LAYOUT_IDEAL_CHARS_PER_LINE = 44;
 // ============================================================
 
 // Só entra aqui quem continuou grande DEMAIS mesmo após o Repair normal.
-// Em episódios como o teste do RuPaul, esperamos pouquíssimos cues.
+// O gatilho depende somente da geometria do cue, nunca do título/conteúdo.
 const COMPACT_RESCUE_ENABLED = true;
 const COMPACT_RESCUE_MAX_CUES_TOTAL = 120;
 const COMPACT_RESCUE_BATCH_MAX_CUES = 24;
@@ -2011,7 +2011,7 @@ function looksLikeClearlySpokenBareLine(value) {
 //
 // Objetivo:
 // - remover descrições de acessibilidade por ESTRUTURA, não por nome/personagem;
-// - reconhecer "RUPAUL CACKLING", "NAYA CLEARS THROAT",
+// - reconhecer "HOST CACKLING", "SPEAKER CLEARS THROAT",
 //   "THE CROWD CHEERS", "DOORBELL RINGS" etc. sem hardcode de pessoas;
 // - continuar conservador com fala real.
 //
@@ -3575,7 +3575,7 @@ function subtitleClockToMs(
 // - decisão musical é por CUE/BLOCO, nunca por linha isolada;
 // - uma letra nunca pode ser mutilada ("linha com ♪ some / continuação fica").
 //
-// Âncoras longas preservam a regra que funcionou no The Voice.
+// Âncoras longas usam evidência estrutural de performance.
 // Clusters curtos só entram quando o contexto imediato prova lançamento
 // de performance ou quando ficam ENTRE dois clusters já confirmados.
 
@@ -5064,14 +5064,6 @@ const CULTURE_HARD_LOCKS = [
       /\bUntucked\b/giu,
     value:
       "Untucked"
-  },
-
-  // Nome da franquia — aceita inclusive fonte sem apóstrofo.
-  {
-    regex:
-      /\bRuPaul(?:'|’)?s\s+Drag\s+Race\b/giu,
-    value:
-      "RuPaul's Drag Race"
   },
 
   // Deve ficar por último para não capturar antes
@@ -13158,20 +13150,14 @@ function copiedEnglishRatio(
 }
 
 function isDragContext(
-  filename,
+  _filename,
   en
 ) {
-  return (
-    /rupaul|drag[ ._-]*race|dragula|queen of the universe/i.test(
-      String(
-        filename ||
-        ""
-      )
-    ) ||
-
-    /\bwerkroom\b|\blip sync\b|\bshantay\b|\bsashay\b|\bcondragulations\b|\bsnatch game\b|\brusical\b/i.test(
-      String(en || "")
-    )
+  // 9.5.0 UNIVERSAL: filename/title NEVER selects semantic behavior.
+  // Domain slang handling is activated only by lexical evidence inside the
+  // SOURCE cue itself, so the same rule works in any movie/show/documentary.
+  return /\bwerkroom\b|\blip[\s-]+sync\b|\bshantay\b|\bsashay\b|\bcondragulations\b|\bsnatch\s+game\b|\brusical\b|\bshade\b|\bslay(?:ed|ing|s)?\b|\bspill(?:ing)?\s+the\s+tea\b/iu.test(
+    String(en || "")
   );
 }
 
@@ -14957,6 +14943,122 @@ function sourceExplicitlyMarksSecondPersonGender(block) {
 }
 
 // ============================================================
+// UNIVERSAL COPULAR IDENTITY NORMALIZER — 9.5.0 ZERO-CLOUD
+// ============================================================
+// Title/content agnostic. Solves a structural PT-BR conflict that previously
+// caused repair cascades:
+//   SOURCE: "I am a coward" / "You're a journalist"
+//   PT:     "Sou um covarde" / "Você é uma jornalista"
+// When SOURCE does not prove human gender and the PT predicate itself is
+// lexically common-gender, Portuguese can preserve the SAME identity relation
+// simply by dropping the gendered article: "Sou covarde", "Você é jornalista".
+//
+// This is NOT a title/cue dictionary and never guesses a person's gender.
+// It only touches direct copular identity frames and only for a high-confidence
+// set of PT-BR predicates whose lexical form does not encode sex/gender.
+const PT_COMMON_GENDER_IDENTITY_950 = new Set([
+  "adolescente","agente","artista","assistente","atendente","atleta",
+  "canalha","celebridade","cliente","colega","covarde","cúmplice",
+  "docente","estudante","fã","gerente","guia","homicida","idiota",
+  "imbecil","intérprete","jornalista","jovem","líder","lider",
+  "motorista","mártir","martir","paciente","pessoa","policial",
+  "presidente","profissional","responsável","responsavel","testemunha",
+  "vítima","vitima"
+]);
+
+const SOURCE_IDENTITY_NEUTRAL_ALIAS_950 = Object.freeze({
+  coward: "covarde",
+  murderer: "homicida",
+  killer: "homicida",
+  journalist: "jornalista",
+  driver: "motorista",
+  student: "estudante",
+  scientist: "cientista",
+  artist: "artista",
+  athlete: "atleta",
+  patient: "paciente",
+  client: "cliente",
+  customer: "cliente",
+  manager: "gerente",
+  assistant: "assistente",
+  witness: "testemunha",
+  victim: "vítima",
+  leader: "líder",
+  president: "presidente",
+  teenager: "adolescente"
+});
+
+function sourceNeutralCopularIdentity950(block) {
+  if (!blockSourceIsEnglish(block)) return null;
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!source) return null;
+
+  const first = source.match(/\bi(?:'m|’m| am| was)\s+(?:just\s+|only\s+)?(?:a|an)\s+([a-z][a-z'’-]{1,40})\b/i);
+  if (first && !sourceExplicitlyMarksSelfGender(block)) {
+    return { person: "first", role: String(first[1] || "").toLocaleLowerCase(), limited: /\b(?:just|only)\b/i.test(first[0]) };
+  }
+
+  const second = source.match(/\byou(?:'re|’re| are| were)\s+(?:just\s+|only\s+)?(?:a|an)\s+([a-z][a-z'’-]{1,40})\b/i);
+  if (second && !sourceExplicitlyMarksSecondPersonGender(block)) {
+    return { person: "second", role: String(second[1] || "").toLocaleLowerCase(), limited: /\b(?:just|only)\b/i.test(second[0]) };
+  }
+
+  return null;
+}
+
+function applyUniversalCopularIdentityNeutrality950(block, value) {
+  let pt = String(value || "").trim();
+  if (!pt || sourceDialogueDashCount(block) >= 2) return pt;
+
+  const identity = sourceNeutralCopularIdentity950(block);
+  if (!identity) return pt;
+
+  const person = identity.person;
+  const subject = person === "first" ? "(?:eu\\s+)?" : "(?:voc[eê]|c[eê]|tu)\\s+";
+  const copula = person === "first"
+    ? "(?:sou|era|fui|fosse|seja|estou|t[oô])"
+    : "(?:[ée]|era|foi|fosse|seja|est[aá]|t[aá])";
+
+  const direct = new RegExp(
+    `\\b(${subject}${copula}\\s+(?:(?:s[oó]|apenas|simplesmente)\\s+)?)(?:um|uma)\\s+([\\p{L}][\\p{L}'’-]{1,40})\\b`,
+    "iu"
+  );
+
+  const m = pt.match(direct);
+  if (m) {
+    const rolePt = String(m[2] || "").toLocaleLowerCase("pt-BR");
+    if (PT_COMMON_GENDER_IDENTITY_950.has(rolePt)) {
+      const before = pt;
+      pt = pt.replace(direct, (_all, head, noun) => `${head}${noun}`);
+      if (pt !== before) {
+        console.log(`[IDENTITY NEUTRALIZER 9.5.0] cue ${block?.index}: artigo de gênero removido sem alterar identidade | role=${rolePt} | 0 Gemini. ✅`);
+      }
+      return pt.replace(/[ \t]{2,}/g, " ").trim();
+    }
+  }
+
+  // Exact neutral aliases for direct identity nouns. This path is still
+  // deterministic because SOURCE supplies the noun and the replacement keeps
+  // the copular identity relation (never turns identity into an action/event).
+  const alias = SOURCE_IDENTITY_NEUTRAL_ALIAS_950[identity.role];
+  if (alias) {
+    const gendered = new RegExp(
+      `\\b(${subject}${copula}\\s+(?:(?:s[oó]|apenas|simplesmente)\\s+)?)(?:um|uma)\\s+[\\p{L}][\\p{L}'’-]{1,40}\\b`,
+      "iu"
+    );
+    if (gendered.test(pt)) {
+      const before = pt;
+      pt = pt.replace(gendered, (_all, head) => `${head}${alias}`);
+      if (pt !== before) {
+        console.log(`[IDENTITY NEUTRALIZER 9.5.0] cue ${block?.index}: identidade copular neutralizada por alias SOURCE-safe | sourceRole=${identity.role} | pt=${alias} | 0 Gemini. ✅`);
+      }
+    }
+  }
+
+  return pt.replace(/[ \t]{2,}/g, " ").trim();
+}
+
+// ============================================================
 // GENDER POSTCONDITION LOCAL — 9.0
 // ============================================================
 // O modelo continua responsável pela tradução. Este guard só reescreve
@@ -14973,6 +15075,10 @@ function applyDeterministicGenderNeutrality(block, value) {
   if (!source || sourceExplicitlyMarksSelfGender(block)) return pt;
 
   const lower = source.toLocaleLowerCase();
+
+  // 9.5.0: resolve direct identity/gender conflicts locally before any cloud
+  // repair can start oscillating between semantic fidelity and gender guards.
+  pt = applyUniversalCopularIdentityNeutrality950(block, pt);
 
   if (/\bi(?:'m|’m| am)\s+(?:always\s+)?right\b/i.test(source)) {
     pt = pt.replace(/\b(?:eu\s+)?sempre\s+(?:estou|t[oô]|sou)\s+cert[oa]\b/iu, "Eu sempre tenho razão");
@@ -15110,7 +15216,9 @@ function applyDeterministicGenderNeutrality(block, value) {
     pt = pt.replace(/\bvoc[eê]\s+n[aã]o\s+(?:est[aá]|t[aá])\s+sozinh[oa]\b/iu, match => /^[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/u.test(match) ? "Você não tá só" : "você não tá só");
   }
 
+  pt = applyUniversalCopularIdentityNeutrality950(block, pt);
   pt = applyGenderV5DefinitiveNeutralization897(block, pt);
+  pt = applyUniversalCopularIdentityNeutrality950(block, pt);
 
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
@@ -16917,6 +17025,8 @@ function repairCandidateRegressionReasons(
   return [...new Set(regressions)];
 }
 
+const SINGLE_SEMANTIC_CLOSURE_950 = true;
+
 async function tryFocusedRepair(
   blocks,
   translations,
@@ -17137,6 +17247,17 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     if (!unresolvedIds.length) return [];
 
     const residualIssues = batch.filter(issue => unresolvedIds.includes(Number(issue.id)));
+
+    // 9.5.0: one semantic correction round per job. Partial JSON salvage is
+    // accepted, but unresolved cues are NOT sent into micro-repair/cue-surgery
+    // cascades. They remain visible to the final verification gate.
+    if (SINGLE_SEMANTIC_CLOSURE_950) {
+      if (residualIssues.length) {
+        console.warn(`[SINGLE SEMANTIC CLOSURE 9.5.0] lote ${batchNumber}: residual=${residualIssues.length}; micro-repair desativado por arquitetura.`);
+      }
+      return residualIssues;
+    }
+
     const consolidated = [];
     for (let i = 0; i < residualIssues.length; i += REPAIR_ISOLATION_MICRO_MAX_CUES_928) {
       consolidated.push(residualIssues.slice(i, i + REPAIR_ISOLATION_MICRO_MAX_CUES_928));
@@ -17220,21 +17341,25 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   job.stats.repairIsolationResidual928 = uniqueResidual.length;
 
   if (uniqueResidual.length) {
-    job.stats.repairIsolationCueSurgery928 = uniqueResidual.length;
-    console.warn(
-      `[REPAIR ISOLATION 9.4.0] micro-repair esgotado | ` +
-      `cue-surgery SOURCE-ONLY=${uniqueResidual.length} | ids=[${uniqueResidual.map(x => x.id).join(",")}].`
-    );
-    const surgicallyRepaired = await runCueSurgery927(
-      blocks, updated, uniqueResidual, plan, job, "source_only"
-    );
-    for (const issue of uniqueResidual) {
-      const id = Number(issue.id);
-      const before = String(updated.get(id) || "");
-      const after = String(surgicallyRepaired.get(id) || "");
-      if (after && after !== before) {
-        updated.set(id, after);
-        acceptedCues++;
+    job.stats.repairIsolationCueSurgery928 = 0;
+    if (SINGLE_SEMANTIC_CLOSURE_950) {
+      console.warn(
+        `[SINGLE SEMANTIC CLOSURE 9.5.0] residual do repair=${uniqueResidual.length} | ` +
+        `SOURCE-ONLY/micro/cascade PROIBIDOS; verificação final decidirá fail-closed sem nova rewrite.`
+      );
+    } else {
+      job.stats.repairIsolationCueSurgery928 = uniqueResidual.length;
+      const surgicallyRepaired = await runCueSurgery927(
+        blocks, updated, uniqueResidual, plan, job, "source_only"
+      );
+      for (const issue of uniqueResidual) {
+        const id = Number(issue.id);
+        const before = String(updated.get(id) || "");
+        const after = String(surgicallyRepaired.get(id) || "");
+        if (after && after !== before) {
+          updated.set(id, after);
+          acceptedCues++;
+        }
       }
     }
   }
@@ -20419,175 +20544,103 @@ async function runBoundedFinalQuality88(
   plan,
   job
 ) {
-  let current = sanitizeTranslationMap(
-    blocks,
-    translations,
-    job
-  );
+  let current = sanitizeTranslationMap(blocks, translations, job);
 
-  const initialFocus = idsFromIssues(qaIssues, blocks);
-
-  let negationFocus926 = 0;
-  const ptHasNegation930 = value => /(?:\bn[aã]o\b|\bnunca\b|\bjamais\b|\bningu[eé]m\b|\bnada\b|\bnem\b|\bsem\b)/iu.test(String(value || ""));
-  for (const block of blocks) {
-    if (!sourceNegationRisk926(block)) continue;
-    const pt = String(current.get(block.index) || "");
-    if (ptHasNegation930(pt)) continue;
-    if (!initialFocus.has(block.index)) negationFocus926++;
-    initialFocus.add(block.index);
-  }
-  if (negationFocus926) {
-    console.log(`[NEGATION INTEGRITY FOCUS 9.4.0] +${negationFocus926} cue(s) com risco REAL de perda de negação (SOURCE negativa / PT sem marcador).`);
-  }
+  // 9.5.0 architectural cut: no semantic rewrite is allowed after the single
+  // consolidated Repair round. This stage is verification only.
+  const focus = idsFromIssues(qaIssues, blocks);
 
   for (const block of blocks) {
-    const before = String(mainTranslations.get(block.index) || "")
-      .replace(/\s+/g, " ").trim();
-    const after = String(current.get(block.index) || "")
-      .replace(/\s+/g, " ").trim();
-    if (before !== after) initialFocus.add(block.index);
+    const before = String(mainTranslations.get(block.index) || "").replace(/\s+/g, " ").trim();
+    const after = String(current.get(block.index) || "").replace(/\s+/g, " ").trim();
+    if (before !== after) focus.add(block.index);
+    if (sourceNegationRisk926(block) && !/(?:\bn[aã]o\b|\bnunca\b|\bjamais\b|\bningu[eé]m\b|\bnada\b|\bnem\b|\bsem\b)/iu.test(after)) {
+      focus.add(block.index);
+    }
   }
 
-  const localBefore = blockingLocalIssues(
-    blocks,
-    applySubtitleLayout(blocks, current, "FINAL-89-CANDIDATE"),
-    job,
-    plan
-  );
-  for (const id of idsFromIssues(localBefore, blocks)) initialFocus.add(id);
+  const laidOut = applySubtitleLayout(blocks, current, "FINAL-95-VERIFY");
+  const local = blockingLocalIssues(blocks, laidOut, job, plan);
+  for (const issue of local) focus.add(Number(issue?.id));
 
   console.log(
-    `[FINAL BOUNDED 9.0] auditoria HIGH única inicial | foco=${initialFocus.size} cue(s); ` +
-    `zero convergência aberta.`
+    `[SINGLE SEMANTIC CLOSURE 9.5.0] FINAL VERIFY ONLY | foco=${focus.size} | ` +
+    `0 Repair / 0 source_only / 0 beam / 0 constrained / 0 contrastive após esta etapa. ✅`
   );
 
-  const semantic1 = await scanFinalPriorityAudit(
-    blocks,
-    current,
-    plan,
-    job,
-    initialFocus
-  );
-
-  let issues1 = mergeIssueLists(localBefore, semantic1);
-  let changedAfterFinalRepair = new Set();
-
-  if (issues1.length) {
-    logIssueSummary("FINAL-89-REPAIR", issues1);
-    const beforeRepair = new Map(current);
-
-    current = await runFinalPriorityEscalatedRepair(
-      blocks,
-      current,
-      issues1,
-      plan,
-      job
-    );
-
-    current = sanitizeTranslationMap(blocks, current, job);
-    current = await runCompactRescue(blocks, current, plan, job);
-    current = sanitizeTranslationMap(blocks, current, job);
-
-    for (const block of blocks) {
-      const a = String(beforeRepair.get(block.index) || "").replace(/\s+/g, " ").trim();
-      const b = String(current.get(block.index) || "").replace(/\s+/g, " ").trim();
-      if (a !== b) changedAfterFinalRepair.add(block.index);
-    }
+  let semantic = [];
+  if (focus.size) {
+    semantic = await scanFinalPriorityAudit(blocks, current, plan, job, focus);
   }
 
-  const verifyFocus = new Set([
-    ...idsFromIssues(issues1, blocks),
-    ...changedAfterFinalRepair
-  ]);
+  let residual = resolveGuardConflicts942(
+    blocks,
+    mergeIssueLists(local, semantic),
+    job,
+    "SINGLE FINAL VERIFY 9.5.0"
+  );
 
-  if (verifyFocus.size) {
-    console.log(
-      `[FINAL BOUNDED 9.0] verificação HIGH final | foco=${verifyFocus.size} cue(s); ` +
-      `esta é a última auditoria Gemini do job.`
-    );
+  // Apply zero-cloud deterministic postconditions once more. This is important
+  // for direct copular identity conflicts where PT-BR can remove grammatical
+  // gender without changing semantics (e.g. "Sou um covarde" -> "Sou covarde").
+  if (residual.length) {
+    const beforeNormalize = new Map(current);
+    current = sanitizeTranslationMap(blocks, current, job);
 
-    const laidOut = applySubtitleLayout(
-      blocks,
-      current,
-      "FINAL-89-VERIFY"
-    );
+    const changed = new Set();
+    for (const issue of residual) {
+      const id = Number(issue?.id);
+      if (!Number.isInteger(id)) continue;
+      if (String(beforeNormalize.get(id) || "") !== String(current.get(id) || "")) changed.add(id);
+    }
 
-    const local2 = blockingLocalIssues(
-      blocks,
-      laidOut,
-      job,
-      plan
-    ).filter(issue => verifyFocus.has(Number(issue.id)));
-
-    const semantic2 = await scanFinalPriorityAudit(
-      blocks,
-      current,
-      plan,
-      job,
-      verifyFocus
-    );
-
-    const issues2 = mergeIssueLists(local2, semantic2);
-
-    if (issues2.length) {
-      logIssueSummary("FINAL-89-LAST-REPAIR", issues2);
-      console.warn(
-        `[FINAL BOUNDED 9.0] ${issues2.length} blocker(s) residuais; ` +
-        `executando UMA reconstrução final focal. Não haverá nova auditoria em loop.`
+    if (changed.size) {
+      console.log(
+        `[SINGLE SEMANTIC CLOSURE 9.5.0] normalização determinística alterou ${changed.size} cue(s); ` +
+        `UMA reauditoria focal de confirmação, 0 Repair adicional.`
       );
-
-      current = await runFinalPriorityEscalatedRepair(
-        blocks,
-        current,
-        issues2,
-        plan,
-        job
-      );
-      current = sanitizeTranslationMap(blocks, current, job);
-      current = await runCompactRescue(blocks, current, plan, job);
-      current = sanitizeTranslationMap(blocks, current, job);
-
-      const target927 = await verifyFinalTargets927(
-        blocks,
-        current,
-        issues2,
-        plan,
-        job
-      );
-      current = target927.translations;
-      if (target927.residual.length) {
-        job.finalTargetResidual927 = target927.residual;
-        job.finalTargetResidualSnapshot9210 = new Map(
-          target927.residual.map(issue => [Number(issue?.id), String(current.get(Number(issue?.id)) || "")])
-        );
-        job.qualityStatus = "best_available";
-        job.noCacheFinal923 = true;
-        console.error(
-          `[FINAL TARGET VERIFICATION 9.4.3.5] FAIL-CLOSED PARA SELO/CACHE | ` +
-          `residual=${target927.residual.length}.`
-        );
-      } else {
-        job.finalTargetResidual927 = [];
-        job.finalTargetResidualSnapshot9210 = new Map();
+      const laid2 = applySubtitleLayout(blocks, current, "FINAL-95-RENORMALIZED");
+      const local2 = blockingLocalIssues(blocks, laid2, job, plan)
+        .filter(issue => changed.has(Number(issue?.id)));
+      let semantic2 = [];
+      try {
+        semantic2 = await scanFinalPriorityAudit(blocks, current, plan, job, changed);
+      } catch (error) {
+        semantic2 = [...changed].map(id => ({
+          id,
+          reasons: ["FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: confirmação focal indisponível; fail-closed."]
+        }));
       }
+      const patch = resolveGuardConflicts942(
+        blocks,
+        mergeIssueLists(local2, semantic2),
+        job,
+        "RENORMALIZED CONFIRM 9.5.0"
+      );
+      const patchIds = new Set(changed);
+      const byId = new Map(residual.map(issue => [Number(issue?.id), issue]));
+      for (const id of patchIds) byId.delete(Number(id));
+      for (const issue of patch) byId.set(Number(issue?.id), issue);
+      residual = [...byId.values()].sort((a,b)=>Number(a.id)-Number(b.id));
     }
   }
 
-  const finalLocal = blockingLocalIssues(
-    blocks,
-    applySubtitleLayout(blocks, current, "FINAL-89-LOCAL"),
-    job,
-    plan
-  );
-
-  if (finalLocal.length) {
-    console.warn(
-      `[FINAL BOUNDED 9.0] ${finalLocal.length} guard(s) local(is) residual(is) ` +
-      `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será preservado sem selo FINAL.`
+  if (residual.length) {
+    job.finalTargetResidual927 = residual;
+    job.finalTargetResidualSnapshot9210 = new Map(
+      residual.map(issue => [Number(issue?.id), String(current.get(Number(issue?.id)) || "")])
     );
-    if (job.qualityStatus === "pending" || job.qualityStatus === "final_pass") job.qualityStatus = "best_available";
-  } else if (!Array.isArray(job.finalTargetResidual927) || job.finalTargetResidual927.length === 0) {
+    job.qualityStatus = "best_available";
+    job.noCacheFinal923 = true;
+    console.error(
+      `[SINGLE SEMANTIC CLOSURE 9.5.0] FAIL-CLOSED | residual=${residual.length} | ` +
+      `nenhuma nova tentativa cloud será criada.`
+    );
+  } else {
+    job.finalTargetResidual927 = [];
+    job.finalTargetResidualSnapshot9210 = new Map();
     job.qualityStatus = "final_pass";
+    console.log(`[SINGLE SEMANTIC CLOSURE 9.5.0] PASSOU ✅ | residual=0 | semantic rewrite rounds=1.`);
   }
 
   return current;
@@ -20765,6 +20818,56 @@ let qaIssues =
 }
 
 // ============================================================
+// SINGLE SEMANTIC CLOSURE PRE-AUDIT — 9.5.0
+// ============================================================
+// Collect every semantic/local constraint BEFORE the only Repair round.
+// Final Priority is therefore not allowed to discover a blocker later and
+// trigger another rewrite cascade.
+{
+  const preClosureLocal950 = detectLocalIssues(
+    blocks,
+    mainTranslations,
+    job.filename,
+    plan
+  );
+  const preClosureFocus950 = new Set([
+    ...idsFromIssues(qaIssues, blocks),
+    ...idsFromIssues(preClosureLocal950, blocks)
+  ]);
+
+  for (const block of blocks) {
+    const pt = String(mainTranslations.get(block.index) || "");
+    if (sourceNegationRisk926(block) &&
+        !/(?:\bn[aã]o\b|\bnunca\b|\bjamais\b|\bningu[eé]m\b|\bnada\b|\bnem\b|\bsem\b)/iu.test(pt)) {
+      preClosureFocus950.add(block.index);
+    }
+  }
+
+  let preClosureSemantic950 = [];
+  if (preClosureFocus950.size) {
+    console.log(
+      `[SINGLE SEMANTIC CLOSURE 9.5.0] PRE-AUDIT | foco=${preClosureFocus950.size} | ` +
+      `todos os blockers serão fundidos ANTES da única rodada de Repair.`
+    );
+    preClosureSemantic950 = await scanFinalPriorityAudit(
+      blocks,
+      mainTranslations,
+      plan,
+      job,
+      preClosureFocus950
+    );
+  }
+
+  qaIssues = resolveGuardConflicts942(
+    blocks,
+    mergeIssueLists(qaIssues, preClosureSemantic950),
+    job,
+    "PRE-REPAIR SINGLE CLOSURE 9.5.0"
+  );
+  rememberSemanticConstraints945(job, qaIssues, "single-pre-repair-9.5.0");
+}
+
+// ============================================================
 // REPAIR
 // ============================================================
 
@@ -20813,13 +20916,10 @@ finalTranslations =
   );
 
 // ============================================================
-// FINAL QUALITY — 8.8 BOUNDED
+// FINAL QUALITY — 9.5.0 SINGLE SEMANTIC CLOSURE
 // ============================================================
-// O QA global HIGH já cobriu o episódio inteiro. Depois dele existe somente:
-// 1) repair focal;
-// 2) uma auditoria HIGH focal;
-// 3) no máximo uma reconstrução focal + uma verificação HIGH final.
-// Não existe convergência aberta, reabertura por layout nem ciclo de rounds.
+// O único Repair cloud já aconteceu. Daqui em diante existe somente
+// verificação HIGH + fechamento determinístico local. ZERO nova rewrite cloud.
 job.episodePlan = plan;
 finalTranslations = await runBoundedFinalQuality88(
   blocks,
@@ -20861,140 +20961,17 @@ let finalClosure898 = finalClosureResidualSummary898(
   blocks, finalTranslations, job.filename, plan
 );
 
-// 9.2.5 STRICT TARGET-ELIMINATION GENDER FINAL GATE.
-// A candidate is NOT "accepted" merely because it introduced no new regressions.
-// For this gate, the repaired cue must locally prove ZERO remaining gender blockers.
-// At most TWO tiny focal passes are allowed; there is no global re-audit and no open loop.
+// 9.5.0 — GENDER FINAL GATE IS VERIFICATION-ONLY.
+// All gender constraints were already included BEFORE the single Repair round,
+// and sanitizeTranslationMap() applies deterministic zero-cloud neutralizers.
+// No model rewrite is allowed here; this prevents repair cascades.
 if (finalClosure898.gender > 0) {
-  const maxGenderPasses925 = 2;
-
-  for (let genderPass925 = 1; genderPass925 <= maxGenderPasses925; genderPass925++) {
-    let genderIssues925 = genderTargetIssues925(
-      blocks,
-      finalTranslations,
-      job.filename,
-      plan
-    );
-
-    if (!genderIssues925.length) break;
-
-    const ids925 = genderIssues925.map(issue => Number(issue.id)).filter(Number.isInteger);
-    console.warn(
-      `[GENDER TARGET GATE 9.2.5] pass=${genderPass925}/${maxGenderPasses925} | ` +
-      `residual=${genderIssues925.length} | ids=[${ids925.join(",")}].`
-    );
-
-    const beforeGenderSnapshot942 = new Map(
-      ids925.map(id => [id, String(finalTranslations.get(id) || "")])
-    );
-    const beforeGenderReasonSignature942 = genderIssues925
-      .map(issue => `${issue.id}:${[...(issue.reasons || [])].sort().join("+")}`)
-      .sort().join("|");
-
-    // The model sees an explicit postcondition in addition to the concrete local reasons.
-    // This is generic: no title/character/release-specific wording.
-    genderIssues925 = genderIssues925.map(issue => ({
-      id: issue.id,
-      reasons: [
-        ...issue.reasons,
-        "STRICT_GENDER_POSTCONDITION_9_2_5: a resposta deste cue só será aceita se a checagem local terminar com ZERO flexão humana de gênero não exigida pela SOURCE; reformule naturalmente em PT-BR, sem parênteses, x/@ ou masculino genérico."
-      ]
-    }));
-
-    finalTranslations = await runFinalPriorityEscalatedRepair(
-      blocks,
-      finalTranslations,
-      genderIssues925,
-      plan,
-      job,
-      { requireGenderZero: true }
-    );
-
-    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
-    finalTranslations = applyRepairPersistenceLock923(
-      blocks, finalTranslations, job, job.filename, plan
-    );
-    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
-
-    const afterIssues925 = genderTargetIssues925(
-      blocks,
-      finalTranslations,
-      job.filename,
-      plan
-    );
-
-    if (!afterIssues925.length) {
-      console.log(
-        `[GENDER TARGET GATE 9.2.5] PASSOU ✅ | pass=${genderPass925} | residual=0.`
-      );
-      break;
-    }
-
-    const detail925 = afterIssues925
-      .map(issue => `${issue.id}:${issue.reasons.join("+")}`)
-      .join(" | ");
-
-    console.warn(
-      `[GENDER TARGET GATE 9.2.5] após pass=${genderPass925}: ` +
-      `residual=${afterIssues925.length} | ${detail925}`
-    );
-
-
-    const afterGenderReasonSignature942 = afterIssues925
-      .map(issue => `${issue.id}:${[...(issue.reasons || [])].sort().join("+")}`)
-      .sort().join("|");
-    const changedGenderTargets942 = ids925.filter(
-      id => String(beforeGenderSnapshot942.get(id) || "") !== String(finalTranslations.get(id) || "")
-    );
-    if (!changedGenderTargets942.length || afterGenderReasonSignature942 === beforeGenderReasonSignature942) {
-      console.warn(
-        `[GENDER TARGET GATE 9.4.2] sem progresso estrutural após pass=${genderPass925}; ` +
-        `não repetiremos a mesma reconstrução. Escalando para estratégia distinta bounded.`
-      );
-      break;
-    }
-  }
-
-  finalClosure898 = finalClosureResidualSummary898(
-    blocks,
-    finalTranslations,
-    job.filename,
-    plan
+  console.warn(
+    `[SINGLE SEMANTIC CLOSURE 9.5.0][GENDER] residual=${finalClosure898.gender} | ` +
+    `0 Repair adicional; fail-closed se a normalização determinística não bastou.`
   );
-}
-
-// 9.4.0 UNIFIED ESCALATION: não reinicia source_only/contrastive cegamente.
-// A ledger por cue + família de blocker sabe o que já foi tentado. Se houver uma
-// estratégia realmente nova (beam/constrained), ela pode entrar; repetição não.
-if (finalClosure898.gender > 0) {
-  let genderResidual928 = genderTargetIssues925(blocks, finalTranslations, job.filename, plan);
-  for (const strategy928 of ["source_only", "candidate_beam", "constrained"]) {
-    if (!genderResidual928.length) break;
-    const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928, { stage: "gender-final", translations: finalTranslations, requireGenderZero: true });
-    if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.3.5][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
-      continue;
-    }
-    console.warn(`[UNIFIED ESCALATION 9.4.3.5][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
-    if (strategy928 === "candidate_beam") {
-      finalTranslations = await runCandidateBeam928(
-        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
-      );
-    } else if (strategy928 === "constrained") {
-      finalTranslations = await runConstrainedReconstruction928(
-        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
-      );
-    } else {
-      finalTranslations = await runCueSurgery927(
-        blocks, finalTranslations, eligible928, plan, job, strategy928, { requireGenderZero: true, stage: "gender-final" }
-      );
-    }
-    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
-    finalTranslations = applyRepairPersistenceLock923(blocks, finalTranslations, job, job.filename, plan);
-    finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
-    genderResidual928 = genderTargetIssues925(blocks, finalTranslations, job.filename, plan);
-  }
-  finalClosure898 = finalClosureResidualSummary898(blocks, finalTranslations, job.filename, plan);
+  job.qualityStatus = "best_available";
+  job.noCacheFinal923 = true;
 }
 
 // 9.4.0 POST-CLOSURE FOCAL REAUDIT.
@@ -23772,7 +23749,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3.5 - SEMANTIC CONSTRAINT MEMORY + INTERSECTION CLOSURE | TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.5.0 - SINGLE SEMANTIC CLOSURE + UNIVERSAL IDENTITY NORMALIZER | TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -24034,7 +24011,7 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-  console.log("Fast Escalation 9.4.0: no máximo source_only + candidate_beam; sem 4 estratégias em cascata ✅");
+  console.log("Semantic Repair Budget 9.5.0: UMA rodada consolidada após PRE-AUDIT; sem source_only/beam/constrained/contrastive em cascata ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
@@ -24190,24 +24167,24 @@ console.log(
     "Gender Lock 9.1: proteções de gênero preservadas integralmente; ambiguidade humana continua fail-closed ✅"
   );
   console.log("Post-Closure Verify 9.4.0: residual stale re-auditado uma vez somente nos cues alterados ✅");
-  console.log("Call Budget 9.4.0: Ownership local <=36 cues; Repair fallback <=2 batches; Timing Compact sem micro-loop ✅");
+  console.log("Call Budget 9.5.0: generic semantic Repair=1 rodada consolidada; ownership selado só quando shift é provado; Timing Compact separado e bounded ✅");
   console.log("Canonical Cache Closure 9.4.0: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
   console.log("Semantic Authority 9.4.0: auditoria HIGH invalida Repair Persistence reprovado; strategy lock só nasce após QA limpa ✅");
-  console.log("Target JSON Budget 9.4.0: source-only/candidate-beam com budget anti-truncamento + Candidate Beam salvage sem retry ✅");
+  console.log("Semantic Rewrite 9.5.0: blockers locais + QA + Final Priority são fundidos ANTES da única rodada genérica de Repair ✅");
   console.log("Gender Evidence Authority 9.4.2: SOURCE lexical explícita governa V3/V5/V8; modifiers e papéis gender-coded genéricos preservados ✅");
   console.log("Guard Conflict Resolver 9.4.2: neutrality guard contraditório com SOURCE explícita é removido; mismatch real continua HARD ✅");
   console.log("Contextual Escalation Ledger 9.4.2: stage + blocker hash + current-PT hash; estratégia só é consumida após resposta utilizável ✅");
-  console.log("Convergence 9.4.2: source_only -> candidate_beam diferente -> constrained; sem repetição cega ✅");
+  console.log("Legacy convergence 9.4.2: DESATIVADA no pipeline ativo 9.5.0; sem source_only/beam/constrained/contrastive após Repair ✅");
   console.log("Router Health 9.4.2: timeout/503/RPM/TPM = cooldown transitório; somente RPD diário vira hard-skip do job ✅");
   console.log("MAIN Checkpoint 9.4.2: invalid_response refaz o lote no fallback; PLAN reutilizado em retomada ✅");
   console.log("FINAL PASS Required 9.4.2: checkpoint sem selo é preservado, mas não é servido como BEST_AVAILABLE final ✅");
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
-  console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
+  console.log("Gender Closure 9.5.0: neutralização determinística antes/depois do Repair; gate final é verificação-only, 0 nova rewrite cloud ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
   console.log("Timing Compact Path Isolation 9.4.3.4: single-turn base 9.4.2 + constrained; multi-turn preservado + SOURCE-turn rebuild quando PT perdeu segmentação ✅");
   console.log("Timing Compact Final Closure 9.4.3.4: residual single recebe NEEDLE semântico; residual multi reconstrói da SOURCE por speaker; UMA micro-etapa bounded; namespace 9.4.3 ✅");
-  console.log("Semantic Constraint Memory 9.4.3.5: blockers hard por cue são acumulados; reparos futuros satisfazem a interseção histórica, não só o último erro ✅");
-  console.log("Semantic Intersection Closure 9.4.3.5: source_only -> beam -> constrained -> contrastive; no máximo quatro estratégias distintas, zero loop aberto ✅");
+  console.log("Single Semantic Closure 9.5.0: todos os blockers são reunidos ANTES de UMA única rodada de Repair; cascata semântica removida ✅");
+  console.log("Universal Identity Normalizer 9.5.0: copular identity neutra usa PT-BR sem artigo de gênero/alias SOURCE-safe; 0 lógica por título/cue ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
