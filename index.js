@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3.3 - TRUE PER-TURN FINAL CLOSURE (SEMANTIC 9.4.3 PRESERVED)
+// STREMIO PT-BR 9.4.3.4 - NEEDLE + SOURCE-TURN FINAL CLOSURE (SEMANTIC 9.4.3 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -22192,6 +22192,45 @@ const TIMING_COMPACT_AUDIT_SCHEMA_928 = {
   required: ["items"]
 };
 
+// 9.4.3.4 — schemas da última micro-recuperação. O namespace semântico NÃO muda:
+// isto é somente fechamento de timing/readability depois de FINAL_PASS/cache_verified.
+const TIMING_COMPACT_NEEDLE_SCHEMA_9434 = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    cues: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { i: { type: "integer" }, candidate: { type: "string" } },
+        required: ["i", "candidate"]
+      }
+    }
+  },
+  required: ["cues"]
+};
+
+const TIMING_COMPACT_SOURCE_TURNS_SCHEMA_9434 = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          i: { type: "integer" },
+          turns_pt: { type: "array", items: { type: "string" } }
+        },
+        required: ["i", "turns_pt"]
+      }
+    }
+  },
+  required: ["items"]
+};
+
 function timingCompactVisibleChars928(text) {
   return String(text || "")
     .replace(/<[^>]+>/g, " ")
@@ -22704,6 +22743,230 @@ async function timingAwareCompactPerTurn9433(items) {
   return out;
 }
 
+// 9.4.3.4 — needle rescue: UMA candidata extremamente dirigida para single-turn que já
+// falhou geração normal + constrained. O motivo da auditoria anterior vira contrato explícito,
+// mas a SOURCE continua sendo a autoridade. Aceitação exige guard local + auditor HIGH independente.
+async function timingAwareCompactNeedleSingle9434(items) {
+  const clean=(Array.isArray(items)?items:[]).map(item=>({
+    ...item,
+    i:Number(item?.i),
+    source:String(item?.source||"").trim(),
+    pt:String(item?.pt||"").trim(),
+    availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs||0))),
+    rejectionReason:String(item?.rejectionReason9434||item?.constraintReason9432||"").replace(/\s+/g," ").trim().slice(0,420),
+    before:String(item?.before||"").slice(0,900),
+    after:String(item?.after||"").slice(0,900)
+  })).filter(x=>Number.isInteger(x.i)&&x.source&&x.pt&&x.availableDisplayMs>0);
+  if(!clean.length) return [];
+
+  const locksById=new Map();
+  const payload=clean.map(item=>{
+    const protectedSource=protectCulturalLocks(item.source,item.i);
+    locksById.set(item.i,protectedSource.locks);
+    return {
+      i:item.i,
+      source:protectedSource.text,
+      current_pt:item.pt,
+      mandatory_semantic_warning:item.rejectionReason,
+      hard_locks:protectedSource.locks.map(x=>x.token),
+      available_display_ms:Math.round(item.availableDisplayMs),
+      hard_visible_char_cap:timingCompactHardVisibleChars941(item.availableDisplayMs),
+      before:item.before,
+      after:item.after
+    };
+  });
+
+  const generated=new Map();
+  const groups=chunks9210(payload,8);
+  const genResults=await runBoundedTasks9210(groups.map(group=>async()=>{
+    const response=await geminiRequest({
+      system:`Você é a ÚLTIMA micro-cirurgia bounded de readability PT-BR.\n`+
+        `Cada item já falhou tentativas anteriores. Gere UMA única candidate, natural e oral, que caiba no hard_visible_char_cap.\n`+
+        `SOURCE é a autoridade. mandatory_semantic_warning informa exatamente a unidade de sentido que a auditoria viu desaparecer; PRESERVE essa unidade ou um equivalente semântico inequívoco.\n`+
+        `Encurte por sintaxe, contrações e lexicalização. Não resolva o limite apagando modalidade epistêmica, negação, referente, predicado, relação, identidade, nome, intensidade ou ownership.\n`+
+        `Hesitação/filler realmente não-semântico pode sair. hard_locks devem sobreviver. Não altere timestamps, não mova conteúdo entre cues.\n`+
+        `Se não houver formulação fiel dentro do cap, devolva current_pt. JSON somente.`,
+      user:JSON.stringify({cues:group}),
+      schema:TIMING_COMPACT_NEEDLE_SCHEMA_9434,
+      thinkingLevel:"high", maxOutputTokens:6000,
+      timeoutMs:60000, maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"repair"
+    });
+    return parseStructuredArraySalvage9210(response.text,"cues").items||[];
+  }),2);
+  for(const result of genResults){
+    if(result?.error) continue;
+    for(const x of (Array.isArray(result)?result:[])){
+      const id=Number(x?.i), candidate=String(x?.candidate||"").trim();
+      if(Number.isInteger(id)&&candidate) generated.set(id,candidate);
+    }
+  }
+
+  const locallySafe=[];
+  for(const item of clean){
+    let candidate=generated.get(item.i)||"";
+    if(!candidate) continue;
+    try{ candidate=restoreCulturalLocks(candidate,locksById.get(item.i)||[],item.i); }catch{ continue; }
+    const block={index:item.i,text:item.source};
+    candidate=sanitizeFinalCue(block,candidate)||sanitizeFallbackCue(candidate)||candidate;
+    if(!candidate||semanticTextKey940(candidate)===semanticTextKey940(item.pt)) continue;
+    const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
+    const layout=layoutCueResult(block,candidate);
+    if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
+    locallySafe.push({...item,candidate});
+  }
+
+  if(!locallySafe.length){
+    console.log(`[TIMING COMPACT NEEDLE SINGLE 9.4.3.4] generated=${clean.length} | localSafe=0 | verified=0/${clean.length}.`);
+    return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false,reason:"needle_no_locally_safe_candidate"}));
+  }
+
+  const auditResults=await runBoundedTasks9210(chunks9210(locallySafe,8).map(group=>async()=>{
+    const response=await geminiRequest({
+      system:`Audite a ÚLTIMA candidata de compactação. SOURCE é autoridade.\n`+
+        `A candidata só pode ser aceita se preservar integralmente significado, modalidade/certeza, negação, referente, predicado/ação, identidade, ownership, registro e força pragmática.\n`+
+        `rejection_reason_previous explica a perda detectada antes e deve estar semanticamente resolvida.\n`+
+        `chosen_index=0 somente se candidate_pts[0] for totalmente segura; senão -1. JSON somente.`,
+      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:[x.candidate],rejection_reason_previous:x.rejectionReason,before:x.before,after:x.after}))}),
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928,
+      thinkingLevel:"high", maxOutputTokens:5000,
+      timeoutMs:60000, maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
+    });
+    return parseStructuredArraySalvage9210(response.text,"items").items||[];
+  }),2);
+  const auditById=new Map();
+  for(const result of auditResults){
+    if(result?.error) continue;
+    for(const x of (Array.isArray(result)?result:[])){
+      const id=Number(x?.i); if(Number.isInteger(id)) auditById.set(id,x);
+    }
+  }
+  const safeById=new Map(locallySafe.map(x=>[x.i,x]));
+  const out=clean.map(item=>{
+    const c=safeById.get(item.i), a=auditById.get(item.i);
+    if(c&&Number(a?.chosen_index)===0){
+      return {i:item.i,pt:c.candidate,changed:true,verified:true,needleRescue9434:true};
+    }
+    return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"needle_semantic_audit_not_passed").slice(0,240)};
+  });
+  console.log(`[TIMING COMPACT NEEDLE SINGLE 9.4.3.4] generated=${clean.length} | localSafe=${locallySafe.length} | verified=${out.filter(x=>x?.verified===true).length}/${clean.length}.`);
+  return out;
+}
+
+// 9.4.3.4 — SOURCE-turn reconstruction para o caso em que o parent é multi-turn pela SOURCE,
+// mas o PT atual perdeu/colou os marcadores e portanto sourceTurns.length !== ptTurns.length.
+// Em vez de desistir com turns=0, reconstruímos EXATAMENTE um PT por SOURCE turn e auditamos o parent final.
+async function timingAwareCompactSourceTurns9434(items) {
+  const clean=(Array.isArray(items)?items:[]).map(item=>{
+    const source=String(item?.source||"").trim();
+    const pt=String(item?.pt||"").trim();
+    return {...item,i:Number(item?.i),source,pt,
+      availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs||0))),
+      sourceTurns:timingCompactDialogueTurns943(source),
+      ptTurns:timingCompactDialogueTurns943(pt),
+      before:String(item?.before||"").slice(0,900),after:String(item?.after||"").slice(0,900)};
+  }).filter(x=>Number.isInteger(x.i)&&x.source&&x.pt&&x.availableDisplayMs>0&&x.sourceTurns.length>1);
+  if(!clean.length) return [];
+
+  const metaById=new Map();
+  const payload=[];
+  for(const item of clean){
+    const budgets=timingCompactTurnBudgets9433(item.sourceTurns,item.availableDisplayMs);
+    const protectedTurns=[]; const locks=[];
+    for(let ti=0;ti<item.sourceTurns.length;ti++){
+      const p=protectCulturalLocks(item.sourceTurns[ti],item.i*100+(ti+1));
+      protectedTurns.push(p.text); locks.push(p.locks);
+    }
+    metaById.set(item.i,{item,budgets,locks});
+    payload.push({
+      i:item.i,
+      source_turns:protectedTurns,
+      current_pt:item.pt,
+      current_pt_turns:item.ptTurns,
+      turn_count:item.sourceTurns.length,
+      turn_visible_char_caps:budgets.map(ms=>timingCompactHardVisibleChars941(ms)),
+      total_available_display_ms:Math.round(item.availableDisplayMs),
+      before:item.before,after:item.after
+    });
+  }
+
+  const generated=new Map();
+  const results=await runBoundedTasks9210(chunks9210(payload,6).map(group=>async()=>{
+    const response=await geminiRequest({
+      system:`Reconstrua um parent de legenda multi-speaker diretamente da SOURCE.\n`+
+        `SOURCE_TURNS é a autoridade absoluta de ownership e ordem. Retorne turns_pt com EXATAMENTE turn_count entradas; turns_pt[k] traduz SOMENTE source_turns[k].\n`+
+        `current_pt é apenas referência lexical: se ele perdeu hífens, fundiu falas ou tem contagem incompatível, NÃO copie esse defeito.\n`+
+        `Cada turns_pt[k] deve caber em turn_visible_char_caps[k] quando semanticamente possível, usando PT-BR oral e conciso. Preserve significado, negação, modalidade, referente, nomes, força pragmática e hard locks.\n`+
+        `Não transfira palavras/sentido entre speakers. Não invente. Não altere timestamps. JSON somente.`,
+      user:JSON.stringify({items:group}),
+      schema:TIMING_COMPACT_SOURCE_TURNS_SCHEMA_9434,
+      thinkingLevel:"high",maxOutputTokens:7000,
+      timeoutMs:60000,maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],job:null,metric:"repair"
+    });
+    return parseStructuredArraySalvage9210(response.text,"items").items||[];
+  }),2);
+  for(const result of results){
+    if(result?.error) continue;
+    for(const x of (Array.isArray(result)?result:[])){
+      const id=Number(x?.i), turns=Array.isArray(x?.turns_pt)?x.turns_pt.map(v=>String(v||"").trim()):[];
+      if(Number.isInteger(id)&&turns.length) generated.set(id,turns);
+    }
+  }
+
+  const locallySafe=[];
+  for(const item of clean){
+    const meta=metaById.get(item.i); const rawTurns=generated.get(item.i)||[];
+    if(!meta||rawTurns.length!==item.sourceTurns.length) continue;
+    const restored=[]; let bad=false;
+    for(let ti=0;ti<rawTurns.length;ti++){
+      let turn=rawTurns[ti];
+      try{turn=restoreCulturalLocks(turn,meta.locks[ti]||[],item.i*100+(ti+1));}catch{bad=true;break;}
+      const blockTurn={index:item.i*100+(ti+1),text:item.sourceTurns[ti]};
+      turn=sanitizeFinalCue(blockTurn,turn)||sanitizeFallbackCue(turn)||turn;
+      if(!turn){bad=true;break;}
+      restored.push(turn);
+    }
+    if(bad||restored.length!==item.sourceTurns.length) continue;
+    const candidate=timingCompactRecomposeTurns9433(restored);
+    const candidateTurns=timingCompactDialogueTurns943(candidate);
+    const block={index:item.i,text:item.source};
+    const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
+    const layout=layoutCueResult(block,candidate);
+    const safe=Boolean(candidate&&candidateTurns.length===item.sourceTurns.length&&!regressions.length&&layout.fits&&layout.lines<=LAYOUT_MAX_LINES&&timingCompactFitsWindow928(candidate,item.availableDisplayMs));
+    if(safe) locallySafe.push({...item,candidate});
+  }
+
+  if(!locallySafe.length){
+    console.log(`[TIMING COMPACT SOURCE-TURNS 9.4.3.4] parents=${clean.length} | localSafe=0 | verified=0/${clean.length}.`);
+    return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false,reason:"source_turn_rebuild_no_locally_safe_candidate"}));
+  }
+
+  const auditResults=await runBoundedTasks9210(chunks9210(locallySafe,6).map(group=>async()=>{
+    const response=await geminiRequest({
+      system:`Audite reconstruções multi-turn SOURCE→PT-BR. SOURCE é autoridade por speaker.\n`+
+        `chosen_index=0 somente se a candidata preservar TODAS as falas na mesma ordem, sem fundir/trocar ownership e sem perda de significado, negação, modalidade, referente ou força pragmática. Caso contrário -1. JSON somente.`,
+      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:[x.candidate],before:x.before,after:x.after}))}),
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928,
+      thinkingLevel:"high",maxOutputTokens:5000,
+      timeoutMs:60000,maxRetries:1,
+      routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],job:null,metric:"qa"
+    });
+    return parseStructuredArraySalvage9210(response.text,"items").items||[];
+  }),2);
+  const auditById=new Map();
+  for(const result of auditResults){if(result?.error)continue;for(const x of (Array.isArray(result)?result:[])){const id=Number(x?.i);if(Number.isInteger(id))auditById.set(id,x);}}
+  const safeById=new Map(locallySafe.map(x=>[x.i,x]));
+  const out=clean.map(item=>{
+    const c=safeById.get(item.i),a=auditById.get(item.i);
+    if(c&&Number(a?.chosen_index)===0)return {i:item.i,pt:c.candidate,changed:true,verified:true,sourceTurnRebuild9434:true};
+    return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"source_turn_rebuild_audit_not_passed").slice(0,240)};
+  });
+  console.log(`[TIMING COMPACT SOURCE-TURNS 9.4.3.4] parents=${clean.length} | localSafe=${locallySafe.length} | verified=${out.filter(x=>x?.verified===true).length}/${clean.length}.`);
+  return out;
+}
+
 async function timingAwareCompactSurgery928(items) {
   const raw = Array.isArray(items) ? items : [];
   const single = [];
@@ -22771,14 +23034,40 @@ async function timingAwareCompactSurgery928(items) {
     console.log(`[TIMING COMPACT FINAL RESCUE 9.4.3.3] single=${rejectedSingle.length} | multi=${rejectedMulti.length} | recovered=${rescueById.size}/${firstRejected.length}.`);
   }
 
+  // 9.4.3.4 — última micro-recuperação SOMENTE nos residuais que sobreviveram a tudo acima.
+  // Single recebe uma candidata needle com o motivo semântico obrigatório. Multi com SOURCE multi-turn
+  // é reconstruído diretamente dos SOURCE turns, inclusive quando o PT atual perdeu a segmentação.
+  const residual9434 = out.filter(x => x?.verified !== true);
+  if (residual9434.length) {
+    const originalById9434 = new Map(raw.map(x => [Number(x?.i), x]));
+    const needleSingle9434 = residual9434
+      .filter(x => x?.compactPath9431 === "single")
+      .map(x => ({...originalById9434.get(Number(x.i)), rejectionReason9434:String(x.reason||"semantic_audit_not_passed")}));
+    const sourceTurnMulti9434 = residual9434
+      .filter(x => x?.compactPath9431 === "multi")
+      .map(x => ({...originalById9434.get(Number(x.i)), rejectionReason9434:String(x.reason||"turn_mismatch")}));
+    const tasks9434=[];
+    if(needleSingle9434.length) tasks9434.push(timingAwareCompactNeedleSingle9434(needleSingle9434).then(items=>({kind:"single-needle-9434",items})));
+    if(sourceTurnMulti9434.length) tasks9434.push(timingAwareCompactSourceTurns9434(sourceTurnMulti9434).then(items=>({kind:"multi-source-turns-9434",items})));
+    const groups9434=await Promise.all(tasks9434);
+    const recovered9434=new Map();
+    for(const group of groups9434){
+      for(const item of (Array.isArray(group?.items)?group.items:[])){
+        if(item?.verified===true) recovered9434.set(Number(item.i),{...item,compactPath9431:group.kind,finalNeedle9434:true});
+      }
+    }
+    if(recovered9434.size) out=out.map(x=>recovered9434.get(Number(x.i))||x);
+    console.log(`[TIMING COMPACT NEEDLE CLOSURE 9.4.3.4] single=${needleSingle9434.length} | multi=${sourceTurnMulti9434.length} | recovered=${recovered9434.size}/${residual9434.length}.`);
+  }
+
   const rejected = out.filter(x => x?.verified !== true);
   console.log(
-    `[TIMING COMPACT ROUTER 9.4.3.3] single=${single.length} | multi=${multi.length} | ` +
+    `[TIMING COMPACT ROUTER 9.4.3.4] single=${single.length} | multi=${multi.length} | ` +
     `verified=${out.filter(x=>x?.verified===true).length}/${out.length}.`
   );
   if (rejected.length) {
     console.warn(
-      `[TIMING COMPACT REJECTIONS 9.4.3.3] ` +
+      `[TIMING COMPACT REJECTIONS 9.4.3.4] ` +
       rejected.map(x => `i=${x.i}:${x.compactPath9431||"?"}:${String(x.reason||"unknown").replace(/\s+/g," ").slice(0,120)}`).join(" | ")
     );
   }
@@ -22815,10 +23104,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.3.3] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.3.3",semanticNamespace:CACHE_VERSION,items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.3.4] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.3.4",semanticNamespace:CACHE_VERSION,items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.3.3] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.3.4] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -23426,7 +23715,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3.3 - TRUE PER-TURN FINAL CLOSURE | SEMANTIC 9.4.3 PRESERVED"
+        " STREMIO PT-BR 9.4.3.4 - NEEDLE + SOURCE-TURN FINAL CLOSURE | SEMANTIC 9.4.3 PRESERVED"
   );
 
   console.log(
@@ -23858,8 +24147,8 @@ console.log(
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
   console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
-  console.log("Timing Compact Path Isolation 9.4.3.3: single-turn mantém base 9.4.2; multi-turn inicial preservado; final multi usa rescue REAL por turno ✅");
-  console.log("Timing Compact Final Closure 9.4.3.3: single usa constrained atoms; multi divide/aloca/audita cada fala e recompõe sem trocar speakers; namespace 9.4.3 ✅");
+  console.log("Timing Compact Path Isolation 9.4.3.4: single-turn base 9.4.2 + constrained; multi-turn preservado + SOURCE-turn rebuild quando PT perdeu segmentação ✅");
+  console.log("Timing Compact Final Closure 9.4.3.4: residual single recebe NEEDLE semântico; residual multi reconstrói da SOURCE por speaker; UMA micro-etapa bounded; namespace 9.4.3 ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
