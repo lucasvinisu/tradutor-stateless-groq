@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3.2 - FINAL HARD READABILITY CLOSURE (SEMANTIC 9.4.3 PRESERVED)
+// STREMIO PT-BR 9.4.3.3 - TRUE PER-TURN FINAL CLOSURE (SEMANTIC 9.4.3 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -22576,6 +22576,134 @@ async function timingAwareCompactTurnAware943(items) {
   return out;
 }
 
+// 9.4.3.3 — rescue realmente por turno. A versão 9.4.3.2 apenas reexecutava
+// o prompt multi-turn inteiro com uma flag mais forte; isso ainda podia falhar quando UM
+// speaker precisava de muita compressão. Agora cada fala recebe seu próprio orçamento
+// proporcional, passa pelo mesmo Single 9.4.2 + auditoria HIGH e só então é recomposta.
+function timingCompactTurnBudgets9433(turns,totalMs) {
+  const clean=(Array.isArray(turns)?turns:[]).map(x=>String(x||"").trim());
+  const n=clean.length;
+  if(!n) return [];
+  const total=Math.max(n,Number(totalMs||0));
+  const weights=clean.map(t=>Math.max(1,timingCompactVisibleChars928(t)));
+  const weightSum=weights.reduce((a,b)=>a+b,0)||n;
+  const avg=total/n;
+  const floorMs=Math.max(120,Math.min(450,Math.floor(avg*0.65)));
+  const baseTotal=Math.min(total,floorMs*n);
+  const remain=Math.max(0,total-baseTotal);
+  const out=weights.map(w=>Math.max(1,Math.floor((baseTotal/n)+(remain*(w/weightSum)))));
+  let delta=Math.round(total-out.reduce((a,b)=>a+b,0));
+  if(out.length) out[out.length-1]=Math.max(1,out[out.length-1]+delta);
+  return out;
+}
+
+function timingCompactRecomposeTurns9433(turns) {
+  const clean=(Array.isArray(turns)?turns:[]).map(x=>String(x||"").trim()).filter(Boolean);
+  if(clean.length<=1) return clean[0]||"";
+  const pivot=Math.ceil(clean.length/2);
+  const pack=part=>part.map((t,i)=>(i===0?"- ":" - ")+t).join("");
+  return `${pack(clean.slice(0,pivot))}\n${pack(clean.slice(pivot))}`.trim();
+}
+
+async function timingAwareCompactPerTurn9433(items) {
+  const clean=(Array.isArray(items)?items:[]).map(item=>{
+    const source=String(item?.source||"").trim();
+    const pt=String(item?.pt||"").trim();
+    return {
+      ...item,
+      i:Number(item?.i), source, pt,
+      availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs||0))),
+      sourceTurns:timingCompactDialogueTurns943(source),
+      ptTurns:timingCompactDialogueTurns943(pt)
+    };
+  }).filter(x=>Number.isInteger(x.i)&&x.source&&x.pt&&x.availableDisplayMs>0);
+  if(!clean.length) return [];
+
+  const directBySynthetic=new Map();
+  const synthetic=[];
+  const metaByParent=new Map();
+  for(const item of clean){
+    const n=Math.max(item.sourceTurns.length,item.ptTurns.length);
+    if(n<=1 || item.sourceTurns.length!==n || item.ptTurns.length!==n){
+      metaByParent.set(item.i,{item,invalid:true,reason:"per_turn_count_mismatch"});
+      continue;
+    }
+    const budgets=timingCompactTurnBudgets9433(item.ptTurns,item.availableDisplayMs);
+    const turnIds=[];
+    for(let ti=0;ti<n;ti++){
+      const syntheticId=item.i*100+(ti+1);
+      turnIds.push(syntheticId);
+      const sourceTurn=item.sourceTurns[ti];
+      const ptTurn=item.ptTurns[ti];
+      const budget=Math.max(1,Number(budgets[ti]||1));
+      if(timingCompactFitsWindow928(ptTurn,budget)){
+        directBySynthetic.set(syntheticId,{i:syntheticId,pt:ptTurn,changed:false,verified:true,perTurnUnchanged9433:true});
+      }else{
+        synthetic.push({
+          i:syntheticId,
+          source:sourceTurn,
+          pt:ptTurn,
+          availableDisplayMs:budget,
+          before:ti>0?item.sourceTurns[ti-1]:String(item?.before||""),
+          after:ti+1<n?item.sourceTurns[ti+1]:String(item?.after||"")
+        });
+      }
+    }
+    metaByParent.set(item.i,{item,invalid:false,turnIds});
+  }
+
+  const compactedBySynthetic=new Map(directBySynthetic);
+  if(synthetic.length){
+    const groups=chunks9210(synthetic,24);
+    const results=await runBoundedTasks9210(groups.map(group=>async()=>timingAwareCompactSingle942(group)),2);
+    for(const result of results){
+      if(result?.error) continue;
+      for(const x of (Array.isArray(result)?result:[])){
+        if(Number.isInteger(Number(x?.i))) compactedBySynthetic.set(Number(x.i),x);
+      }
+    }
+  }
+
+  const out=[];
+  for(const item of clean){
+    const meta=metaByParent.get(item.i);
+    if(!meta || meta.invalid){
+      out.push({i:item.i,pt:item.pt,changed:false,verified:false,reason:meta?.reason||"per_turn_metadata_missing"});
+      continue;
+    }
+    const resolved=[];
+    let failedReason="";
+    for(const sid of meta.turnIds){
+      const got=compactedBySynthetic.get(sid);
+      if(got?.verified!==true || !String(got?.pt||"").trim()){
+        failedReason=String(got?.reason||"per_turn_unresolved");
+        break;
+      }
+      resolved.push(String(got.pt).trim());
+    }
+    if(failedReason){
+      out.push({i:item.i,pt:item.pt,changed:false,verified:false,reason:`per_turn_unresolved:${failedReason}`.slice(0,240)});
+      continue;
+    }
+    const candidate=timingCompactRecomposeTurns9433(resolved);
+    const candidateTurns=timingCompactDialogueTurns943(candidate);
+    const block={index:item.i,text:item.source};
+    const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
+    const layout=layoutCueResult(block,candidate);
+    const safe=Boolean(
+      candidate && candidateTurns.length===meta.turnIds.length && !regressions.length &&
+      layout.fits && layout.lines<=LAYOUT_MAX_LINES && timingCompactFitsWindow928(candidate,item.availableDisplayMs)
+    );
+    if(!safe){
+      out.push({i:item.i,pt:item.pt,changed:false,verified:false,reason:"per_turn_recompose_failed_local_guard"});
+      continue;
+    }
+    out.push({i:item.i,pt:candidate,changed:semanticTextKey940(candidate)!==semanticTextKey940(item.pt),verified:true,perTurnRescue9433:true});
+  }
+  console.log(`[TIMING COMPACT TRUE PER-TURN 9.4.3.3] parents=${clean.length} | turns=${[...metaByParent.values()].reduce((n,m)=>n+(m?.turnIds?.length||0),0)} | verified=${out.filter(x=>x?.verified===true).length}/${clean.length}.`);
+  return out;
+}
+
 async function timingAwareCompactSurgery928(items) {
   const raw = Array.isArray(items) ? items : [];
   const single = [];
@@ -22628,7 +22756,7 @@ async function timingAwareCompactSurgery928(items) {
       timingAwareCompactSingle942(rejectedSingle).then(items => ({kind:"single-constrained",items}))
     );
     if (rejectedMulti.length) rescueTasks.push(
-      timingAwareCompactTurnAware943(rejectedMulti).then(items => ({kind:"multi-per-turn",items}))
+      timingAwareCompactPerTurn9433(rejectedMulti).then(items => ({kind:"multi-per-turn-9433",items}))
     );
     const rescueGroups = await Promise.all(rescueTasks);
     const rescueById = new Map();
@@ -22640,17 +22768,17 @@ async function timingAwareCompactSurgery928(items) {
     if (rescueById.size) {
       out = out.map(x => rescueById.get(Number(x.i)) || x);
     }
-    console.log(`[TIMING COMPACT FINAL RESCUE 9.4.3.2] single=${rejectedSingle.length} | multi=${rejectedMulti.length} | recovered=${rescueById.size}/${firstRejected.length}.`);
+    console.log(`[TIMING COMPACT FINAL RESCUE 9.4.3.3] single=${rejectedSingle.length} | multi=${rejectedMulti.length} | recovered=${rescueById.size}/${firstRejected.length}.`);
   }
 
   const rejected = out.filter(x => x?.verified !== true);
   console.log(
-    `[TIMING COMPACT ROUTER 9.4.3.2] single=${single.length} | multi=${multi.length} | ` +
+    `[TIMING COMPACT ROUTER 9.4.3.3] single=${single.length} | multi=${multi.length} | ` +
     `verified=${out.filter(x=>x?.verified===true).length}/${out.length}.`
   );
   if (rejected.length) {
     console.warn(
-      `[TIMING COMPACT REJECTIONS 9.4.3.2] ` +
+      `[TIMING COMPACT REJECTIONS 9.4.3.3] ` +
       rejected.map(x => `i=${x.i}:${x.compactPath9431||"?"}:${String(x.reason||"unknown").replace(/\s+/g," ").slice(0,120)}`).join(" | ")
     );
   }
@@ -22687,10 +22815,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.3.2] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.3.2",semanticNamespace:CACHE_VERSION,items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.3.3] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.3.3",semanticNamespace:CACHE_VERSION,items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.3.2] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.3.3] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -23298,7 +23426,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3.2 - FINAL HARD READABILITY CLOSURE | SEMANTIC 9.4.3 PRESERVED"
+        " STREMIO PT-BR 9.4.3.3 - TRUE PER-TURN FINAL CLOSURE | SEMANTIC 9.4.3 PRESERVED"
   );
 
   console.log(
@@ -23730,8 +23858,8 @@ console.log(
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
   console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
-  console.log("Timing Compact Path Isolation 9.4.3.2: single-turn mantém base 9.4.2; multi-turn turn-aware; rejeitados recebem UMA recuperação final especializada ✅");
-  console.log("Timing Compact Final Closure 9.4.3.2: single rejeitado usa constrained atoms; multi rejeitado usa per-turn rescue; semantic namespace permanece 9.4.3 ✅");
+  console.log("Timing Compact Path Isolation 9.4.3.3: single-turn mantém base 9.4.2; multi-turn inicial preservado; final multi usa rescue REAL por turno ✅");
+  console.log("Timing Compact Final Closure 9.4.3.3: single usa constrained atoms; multi divide/aloca/audita cada fala e recompõe sem trocar speakers; namespace 9.4.3 ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
