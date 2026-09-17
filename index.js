@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3.4 - NEEDLE + SOURCE-TURN FINAL CLOSURE (SEMANTIC 9.4.3 PRESERVED)
+// STREMIO PT-BR 9.4.3.5 - SEMANTIC CONSTRAINT MEMORY + INTERSECTION CLOSURE (TIMING 9.4.3.4 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -20060,6 +20060,60 @@ function finalIssueWeight927(issue) {
   return /FINAL_PRIORITY/i.test(joined) ? 60 : 40;
 }
 
+
+function semanticConstraintMemory945(job) {
+  if (!(job?.semanticConstraintMemory945 instanceof Map)) {
+    if (job) job.semanticConstraintMemory945 = new Map();
+  }
+  return job?.semanticConstraintMemory945 instanceof Map ? job.semanticConstraintMemory945 : new Map();
+}
+
+function shouldRememberSemanticReason945(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return false;
+  return /GENDER|MEANING_INTEGRITY|NEGATION|CUE_OWNERSHIP|OWNERSHIP|OMISSION|REFERENT|IDENTITY|PREDICATE|DIALOGUE|CENSOR|BLEEP|REPETITION_LOST|EMPTY|POSSIBLE_UNTRANSLATED|FINAL_PRIORITY/i.test(text);
+}
+
+function rememberSemanticConstraints945(job, issues, label = "semantic") {
+  if (!job || !Array.isArray(issues) || !issues.length) return 0;
+  const store = semanticConstraintMemory945(job);
+  let added = 0;
+  for (const issue of issues) {
+    const id = Number(issue?.id);
+    if (!Number.isInteger(id)) continue;
+    if (!(store.get(id) instanceof Set)) store.set(id, new Set());
+    const set = store.get(id);
+    for (const reason of (Array.isArray(issue?.reasons) ? issue.reasons : [issue?.reason])) {
+      const text = String(reason || "").trim();
+      if (!shouldRememberSemanticReason945(text) || set.has(text)) continue;
+      set.add(text);
+      added++;
+    }
+  }
+  if (added) {
+    job.stats.semanticConstraintMemoryAdded945 = Number(job.stats.semanticConstraintMemoryAdded945 || 0) + added;
+    console.log(`[SEMANTIC CONSTRAINT MEMORY 9.4.3.5] ${label} | novas=${added} | cues=${store.size}.`);
+  }
+  return added;
+}
+
+function reasonsWithSemanticMemory945(job, issue) {
+  const id = Number(issue?.id);
+  const current = (Array.isArray(issue?.reasons) ? issue.reasons : [issue?.reason])
+    .map(x => String(x || "").trim()).filter(Boolean);
+  const historical = Number.isInteger(id) && semanticConstraintMemory945(job).get(id) instanceof Set
+    ? [...semanticConstraintMemory945(job).get(id)]
+    : [];
+  return [...new Set([...historical, ...current])];
+}
+
+function issuesWithSemanticMemory945(job, issues) {
+  return (Array.isArray(issues) ? issues : []).map(issue => ({
+    ...issue,
+    reasons: reasonsWithSemanticMemory945(job, issue)
+  }));
+}
+
 function issueScore927(issues) {
   const list = Array.isArray(issues) ? issues : [];
   let hard = 0;
@@ -20228,6 +20282,7 @@ async function auditTargetSet927(blocks, translations, targetIds, plan, job, lab
   }
   const mergedRaw = mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
   const merged = resolveGuardConflicts942(blocks, mergedRaw, job, `FINAL TARGET AUDIT ${label}`);
+  rememberSemanticConstraints945(job, merged, `audit:${label}`);
   markSemanticResidualRejected940(job, translations, merged, `FINAL TARGET AUDIT ${label}`);
   return merged;
 }
@@ -20244,6 +20299,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   const targetIds = new Set((Array.isArray(targetIssues) ? targetIssues : [])
     .map(issue => Number(issue?.id)).filter(Number.isInteger));
   if (!targetIds.size) return { translations: new Map(translations), residual: [] };
+  rememberSemanticConstraints945(job, targetIssues, "target-entry");
 
   const posMap = positionMap(blocks);
   const expandChangedIds9210 = changedIds => {
@@ -20275,18 +20331,19 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   let bestScore = issueScore927(residual);
   recordBestCandidate927(blocks, current, residual, job, "target-initial-9210");
   if (!residual.length) {
-    console.log(`[FINAL TARGET VERIFICATION 9.4.3] PASSOU ✅ | strategy=initial | residual=0.`);
+    console.log(`[FINAL TARGET VERIFICATION 9.4.3.5] PASSOU ✅ | strategy=initial | residual=0.`);
     return { translations: current, residual: [] };
   }
 
-  const strategies = ["source_only", "candidate_beam", "constrained"];
+  // 9.4.3.5: toda reconstrução recebe a UNIÃO dos blockers hard já observados
+  // para o cue. Isso impede oscilação "corrige significado -> quebra gênero ->
+  // corrige gênero -> quebra significado". A SOURCE continua sendo autoridade.
+  // CONTRASTIVE é a quarta e ÚLTIMA estratégia bounded, nunca um loop.
+  const strategies = ["source_only", "candidate_beam", "constrained", "contrastive"];
   for (const strategy of strategies) {
-    // 9.4.3 SPECIALIST-FIRST: residual exclusivamente de gênero NÃO atravessa
-    // source_only/beam/constrained aqui. O Gender Target Gate especializado vem
-    // logo depois e provou resolver esse tipo de blocker com menos chamadas.
-    // Residuais semânticos/ownership/negação continuam usando a escalada genérica.
-    const genericResidual943 = bestResidual.filter(issue => !isPureGenderResidual943(issue));
-    const deferredGender943 = bestResidual.length - genericResidual943.length;
+    const residualWithMemory945 = issuesWithSemanticMemory945(job, bestResidual);
+    const genericResidual943 = residualWithMemory945.filter(issue => !isPureGenderResidual943(issue));
+    const deferredGender943 = residualWithMemory945.length - genericResidual943.length;
     if (!genericResidual943.length) {
       if (deferredGender943 > 0) {
         console.log(`[SPECIALIST-FIRST 9.4.3] ${deferredGender943} residual(is) exclusivamente de gênero adiado(s) ao Gender Target Gate; 0 source_only/beam/constrained desperdiçado. ✅`);
@@ -20295,10 +20352,10 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
     }
     const eligible = eligibleForStrategy928(job, genericResidual943, strategy, { stage: "final-target", translations: best });
     if (!eligible.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} já esgotada para blockers genéricos; 0 chamadas repetidas. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.3.5] strategy=${strategy} já esgotada para blockers genéricos; 0 chamadas repetidas. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} | eligible=${eligible.length}/${genericResidual943.length} genérico(s) | gender-deferred=${deferredGender943} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+    console.warn(`[UNIFIED ESCALATION 9.4.3.5] strategy=${strategy} | eligible=${eligible.length}/${genericResidual943.length} genérico(s) | gender-deferred=${deferredGender943} | ids=[${eligible.map(x=>x.id).join(",")}].`);
 
     let candidate;
     if (strategy === "candidate_beam") {
@@ -20316,7 +20373,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       if (String(candidate.get(id) || "") !== String(best.get(id) || "")) changedIds.add(id);
     }
     if (!changedIds.size) {
-      console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
+      console.warn(`[UNIFIED ESCALATION 9.4.3.5] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
       continue;
     }
 
@@ -20332,17 +20389,17 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       bestResidual = candidateResidual;
       bestScore = score;
       commitVerifiedRepairLocks940(job, best, changedIds, bestResidual, `strategy=${strategy}`);
-      console.log(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
+      console.log(`[UNIFIED ESCALATION 9.4.3.5] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
     } else {
-      console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
+      console.warn(`[UNIFIED ESCALATION 9.4.3.5] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
     }
     if (!bestResidual.length) {
-      console.log(`[FINAL TARGET VERIFICATION 9.4.3] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+      console.log(`[FINAL TARGET VERIFICATION 9.4.3.5] PASSOU ✅ | strategy=${strategy} | residual=0.`);
       return { translations: best, residual: [] };
     }
   }
 
-  console.warn(`[FINAL TARGET VERIFICATION 9.4.3] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será preservado como RECOVERY CHECKPOINT.`);
+  console.warn(`[FINAL TARGET VERIFICATION 9.4.3.5] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será preservado como RECOVERY CHECKPOINT.`);
   return { translations: best, residual: bestResidual };
 }
 
@@ -20506,7 +20563,7 @@ async function runBoundedFinalQuality88(
         job.qualityStatus = "best_available";
         job.noCacheFinal923 = true;
         console.error(
-          `[FINAL TARGET VERIFICATION 9.4.3] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `[FINAL TARGET VERIFICATION 9.4.3.5] FAIL-CLOSED PARA SELO/CACHE | ` +
           `residual=${target927.residual.length}.`
         );
       } else {
@@ -20915,10 +20972,10 @@ if (finalClosure898.gender > 0) {
     if (!genderResidual928.length) break;
     const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928, { stage: "gender-final", translations: finalTranslations, requireGenderZero: true });
     if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.3][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.3.5][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.3][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
+    console.warn(`[UNIFIED ESCALATION 9.4.3.5][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
     if (strategy928 === "candidate_beam") {
       finalTranslations = await runCandidateBeam928(
         blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
@@ -23715,7 +23772,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3.4 - NEEDLE + SOURCE-TURN FINAL CLOSURE | SEMANTIC 9.4.3 PRESERVED"
+        " STREMIO PT-BR 9.4.3.5 - SEMANTIC CONSTRAINT MEMORY + INTERSECTION CLOSURE | TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -24149,6 +24206,8 @@ console.log(
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
   console.log("Timing Compact Path Isolation 9.4.3.4: single-turn base 9.4.2 + constrained; multi-turn preservado + SOURCE-turn rebuild quando PT perdeu segmentação ✅");
   console.log("Timing Compact Final Closure 9.4.3.4: residual single recebe NEEDLE semântico; residual multi reconstrói da SOURCE por speaker; UMA micro-etapa bounded; namespace 9.4.3 ✅");
+  console.log("Semantic Constraint Memory 9.4.3.5: blockers hard por cue são acumulados; reparos futuros satisfazem a interseção histórica, não só o último erro ✅");
+  console.log("Semantic Intersection Closure 9.4.3.5: source_only -> beam -> constrained -> contrastive; no máximo quatro estratégias distintas, zero loop aberto ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
