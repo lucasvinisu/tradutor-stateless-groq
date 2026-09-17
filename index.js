@@ -10,8 +10,8 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.1 - TIMING CLOSURE + INVARIANT CORE + FAST FAIL-CLOSED DELIVERY
-// GenerateContent + per-model quotas + fast failover + batch checkpoints.
+// STREMIO PT-BR 9.4.2 - EVIDENCE AUTHORITY + CONVERGENCE ROUTER + FINAL-PASS RECOVERY
+// GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -30,8 +30,17 @@ const GEMINI_MODELS = Object.freeze({
 const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
+// 9.4.2: o MAIN continua 3.5-first por padrão porque os benchmarks reais deste
+// projeto mostraram ~77s/1480 cues. Para A/B controlado, MAIN_ROUTE_PREFERENCE=3.1
+// troca SOMENTE o MAIN para 3.1-first sem alterar QA/Repair/closure.
+const MAIN_ROUTE_PREFERENCE_942 = String(process.env.MAIN_ROUTE_PREFERENCE || "3.5").trim();
+const ROUTER_INVALID_RESPONSE_COOLDOWN_MS_942 = 8000;
+const ROUTER_TIMEOUT_COOLDOWN_MS_942 = 15000;
+const ROUTER_TRANSIENT_COOLDOWN_MS_942 = 10000;
+const ROUTER_RECOVERY_WAIT_MAX_MS_942 = 18000;
+
 const CACHE_VERSION =
-  "9.4.0-invariant-core-v1";
+  "9.4.2-gender-evidence-convergence-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -141,7 +150,7 @@ const MAIN_THINKING = "medium";
 const MAIN_MAX_OUTPUT_TOKENS = 18000;
 const MAIN_TIMEOUT_MS = 45000;
 const MAIN_HTTP_RETRIES = 2;
-const MAIN_PARSE_ATTEMPTS = 1;
+const MAIN_PARSE_ATTEMPTS = 2;
 
 // MAIN EMPTY-CUE RESCUE
 // Se uma resposta estruturalmente válida trouxer pt vazio para um target
@@ -1159,9 +1168,13 @@ function createJob({
 
     // MAIN conclui por lote e preserva progresso em retries/failover.
     mainCheckpoint: new Map(),
+    // Hard skip = somente indisponibilidade realmente terminal no job (ex.: RPD diário).
     modelRouterSkip: new Set(),
+    // Cooldown por métrica = falhas localizadas não envenenam todas as fases.
+    modelRouterMetricCooldown: new Map(),
     modelRouterHealth: new Map(),
     compactRescueFailedSignatures: new Set(),
+    episodePlan: null,
 
     cacheKey:
       makeCacheKey(
@@ -8618,13 +8631,20 @@ function extractLastValidJsonObject(value) {
 }
 
 function geminiRouteForMetric(metric) {
-  // 9.4.0: rota empírica do projeto. Nos testes reais, 3.5 Flash-Lite respondeu
-  // com latência muito menor e sem cadeia longa de timeout. 3.1 continua como
-  // fallback independente. O nível de thinking por fase NÃO é reduzido.
-  return [
-    GEMINI_MODELS.MAIN_FALLBACK,
-    GEMINI_MODELS.MAIN_PRIMARY
-  ];
+  const normalized = String(metric || "main").toLowerCase();
+  const refinedFirst = [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY]; // 3.5 -> 3.1
+  const scaleFirst = [GEMINI_MODELS.MAIN_PRIMARY, GEMINI_MODELS.MAIN_FALLBACK];   // 3.1 -> 3.5
+
+  // MAIN é o único estágio cuja preferência pode ser invertida para benchmark A/B.
+  if (normalized === "main") {
+    return MAIN_ROUTE_PREFERENCE_942 === "3.1" ? scaleFirst : refinedFirst;
+  }
+
+  // Proxy lexical em massa pode aproveitar 3.1 primeiro; se falhar, 3.5 assume.
+  if (normalized === "syncproxy") return scaleFirst;
+
+  // PLAN/QA/REPAIR/COMPACT/SYNC-ALIGN/PRECONFIRM privilegiam refinamento.
+  return refinedFirst;
 }
 
 const geminiModelRuntime = new Map();
@@ -8663,6 +8683,34 @@ function modelSkippedForJob(job, modelId) {
   );
 }
 
+function routerMetricCooldownKey942(metric, modelId) {
+  return `${String(metric || "main").toLowerCase()}|${String(modelId || "")}`;
+}
+
+function modelMetricCooldownUntil942(job, metric, modelId) {
+  if (!(job?.modelRouterMetricCooldown instanceof Map)) return 0;
+  const row = job.modelRouterMetricCooldown.get(routerMetricCooldownKey942(metric, modelId));
+  return Math.max(0, Number(row?.until || 0));
+}
+
+function setModelMetricCooldown942(job, metric, modelId, waitMs, reason, status = "metric_cooldown") {
+  if (!job) return;
+  if (!(job.modelRouterMetricCooldown instanceof Map)) job.modelRouterMetricCooldown = new Map();
+  const key = routerMetricCooldownKey942(metric, modelId);
+  const until = Date.now() + Math.max(500, Number(waitMs || 0));
+  const current = job.modelRouterMetricCooldown.get(key);
+  if (!current || until > Number(current.until || 0)) {
+    job.modelRouterMetricCooldown.set(key, { until, reason: String(reason || ""), status: String(status || "metric_cooldown") });
+  }
+}
+
+function clearExpiredMetricCooldowns942(job, now = Date.now()) {
+  if (!(job?.modelRouterMetricCooldown instanceof Map)) return;
+  for (const [key, row] of job.modelRouterMetricCooldown.entries()) {
+    if (Number(row?.until || 0) <= now) job.modelRouterMetricCooldown.delete(key);
+  }
+}
+
 function setJobModelHealth(job, modelId, status, reason = "") {
   if (!job) return;
   if (!(job.modelRouterHealth instanceof Map)) job.modelRouterHealth = new Map();
@@ -8674,7 +8722,7 @@ function setJobModelHealth(job, modelId, status, reason = "") {
   });
 }
 
-function skipModelForJob(job, modelId, reason, status = "unavailable") {
+function skipModelForJob(job, modelId, reason, status = "hard_unavailable") {
   if (!job) return;
   if (!(job.modelRouterSkip instanceof Set)) job.modelRouterSkip = new Set();
   const already = job.modelRouterSkip.has(modelId);
@@ -8682,39 +8730,31 @@ function skipModelForJob(job, modelId, reason, status = "unavailable") {
   setJobModelHealth(job, modelId, status, reason);
 
   if (!already) {
-    console.warn(`[MODEL ROUTER] ${modelId} ignorado pelo restante deste job | ${status} | ${reason}.`);
+    console.warn(`[MODEL ROUTER HARD-SKIP] ${modelId} indisponível pelo restante deste job | ${status} | ${reason}.`);
   }
 }
 
-function invalidateResponseModelForJob(job, response, label, error) {
+function invalidateResponseModelForJob(job, response, label, error, metric = "main") {
   const modelId = String(response?.modelId || "").trim();
   if (!modelId || !job) return;
 
   job.stats.modelInvalidResponses = Number(job.stats.modelInvalidResponses || 0) + 1;
-
   const reason = `${label}: ${errorMessage(error).slice(0, 220)}`;
-  const now = Date.now();
-  const hasEligibleAlternative = geminiRouteForMetric("main").some(otherModelId => {
-    if (otherModelId === modelId) return false;
-    if (modelSkippedForJob(job, otherModelId)) return false;
-    return Number(runtimeForGeminiModel(otherModelId).unavailableUntil || 0) <= now;
-  });
 
-  if (hasEligibleAlternative) {
-    // 9.2.1: uma resposta estruturalmente inválida pode justificar trocar de modelo
-    // quando ainda existe outra rota saudável, mas isso NÃO é uma indisponibilidade
-    // global. O modelo atual só é evitado dentro deste job.
-    skipModelForJob(job, modelId, reason, "invalid_response");
-    return;
-  }
-
-  // 9.2.1: nunca envenene a última rota disponível por um erro de conteúdo
-  // localizado (ex.: um __LOCK_C...__ omitido). O caller já possui retries
-  // de parse estritamente limitados, então podemos repetir de forma bounded.
-  setJobModelHealth(job, modelId, "invalid_response_retryable", reason);
+  // 9.4.2: JSON/lock inválido é propriedade desta chamada/payload, NÃO prova que
+  // o modelo ficou incapaz para QA/Repair ou para o resto do episódio.
+  setModelMetricCooldown942(
+    job,
+    metric,
+    modelId,
+    ROUTER_INVALID_RESPONSE_COOLDOWN_MS_942,
+    reason,
+    "invalid_response_local"
+  );
+  setJobModelHealth(job, modelId, "invalid_response_local", reason);
   console.warn(
-    `[MODEL ROUTER] ${modelId} resposta inválida localizada | ${reason} | ` +
-    `nenhuma rota alternativa saudável; modelo permanece elegível para retry bounded.`
+    `[MODEL ROUTER] ${modelId} resposta inválida em ${metric}; cooldown SOMENTE desta métrica por ` +
+    `${Math.round(ROUTER_INVALID_RESPONSE_COOLDOWN_MS_942 / 1000)}s e fallback imediato. Não há hard-skip do job.`
   );
 }
 
@@ -9022,176 +9062,195 @@ async function geminiRequest({
     throw new Error("GEMINI_API_KEY não configurada.");
   }
 
-  void maxRetries; // 9.0: sem loop cego por modelo; o router troca de rota.
+  void maxRetries; // retries continuam bounded e orientados por estratégia/modelo.
 
   const defaultRoute = geminiRouteForMetric(metric);
   const route = Array.isArray(routeOverride) && routeOverride.length
     ? [...new Set(routeOverride.filter(modelId => GEMINI_MODEL_PROFILES[modelId]))]
     : defaultRoute;
   const errors = [];
-  let routeIndex = 0;
+  let recoveryPass = 0;
 
-  for (const modelId of route) {
-    if (modelSkippedForJob(job, modelId)) {
-      routeIndex++;
-      continue;
-    }
+  while (recoveryPass <= 1) {
+    clearExpiredMetricCooldowns942(job);
+    for (let routeIndex = 0; routeIndex < route.length; routeIndex++) {
+      const modelId = route[routeIndex];
+      if (modelSkippedForJob(job, modelId)) continue;
 
-    const runtime = runtimeForGeminiModel(modelId);
-    if (runtime.unavailableUntil > Date.now()) {
-      routeIndex++;
-      continue;
-    }
+      const runtime = runtimeForGeminiModel(modelId);
+      const now = Date.now();
+      const metricCooldownUntil = modelMetricCooldownUntil942(job, metric, modelId);
+      if (runtime.unavailableUntil > now || metricCooldownUntil > now) continue;
 
-    const primaryShort503Retry =
-      modelId === GEMINI_MODELS.MAIN_PRIMARY ? 1 : 0;
-    // 9.2.4: if no later route is currently healthy, the last usable model gets
-    // one bounded transient retry too. A single 502/503 must not poison the only
-    // remaining route for the rest of the job.
-    const laterHealthyRoute = route.slice(routeIndex + 1).some(candidate => {
-      if (modelSkippedForJob(job, candidate)) return false;
-      return runtimeForGeminiModel(candidate).unavailableUntil <= Date.now();
-    });
-    const sameModelRetryBudget = Math.max(primaryShort503Retry, laterHealthyRoute ? 0 : 1);
+      // Se ainda há fallback saudável, falha transitória troca de rota imediatamente.
+      // Só o último modelo utilizável recebe UM retry curto bounded.
+      const laterHealthyRoute = route.slice(routeIndex + 1).some(candidate => {
+        if (modelSkippedForJob(job, candidate)) return false;
+        const candidateRuntime = runtimeForGeminiModel(candidate);
+        return Math.max(
+          Number(candidateRuntime.unavailableUntil || 0),
+          modelMetricCooldownUntil942(job, metric, candidate)
+        ) <= Date.now();
+      });
+      const sameModelRetryBudget = laterHealthyRoute ? 0 : 1;
 
-    for (let sameModelAttempt = 0; sameModelAttempt <= sameModelRetryBudget; sameModelAttempt++) {
-      markAttempt(job, metric);
-      recordRouterModelCall(job, modelId);
+      for (let sameModelAttempt = 0; sameModelAttempt <= sameModelRetryBudget; sameModelAttempt++) {
+        markAttempt(job, metric);
+        recordRouterModelCall(job, modelId);
 
-      if (routeIndex > 0 && job) {
-        job.stats.modelFallbacks = Number(job.stats.modelFallbacks || 0) + 1;
-      }
-
-      try {
-        console.log(
-          `[MODEL ROUTER ${String(metric).toUpperCase()}] ${modelId} | ` +
-          `route=${routeIndex + 1}/${route.length} | thinking=${thinkingLevel} | ` +
-          `attempt=${sameModelAttempt + 1}/${sameModelRetryBudget + 1}.`
-        );
-
-        const result = await callGenerateContentModel({
-          modelId,
-          system,
-          user,
-          schema,
-          thinkingLevel,
-          maxOutputTokens,
-          timeoutMs,
-          job,
-          metric,
-          bypassPacer: sameModelAttempt > 0
-        });
-
-        markSuccess(job, metric, { usage: result.usage });
-
-        console.log(
-          `[MODEL ROUTER ${String(metric).toUpperCase()}] OK ${modelId} | ` +
-          `input=${result.usage.total_input_tokens} | ` +
-          `output=${result.usage.total_output_tokens} | ` +
-          `thought=${result.usage.total_thought_tokens}.`
-        );
-
-        return result;
-      } catch (error) {
-        const status = Number(error?.status || 0);
-        errors.push(`${modelId}:${status || error?.code || "ERR"}`);
-
-        if (status === 429) {
-          mark429(job, metric);
-          const kind = routedQuotaKind(error?.providerData || {});
-          const wait = Math.max(1000, Number(error?.retryAfterMs || 30000));
-
-          if (kind === "daily") {
-            if (job) job.stats.model429Daily = Number(job.stats.model429Daily || 0) + 1;
-            skipModelForJob(
-              job,
-              modelId,
-              `quota diária/RPD | ${quotaDetailsText(error?.providerData || {})}`,
-              "daily_exhausted"
-            );
-            // Fora deste job, só fazemos um novo probe depois de um intervalo curto.
-            setModelUnavailable(modelId, Math.max(wait, 60000), "RPD/quota diária");
-          } else {
-            if (job) job.stats.model429Rate = Number(job.stats.model429Rate || 0) + 1;
-            skipModelForJob(job, modelId, `${kind.toUpperCase()} 429`, "rate_limited");
-            setModelUnavailable(modelId, wait, `${kind.toUpperCase()} 429`);
-          }
-
-          console.warn(
-            `[MODEL ROUTER] ${modelId} 429 ${kind.toUpperCase()} -> fallback imediato | ` +
-            `${quotaDetailsText(error?.providerData || {})}`
-          );
-          break;
+        if (routeIndex > 0 && job) {
+          job.stats.modelFallbacks = Number(job.stats.modelFallbacks || 0) + 1;
         }
 
-        if (status === 503) {
-          if (job) job.stats.model503 = Number(job.stats.model503 || 0) + 1;
+        try {
+          console.log(
+            `[MODEL ROUTER ${String(metric).toUpperCase()}] ${modelId} | ` +
+            `route=${routeIndex + 1}/${route.length} | thinking=${thinkingLevel} | ` +
+            `attempt=${sameModelAttempt + 1}/${sameModelRetryBudget + 1}.`
+          );
 
-          if (sameModelAttempt < sameModelRetryBudget) {
+          const result = await callGenerateContentModel({
+            modelId,
+            system,
+            user,
+            schema,
+            thinkingLevel,
+            maxOutputTokens,
+            timeoutMs,
+            job,
+            metric,
+            bypassPacer: sameModelAttempt > 0
+          });
+
+          markSuccess(job, metric, { usage: result.usage });
+          setJobModelHealth(job, modelId, "healthy", `${metric} OK`);
+
+          console.log(
+            `[MODEL ROUTER ${String(metric).toUpperCase()}] OK ${modelId} | ` +
+            `input=${result.usage.total_input_tokens} | ` +
+            `output=${result.usage.total_output_tokens} | ` +
+            `thought=${result.usage.total_thought_tokens}.`
+          );
+
+          return result;
+        } catch (error) {
+          const status = Number(error?.status || 0);
+          errors.push(`${modelId}:${status || error?.code || "ERR"}`);
+
+          if (status === 429) {
+            mark429(job, metric);
+            const kind = routedQuotaKind(error?.providerData || {});
+            const wait = Math.max(1000, Number(error?.retryAfterMs || 30000));
+
+            if (kind === "daily") {
+              if (job) job.stats.model429Daily = Number(job.stats.model429Daily || 0) + 1;
+              skipModelForJob(
+                job,
+                modelId,
+                `quota diária/RPD | ${quotaDetailsText(error?.providerData || {})}`,
+                "daily_exhausted"
+              );
+              setModelUnavailable(modelId, Math.max(wait, 60000), "RPD/quota diária");
+            } else {
+              if (job) job.stats.model429Rate = Number(job.stats.model429Rate || 0) + 1;
+              // RPM/TPM são transitórios: cooldown, nunca banimento do job inteiro.
+              setModelUnavailable(modelId, wait, `${kind.toUpperCase()} 429`);
+              setJobModelHealth(job, modelId, "rate_limited_cooldown", `${kind.toUpperCase()} 429`);
+            }
+
             console.warn(
-              `[MODEL ROUTER] ${modelId} 503 HIGH DEMAND -> retry curto bounded antes do fallback/skip.`
+              `[MODEL ROUTER] ${modelId} 429 ${kind.toUpperCase()} -> fallback imediato | ` +
+              `${quotaDetailsText(error?.providerData || {})}`
             );
-            if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
-            await sleep(900);
-            continue;
+            break;
           }
 
-          setModelUnavailable(
-            modelId,
-            GEMINI_MODEL_PROFILES[modelId]?.unavailable503Ms || 60000,
-            "503 high demand"
-          );
-          skipModelForJob(job, modelId, "503 persistiu após retry permitido", "temporarily_unavailable");
-          console.warn(`[MODEL ROUTER] ${modelId} 503 persistiu -> fallback imediato e skip até o fim do job.`);
-          break;
-        }
+          if (status === 503) {
+            if (job) job.stats.model503 = Number(job.stats.model503 || 0) + 1;
 
-        if (error?.isRouterTimeout || status === 504) {
-          if (job) job.stats.modelTimeouts = Number(job.stats.modelTimeouts || 0) + 1;
-          setModelUnavailable(
-            modelId,
-            GEMINI_MODEL_PROFILES[modelId]?.family === "gemma" ? 300000 : 45000,
-            "timeout"
-          );
-          skipModelForJob(job, modelId, "timeout", "temporarily_unavailable");
-          console.warn(`[MODEL ROUTER] ${modelId} timeout -> fallback imediato e skip até o fim do job.`);
-          break;
-        }
+            if (sameModelAttempt < sameModelRetryBudget) {
+              console.warn(`[MODEL ROUTER] ${modelId} 503 -> UM retry curto bounded por ser a última rota saudável.`);
+              if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
+              await sleep(900);
+              continue;
+            }
 
-        if (error?.code === "MODEL_COOLDOWN" || error?.code === "MODEL_JOB_SKIP" || error?.code === "MODEL_LOCAL_RPD") {
-          break;
-        }
-
-        if (error?.routerCanSplit || status === 413 || status === 422) {
-          // Preserve o status para o caller dividir o lote uma única vez.
-          throw error;
-        }
-
-        if (isDeterministicGeminiRequestError(error)) {
-          // 400/401/403 etc. normalmente é problema do payload/configuração,
-          // e repetir em todos os modelos só desperdiça quota.
-          throw error;
-        }
-
-        if (status >= 500 || [408, 409, 425].includes(status)) {
-          const shortTransient = [500, 502, 408, 425].includes(status);
-          if (shortTransient && sameModelAttempt < sameModelRetryBudget) {
-            if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
-            console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} transitório -> 1 retry curto bounded antes de skip.`);
-            await sleep(800);
-            continue;
+            const waitMs = GEMINI_MODEL_PROFILES[modelId]?.unavailable503Ms || 20000;
+            setModelUnavailable(modelId, waitMs, "503 high demand");
+            setJobModelHealth(job, modelId, "temporarily_unavailable", "503 high demand");
+            console.warn(`[MODEL ROUTER] ${modelId} 503 persistiu -> cooldown ${Math.round(waitMs/1000)}s + fallback; modelo poderá voltar neste mesmo job.`);
+            break;
           }
-          setModelUnavailable(modelId, 30000, `HTTP ${status}`);
-          skipModelForJob(job, modelId, `HTTP ${status} persistiu após retry permitido`, "temporarily_unavailable");
-          console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} persistiu -> fallback/skip até o fim do job.`);
-          break;
-        }
 
-        throw error;
+          if (error?.isRouterTimeout || status === 504) {
+            if (job) job.stats.modelTimeouts = Number(job.stats.modelTimeouts || 0) + 1;
+            const waitMs = GEMINI_MODEL_PROFILES[modelId]?.family === "gemma"
+              ? 300000
+              : ROUTER_TIMEOUT_COOLDOWN_MS_942;
+            setModelUnavailable(modelId, waitMs, "timeout");
+            setJobModelHealth(job, modelId, "timeout_cooldown", "timeout");
+            console.warn(`[MODEL ROUTER] ${modelId} timeout -> cooldown ${Math.round(waitMs/1000)}s + fallback; SEM skip permanente do job.`);
+            break;
+          }
+
+          if (error?.code === "MODEL_COOLDOWN" || error?.code === "MODEL_JOB_SKIP" || error?.code === "MODEL_LOCAL_RPD") {
+            break;
+          }
+
+          if (error?.routerCanSplit || status === 413 || status === 422) {
+            throw error;
+          }
+
+          if (isDeterministicGeminiRequestError(error)) {
+            throw error;
+          }
+
+          if (status >= 500 || [408, 409, 425].includes(status)) {
+            const shortTransient = [500, 502, 408, 425].includes(status);
+            if (shortTransient && sameModelAttempt < sameModelRetryBudget) {
+              if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
+              console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} transitório -> UM retry curto bounded.`);
+              await sleep(800);
+              continue;
+            }
+            setModelUnavailable(modelId, ROUTER_TRANSIENT_COOLDOWN_MS_942, `HTTP ${status}`);
+            setJobModelHealth(job, modelId, "transient_cooldown", `HTTP ${status}`);
+            console.warn(`[MODEL ROUTER] ${modelId} HTTP ${status} persistiu -> cooldown + fallback; SEM skip permanente.`);
+            break;
+          }
+
+          throw error;
+        }
       }
     }
 
-    routeIndex++;
+    // 9.4.2: se TODAS as rotas só estão em cooldown curto, aguarda no máximo UMA
+    // janela e reprova. Isso evita transformar dois azares transitórios em BEST_AVAILABLE,
+    // sem criar polling/loop aberto.
+    if (recoveryPass === 0) {
+      const now = Date.now();
+      const eligibleRecovery = route
+        .filter(modelId => !modelSkippedForJob(job, modelId))
+        .map(modelId => Math.max(
+          Number(runtimeForGeminiModel(modelId).unavailableUntil || 0),
+          modelMetricCooldownUntil942(job, metric, modelId)
+        ))
+        .filter(until => until > now)
+        .sort((a, b) => a - b);
+
+      if (eligibleRecovery.length) {
+        const waitMs = eligibleRecovery[0] - now + 120;
+        if (waitMs > 0 && waitMs <= ROUTER_RECOVERY_WAIT_MAX_MS_942) {
+          recoveryPass++;
+          if (job) job.stats.modelRouterRecoveryWaits = Number(job.stats.modelRouterRecoveryWaits || 0) + 1;
+          console.warn(`[MODEL ROUTER ${String(metric).toUpperCase()}] todas as rotas em cooldown curto; aguardando ${(waitMs/1000).toFixed(1)}s e fazendo UMA reprova bounded.`);
+          await sleep(waitMs);
+          continue;
+        }
+      }
+    }
+
+    break;
   }
 
   const last = errors.length ? errors[errors.length - 1] : "nenhum modelo elegível";
@@ -9200,6 +9259,7 @@ async function geminiRequest({
   );
   error.routerExhausted = true;
   error.code = "MODEL_ROUTE_EXHAUSTED";
+  error.metric = metric;
   throw error;
 }
 
@@ -11807,7 +11867,7 @@ async function translateMainBatch({
             ownershipById
           );
       } catch (parseError) {
-        invalidateResponseModelForJob(job, response, "MAIN structured output inválido", parseError);
+        invalidateResponseModelForJob(job, response, "MAIN structured output inválido", parseError, "main");
         throw parseError;
       }
 
@@ -13396,17 +13456,70 @@ const FIRST_PERSON_FEMALE_MARKERS = [
   /\b(?:fui|era|estava\s+sendo)\s+(?:interrogada|questionada|acusada|convidada|obrigada|destinada|colocada|marcada)\b/iu
 ];
 
+// ============================================================
+// SOURCE GENDER EVIDENCE AUTHORITY — 9.4.2
+// ============================================================
+// Uma única autoridade decide se a PRÓPRIA SOURCE lexicalmente prova gênero.
+// Isso evita conflito entre V3/V5/V8 e o QA semântico. Não usa título/cue/personagem.
+const SOURCE_FEMALE_IDENTITY_ROLE_942 =
+  "(?:woman|girl|mother|mom|mum|wife|daughter|sister|bride|female|nun|queen|princess|lady|widow|actress|waitress|heiress|sorceress|hostess|stewardess|aunt|niece|girlfriend|grandmother|grandma|businesswoman|policewoman|saleswoman|chairwoman|congresswoman|spokeswoman|showgirl|cowgirl|schoolgirl|goddess|duchess|baroness|countess|empress|matriarch|cougar)";
+const SOURCE_MALE_IDENTITY_ROLE_942 =
+  "(?:man|boy|father|dad|husband|son|brother|groom|male|monk|king|prince|gentleman|widower|waiter|uncle|nephew|boyfriend|grandfather|grandpa|businessman|policeman|salesman|chairman|congressman|spokesman|cowboy|schoolboy|duke|baron|emperor|patriarch)";
+
+const SOURCE_ROLE_PREFIX_942 =
+  "(?:(?:a|an|the)\\s+)?(?:(?!(?:a|an|the|not|no|never|neither|almost|because|with|about|for|to|from|of|as|like|at|in|on|over|under|my|your|his|her|our|their|playing|portraying|pretending|impersonating|that|who|which|when|if|but|and|or)\\b)[\\p{L}'’.-]+(?:\\s*,\\s*|\\s+)){0,5}";
+
+const SOURCE_SELF_FEMALE_942 = new RegExp(
+  `\\b(?:i\\s+am|i'm|i’m|i\\s+was|i've\\s+been|i’ve\\s+been)\\b\\s+${SOURCE_ROLE_PREFIX_942}${SOURCE_FEMALE_IDENTITY_ROLE_942}\\b`,
+  "iu"
+);
+const SOURCE_SELF_MALE_942 = new RegExp(
+  `\\b(?:i\\s+am|i'm|i’m|i\\s+was|i've\\s+been|i’ve\\s+been)\\b\\s+${SOURCE_ROLE_PREFIX_942}${SOURCE_MALE_IDENTITY_ROLE_942}\\b`,
+  "iu"
+);
+const SOURCE_SECOND_FEMALE_942 = new RegExp(
+  `\\byou(?:'re|’re|\\s+are|\\s+were|\\s+have\\s+been|'ve\\s+been|’ve\\s+been)\\b\\s+${SOURCE_ROLE_PREFIX_942}${SOURCE_FEMALE_IDENTITY_ROLE_942}\\b`,
+  "iu"
+);
+const SOURCE_SECOND_MALE_942 = new RegExp(
+  `\\byou(?:'re|’re|\\s+are|\\s+were|\\s+have\\s+been|'ve\\s+been|’ve\\s+been)\\b\\s+${SOURCE_ROLE_PREFIX_942}${SOURCE_MALE_IDENTITY_ROLE_942}\\b`,
+  "iu"
+);
+
+function sourceGenderEvidence942(block, person = "first") {
+  const source = String(block?.text || "").replace(/\s+/g, " ").trim();
+  if (!source) return { explicit: false, gender: null, provenance: "none" };
+
+  let female = false;
+  let male = false;
+
+  if (person === "second") {
+    female = SOURCE_SECOND_FEMALE_942.test(source) ||
+      /\b(?:voc[eê]|tu)\s+(?:[ée]|era)\s+(?:uma\s+)?(?:mulher|garota|menina|mãe|esposa|filha|irmã|noiva|rainha|princesa|viúva)\b/iu.test(source) ||
+      /\b(?:eres|t[uú]\s+eres)\s+(?:una\s+)?(?:mujer|chica|madre|esposa|hija|hermana|novia|reina|princesa|viuda)\b/iu.test(source);
+    male = SOURCE_SECOND_MALE_942.test(source) ||
+      /\b(?:voc[eê]|tu)\s+(?:[ée]|era)\s+(?:um\s+)?(?:homem|garoto|menino|pai|marido|filho|irmão|noivo|rei|príncipe|viúvo)\b/iu.test(source) ||
+      /\b(?:eres|t[uú]\s+eres)\s+(?:un\s+)?(?:hombre|chico|padre|esposo|hijo|hermano|novio|rey|pr[ií]ncipe|viudo)\b/iu.test(source);
+  } else if (person === "plural") {
+    female = /\bwe(?:'re|’re|\s+are|\s+were)\s+(?:all\s+)?(?:women|girls|mothers|wives|daughters|sisters|queens|ladies)\b/iu.test(source);
+    male = /\bwe(?:'re|’re|\s+are|\s+were)\s+(?:all\s+)?(?:men|boys|fathers|husbands|sons|brothers|kings|gentlemen)\b/iu.test(source);
+  } else {
+    female = SOURCE_SELF_FEMALE_942.test(source) ||
+      /\b(?:sou|era|fui|estou)\s+(?:uma\s+)?(?:mulher|garota|menina|mãe|esposa|filha|irmã|noiva|rainha|princesa|viúva)\b/iu.test(source) ||
+      /\b(?:soy|era|fui)\s+(?:una\s+)?(?:mujer|chica|madre|esposa|hija|hermana|novia|reina|princesa|viuda)\b/iu.test(source);
+    male = SOURCE_SELF_MALE_942.test(source) ||
+      /\b(?:sou|era|fui|estou)\s+(?:um\s+)?(?:homem|garoto|menino|pai|marido|filho|irmão|noivo|rei|príncipe|viúvo)\b/iu.test(source) ||
+      /\b(?:soy|era|fui)\s+(?:un\s+)?(?:hombre|chico|padre|esposo|hijo|hermano|novio|rey|pr[ií]ncipe|viudo)\b/iu.test(source);
+  }
+
+  if (female && male) return { explicit: false, gender: null, provenance: "ambiguous_source" };
+  if (female) return { explicit: true, gender: "female", provenance: "lexical_source" };
+  if (male) return { explicit: true, gender: "male", provenance: "lexical_source" };
+  return { explicit: false, gender: null, provenance: "none" };
+}
+
 function sourceExplicitlyMarksSelfGender(block) {
-  const source = String(block?.text || "")
-    .toLocaleLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!source) return false;
-
-  return /\b(?:i\s+am|i'm|i’m|i\s+was|i've\s+been|i’ve\s+been|as)\s+(?:(?:a|an)\s+)?(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male|nun|monk|king|queen|prince|princess|gentleman|lady|widow|widower|actress|actor|waitress|waiter|aunt|uncle|niece|nephew|girlfriend|boyfriend|grandmother|grandfather|grandma|grandpa|businessman|businesswoman|policeman|policewoman|salesman|saleswoman|chairman|chairwoman|congressman|congresswoman|spokesman|spokeswoman)\b/i.test(source) ||
-    /\b(?:sou|era|como)\s+(?:uma?\s+)?(?:mulher|homem|garota|garoto|menina|menino|mãe|pai|esposa|marido|filha|filho|irmã|irmão|noiva|noivo)\b/iu.test(source) ||
-    /\b(?:soy|era|como)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
+  return sourceGenderEvidence942(block, "first").explicit;
 }
 
 // Nouns whose grammatical article does NOT identify the person's sex/gender.
@@ -14223,7 +14336,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -14462,7 +14575,7 @@ function finalClosureResidualSummary898(blocks, translations, filename, plan) {
     const pt = String(translations.get(block.index) || "").trim();
     if (!layoutCueResult(block, pt).fits) layout++;
     const reasons = localReasonsForCue(block, pt, filename, plan);
-    if (reasons.some(r => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
+    if (reasons.some(r => /GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
     if (reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
     if (/\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
     const source = String(block?.text || "");
@@ -14717,14 +14830,14 @@ function sourceNeutralPredicateFrame923(block, person = "first") {
   const source = String(block?.text || "").replace(/\s+/g, " ").trim();
   if (!source) return false;
   if (person === "first") {
-    if (sourceExplicitlyMarksSelfGender(block)) return false;
+    if (sourceGenderEvidence942(block, "first").explicit) return false;
     return /\bi(?:'m|’m| am| was| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
   }
   if (person === "second") {
-    if (sourceExplicitlyMarksSecondPersonGender(block)) return false;
+    if (sourceGenderEvidence942(block, "second").explicit) return false;
     return /\byou(?:'re|’re| are| were| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
   }
-  if (/\b(?:men|women|boys|girls|male|female)\b/iu.test(source)) return false;
+  if (sourceGenderEvidence942(block, "plural").explicit) return false;
   return /\bwe(?:'re|’re| are| were| have been|'ve been|’ve been| had been| feel| felt| look| looked| seem| seemed| became| got)\b/iu.test(source);
 }
 
@@ -14742,6 +14855,17 @@ function structuralGenderReasons923(block, pt) {
   return reasons;
 }
 
+function targetSelfLexicalGender942(pt) {
+  const text = String(pt || "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const femaleRole = /\b(?:eu\s+)?(?:sou|era|fui|estou|t[oô])\s+(?:uma\s+)?(?:[\p{L}'’-]+\s+){0,4}(?:mulher|garota|menina|mãe|esposa|filha|irmã|noiva|rainha|princesa|viúva|atriz|garçonete|tia|sobrinha|namorada|avó)\b/iu.test(text);
+  const maleRole = /\b(?:eu\s+)?(?:sou|era|fui|estou|t[oô])\s+(?:um\s+)?(?:[\p{L}'’-]+\s+){0,4}(?:homem|garoto|menino|pai|marido|filho|irmão|noivo|rei|príncipe|viúvo|garçom|tio|sobrinho|namorado|avô)\b/iu.test(text);
+  if (femaleRole && maleRole) return null;
+  if (femaleRole) return "female";
+  if (maleRole) return "male";
+  return null;
+}
+
 function genderIntegrityV2Reasons(block, pt, plan) {
   const text = String(pt || "");
   if (!text.trim()) return [];
@@ -14756,12 +14880,22 @@ function genderIntegrityV2Reasons(block, pt, plan) {
 
   const lock = identityLockForCapsule(block, plan);
   const trusted = lock.trusted_speaker_gender;
+  const sourceSelfGender942 = sourceGenderEvidence942(block, "first");
+  const targetSelfGender942 = targetSelfLexicalGender942(text);
 
-  if (trusted === "female" && male) {
+  // SOURCE é autoridade superior ao Character Ledger para a proposição atual.
+  if (sourceSelfGender942.gender === "female" && (male || targetSelfGender942 === "male")) {
+    reasons.push("GENDER_V9_SOURCE_FEMALE_TARGET_MASCULINE");
+  }
+  if (sourceSelfGender942.gender === "male" && (female || targetSelfGender942 === "female")) {
+    reasons.push("GENDER_V9_SOURCE_MALE_TARGET_FEMININE");
+  }
+
+  if (!sourceSelfGender942.explicit && trusted === "female" && male) {
     reasons.push("GENDER_V2_TRUSTED_FEMALE_MASCULINE_SELF_MARKER");
   }
 
-  if (trusted === "male" && female) {
+  if (!sourceSelfGender942.explicit && trusted === "male" && female) {
     reasons.push("GENDER_V2_TRUSTED_MALE_FEMININE_SELF_MARKER");
   }
 
@@ -14819,16 +14953,7 @@ const SECOND_PERSON_GENDERED_STATE_RE =
   /\b(?:voc[eê]|vc|c[eê])\s+(?:[ée]|est[aá]|t[aá]|ficou|parece|anda)\s+(?:muito\s+)?(?:assustad[oa]s?|apavorad[oa]s?|aterrorizad[oa]s?|amedrontad[oa]s?|cansad[oa]s?|preocupad[oa]s?|nervos[oa]s?|sozinh[oa]s?|pront[oa]s?|lou[cq][oa]s?|chocad[oa]s?|confus[oa]s?|exaust[oa]s?|orgulhos[oa]s?|aliviad[oa]s?|animad[oa]s?|decepcionad[oa]s?|desesperad[oa]s?|irritad[oa]s?|furios[oa]s?|envergonhad[oa]s?|surpres[oa]s?|bonit[oa]s?|lind[oa]s?)\b|\b(?:voc[eê]|vc|c[eê])\s+[ée]\s+(?:o\s+vencedor|a\s+vencedora)\b/iu;
 
 function sourceExplicitlyMarksSecondPersonGender(block) {
-  const source = String(block?.text || "")
-    .toLocaleLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!source) return false;
-
-  return /\byou(?:'re|’re|\s+are|\s+were)?\s+(?:(?:a|an)\s+)?(?:[a-z0-9'’-]+\s+){0,4}(?:woman|man|girl|boy|mother|father|mom|mum|dad|wife|husband|daughter|son|sister|brother|bride|groom|female|male|nun|monk|king|queen|prince|princess|gentleman|lady|widow|widower|actress|actor|waitress|waiter|aunt|uncle|niece|nephew|girlfriend|boyfriend|grandmother|grandfather|grandma|grandpa|businessman|businesswoman|policeman|policewoman|salesman|saleswoman|chairman|chairwoman|congressman|congresswoman|spokesman|spokeswoman)\b/i.test(source) ||
-    /\b(?:voc[eê]|tu)\s+(?:[ée]|era)\s+(?:uma?\s+)?(?:mulher|homem|garota|garoto|menina|menino|mãe|pai|esposa|marido|filha|filho|irmã|irmão|noiva|noivo)\b/iu.test(source) ||
-    /\b(?:eres|eres\s+una?|t[uú]\s+eres)\s+(?:una?\s+)?(?:mujer|hombre|chica|chico|madre|padre|esposa|esposo|hija|hijo|hermana|hermano|novia|novio)\b/iu.test(source);
+  return sourceGenderEvidence942(block, "second").explicit;
 }
 
 // ============================================================
@@ -15014,6 +15139,12 @@ function unknownSpeakerGenderRisk(
       en
     )
   ) {
+    return false;
+  }
+
+  // SOURCE lexical explícita autoriza a marca correspondente; mismatch continua
+  // coberto por GENDER_V9, portanto UNKNOWN não deve contradizer a própria SOURCE.
+  if (sourceGenderEvidence942(block, "first").explicit) {
     return false;
   }
 
@@ -15743,7 +15874,7 @@ function issuePriority(issue) {
 
   if (
     /FINAL_PRIORITY/i.test(joined) ||
-    /GENDER_V[2-8]_/i.test(joined) ||
+    /GENDER_V[2-9]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
     /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
@@ -16725,7 +16856,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-8]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-9]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -18743,7 +18874,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -19171,7 +19302,7 @@ function idsFromIssues(issues, blocks, radius = FINAL_PRIORITY_CONTEXT_RADIUS) {
 
 function genderTargetReasons925(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan)
-    .filter(reason => /GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
+    .filter(reason => /GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
 }
 
 function genderTargetIssues925(blocks, translations, filename, plan) {
@@ -19600,32 +19731,94 @@ function blockerFamilies928(issue) {
   return families.length ? [...new Set(families)] : ["OTHER"];
 }
 
+function resolveGuardConflicts942(blocks, issues, job, label = "audit") {
+  const byId = new Map(blocks.map(block => [Number(block.index), block]));
+  const out = [];
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    const id = Number(issue?.id);
+    const block = byId.get(id);
+    let reasons = [...new Set((issue?.reasons || []).map(x => String(x || "")).filter(Boolean))];
+    if (!block || !reasons.length) {
+      if (reasons.length) out.push({ ...issue, reasons });
+      continue;
+    }
+
+    const first = sourceGenderEvidence942(block, "first");
+    const second = sourceGenderEvidence942(block, "second");
+    const plural = sourceGenderEvidence942(block, "plural");
+    const removed = [];
+
+    reasons = reasons.filter(reason => {
+      const r = String(reason || "");
+      const firstNeutral = /GENDER_V3_NEUTRAL_DEFAULT_VIOLATION|GENDER_V5_FIRST_PERSON_HUMAN_ROLE_MARKED|GENDER_V8_STRUCTURAL_FIRST_PERSON_PREDICATE|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(r);
+      const secondNeutral = /GENDER_V4_SECOND_PERSON_NEUTRAL_DEFAULT_VIOLATION|GENDER_V5_SECOND_PERSON_HUMAN_ROLE_MARKED|GENDER_V8_STRUCTURAL_SECOND_PERSON_PREDICATE/i.test(r);
+      const pluralNeutral = /GENDER_V8_STRUCTURAL_PLURAL_PREDICATE/i.test(r);
+      if ((first.explicit && firstNeutral) || (second.explicit && secondNeutral) || (plural.explicit && pluralNeutral)) {
+        removed.push(r);
+        return false;
+      }
+      return true;
+    });
+
+    if (removed.length) {
+      if (job) job.stats.guardConflictsResolved942 = Number(job.stats.guardConflictsResolved942 || 0) + 1;
+      console.warn(
+        `[GUARD CONFLICT 9.4.2] ${label} cue=${id}: SOURCE lexicalmente prova gênero; ` +
+        `neutrality blocker(s) stale removido(s)=[${removed.join(", ")}]. Mismatch real continua fail-closed.`
+      );
+    }
+    if (reasons.length) out.push({ ...issue, reasons });
+  }
+  return out;
+}
+
 function escalationAttemptStore928(job) {
   if (!(job?.escalationAttempts928 instanceof Set)) job.escalationAttempts928 = new Set();
   return job.escalationAttempts928;
 }
 
-function escalationKeys928(issue, strategy) {
+function escalationStateOptions942(issue, options = {}) {
   const id = Number(issue?.id);
-  if (!Number.isInteger(id)) return [];
-  return blockerFamilies928(issue).map(family => `${id}|${String(strategy)}|${family}`);
+  const translations = options?.translations instanceof Map ? options.translations : null;
+  const currentPt = String(
+    options?.currentPt !== undefined
+      ? options.currentPt
+      : (translations && Number.isInteger(id) ? translations.get(id) : "") || ""
+  ).replace(/\s+/g, " ").trim();
+  const reasons = (Array.isArray(issue?.reasons) ? issue.reasons : [issue?.reason])
+    .map(x => String(x || "").trim()).filter(Boolean).sort();
+  return {
+    stage: String(options?.stage || "generic"),
+    currentHash: sha256(currentPt).slice(0, 12),
+    blockerHash: sha256(reasons.join(" | ")).slice(0, 12),
+    requireGenderZero: Boolean(options?.requireGenderZero)
+  };
 }
 
-function strategyAlreadyAttempted928(job, issue, strategy) {
-  const keys = escalationKeys928(issue, strategy);
+function escalationKeys928(issue, strategy, options = {}) {
+  const id = Number(issue?.id);
+  if (!Number.isInteger(id)) return [];
+  const state = escalationStateOptions942(issue, options);
+  return blockerFamilies928(issue).map(family =>
+    `${id}|${state.stage}|${String(strategy)}|${family}|${state.blockerHash}|${state.currentHash}|g0=${state.requireGenderZero ? 1 : 0}`
+  );
+}
+
+function strategyAlreadyAttempted928(job, issue, strategy, options = {}) {
+  const keys = escalationKeys928(issue, strategy, options);
   if (!keys.length) return false;
   const store = escalationAttemptStore928(job);
   return keys.every(key => store.has(key));
 }
 
-function markStrategyAttempted928(job, issue, strategy) {
+function markStrategyAttempted928(job, issue, strategy, options = {}) {
   const store = escalationAttemptStore928(job);
-  for (const key of escalationKeys928(issue, strategy)) store.add(key);
+  for (const key of escalationKeys928(issue, strategy, options)) store.add(key);
 }
 
-function eligibleForStrategy928(job, issues, strategy) {
+function eligibleForStrategy928(job, issues, strategy, options = {}) {
   return (Array.isArray(issues) ? issues : []).filter(
-    issue => !strategyAlreadyAttempted928(job, issue, strategy)
+    issue => !strategyAlreadyAttempted928(job, issue, strategy, options)
   );
 }
 
@@ -19694,7 +19887,9 @@ Não use conteúdo de before/after como conteúdo do target. Não altere timesta
 async function runCandidateBeam928(blocks, translations, issues, plan, job, options = {}) {
   const posMap = positionMap(blocks);
   const updated = new Map(translations);
-  const selected = eligibleForStrategy928(job, issues, "candidate_beam")
+  const stage = String(options?.stage || "candidate-beam");
+  const eligibilityOptions = { ...options, stage, translations };
+  const selected = eligibleForStrategy928(job, issues, "candidate_beam", eligibilityOptions)
     .filter(issue => posMap.has(Number(issue?.id)));
   let cursor = 0;
   const concurrency = Math.min(2, Math.max(1, selected.length));
@@ -19705,17 +19900,18 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
       if (at >= selected.length) return;
       const issue = selected[at];
       const id = Number(issue.id);
-      markStrategyAttempted928(job, issue, "candidate_beam");
       const pos = posMap.get(id);
       const block = blocks[pos];
       const protectedTarget = protectCulturalLocks(block.text, id);
+      const beforePt = String(updated.get(id) || "");
+      const attemptOptions = { ...options, stage, currentPt: beforePt };
       try {
         const response = await finalPriorityGeminiRequest({
           system: CANDIDATE_BEAM_PROMPT_928,
           user: JSON.stringify({
             i: id,
             source: protectedTarget.text,
-            current_pt: String(updated.get(id) || ""),
+            current_pt: beforePt,
             blockers: issue.reasons || [],
             identity_lock: identityLockForCapsule(block, plan),
             hard_locks: protectedTarget.locks.map(lock => lock.token),
@@ -19731,16 +19927,17 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
           routeOverride: [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY],
           job,
           metric: "repair"
-        }, job, `CANDIDATE BEAM 9.4.0 W${workerId} cue ${id}`);
+        }, job, `CANDIDATE BEAM 9.4.2 W${workerId} cue ${id}`);
         const list = parseCandidateBeamSalvage940(response.text);
         if (!list.length) throw new Error("Candidate Beam sem candidato JSON completo após salvage.");
         let winner = "";
+        let safeButSame = 0;
+        const normalizedBefore = beforePt.replace(/\s+/g, " ").trim();
         for (const raw of list) {
           let candidate = String(raw || "").trim();
           if (!candidate) continue;
           try { candidate = restoreCulturalLocks(candidate, protectedTarget.locks, id); }
           catch { continue; }
-          const beforePt = String(updated.get(id) || "");
           let regressions = [];
           if (options?.requireGenderZero) {
             const target = strictGenderCandidateCheck925(block, beforePt, candidate, job.filename, plan);
@@ -19753,21 +19950,30 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
           if (regressions.length) continue;
           const layout = layoutCueResult(block, candidate);
           if (!layout.fits || layout.lines > LAYOUT_MAX_LINES) continue;
+          if (candidate.replace(/\s+/g, " ").trim() === normalizedBefore) {
+            safeButSame++;
+            continue;
+          }
           winner = candidate;
           break;
         }
+
+        // Só depois de uma resposta semanticamente processável a estratégia é consumida
+        // para ESTE stage+texto+blockers. Falha técnica não fecha portas futuras.
+        markStrategyAttempted928(job, issue, "candidate_beam", attemptOptions);
+
         if (winner) {
           updated.set(id, winner);
-          console.log(`[CANDIDATE BEAM 9.4.0] cue=${id} vencedor local seguro selecionado; lock aguardará auditoria semântica.`);
+          console.log(`[CANDIDATE BEAM 9.4.2] cue=${id} vencedor local seguro E diferente selecionado; lock aguardará auditoria semântica.`);
         } else {
-          console.warn(`[CANDIDATE BEAM 9.4.0] cue=${id} sem candidata localmente segura; melhor anterior preservado.`);
+          console.warn(`[CANDIDATE BEAM 9.4.2] cue=${id} sem progresso real (${safeButSame} candidata(s) segura(s) idêntica(s)); melhor anterior preservado e próxima estratégia poderá escalar.`);
         }
       } catch (error) {
-        console.warn(`[CANDIDATE BEAM 9.4.0] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CANDIDATE BEAM 9.4.2] cue=${id} falhou tecnicamente; estratégia NÃO consumida para fase futura | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
-  await Promise.all(Array.from({length: concurrency},(_,i)=>worker(i+1)));
+  await Promise.all(Array.from({length:concurrency},(_,i)=>worker(i+1)));
   return updated;
 }
 
@@ -19782,7 +19988,8 @@ Before/after são só contexto. Não mova conteúdo. Não altere timestamps.
 async function runConstrainedReconstruction928(blocks, translations, issues, plan, job, options = {}) {
   const posMap = positionMap(blocks);
   const updated = new Map(translations);
-  const selected = eligibleForStrategy928(job, issues, "constrained")
+  const stage = String(options?.stage || "constrained");
+  const selected = eligibleForStrategy928(job, issues, "constrained", { ...options, stage, translations })
     .filter(issue => posMap.has(Number(issue?.id)));
   let cursor = 0;
   const concurrency = Math.min(2, Math.max(1, selected.length));
@@ -19792,16 +19999,17 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
       if (at >= selected.length) return;
       const issue = selected[at];
       const id = Number(issue.id);
-      markStrategyAttempted928(job, issue, "constrained");
       const pos = posMap.get(id);
       const block = blocks[pos];
       const protectedTarget = protectCulturalLocks(block.text,id);
       const locksById = new Map([[id,protectedTarget.locks]]);
+      const beforePt = String(updated.get(id)||"");
+      const attemptOptions = { ...options, stage, currentPt: beforePt };
       try {
         const response = await finalPriorityGeminiRequest({
           system: CONSTRAINED_RECONSTRUCTION_PROMPT_928,
           user: JSON.stringify({
-            i:id, source:protectedTarget.text, current_pt:String(updated.get(id)||""),
+            i:id, source:protectedTarget.text, current_pt:beforePt,
             blockers:issue.reasons||[], hard_locks:protectedTarget.locks.map(x=>x.token),
             identity_lock:identityLockForCapsule(block,plan), dialogue_turn_count:sourceDialogueDashCount(block),
             before_source:blocks.slice(Math.max(0,pos-1),pos).map(x=>({i:x.index,source:x.text})),
@@ -19809,12 +20017,11 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
           }),
           schema: cueTranslationSchema(1),
           thinkingLevel:"high", maxOutputTokens:7000, timeoutMs:90000, maxRetries:1,
-          routeOverride:[GEMINI_MODELS.MAIN_PRIMARY,GEMINI_MODELS.MAIN_FALLBACK],
+          routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],
           job, metric:"repair"
-        },job,`CONSTRAINED 9.4.0 W${workerId} cue ${id}`);
+        },job,`CONSTRAINED 9.4.2 W${workerId} cue ${id}`);
         const repaired = parseCueTranslation([block],response.text,locksById);
         let candidate=String(repaired.get(id)||"").trim();
-        const beforePt=String(updated.get(id)||"");
         let regressions=[];
         if(options?.requireGenderZero){
           const target=strictGenderCandidateCheck925(block,beforePt,candidate,job.filename,plan);
@@ -19825,14 +20032,19 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
         }
         const layout=layoutCueResult(block,candidate);
         if(!layout.fits||layout.lines>LAYOUT_MAX_LINES) regressions.push("SUBTITLE_TOO_DENSE");
+        markStrategyAttempted928(job, issue, "constrained", attemptOptions);
         if(regressions.length){
-          console.warn(`[CONSTRAINED 9.4.0] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CONSTRAINED 9.4.2] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
+          continue;
+        }
+        if(candidate.replace(/\s+/g," ").trim()===beforePt.replace(/\s+/g," ").trim()){
+          console.warn(`[CONSTRAINED 9.4.2] cue=${id} não produziu mudança real; melhor anterior preservado.`);
           continue;
         }
         updated.set(id,candidate);
-        console.log(`[CONSTRAINED 9.4.0] cue=${id} candidato produzido; lock aguardará auditoria semântica.`);
+        console.log(`[CONSTRAINED 9.4.2] cue=${id} candidato diferente produzido; lock aguardará auditoria semântica.`);
       } catch(error){
-        console.warn(`[CONSTRAINED 9.4.0] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CONSTRAINED 9.4.2] cue=${id} falhou tecnicamente; estratégia NÃO consumida para fase futura | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19922,13 +20134,12 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
   const updated = new Map(translations);
   const deduped = [...new Map((Array.isArray(issues) ? issues : []).map(issue => [Number(issue?.id), issue])).values()]
     .filter(issue => Number.isInteger(Number(issue?.id)) && posMap.has(Number(issue?.id)));
-  const selected = eligibleForStrategy928(job, deduped, mode);
+  const stage = String(options?.stage || `cue-surgery:${mode}`);
+  const selected = eligibleForStrategy928(job, deduped, mode, { ...options, stage, translations });
   if (!selected.length) return updated;
 
   const system = mode === "contrastive" ? CONTRASTIVE_SURGERY_PROMPT_927 : SOURCE_ONLY_SURGERY_PROMPT_927;
-  const routeOverride = mode === "source_only"
-    ? [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY]
-    : [GEMINI_MODELS.MAIN_PRIMARY, GEMINI_MODELS.MAIN_FALLBACK];
+  const routeOverride = [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY];
   let cursor = 0;
   const concurrency = Math.min(2, selected.length);
 
@@ -19940,6 +20151,8 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
       const id = Number(issue.id);
       const pos = posMap.get(id);
       const block = blocks[pos];
+      const beforePt942 = String(updated.get(id) || "");
+      const attemptOptions942 = { ...options, stage, currentPt: beforePt942 };
       const protectedTarget = protectCulturalLocks(block.text, block.index);
       const locksById = new Map([[id, protectedTarget.locks]]);
       const payload = {
@@ -19971,6 +20184,8 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
         const repaired = parseCueTranslation([block], response.text, locksById);
         let candidate = String(repaired.get(id) || "").trim();
         const beforePt = String(updated.get(id) || "");
+        // Resposta utilizável recebida: agora sim esta estratégia foi tentada neste estado.
+        markStrategyAttempted928(job, issue, mode, attemptOptions942);
         let regressions = [];
         if (options?.requireGenderZero) {
           const target = strictGenderCandidateCheck925(block, beforePt, candidate, job.filename, plan);
@@ -19981,13 +20196,13 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
           regressions = repairCandidateRegressionReasons(block, beforePt, candidate, job.filename, plan);
         }
         if (regressions.length) {
-          console.warn(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CUE SURGERY 9.4.2] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
           continue;
         }
         updated.set(id, candidate);
-        console.log(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} candidato produzido; lock aguardará auditoria semântica.`);
+        console.log(`[CUE SURGERY 9.4.2] mode=${mode} cue=${id} candidato produzido; lock aguardará auditoria semântica.`);
       } catch (error) {
-        console.warn(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CUE SURGERY 9.4.2] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -20011,7 +20226,8 @@ async function auditTargetSet927(blocks, translations, targetIds, plan, job, lab
     }));
     job.finalTargetAuditTechnicalFailure927 = true;
   }
-  const merged = mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
+  const mergedRaw = mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
+  const merged = resolveGuardConflicts942(blocks, mergedRaw, job, `FINAL TARGET AUDIT ${label}`);
   markSemanticResidualRejected940(job, translations, merged, `FINAL TARGET AUDIT ${label}`);
   return merged;
 }
@@ -20051,26 +20267,26 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   let bestScore = issueScore927(residual);
   recordBestCandidate927(blocks, current, residual, job, "target-initial-9210");
   if (!residual.length) {
-    console.log(`[FINAL TARGET VERIFICATION 9.4.0] PASSOU ✅ | strategy=initial | residual=0.`);
+    console.log(`[FINAL TARGET VERIFICATION 9.4.2] PASSOU ✅ | strategy=initial | residual=0.`);
     return { translations: current, residual: [] };
   }
 
-  const strategies = ["source_only", "candidate_beam"];
+  const strategies = ["source_only", "candidate_beam", "constrained"];
   for (const strategy of strategies) {
-    const eligible = eligibleForStrategy928(job, bestResidual, strategy);
+    const eligible = eligibleForStrategy928(job, bestResidual, strategy, { stage: "final-target", translations: best });
     if (!eligible.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+    console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
 
     let candidate;
     if (strategy === "candidate_beam") {
-      candidate = await runCandidateBeam928(blocks, best, eligible, plan, job);
+      candidate = await runCandidateBeam928(blocks, best, eligible, plan, job, { stage: "final-target" });
     } else if (strategy === "constrained") {
-      candidate = await runConstrainedReconstruction928(blocks, best, eligible, plan, job);
+      candidate = await runConstrainedReconstruction928(blocks, best, eligible, plan, job, { stage: "final-target" });
     } else {
-      candidate = await runCueSurgery927(blocks, best, eligible, plan, job, strategy);
+      candidate = await runCueSurgery927(blocks, best, eligible, plan, job, strategy, { stage: "final-target" });
     }
 
     const changedIds = new Set();
@@ -20080,7 +20296,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       if (String(candidate.get(id) || "") !== String(best.get(id) || "")) changedIds.add(id);
     }
     if (!changedIds.size) {
-      console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
+      console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
       continue;
     }
 
@@ -20096,17 +20312,17 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       bestResidual = candidateResidual;
       bestScore = score;
       commitVerifiedRepairLocks940(job, best, changedIds, bestResidual, `strategy=${strategy}`);
-      console.log(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
+      console.log(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
     } else {
-      console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
+      console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
     }
     if (!bestResidual.length) {
-      console.log(`[FINAL TARGET VERIFICATION 9.4.0] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+      console.log(`[FINAL TARGET VERIFICATION 9.4.2] PASSOU ✅ | strategy=${strategy} | residual=0.`);
       return { translations: best, residual: [] };
     }
   }
 
-  console.warn(`[FINAL TARGET VERIFICATION 9.4.0] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue como PROVISIONAL.`);
+  console.warn(`[FINAL TARGET VERIFICATION 9.4.2] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será preservado como RECOVERY CHECKPOINT.`);
   return { translations: best, residual: bestResidual };
 }
 
@@ -20270,7 +20486,7 @@ async function runBoundedFinalQuality88(
         job.qualityStatus = "best_available";
         job.noCacheFinal923 = true;
         console.error(
-          `[FINAL TARGET VERIFICATION 9.4.0] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `[FINAL TARGET VERIFICATION 9.4.2] FAIL-CLOSED PARA SELO/CACHE | ` +
           `residual=${target927.residual.length}.`
         );
       } else {
@@ -20290,7 +20506,7 @@ async function runBoundedFinalQuality88(
   if (finalLocal.length) {
     console.warn(
       `[FINAL BOUNDED 9.0] ${finalLocal.length} guard(s) local(is) residual(is) ` +
-      `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será servido.`
+      `após o pipeline fechado; sem loop cloud. Melhor candidato íntegro será preservado sem selo FINAL.`
     );
     if (job.qualityStatus === "pending" || job.qualityStatus === "final_pass") job.qualityStatus = "best_available";
   } else if (!Array.isArray(job.finalTargetResidual927) || job.finalTargetResidual927.length === 0) {
@@ -20336,11 +20552,13 @@ async function translateSrt(
     } cues.`
   );
 
-  const plan =
-    await buildEpisodePlan(
-      blocks,
-      job
-    );
+  let plan = job.episodePlan;
+  if (plan) {
+    console.log(`[EPISODE PLAN 9.4.2] CHECKPOINT reutilizado; 0 nova chamada PLAN.`);
+  } else {
+    plan = await buildEpisodePlan(blocks, job);
+    job.episodePlan = plan;
+  }
 
   job.progress = Math.max(5, Number(job.progress || 0));
 
@@ -20384,7 +20602,7 @@ const preSafeHardIssues = detectLocalIssues(
 ).map(issue => ({
   id: issue.id,
   reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-8]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   )
 })).filter(issue => issue.reasons.length);
 
@@ -20601,6 +20819,13 @@ if (finalClosure898.gender > 0) {
       `residual=${genderIssues925.length} | ids=[${ids925.join(",")}].`
     );
 
+    const beforeGenderSnapshot942 = new Map(
+      ids925.map(id => [id, String(finalTranslations.get(id) || "")])
+    );
+    const beforeGenderReasonSignature942 = genderIssues925
+      .map(issue => `${issue.id}:${[...(issue.reasons || [])].sort().join("+")}`)
+      .sort().join("|");
+
     // The model sees an explicit postcondition in addition to the concrete local reasons.
     // This is generic: no title/character/release-specific wording.
     genderIssues925 = genderIssues925.map(issue => ({
@@ -20648,6 +20873,21 @@ if (finalClosure898.gender > 0) {
       `[GENDER TARGET GATE 9.2.5] após pass=${genderPass925}: ` +
       `residual=${afterIssues925.length} | ${detail925}`
     );
+
+
+    const afterGenderReasonSignature942 = afterIssues925
+      .map(issue => `${issue.id}:${[...(issue.reasons || [])].sort().join("+")}`)
+      .sort().join("|");
+    const changedGenderTargets942 = ids925.filter(
+      id => String(beforeGenderSnapshot942.get(id) || "") !== String(finalTranslations.get(id) || "")
+    );
+    if (!changedGenderTargets942.length || afterGenderReasonSignature942 === beforeGenderReasonSignature942) {
+      console.warn(
+        `[GENDER TARGET GATE 9.4.2] sem progresso estrutural após pass=${genderPass925}; ` +
+        `não repetiremos a mesma reconstrução. Escalando para estratégia distinta bounded.`
+      );
+      break;
+    }
   }
 
   finalClosure898 = finalClosureResidualSummary898(
@@ -20663,25 +20903,25 @@ if (finalClosure898.gender > 0) {
 // estratégia realmente nova (beam/constrained), ela pode entrar; repetição não.
 if (finalClosure898.gender > 0) {
   let genderResidual928 = genderTargetIssues925(blocks, finalTranslations, job.filename, plan);
-  for (const strategy928 of ["source_only", "candidate_beam"]) {
+  for (const strategy928 of ["source_only", "candidate_beam", "constrained"]) {
     if (!genderResidual928.length) break;
-    const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928);
+    const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928, { stage: "gender-final", translations: finalTranslations, requireGenderZero: true });
     if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.0][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.2][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.0][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
+    console.warn(`[UNIFIED ESCALATION 9.4.2][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
     if (strategy928 === "candidate_beam") {
       finalTranslations = await runCandidateBeam928(
-        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true }
+        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
       );
     } else if (strategy928 === "constrained") {
       finalTranslations = await runConstrainedReconstruction928(
-        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true }
+        blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
       );
     } else {
       finalTranslations = await runCueSurgery927(
-        blocks, finalTranslations, eligible928, plan, job, strategy928, { requireGenderZero: true }
+        blocks, finalTranslations, eligible928, plan, job, strategy928, { requireGenderZero: true, stage: "gender-final" }
       );
     }
     finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
@@ -20729,7 +20969,7 @@ if (Array.isArray(job.finalTargetResidual927) && job.finalTargetResidual927.leng
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro SERÁ entregue; selo canônico bloqueado e cache PROVISIONAL será usado.`);
+  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
 }
 console.log(
   `[FINAL CLOSURE 9.4.0] layout=${finalClosure898.layout} | ` +
@@ -20801,7 +21041,7 @@ auditTimestamps(
     job.noCacheFinal923 = false;
     job.qualityStatus = "final_pass";
     console.log(
-      `[PIPELINE 9.4.0 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.4.2 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -20813,7 +21053,7 @@ auditTimestamps(
     );
   } else {
     console.warn(
-      `[PIPELINE 9.4.0 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.4.2 ROUTED] CHECKPOINT ONLY + PROVISIONAL | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | semantic-residual=${semanticResidual927} | ` +
       `closure-clean=${finalHardClosureClean931 ? "sim" : "não"} | ` +
       `pipeline=${pipelineElapsedSeconds.toFixed(1)}s | job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
@@ -20823,7 +21063,7 @@ auditTimestamps(
   }
 
   job.bestAvailableSrt927 = finalSrt;
-  job.bestAvailableLabel927 = job.qualityStatus === "final_pass" ? "FINAL_PASS" : "BEST_AVAILABLE_FINAL";
+  job.bestAvailableLabel927 = job.qualityStatus === "final_pass" ? "FINAL_PASS" : "RECOVERY_CHECKPOINT_FINAL";
   return finalSrt;
 }
 
@@ -20884,6 +21124,28 @@ async function processJob(
         job
       );
 
+      // 9.4.2: disponibilidade técnica NÃO é produto final. Se qualquer closure
+      // terminou com residual, preservamos o candidato como recovery checkpoint,
+      // mas NÃO marcamos completed e NÃO servimos BEST_AVAILABLE como legenda.
+      if (job.qualityStatus !== "final_pass") {
+        job.bestAvailableSrt927 = finalSrt || job.bestAvailableSrt927 || job.safeDraft || null;
+        if (job.bestAvailableSrt927) {
+          setProvisionalCache927(job.cacheKey, job.bestAvailableSrt927, job, "recovery_checkpoint");
+        }
+        job.result = null;
+        job.status = "failed";
+        job.progress = 100;
+        job.noCacheFinal923 = true;
+        job.qualityStatus = "no_final_pass";
+        job.error = `FINAL_PASS bloqueado por residual hard/semântico; checkpoint preservado e não servido.`;
+        job.updatedAt = Date.now();
+        console.error(
+          `[FINAL PASS REQUIRED 9.4.2] translateSrt terminou sem closure limpa; ` +
+          `checkpoint preservado, canonical bloqueado e entrega final recusada.`
+        );
+        return;
+      }
+
       // 9.2.3: strict final gate may allow availability without freezing a
       // residual as canonical. Such results are served but never cached.
       if (!job.noCacheFinal923) {
@@ -20910,10 +21172,31 @@ async function processJob(
       lastJobError = error;
 
       if (error?.routerExhausted && job.safeDraft) {
-        console.warn(
-          `[JOB ${job.id}] router esgotado DEPOIS do SAFE DRAFT hard-guarded; ` +
-          `não haverá full-job retry inútil. Liberando melhor candidato íntegro.`
-        );
+        attempt++;
+        job.stats.jobRetries = (job.stats.jobRetries || 0) + 1;
+        if (attempt < JOB_MAX_ATTEMPTS) {
+          const metric = String(error?.metric || "repair");
+          const now = Date.now();
+          const route = geminiRouteForMetric(metric);
+          const waits = route
+            .filter(modelId => !modelSkippedForJob(job, modelId))
+            .map(modelId => Math.max(
+              Number(runtimeForGeminiModel(modelId).unavailableUntil || 0),
+              modelMetricCooldownUntil942(job, metric, modelId)
+            ) - now)
+            .filter(ms => ms > 0);
+          const waitMs = Math.min(ROUTER_RECOVERY_WAIT_MAX_MS_942, waits.length ? Math.min(...waits) + 150 : JOB_RETRY_BASE_MS);
+          job.status = "processing";
+          job.qualityStatus = "recovering_final_pass";
+          job.error = `ROUTER RECOVERY: retomando do PLAN/MAIN checkpoint em ${(waitMs/1000).toFixed(1)}s`;
+          console.warn(
+            `[JOB ${job.id}] router esgotado após SAFE DRAFT; UMA retomada bounded será feita do checkpoint ` +
+            `(PLAN reutilizado + MAIN checkpoint), sem apagar progresso | wait=${(waitMs/1000).toFixed(1)}s.`
+          );
+          await sleep(waitMs);
+          continue;
+        }
+        console.error(`[JOB ${job.id}] router continuou esgotado após a única retomada bounded; FINAL_PASS não será falsificado.`);
         break;
       }
 
@@ -20923,7 +21206,7 @@ async function processJob(
       if (job.safeDraft && Number(job.progress || 0) >= 92) {
         console.warn(
           `[DELIVERY GUARANTEE 9.4.0] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
-          `Melhor candidato será entregue/provisionado | ${errorMessage(error).slice(0,320)}`
+          `Checkpoint será preservado sem entrega FINAL | ${errorMessage(error).slice(0,320)}`
         );
         break;
       }
@@ -20979,20 +21262,23 @@ async function processJob(
     null;
 
   if (deliveryCandidate927) {
-    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.4.0", job);
-    job.result = deliveryCandidate927;
-    job.status = "completed";
+    auditTimestamps(job.sourceSrt, deliveryCandidate927, "RECOVERY-CHECKPOINT-9.4.2", job);
+    job.bestAvailableSrt927 = deliveryCandidate927;
+    job.result = null;
+    job.status = "failed";
     job.progress = 100;
-    job.error = null;
-    job.qualityStatus = "best_available_technical";
+    job.qualityStatus = "no_final_pass";
     job.noCacheFinal923 = true;
     job.updatedAt = Date.now();
-    setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "best_available_technical");
+    job.error =
+      `FINAL_PASS não obtido; melhor checkpoint íntegro foi preservado internamente, mas NÃO será servido como legenda final: ` +
+      `${errorMessage(lastJobError).slice(0, 360)}`;
+    setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "recovery_checkpoint");
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
-    console.warn(
-      `[DELIVERY GUARANTEE 9.4.0] cloud/estratégias encerradas sem selo canônico; ` +
-      `melhor candidato íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) ` +
-      `foi ENTREGUE e preservado como PROVISIONAL. Job não foi morto. ✅ | ${errorMessage(lastJobError).slice(0,360)}`
+    console.error(
+      `[FINAL PASS REQUIRED 9.4.2] cloud/estratégias encerradas sem selo canônico; ` +
+      `checkpoint íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) preservado ` +
+      `APENAS para recuperação. Não será entregue como FINAL nem substituirá canonical.`
     );
     return;
   }
@@ -21603,13 +21889,13 @@ const manifest = {
     "org.tradutor.stateless.gemini.free",
 
     version:
-    "9.2",
+    "9.4.2",
 
   name:
     "PT-BR Cloud • OpenSubtitles",
 
   description:
-    "OpenSubtitles → PT-BR com Multi-Model Router, Gemini 3.1 Flash-Lite MEDIUM no MAIN, HARD SDH, gênero neutro natural, Cue Ownership, QA/Repair focal e OpenSub Sync preservado.",
+    "OpenSubtitles → PT-BR com Router por fase, SOURCE Gender Evidence Authority, convergência bounded, Cue Ownership, QA/Repair focal e OpenSub Sync preservado.",
 
   resources: [
     "subtitles"
@@ -21656,10 +21942,12 @@ app.get(
         GEMINI_MODEL,
 
       models: {
-        mainPrimary: GEMINI_MODELS.MAIN_PRIMARY,
-        mainFallback: GEMINI_MODELS.MAIN_FALLBACK,
-        qaPrimary: GEMINI_MODELS.MAIN_PRIMARY,
-        qaFallback: GEMINI_MODELS.MAIN_FALLBACK
+        mainPreferred: geminiRouteForMetric("main")[0],
+        mainFallback: geminiRouteForMetric("main")[1],
+        qaPreferred: geminiRouteForMetric("qa")[0],
+        qaFallback: geminiRouteForMetric("qa")[1],
+        repairPreferred: geminiRouteForMetric("repair")[0],
+        repairFallback: geminiRouteForMetric("repair")[1]
       },
 
       mode:
@@ -22150,7 +22438,7 @@ app.post(
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
       console.log(`[TIMING COMPACT API 9.4.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.1",items:compacted});
+      return safeJson(res,{ok:true,version:"9.4.2",items:compacted});
     }catch(error){
       console.error(`[TIMING COMPACT API 9.4.1] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
@@ -22718,6 +23006,14 @@ app.get(
       job.status ===
       "failed"
     ) {
+      if (job.qualityStatus === "no_final_pass") {
+        return sendSrt(
+          res,
+          errorSrt("FINAL_PASS não foi obtido. O checkpoint íntegro foi preservado, mas esta versão não entrega BEST_AVAILABLE como final."),
+          "no-store, no-cache, must-revalidate"
+        );
+      }
+
       console.warn(
         `[SELF-HEAL 8.4.0] job ${job.id} estava failed; ` +
         `reativando como processing em vez de matar a legenda.`
@@ -22752,7 +23048,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.1 - TIMING CLOSURE + INVARIANT CORE + FAST FAIL-CLOSED DELIVERY"
+        " STREMIO PT-BR 9.4.2 - EVIDENCE AUTHORITY + CONVERGENCE ROUTER + FINAL-PASS RECOVERY"
   );
 
   console.log(
@@ -22768,11 +23064,11 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    `MAIN fast route: ${GEMINI_MODELS.MAIN_FALLBACK} | fallback=${GEMINI_MODELS.MAIN_PRIMARY} ✅`
+    `MAIN route: ${geminiRouteForMetric("main").join(" -> ")} | preferência configurável por MAIN_ROUTE_PREFERENCE ✅`
   );
 
   console.log(
-    `QA/Repair fast route: ${GEMINI_MODELS.MAIN_FALLBACK} HIGH -> ${GEMINI_MODELS.MAIN_PRIMARY} HIGH | 3.7/3.8 removidos ✅`
+    `QA/Repair refined route: ${geminiRouteForMetric("qa").join(" -> ")} | HIGH preservado ✅`
   );
 
   console.log(
@@ -23003,7 +23299,7 @@ console.log(
   console.log("Focused Repair 8.4.3: Final Priority repairs only current-round blockers. OK");
 
   console.log(
-    `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
+    `Job Liveness 9.4.2: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT é checkpoint, nunca substitui FINAL_PASS; zero loop aberto ✅`
   );
   console.log("Final 9.0: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
   console.log("MAIN 9.4.0 runtime: 3.5 Flash-Lite MEDIUM primeiro; 3.1 é fallback; checkpoint por lote preservado ✅");
@@ -23073,11 +23369,11 @@ console.log(
   );
 
   console.log(
-    "Model Health 9.0: 429/503/timeout/JSON inválido marcam o modelo e evitam nova perda de tempo no mesmo job ✅"
+    "Model Health 9.4.2: RPD diário hard-skip; timeout/503/RPM/TPM/JSON inválido usam cooldown e podem voltar no mesmo job ✅"
   );
 
   console.log(
-    "Quota Diagnostics 9.0: RPD diário = daily_exhausted; 503 = 1 retry curto no 3.1 e depois fallback persistente no job ✅"
+    "Quota Diagnostics 9.4.2: RPD diário = daily_exhausted; falhas transitórias fazem fallback imediato + recuperação bounded ✅"
   );
   console.log("Turn Canonicalization 9.0: ~ colado/com espaço + hífen => speakers separados localmente; 0 Gemini extra ✅");
   console.log("Standalone Speaker Labels 9.0: labels ALL CAPS em linha própria viram metadata e nunca texto visível ✅");
@@ -23174,8 +23470,15 @@ console.log(
   console.log("Canonical Cache Closure 9.4.0: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
   console.log("Semantic Authority 9.4.0: auditoria HIGH invalida Repair Persistence reprovado; strategy lock só nasce após QA limpa ✅");
   console.log("Target JSON Budget 9.4.0: source-only/candidate-beam com budget anti-truncamento + Candidate Beam salvage sem retry ✅");
+  console.log("Gender Evidence Authority 9.4.2: SOURCE lexical explícita governa V3/V5/V8; modifiers e papéis gender-coded genéricos preservados ✅");
+  console.log("Guard Conflict Resolver 9.4.2: neutrality guard contraditório com SOURCE explícita é removido; mismatch real continua HARD ✅");
+  console.log("Contextual Escalation Ledger 9.4.2: stage + blocker hash + current-PT hash; estratégia só é consumida após resposta utilizável ✅");
+  console.log("Convergence 9.4.2: source_only -> candidate_beam diferente -> constrained; sem repetição cega ✅");
+  console.log("Router Health 9.4.2: timeout/503/RPM/TPM = cooldown transitório; somente RPD diário vira hard-skip do job ✅");
+  console.log("MAIN Checkpoint 9.4.2: invalid_response refaz o lote no fallback; PLAN reutilizado em retomada ✅");
+  console.log("FINAL PASS Required 9.4.2: checkpoint sem selo é preservado, mas não é servido como BEST_AVAILABLE final ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
-  console.log("Timing Closure 9.4.1: target_visible_chars agora é contrato DURO; cache principal 9.4.0 preservado para não retraduzir sem necessidade ✅");
+  console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
   console.log(
     "Status: ONLINE"
