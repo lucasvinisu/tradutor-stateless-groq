@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.2 - EVIDENCE AUTHORITY + CONVERGENCE ROUTER + FINAL-PASS RECOVERY
+// STREMIO PT-BR 9.4.3 - SPECIALIST-FIRST + COMBINED REPAIR + TURN-AWARE COMPACT
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -40,7 +40,7 @@ const ROUTER_TRANSIENT_COOLDOWN_MS_942 = 10000;
 const ROUTER_RECOVERY_WAIT_MAX_MS_942 = 18000;
 
 const CACHE_VERSION =
-  "9.4.2-gender-evidence-convergence-v1";
+  "9.4.3-bounded-specialist-first-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -20232,6 +20232,14 @@ async function auditTargetSet927(blocks, translations, targetIds, plan, job, lab
   return merged;
 }
 
+function isPureGenderResidual943(issue) {
+  const reasons = Array.isArray(issue?.reasons) ? issue.reasons.map(x => String(x || "").trim()).filter(Boolean) : [];
+  if (!reasons.length) return false;
+  return reasons.every(reason =>
+    /^(?:GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|STRICT_GENDER_POSTCONDITION_)/i.test(reason)
+  );
+}
+
 async function verifyFinalTargets927(blocks, translations, targetIssues, plan, job) {
   const targetIds = new Set((Array.isArray(targetIssues) ? targetIssues : [])
     .map(issue => Number(issue?.id)).filter(Number.isInteger));
@@ -20267,18 +20275,30 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   let bestScore = issueScore927(residual);
   recordBestCandidate927(blocks, current, residual, job, "target-initial-9210");
   if (!residual.length) {
-    console.log(`[FINAL TARGET VERIFICATION 9.4.2] PASSOU ✅ | strategy=initial | residual=0.`);
+    console.log(`[FINAL TARGET VERIFICATION 9.4.3] PASSOU ✅ | strategy=initial | residual=0.`);
     return { translations: current, residual: [] };
   }
 
   const strategies = ["source_only", "candidate_beam", "constrained"];
   for (const strategy of strategies) {
-    const eligible = eligibleForStrategy928(job, bestResidual, strategy, { stage: "final-target", translations: best });
+    // 9.4.3 SPECIALIST-FIRST: residual exclusivamente de gênero NÃO atravessa
+    // source_only/beam/constrained aqui. O Gender Target Gate especializado vem
+    // logo depois e provou resolver esse tipo de blocker com menos chamadas.
+    // Residuais semânticos/ownership/negação continuam usando a escalada genérica.
+    const genericResidual943 = bestResidual.filter(issue => !isPureGenderResidual943(issue));
+    const deferredGender943 = bestResidual.length - genericResidual943.length;
+    if (!genericResidual943.length) {
+      if (deferredGender943 > 0) {
+        console.log(`[SPECIALIST-FIRST 9.4.3] ${deferredGender943} residual(is) exclusivamente de gênero adiado(s) ao Gender Target Gate; 0 source_only/beam/constrained desperdiçado. ✅`);
+      }
+      break;
+    }
+    const eligible = eligibleForStrategy928(job, genericResidual943, strategy, { stage: "final-target", translations: best });
     if (!eligible.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} já esgotada para blockers genéricos; 0 chamadas repetidas. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+    console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} | eligible=${eligible.length}/${genericResidual943.length} genérico(s) | gender-deferred=${deferredGender943} | ids=[${eligible.map(x=>x.id).join(",")}].`);
 
     let candidate;
     if (strategy === "candidate_beam") {
@@ -20296,7 +20316,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       if (String(candidate.get(id) || "") !== String(best.get(id) || "")) changedIds.add(id);
     }
     if (!changedIds.size) {
-      console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
+      console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
       continue;
     }
 
@@ -20312,17 +20332,17 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       bestResidual = candidateResidual;
       bestScore = score;
       commitVerifiedRepairLocks940(job, best, changedIds, bestResidual, `strategy=${strategy}`);
-      console.log(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
+      console.log(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
     } else {
-      console.warn(`[UNIFIED ESCALATION 9.4.2] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
+      console.warn(`[UNIFIED ESCALATION 9.4.3] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
     }
     if (!bestResidual.length) {
-      console.log(`[FINAL TARGET VERIFICATION 9.4.2] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+      console.log(`[FINAL TARGET VERIFICATION 9.4.3] PASSOU ✅ | strategy=${strategy} | residual=0.`);
       return { translations: best, residual: [] };
     }
   }
 
-  console.warn(`[FINAL TARGET VERIFICATION 9.4.2] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será preservado como RECOVERY CHECKPOINT.`);
+  console.warn(`[FINAL TARGET VERIFICATION 9.4.3] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será preservado como RECOVERY CHECKPOINT.`);
   return { translations: best, residual: bestResidual };
 }
 
@@ -20486,7 +20506,7 @@ async function runBoundedFinalQuality88(
         job.qualityStatus = "best_available";
         job.noCacheFinal923 = true;
         console.error(
-          `[FINAL TARGET VERIFICATION 9.4.2] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `[FINAL TARGET VERIFICATION 9.4.3] FAIL-CLOSED PARA SELO/CACHE | ` +
           `residual=${target927.residual.length}.`
         );
       } else {
@@ -20554,7 +20574,7 @@ async function translateSrt(
 
   let plan = job.episodePlan;
   if (plan) {
-    console.log(`[EPISODE PLAN 9.4.2] CHECKPOINT reutilizado; 0 nova chamada PLAN.`);
+    console.log(`[EPISODE PLAN 9.4.3] CHECKPOINT reutilizado; 0 nova chamada PLAN.`);
   } else {
     plan = await buildEpisodePlan(blocks, job);
     job.episodePlan = plan;
@@ -20607,24 +20627,12 @@ const preSafeHardIssues = detectLocalIssues(
 })).filter(issue => issue.reasons.length);
 
 if (preSafeHardIssues.length) {
+  // 9.4.3: não paga uma rodada cloud antes do QA global. Estes blockers já
+  // entram novamente no detectLocalIssues() do Repair combinado, junto com a
+  // autoridade semântica do QA. SAFE DRAFT continua apenas checkpoint interno.
   console.log(
-    `[HARD GUARD PRE-SAFE 8.9] ${preSafeHardIssues.length} blocker(s) real(is); ` +
-    `repair focal antes de autorizar SAFE DRAFT.`
-  );
-
-  mainTranslations = await tryFocusedRepair(
-    blocks,
-    mainTranslations,
-    plan,
-    job,
-    preSafeHardIssues,
-    { extraOnly: true }
-  );
-
-  mainTranslations = sanitizeTranslationMap(
-    blocks,
-    mainTranslations,
-    job
+    `[HARD GUARD PRE-SAFE 9.4.3] ${preSafeHardIssues.length} blocker(s) local(is) detectado(s); ` +
+    `REPAIR cloud adiado e fundido ao QA global (0 request extra nesta fase). ✅`
   );
 }
 
@@ -20907,10 +20915,10 @@ if (finalClosure898.gender > 0) {
     if (!genderResidual928.length) break;
     const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928, { stage: "gender-final", translations: finalTranslations, requireGenderZero: true });
     if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.4.2][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.3][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.4.2][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
+    console.warn(`[UNIFIED ESCALATION 9.4.3][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
     if (strategy928 === "candidate_beam") {
       finalTranslations = await runCandidateBeam928(
         blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true, stage: "gender-final" }
@@ -21041,7 +21049,7 @@ auditTimestamps(
     job.noCacheFinal923 = false;
     job.qualityStatus = "final_pass";
     console.log(
-      `[PIPELINE 9.4.2 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.4.3 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -21053,7 +21061,7 @@ auditTimestamps(
     );
   } else {
     console.warn(
-      `[PIPELINE 9.4.2 ROUTED] CHECKPOINT ONLY + PROVISIONAL | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.4.3 ROUTED] CHECKPOINT ONLY + PROVISIONAL | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | semantic-residual=${semanticResidual927} | ` +
       `closure-clean=${finalHardClosureClean931 ? "sim" : "não"} | ` +
       `pipeline=${pipelineElapsedSeconds.toFixed(1)}s | job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
@@ -22283,13 +22291,40 @@ async function runBoundedTasks9210(tasks, concurrency = 2) {
   return results;
 }
 
+function timingCompactDialogueTurns943(text) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n").map(x => x.trim()).filter(Boolean);
+  if (!lines.some(line => /^[-–—]\s*/u.test(line))) return lines.length ? [lines.join(" ")] : [];
+  const turns = [];
+  for (const line of lines) {
+    if (/^[-–—]\s*/u.test(line)) {
+      const body = line.replace(/^[-–—]\s*/u, "");
+      const parts = body.split(/\s+[-–—]\s+(?=\S)/u).map(x => x.trim()).filter(Boolean);
+      turns.push(...parts);
+    } else if (lines.length === 1 && /\s+[-–—]\s+(?=\S)/u.test(line)) {
+      turns.push(...line.split(/\s+[-–—]\s+(?=\S)/u).map(x => x.trim()).filter(Boolean));
+    } else {
+      turns.push(line);
+    }
+  }
+  return turns;
+}
+
 async function timingAwareCompactSurgery928(items) {
   const clean = (Array.isArray(items) ? items : [])
-    .map(item => ({
-      i:Number(item?.i), source:String(item?.source || "").trim(), pt:String(item?.pt || "").trim(),
-      availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs || 0))),
-      before:String(item?.before || "").slice(0,900), after:String(item?.after || "").slice(0,900)
-    }))
+    .map(item => {
+      const source = String(item?.source || "").trim();
+      const pt = String(item?.pt || "").trim();
+      const sourceTurns = timingCompactDialogueTurns943(source);
+      const ptTurns = timingCompactDialogueTurns943(pt);
+      return {
+        i:Number(item?.i), source, pt,
+        availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs || 0))),
+        before:String(item?.before || "").slice(0,900), after:String(item?.after || "").slice(0,900),
+        sourceTurns, ptTurns,
+        dialogueTurnCount: Math.max(sourceTurns.length, ptTurns.length),
+        turnAwareRescue: Boolean(item?.turnAwareRescue)
+      };
+    })
     .filter(item => Number.isInteger(item.i) && item.source && item.pt && item.availableDisplayMs > 0);
   if (!clean.length) throw new Error("TIMING COMPACT sem itens válidos.");
   if (clean.length > TIMING_COMPACT_MAX_ITEMS_928) throw new Error(`TIMING COMPACT excede ${TIMING_COMPACT_MAX_ITEMS_928} itens.`);
@@ -22306,7 +22341,9 @@ async function timingAwareCompactSurgery928(items) {
       current_visible_chars:timingCompactVisibleChars928(item.pt),
       target_visible_chars:timingCompactHardVisibleChars941(item.availableDisplayMs),
       variant_caps:timingCompactVariantCaps941(item.availableDisplayMs),
-      hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after
+      hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after,
+      dialogue_turn_count:item.dialogueTurnCount, source_turns:item.sourceTurns, current_pt_turns:item.ptTurns,
+      turn_aware_rescue:item.turnAwareRescue
     };
   });
 
@@ -22322,6 +22359,8 @@ async function timingAwareCompactSurgery928(items) {
         `Candidate 0 deve ser a formulação mais natural que já caiba; as seguintes devem ficar progressivamente mais curtas SEM virar fragmento.\n`+
         `Comprima por redação idiomática, contração natural e remoção apenas de hesitações/redundâncias sem valor semântico. Nunca apague uma unidade de sentido para cumprir o limite.\n`+
         `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes, turnos de diálogo e hard_locks.\n`+
+        `Se dialogue_turn_count > 1, preserve EXATAMENTE essa quantidade e a MESMA ordem de falantes/turnos. Compacte CADA turno de forma independente antes de recompor o cue; não funda falas e não transfira sentido entre speakers.\n`+
+        `Se turn_aware_rescue=true, priorize formulações orais muito concisas por turno, removendo apenas hesitações/fillers sem carga semântica; ainda assim preserve integralmente o conteúdo proposicional de cada fala.\n`+
         `Não invente, não mova conteúdo entre cues, não altere timestamps. PT-BR natural, máximo 2x50.\n`+
         `Se for semanticamente impossível cumprir um cap, repita current_pt naquela posição; o filtro local a rejeitará com segurança. JSON somente.`,
       user:JSON.stringify({cues:group}), schema:TIMING_COMPACT_SCHEMA_928,
@@ -22357,7 +22396,9 @@ async function timingAwareCompactSurgery928(items) {
       seen.add(key);
       const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
       const layout=layoutCueResult(block,candidate);
-      if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
+      const candidateTurns943=timingCompactDialogueTurns943(candidate);
+      const turnMismatch943=item.dialogueTurnCount>1 && candidateTurns943.length!==item.dialogueTurnCount;
+      if(regressions.length||turnMismatch943||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
       safe.push(candidate);
     }
     if(safe.length) {
@@ -22376,8 +22417,9 @@ async function timingAwareCompactSurgery928(items) {
         `Para cada item, compare SOURCE, BEFORE_PT e cada CANDIDATE_PT.\n`+
         `candidate_pts já chega ordenado do MAIS CURTO para o MAIS LONGO entre os candidatos que passaram pelos guards locais.\n`+
         `chosen_index deve ser o índice 0-based da PRIMEIRA candidata totalmente segura, ou -1 se nenhuma preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e conteúdo.\n`+
+        `Para itens com dialogue_turn_count > 1, rejeite qualquer candidata que funda, apague, reordene ou troque conteúdo entre turnos/speakers; cada turno precisa continuar semanticamente fiel ao correspondente SOURCE/PT.\n`+
         `Portanto escolha o texto MAIS CURTO que ainda seja semanticamente completo. Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
-      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after}))}),
+      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after,dialogue_turn_count:x.dialogueTurnCount,source_turns:x.sourceTurns,current_pt_turns:x.ptTurns,turn_aware_rescue:x.turnAwareRescue}))}),
       schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
@@ -22403,7 +22445,7 @@ async function timingAwareCompactSurgery928(items) {
     }
     return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"semantic_audit_not_passed").slice(0,240)};
   });
-  console.log(`[TIMING COMPACT 9.4.1] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  console.log(`[TIMING COMPACT 9.4.3] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
   return out;
 }
 
@@ -22437,10 +22479,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.2",items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.3] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.3",items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.1] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.3] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -23048,7 +23090,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.2 - EVIDENCE AUTHORITY + CONVERGENCE ROUTER + FINAL-PASS RECOVERY"
+        " STREMIO PT-BR 9.4.3 - SPECIALIST-FIRST + COMBINED REPAIR + TURN-AWARE COMPACT"
   );
 
   console.log(
@@ -23477,6 +23519,9 @@ console.log(
   console.log("Router Health 9.4.2: timeout/503/RPM/TPM = cooldown transitório; somente RPD diário vira hard-skip do job ✅");
   console.log("MAIN Checkpoint 9.4.2: invalid_response refaz o lote no fallback; PLAN reutilizado em retomada ✅");
   console.log("FINAL PASS Required 9.4.2: checkpoint sem selo é preservado, mas não é servido como BEST_AVAILABLE final ✅");
+  console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
+  console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
+  console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
