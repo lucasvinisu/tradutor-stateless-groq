@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.4.3.1 - TIMING-COMPACT PATH ISOLATION (SEMANTIC 9.4.3 PRESERVED)
+// STREMIO PT-BR 9.4.3.2 - FINAL HARD READABILITY CLOSURE (SEMANTIC 9.4.3 PRESERVED)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -22314,7 +22314,8 @@ async function timingAwareCompactSingle942(items) {
     .map(item => ({
       i:Number(item?.i), source:String(item?.source || "").trim(), pt:String(item?.pt || "").trim(),
       availableDisplayMs:Math.max(1,Math.min(10000,Number(item?.availableDisplayMs || 0))),
-      before:String(item?.before || "").slice(0,900), after:String(item?.after || "").slice(0,900)
+      before:String(item?.before || "").slice(0,900), after:String(item?.after || "").slice(0,900),
+      constraintReason9432:String(item?.constraintReason9432 || "").replace(/\s+/g," ").trim().slice(0,320)
     }))
     .filter(item => Number.isInteger(item.i) && item.source && item.pt && item.availableDisplayMs > 0);
   if (!clean.length) throw new Error("TIMING COMPACT sem itens válidos.");
@@ -22332,7 +22333,8 @@ async function timingAwareCompactSingle942(items) {
       current_visible_chars:timingCompactVisibleChars928(item.pt),
       target_visible_chars:timingCompactHardVisibleChars941(item.availableDisplayMs),
       variant_caps:timingCompactVariantCaps941(item.availableDisplayMs),
-      hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after
+      hard_locks:protectedSource.locks.map(lock=>lock.token), before:item.before, after:item.after,
+      constraint_reason:item.constraintReason9432 || ""
     };
   });
 
@@ -22348,6 +22350,7 @@ async function timingAwareCompactSingle942(items) {
         `Candidate 0 deve ser a formulação mais natural que já caiba; as seguintes devem ficar progressivamente mais curtas SEM virar fragmento.\n`+
         `Comprima por redação idiomática, contração natural e remoção apenas de hesitações/redundâncias sem valor semântico. Nunca apague uma unidade de sentido para cumprir o limite.\n`+
         `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes, turnos de diálogo e hard_locks.\n`+
+        `Se constraint_reason estiver preenchido, esta é a ÚNICA tentativa constrained final: preserve explicitamente cada unidade semântica citada no motivo da rejeição anterior; encurte por sintaxe/lexicalização, NUNCA por omissão.\n`+
         `Não invente, não mova conteúdo entre cues, não altere timestamps. PT-BR natural, máximo 2x50.\n`+
         `Se for semanticamente impossível cumprir um cap, repita current_pt naquela posição; o filtro local a rejeitará com segurança. JSON somente.`,
       user:JSON.stringify({cues:group}), schema:TIMING_COMPACT_SCHEMA_928,
@@ -22600,7 +22603,7 @@ async function timingAwareCompactSurgery928(items) {
     }
   }
 
-  const out = raw.map(item => {
+  let out = raw.map(item => {
     const id = Number(item?.i);
     return byId.get(id) || {
       i:id, pt:String(item?.pt || ""), changed:false, verified:false,
@@ -22608,14 +22611,46 @@ async function timingAwareCompactSurgery928(items) {
     };
   });
 
+  // 9.4.3.2 — UMA recuperação final, somente nos itens realmente rejeitados.
+  // single: constrained retry recebe o motivo do auditor e não pode omitir os atoms citados.
+  // multi: retry per-turn usa o modo turnAwareRescue já bounded, preservando número/ordem de speakers.
+  const firstRejected = out.filter(x => x?.verified !== true);
+  if (firstRejected.length) {
+    const originalById = new Map(raw.map(x => [Number(x?.i), x]));
+    const rejectedSingle = firstRejected
+      .filter(x => x?.compactPath9431 === "single")
+      .map(x => ({...originalById.get(Number(x.i)), constraintReason9432:String(x.reason || "semantic_audit_not_passed")}));
+    const rejectedMulti = firstRejected
+      .filter(x => x?.compactPath9431 === "multi")
+      .map(x => ({...originalById.get(Number(x.i)), turnAwareRescue:true}));
+    const rescueTasks = [];
+    if (rejectedSingle.length) rescueTasks.push(
+      timingAwareCompactSingle942(rejectedSingle).then(items => ({kind:"single-constrained",items}))
+    );
+    if (rejectedMulti.length) rescueTasks.push(
+      timingAwareCompactTurnAware943(rejectedMulti).then(items => ({kind:"multi-per-turn",items}))
+    );
+    const rescueGroups = await Promise.all(rescueTasks);
+    const rescueById = new Map();
+    for (const group of rescueGroups) {
+      for (const item of (Array.isArray(group?.items) ? group.items : [])) {
+        if (item?.verified === true) rescueById.set(Number(item.i), {...item,compactPath9431:group.kind,finalRescue9432:true});
+      }
+    }
+    if (rescueById.size) {
+      out = out.map(x => rescueById.get(Number(x.i)) || x);
+    }
+    console.log(`[TIMING COMPACT FINAL RESCUE 9.4.3.2] single=${rejectedSingle.length} | multi=${rejectedMulti.length} | recovered=${rescueById.size}/${firstRejected.length}.`);
+  }
+
   const rejected = out.filter(x => x?.verified !== true);
   console.log(
-    `[TIMING COMPACT ROUTER 9.4.3.1] single=${single.length} | multi=${multi.length} | ` +
+    `[TIMING COMPACT ROUTER 9.4.3.2] single=${single.length} | multi=${multi.length} | ` +
     `verified=${out.filter(x=>x?.verified===true).length}/${out.length}.`
   );
   if (rejected.length) {
     console.warn(
-      `[TIMING COMPACT REJECTIONS 9.4.3.1] ` +
+      `[TIMING COMPACT REJECTIONS 9.4.3.2] ` +
       rejected.map(x => `i=${x.i}:${x.compactPath9431||"?"}:${String(x.reason||"unknown").replace(/\s+/g," ").slice(0,120)}`).join(" | ")
     );
   }
@@ -22652,10 +22687,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.4.3.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.4.3.1",semanticNamespace:CACHE_VERSION,items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.3.2] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.3.2",semanticNamespace:CACHE_VERSION,items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.4.3.1] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.3.2] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -23263,7 +23298,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.4.3.1 - TIMING-COMPACT PATH ISOLATION | SEMANTIC 9.4.3 PRESERVED"
+        " STREMIO PT-BR 9.4.3.2 - FINAL HARD READABILITY CLOSURE | SEMANTIC 9.4.3 PRESERVED"
   );
 
   console.log(
@@ -23695,8 +23730,8 @@ console.log(
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
   console.log("Specialist-First 9.4.3: residual puramente de gênero vai ao Gender Target Gate antes de source_only/beam/constrained ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
-  console.log("Timing Compact Path Isolation 9.4.3.1: single-turn usa exatamente o algoritmo 9.4.2; somente multi-turn entra no caminho turn-aware ✅");
-  console.log("Timing Compact Diagnostics 9.4.3.1: cada parent não verificado reporta path + motivo; semantic namespace permanece 9.4.3 ✅");
+  console.log("Timing Compact Path Isolation 9.4.3.2: single-turn mantém base 9.4.2; multi-turn turn-aware; rejeitados recebem UMA recuperação final especializada ✅");
+  console.log("Timing Compact Final Closure 9.4.3.2: single rejeitado usa constrained atoms; multi rejeitado usa per-turn rescue; semantic namespace permanece 9.4.3 ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
