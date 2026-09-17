@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.6.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -12906,7 +12906,7 @@ async function runOwnershipQuarantine900(blocks, translations, qaIssues, plan, j
 
   if (!plan900.targetIds.size) {
     job.ownershipQuarantineIds900 = [];
-    console.log(`[OWNERSHIP GATE 9.6.0] nenhum shift provado; 0 rewrite cloud ✅.`);
+    console.log(`[OWNERSHIP GATE 9.7.0] nenhum shift provado; 0 rewrite cloud ✅.`);
     return { translations, qaIssues };
   }
 
@@ -12922,7 +12922,7 @@ async function runOwnershipQuarantine900(blocks, translations, qaIssues, plan, j
   ];
 
   console.warn(
-    `[OWNERSHIP GATE 9.6.0] ANALYSIS-ONLY | sinais=${plan900.ownershipIds.length} | ` +
+    `[OWNERSHIP GATE 9.7.0] ANALYSIS-ONLY | sinais=${plan900.ownershipIds.length} | ` +
     `cues=${job.ownershipQuarantineIds900.length} | 0 micro-batch / 0 SOURCE-ONLY / ` +
     `todos os blockers seguem para a ÚNICA rodada consolidada de Repair. ✅`
   );
@@ -12939,6 +12939,9 @@ async function runOwnershipQuarantine900(blocks, translations, qaIssues, plan, j
 async function enforceFinalOwnershipGate900(blocks, translations, plan, job) {
   const out = new Map(translations);
 
+  // 9.7.0: ownership já foi analisado pelo QA global + PRE-AUDIT e enviado à
+  // única rodada consolidada. O candidate regression guard impede criar novos
+  // shifts. Portanto não existe mais QA cloud pós-Repair.
   const localOwnership = detectLocalIssues(
     blocks,
     out,
@@ -12946,9 +12949,10 @@ async function enforceFinalOwnershipGate900(blocks, translations, plan, job) {
     plan
   ).filter(ownershipIssue900);
 
+  job.ownershipFinalResidual900 = localOwnership.length;
+
   if (!localOwnership.length) {
-    job.ownershipFinalResidual900 = 0;
-    console.log(`[OWNERSHIP FINAL GATE 9.6.0] local=0 | 0 QA extra / 0 Repair ✅.`);
+    console.log(`[OWNERSHIP FINAL GATE 9.7.0] local=0 | 0 QA extra / 0 Repair ✅.`);
     return out;
   }
 
@@ -12956,35 +12960,10 @@ async function enforceFinalOwnershipGate900(blocks, translations, plan, job) {
     localOwnership.map(issue => Number(issue?.id)).filter(Number.isInteger)
   )];
 
-  const idSet = new Set(ids);
-  const subset = blocks.filter(block => idSet.has(Number(block.index)));
-
-  console.warn(
-    `[OWNERSHIP FINAL GATE 9.6.0] local=${ids.length}; UMA confirmação QA verification-only, 0 rewrite.`
+  console.error(
+    `[OWNERSHIP FINAL GATE 9.7.0] FAIL-CLOSED determinístico | local=${localOwnership.length} | ` +
+    `ids=[${ids.join(",")}]; blocker já teve chance na única rodada consolidada; 0 nova rede.`
   );
-
-  const verify = await qaSubset900(
-    subset,
-    out,
-    plan,
-    job,
-    "OWNERSHIP FINAL VERIFY 9.6.0"
-  );
-
-  const confirmed = verify.filter(ownershipIssue900);
-  job.ownershipFinalResidual900 = confirmed.length;
-
-  if (confirmed.length) {
-    const confirmedIds = confirmed.map(issue => Number(issue?.id)).filter(Number.isInteger);
-    console.error(
-      `[OWNERSHIP FINAL GATE 9.6.0] FAIL-CLOSED | confirmados=${confirmed.length} | ` +
-      `ids=[${confirmedIds.join(",")}]; 0 nova tentativa de Repair.`
-    );
-  } else {
-    console.log(
-      `[OWNERSHIP FINAL GATE 9.6.0] sinais locais não confirmados semanticamente; 0 shift residual ✅.`
-    );
-  }
 
   return out;
 }
@@ -14230,6 +14209,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
+    !isGenderGrammaticalAdvisory970(reason) &&
     /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
@@ -14469,7 +14449,7 @@ function finalClosureResidualSummary898(blocks, translations, filename, plan) {
     const pt = String(translations.get(block.index) || "").trim();
     if (!layoutCueResult(block, pt).fits) layout++;
     const reasons = localReasonsForCue(block, pt, filename, plan);
-    if (reasons.some(r => /GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(r)))) gender++;
+    if (reasons.some(r => isHardGenderReason970(r))) gender++;
     if (reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
     if (/\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
     const source = String(block?.text || "");
@@ -14678,6 +14658,64 @@ function applyContextSemanticPostconditions896(block, value) {
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
 
+
+
+// ============================================================
+// GENDER EVIDENCE SEVERITY — 9.7.0
+// ============================================================
+// Universal linguistic rule:
+// - SOURCE-proven contradiction is HARD.
+// - PT-BR grammatical marking without SOURCE gender evidence is ADVISORY.
+// We still neutralize advisory marking deterministically whenever a safe,
+// natural form exists, but failure to find such a paraphrase never blocks an
+// otherwise semantically/structurally valid subtitle.
+const GENDER_GRAMMATICAL_ADVISORY_970 =
+  /^(?:GENDER_V2_UNKNOWN_SPEAKER_MARKED|UNKNOWN_SPEAKER_GENDER_MARKED|GENDER_V3_NEUTRAL_DEFAULT_VIOLATION|GENDER_V4_SECOND_PERSON_NEUTRAL_DEFAULT_VIOLATION|GENDER_V5_(?:FIRST|SECOND)_PERSON_HUMAN_ROLE_MARKED|GENDER_V6_[A-Z0-9_]+|GENDER_V7_AVOIDABLE_MARKING_9_2_2|GENDER_V8_STRUCTURAL_(?:FIRST|SECOND|PLURAL)_PERSON_PREDICATE)$/i;
+
+function isGenderGrammaticalAdvisory970(reason) {
+  return GENDER_GRAMMATICAL_ADVISORY_970.test(String(reason || "").trim());
+}
+
+function isHardGenderReason970(reason) {
+  const r = String(reason || "").trim();
+  if (!/^(?:GENDER_|UNKNOWN_SPEAKER_GENDER_MARKED)/i.test(r)) return false;
+  return !isGenderGrammaticalAdvisory970(r);
+}
+
+function splitGenderSeverity970(blocks, issues, job = null, label = "gender") {
+  const out = [];
+  const advisory = [];
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    const id = Number(issue?.id);
+    const hardReasons = [];
+    const advisoryReasons = [];
+    for (const reason of (Array.isArray(issue?.reasons) ? issue.reasons : [issue?.reason])) {
+      const r = String(reason || "").trim();
+      if (!r) continue;
+      if (isGenderGrammaticalAdvisory970(r)) advisoryReasons.push(r);
+      else hardReasons.push(r);
+    }
+    if (advisoryReasons.length) advisory.push({ id, reasons: [...new Set(advisoryReasons)] });
+    if (hardReasons.length) out.push({ ...issue, id, reasons: [...new Set(hardReasons)] });
+  }
+  if (advisory.length) {
+    const count = advisory.reduce((n, item) => n + item.reasons.length, 0);
+    if (job) {
+      job.stats.genderGrammarAdvisory970 = Number(job.stats.genderGrammarAdvisory970 || 0) + count;
+      job.genderGrammarAdvisory970 = advisory;
+    }
+    console.warn(
+      `[GENDER EVIDENCE 9.7.0] ${label}: ${advisory.length} cue(s) / ${count} marca(s) gramatical(is) ` +
+      `sem contradição SOURCE viraram ADVISORY; neutralização local continua best-effort, selo não é bloqueado.`
+    );
+  }
+  return { hard: out, advisory };
+}
+
+function hardGenderReasons970(block, pt, filename, plan) {
+  return genderIntegrityV2Reasons(block, pt, plan)
+    .filter(isHardGenderReason970);
+}
 
 // ============================================================
 // STRUCTURAL GENDER NEUTRALITY — 9.2.3
@@ -16965,6 +17003,7 @@ async function tryFocusedRepair(
   // 9.6.0: a única rodada de Repair recebe a INTERSEÇÃO histórica completa.
   // Nenhum blocker hard já observado pode ser esquecido entre detectores.
   issues = issuesWithSemanticMemory945(job, issues);
+  issues = splitGenderSeverity970(blocks, issues, job, "repair-input").hard;
 
   if (!extraOnly) {
     issues = await preConfirmAmbiguousRepairIssues(
@@ -17136,7 +17175,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
 
       const regressions = repairCandidateRegressionReasons(
         block, beforePt, candidatePt, job.filename, plan
-      );
+      ).filter(reason => !isGenderGrammaticalAdvisory970(reason));
 
       // Bug estrutural eliminado em 9.6.0:
       // antes, um candidato podia manter o MESMO blocker antigo e ainda ser
@@ -17156,7 +17195,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
         candidatePt,
         job.filename,
         plan
-      );
+      ).filter(reason => !isGenderGrammaticalAdvisory970(reason));
       const candidateFamilies960 = new Set(
         blockerFamilies928({ reasons: candidateLocalReasons960 })
       );
@@ -17211,7 +17250,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     // cascades. They remain visible to the final verification gate.
     if (SINGLE_REPAIR_CONTRACT_960) {
       if (residualIssues.length) {
-        console.warn(`[SINGLE REPAIR CONTRACT 9.6.0] lote ${batchNumber}: residual=${residualIssues.length}; micro-repair desativado por arquitetura.`);
+        console.warn(`[SINGLE REPAIR CONTRACT 9.7.0] lote ${batchNumber}: residual=${residualIssues.length}; micro-repair desativado por arquitetura.`);
       }
       return residualIssues;
     }
@@ -17302,7 +17341,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     job.stats.repairIsolationCueSurgery928 = 0;
     if (SINGLE_REPAIR_CONTRACT_960) {
       console.warn(
-        `[SINGLE REPAIR CONTRACT 9.6.0] residual do repair=${uniqueResidual.length} | ` +
+        `[SINGLE REPAIR CONTRACT 9.7.0] residual do repair=${uniqueResidual.length} | ` +
         `SOURCE-ONLY/micro/cascade PROIBIDOS; verificação final decidirá fail-closed sem nova rewrite.`
       );
     } else {
@@ -19385,7 +19424,7 @@ function idsFromIssues(issues, blocks, radius = FINAL_PRIORITY_CONTEXT_RADIUS) {
 
 function genderTargetReasons925(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan)
-    .filter(reason => /GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED/i.test(String(reason || "")));
+    .filter(reason => isHardGenderReason970(reason));
 }
 
 function genderTargetIssues925(blocks, translations, filename, plan) {
@@ -20504,15 +20543,20 @@ function deterministicFinalResidual960(
   const laidOut = applySubtitleLayout(
     blocks,
     current,
-    "FINAL-96-DETERMINISTIC"
+    "FINAL-97-DETERMINISTIC"
   );
 
-  const local = resolveGuardConflicts942(
+  const local = splitGenderSeverity970(
     blocks,
-    blockingLocalIssues(blocks, laidOut, job, plan),
+    resolveGuardConflicts942(
+      blocks,
+      blockingLocalIssues(blocks, laidOut, job, plan),
+      job,
+      "DETERMINISTIC FINAL LOCAL 9.7.0"
+    ),
     job,
-    "DETERMINISTIC FINAL LOCAL 9.6.0"
-  );
+    "deterministic-final"
+  ).hard;
 
   const localById = new Map(
     local.map(issue => [Number(issue?.id), issue])
@@ -20565,12 +20609,17 @@ function deterministicFinalResidual960(
     unresolvedSemantic.push(issue);
   }
 
-  return resolveGuardConflicts942(
+  return splitGenderSeverity970(
     blocks,
-    mergeIssueLists(local, unresolvedSemantic),
+    resolveGuardConflicts942(
+      blocks,
+      mergeIssueLists(local, unresolvedSemantic),
+      job,
+      "DETERMINISTIC FINAL CONTRACT 9.7.0"
+    ),
     job,
-    "DETERMINISTIC FINAL CONTRACT 9.6.0"
-  );
+    "deterministic-contract"
+  ).hard;
 }
 
 async function runBoundedFinalQuality88(
@@ -20608,19 +20657,19 @@ async function runBoundedFinalQuality88(
     job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[DETERMINISTIC FINAL GATE 9.6.0] FAIL-CLOSED | residual=${residual.length} | ` +
+      `[DETERMINISTIC FINAL GATE 9.7.0] FAIL-CLOSED | residual=${residual.length} | ` +
       `0 QA pós-Repair / 0 Repair extra / 0 cascade.`
     );
     for (const issue of residual.slice(0, 24)) {
       console.error(
-        `[DETERMINISTIC FINAL RESIDUAL 9.6.0] cue=${Number(issue?.id)} | ` +
+        `[DETERMINISTIC FINAL RESIDUAL 9.7.0] cue=${Number(issue?.id)} | ` +
         `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
       );
     }
   } else {
     job.qualityStatus = "final_pass";
     console.log(
-      `[DETERMINISTIC FINAL GATE 9.6.0] PASSOU ✅ | residual=0 | ` +
+      `[DETERMINISTIC FINAL GATE 9.7.0] PASSOU ✅ | residual=0 | ` +
       `semantic rewrite rounds=1 | post-repair cloud=0.`
     );
   }
@@ -20706,17 +20755,22 @@ mainTranslations =
 // ============================================================
 // SAFE DRAFT não pode depender de QA premium para SDH/gênero/turns/ownership.
 // Só chama IA se houver blocker local real; caso contrário custa 0 requests.
-const preSafeHardIssues = detectLocalIssues(
+const preSafeHardIssues = splitGenderSeverity970(
   blocks,
-  mainTranslations,
-  job.filename,
-  plan
-).map(issue => ({
-  id: issue.id,
-  reasons: (issue.reasons || []).filter(reason =>
-    /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
-  )
-})).filter(issue => issue.reasons.length);
+  detectLocalIssues(
+    blocks,
+    mainTranslations,
+    job.filename,
+    plan
+  ).map(issue => ({
+    id: issue.id,
+    reasons: (issue.reasons || []).filter(reason =>
+      /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    )
+  })).filter(issue => issue.reasons.length),
+  job,
+  "pre-safe"
+).hard;
 
 if (preSafeHardIssues.length) {
   // 9.4.3: não paga uma rodada cloud antes do QA global. Estes blockers já
@@ -20828,7 +20882,7 @@ let qaIssues =
   let preClosureSemantic950 = [];
   if (preClosureFocus950.size) {
     console.log(
-      `[SINGLE REPAIR CONTRACT 9.6.0] PRE-AUDIT | foco=${preClosureFocus950.size} | ` +
+      `[SINGLE REPAIR CONTRACT 9.7.0] PRE-AUDIT | foco=${preClosureFocus950.size} | ` +
       `todos os blockers serão fundidos ANTES da única rodada de Repair.`
     );
     preClosureSemantic950 = await scanFinalPriorityAudit(
@@ -20844,9 +20898,10 @@ let qaIssues =
     blocks,
     mergeIssueLists(qaIssues, preClosureSemantic950, preClosureLocal950),
     job,
-    "PRE-REPAIR SINGLE CLOSURE 9.6.0"
+    "PRE-REPAIR SINGLE CLOSURE 9.7.0"
   );
-  rememberSemanticConstraints945(job, qaIssues, "single-pre-repair-9.6.0");
+  qaIssues = splitGenderSeverity970(blocks, qaIssues, job, "pre-repair").hard;
+  rememberSemanticConstraints945(job, qaIssues, "single-pre-repair-9.7.0");
 
   // Contrato hard pré-Repair: depois da ÚNICA rewrite, não haverá outro
   // auditor probabilístico autorizado a inventar uma nova cascata.
@@ -20859,7 +20914,7 @@ let qaIssues =
     ])
   );
   console.log(
-    `[SEMANTIC CONTRACT 9.6.0] hard-pre-repair=${job.preRepairHardIssues960.length} | ` +
+    `[SEMANTIC CONTRACT 9.7.0] hard-pre-repair=${job.preRepairHardIssues960.length} | ` +
     `UMA rewrite consolidada; pós-Repair somente gates determinísticos.`
   );
 }
@@ -20964,7 +21019,7 @@ let finalClosure898 = finalClosureResidualSummary898(
 // No model rewrite is allowed here; this prevents repair cascades.
 if (finalClosure898.gender > 0) {
   console.warn(
-    `[SINGLE REPAIR CONTRACT 9.6.0][GENDER] residual=${finalClosure898.gender} | ` +
+    `[GENDER EVIDENCE 9.7.0][HARD] residual=${finalClosure898.gender} | ` +
     `0 Repair adicional; fail-closed se a normalização determinística não bastou.`
   );
   job.qualityStatus = "best_available";
@@ -20993,11 +21048,11 @@ if (finalClosure898.gender > 0) {
     job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.6.0] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.0] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.6.0] residual=0 ✅ | 0 chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.0] residual=0 ✅ | 0 chamada cloud.`
     );
   }
 }
@@ -21005,7 +21060,7 @@ if (finalClosure898.gender > 0) {
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
+  console.error(`[GENDER HARD FINAL GATE 9.7.0] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
 }
 console.log(
   `[FINAL CLOSURE 9.4.0] layout=${finalClosure898.layout} | ` +
@@ -23743,7 +23798,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.6.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -24005,7 +24060,7 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-  console.log("Semantic Repair Budget 9.6.0: UMA rodada consolidada após PRE-AUDIT; Ownership não reescreve fora dela; pós-Repair cloud=0 ✅");
+  console.log("Semantic Repair Budget 9.7.0: UMA rodada consolidada após PRE-AUDIT; Ownership não reescreve fora dela; pós-Repair cloud=0 ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
@@ -24122,7 +24177,7 @@ console.log(
     "Broadcast/English Closure 9.0: Take/Roll/Okay/Move só são localizados quando a SOURCE prova o uso ✅"
   );
   console.log(
-    "Ownership Gate 9.6.0: shift detectado entra na única rodada consolidada; 0 micro-batch / 0 SOURCE-ONLY de rewrite ✅"
+    "Ownership Gate 9.7.0: shift detectado entra na única rodada consolidada; 0 micro-batch / 0 SOURCE-ONLY de rewrite ✅"
   );
   console.log(
     "Ownership Fail-Closed 9.0: shift persistente após isolamento nunca é servido como SRT final ✅"
@@ -24160,25 +24215,25 @@ console.log(
   console.log(
     "Gender Lock 9.1: proteções de gênero preservadas integralmente; ambiguidade humana continua fail-closed ✅"
   );
-  console.log("Post-Closure Verify 9.6.0: recheck determinístico local; 0 auditoria Gemini pós-Repair ✅");
-  console.log("Call Budget 9.6.0: semantic Repair=1; Ownership rewrite=0 fora dela; pós-Repair semantic QA=0; Timing Compact separado e bounded ✅");
+  console.log("Post-Closure Verify 9.7.0: recheck determinístico local; 0 auditoria Gemini pós-Repair ✅");
+  console.log("Call Budget 9.7.0: semantic Repair=1; Ownership rewrite=0 fora dela; pós-Repair semantic QA=0; Timing Compact separado e bounded ✅");
   console.log("Canonical Cache Closure 9.4.0: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
   console.log("Semantic Authority 9.4.0: auditoria HIGH invalida Repair Persistence reprovado; strategy lock só nasce após QA limpa ✅");
-  console.log("Semantic Rewrite 9.6.0: blockers locais + QA + Final Priority + Ownership são fundidos ANTES da única rodada genérica de Repair ✅");
+  console.log("Semantic Rewrite 9.7.0: blockers locais + QA + Final Priority + Ownership são fundidos ANTES da única rodada genérica de Repair ✅");
   console.log("Gender Evidence Authority 9.4.2: SOURCE lexical explícita governa V3/V5/V8; modifiers e papéis gender-coded genéricos preservados ✅");
   console.log("Guard Conflict Resolver 9.4.2: neutrality guard contraditório com SOURCE explícita é removido; mismatch real continua HARD ✅");
   console.log("Contextual Escalation Ledger 9.4.2: stage + blocker hash + current-PT hash; estratégia só é consumida após resposta utilizável ✅");
-  console.log("Legacy convergence 9.4.2: DESATIVADA no pipeline ativo 9.6.0; sem source_only/beam/constrained/contrastive após Repair ✅");
+  console.log("Legacy convergence 9.4.2: DESATIVADA no pipeline ativo 9.7.0; sem source_only/beam/constrained/contrastive após Repair ✅");
   console.log("Router Health 9.4.2: timeout/503/RPM/TPM = cooldown transitório; somente RPD diário vira hard-skip do job ✅");
   console.log("MAIN Checkpoint 9.4.2: invalid_response refaz o lote no fallback; PLAN reutilizado em retomada ✅");
   console.log("FINAL PASS Required 9.4.2: checkpoint sem selo é preservado, mas não é servido como BEST_AVAILABLE final ✅");
   console.log("Combined Repair 9.4.3: HARD local pré-SAFE é detectado cedo, mas a chamada cloud é fundida ao QA global; elimina Repair redundante ✅");
-  console.log("Gender Closure 9.6.0: candidato de Repair só é aceito se a família GENDER antiga realmente sumir após neutralização local ✅");
+  console.log("Gender Evidence Severity 9.7.0: contradição SOURCE↔PT é HARD; marca gramatical PT-BR sem evidência de gênero é ADVISORY e nunca bloqueia FINAL ✅");
   console.log("Turn-Aware Timing Compact 9.4.3: cues multi-speaker preservam contagem/ordem de turnos e compactam cada fala sem mover sentido ✅");
   console.log("Timing Compact Path Isolation 9.4.3.4: single-turn base 9.4.2 + constrained; multi-turn preservado + SOURCE-turn rebuild quando PT perdeu segmentação ✅");
   console.log("Timing Compact Final Closure 9.4.3.4: residual single recebe NEEDLE semântico; residual multi reconstrói da SOURCE por speaker; UMA micro-etapa bounded; namespace 9.4.3 ✅");
-  console.log("Deterministic Final Gate 9.6.0: nenhum auditor probabilístico pós-Repair pode derrubar o episódio; só invariantes objetivas bloqueiam ✅");
-  console.log("Universal Identity Normalizer 9.6.0: copular identity neutra usa PT-BR sem artigo de gênero/alias SOURCE-safe; 0 lógica por título/cue ✅");
+  console.log("Deterministic Final Gate 9.7.0: nenhum auditor probabilístico pós-Repair pode derrubar o episódio; só invariantes objetivas bloqueiam ✅");
+  console.log("Universal Identity Normalizer 9.7.0: copular identity neutra usa PT-BR sem artigo de gênero/alias SOURCE-safe; 0 lógica por título/cue ✅");
   console.log("Timing Compact Beam 9.4.1: 5 alternativas por parent com hard char caps; auditor recebe shortest-first; zero micro-loop ✅");
   console.log("Timing Closure 9.4.1 preservado; semantic namespace sobe para 9.4.2 porque Gender Evidence/Convergence mudaram a autoridade textual ✅");
 
