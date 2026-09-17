@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.3.1 - FAST CONSOLIDATED PIPELINE + FAIL-CLOSED DELIVERY
+// STREMIO PT-BR 9.4.0 - INVARIANT CORE + FAST FAIL-CLOSED DELIVERY
 // GenerateContent + per-model quotas + fast failover + batch checkpoints.
 // ============================================================
 
@@ -31,7 +31,7 @@ const GEMINI_MODEL = GEMINI_MODELS.MAIN_PRIMARY;
 const GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 
 const CACHE_VERSION =
-  "9.3.1-fast-consolidated-pipeline-v1";
+  "9.4.0-invariant-core-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -169,7 +169,7 @@ const REPAIR_HTTP_RETRIES = 2;
 const REPAIR_PARSE_ATTEMPTS = 1;
 const REPAIR_CONCURRENCY = 2;
 
-// 9.3.1 — REPAIR ISOLATION. Um único cue estruturalmente inválido nunca
+// 9.4.0 — REPAIR ISOLATION. Um único cue estruturalmente inválido nunca
 // invalida dezenas de repairs bons. Primeiro fazemos salvage item-a-item;
 // somente o residual entra em micro-batches bounded e, por último, cue surgery.
 const REPAIR_ISOLATION_MICRO_MAX_CUES_928 = 18;
@@ -273,7 +273,7 @@ const COMPACT_RESCUE_HTTP_RETRIES = 3;
 // Não é truncamento; é objetivo editorial para o Gemini.
 const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
 
-// 9.3.1 — TIMING-AWARE COMPACT SURGERY. A Ponte chama SOMENTE quando a
+// 9.4.0 — TIMING-AWARE COMPACT SURGERY. A Ponte chama SOMENTE quando a
 // geometria final prova que não existe janela física suficiente para leitura.
 // Este endpoint reescreve TEXTO, jamais timestamps, e passa por auditoria
 // semântica independente antes de devolver qualquer mudança.
@@ -1090,7 +1090,7 @@ function setProvisionalCache927(key, srt, job = null, label = "best_available") 
     createdAt: Date.now(),
     expiresAt: Date.now() + CACHE_TTL_MS
   });
-  console.warn(`[PROVISIONAL CACHE 9.3.1] salvo | quality=${String(job?.qualityStatus || label)} | key=${String(key).slice(0,18)}...`);
+  console.warn(`[PROVISIONAL CACHE 9.4.0] salvo | quality=${String(job?.qualityStatus || label)} | key=${String(key).slice(0,18)}...`);
   return true;
 }
 
@@ -8618,7 +8618,7 @@ function extractLastValidJsonObject(value) {
 }
 
 function geminiRouteForMetric(metric) {
-  // 9.3.1: rota empírica do projeto. Nos testes reais, 3.5 Flash-Lite respondeu
+  // 9.4.0: rota empírica do projeto. Nos testes reais, 3.5 Flash-Lite respondeu
   // com latência muito menor e sem cadeia longa de timeout. 3.1 continua como
   // fallback independente. O nível de thinking por fase NÃO é reduzido.
   return [
@@ -12861,7 +12861,7 @@ async function runOwnershipQuarantine900(blocks, translations, qaIssues, plan, j
   }
 
   console.warn(
-    `[OWNERSHIP GATE 9.3.1] QUARANTENA LOCAL | sinais=${plan900.ownershipIds.length} | ` +
+    `[OWNERSHIP GATE 9.4.0] QUARANTENA LOCAL | sinais=${plan900.ownershipIds.length} | ` +
     `cues=${targetBlocks.length} | batches=${microBatches.length}x<=${OWNERSHIP_MICRO_MAX_CUES_900}.`
   );
 
@@ -14272,6 +14272,69 @@ function isFinalRepairLocked923(job, id) {
   return Boolean(job?.finalRepairLockedText923 instanceof Map && job.finalRepairLockedText923.has(Number(id)));
 }
 
+// 9.4.0 — AUTHORITATIVE SEMANTIC STATE.
+// A text that a HIGH semantic audit has rejected may never be resurrected by
+// Repair Persistence. Rejection is text-specific (not cue-specific), so a
+// genuinely new repaired text can still become canonical later.
+function semanticTextKey940(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function semanticRejectedTexts940(job, id, create = false) {
+  if (!job) return null;
+  if (!(job.semanticRejectedTexts940 instanceof Map)) {
+    if (!create) return null;
+    job.semanticRejectedTexts940 = new Map();
+  }
+  const key = Number(id);
+  if (!job.semanticRejectedTexts940.has(key) && create) job.semanticRejectedTexts940.set(key, new Set());
+  return job.semanticRejectedTexts940.get(key) || null;
+}
+
+function markSemanticResidualRejected940(job, translations, issues, label = "audit") {
+  if (!job || !(translations instanceof Map)) return 0;
+  let marked = 0;
+  for (const issue of (Array.isArray(issues) ? issues : [])) {
+    const id = Number(issue?.id);
+    if (!Number.isInteger(id)) continue;
+    const text = semanticTextKey940(translations.get(id));
+    if (!text) continue;
+    const set = semanticRejectedTexts940(job, id, true);
+    if (!set.has(text)) { set.add(text); marked++; }
+    if (job.finalRepairLockedText923 instanceof Map) {
+      const locked = semanticTextKey940(job.finalRepairLockedText923.get(id));
+      if (locked && locked === text) {
+        job.finalRepairLockedText923.delete(id);
+        console.warn(`[SEMANTIC AUTHORITY 9.4.0] cue ${id}: lock de Repair Persistence invalidado por ${label}.`);
+      }
+    }
+  }
+  return marked;
+}
+
+function isSemanticallyRejectedText940(job, id, value) {
+  const set = semanticRejectedTexts940(job, id, false);
+  if (!set) return false;
+  return set.has(semanticTextKey940(value));
+}
+
+function commitVerifiedRepairLocks940(job, translations, changedIds, residual, label = "verified") {
+  if (!job || !(translations instanceof Map)) return 0;
+  if (!(job.finalRepairLockedText923 instanceof Map)) job.finalRepairLockedText923 = new Map();
+  const residualIds = new Set((Array.isArray(residual) ? residual : []).map(x => Number(x?.id)).filter(Number.isInteger));
+  let committed = 0;
+  for (const rawId of changedIds || []) {
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || residualIds.has(id)) continue;
+    const text = String(translations.get(id) || "").trim();
+    if (!text || isSemanticallyRejectedText940(job, id, text)) continue;
+    job.finalRepairLockedText923.set(id, text);
+    committed++;
+  }
+  if (committed) console.log(`[SEMANTIC AUTHORITY 9.4.0] ${label}: ${committed} repair lock(s) commitados SOMENTE após auditoria limpa.`);
+  return committed;
+}
+
 function applyRepairPersistenceLock923(blocks, translations, job, filename, plan) {
   const out=new Map(translations);
   if (!(job?.finalRepairLockedText923 instanceof Map) || !job.finalRepairLockedText923.size) return out;
@@ -14283,6 +14346,11 @@ function applyRepairPersistenceLock923(blocks, translations, job, filename, plan
     const accepted=String(acceptedRaw || "").trim();
     const current=String(out.get(Number(id)) || "").trim();
     if (!accepted || current===accepted) continue;
+    if (isSemanticallyRejectedText940(job, id, accepted)) {
+      job.finalRepairLockedText923.delete(Number(id));
+      console.warn(`[REPAIR PERSISTENCE 9.4.0] cue ${id}: candidato previamente reprovado semanticamente NÃO será restaurado.`);
+      continue;
+    }
     const acceptedReasons=priorityLocalReasons898(block, accepted, filename, plan);
     const currentReasons=priorityLocalReasons898(block, current, filename, plan);
     const acceptedFits=layoutCueResult(block,accepted).fits;
@@ -16308,7 +16376,7 @@ async function repairBatch(
           job.stats.repairSalvagedCues928 =
             Number(job.stats.repairSalvagedCues928 || 0) + salvagedCount;
           console.warn(
-            `[REPAIR ISOLATION 9.3.1] salvage=${salvagedCount}/${issues.length} | ` +
+            `[REPAIR ISOLATION 9.4.0] salvage=${salvagedCount}/${issues.length} | ` +
             `residual=${salvaged.unresolvedIds.length} | ids=[${salvaged.unresolvedIds.join(",")}].`
           );
         }
@@ -16943,7 +17011,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
       consolidated.push(residualIssues.slice(i, i + REPAIR_ISOLATION_MICRO_MAX_CUES_928));
     }
     if (consolidated.length > REPAIR_ISOLATION_MAX_MICRO_BATCHES_928) {
-      console.warn(`[REPAIR CONSOLIDATED 9.3.1] residual=${residualIssues.length} excede cap local; cue-surgery recebe somente residual não resolvido.`);
+      console.warn(`[REPAIR CONSOLIDATED 9.4.0] residual=${residualIssues.length} excede cap local; cue-surgery recebe somente residual não resolvido.`);
       return residualIssues;
     }
 
@@ -16957,10 +17025,10 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
           acceptRepairCandidates928(result.translations, updated, `consolidated-${batchNumber}.${idx + 1}`);
         }
         const missing = new Set((result?.unresolvedIds || []).map(Number));
-        console.log(`[REPAIR CONSOLIDATED 9.3.1][W${workerId}] ${idx + 1}/${consolidated.length} | targets=${group.length} | residual=${missing.size}.`);
+        console.log(`[REPAIR CONSOLIDATED 9.4.0][W${workerId}] ${idx + 1}/${consolidated.length} | targets=${group.length} | residual=${missing.size}.`);
         return group.filter(issue => missing.has(Number(issue.id)));
       } catch (error) {
-        console.warn(`[REPAIR CONSOLIDATED 9.3.1][W${workerId}] ${idx + 1}/${consolidated.length} falhou; ${group.length} cue(s) seguem para surgery | ${errorMessage(error).slice(0,220)}`);
+        console.warn(`[REPAIR CONSOLIDATED 9.4.0][W${workerId}] ${idx + 1}/${consolidated.length} falhou; ${group.length} cue(s) seguem para surgery | ${errorMessage(error).slice(0,220)}`);
         return group;
       }
     }));
@@ -17023,7 +17091,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   if (uniqueResidual.length) {
     job.stats.repairIsolationCueSurgery928 = uniqueResidual.length;
     console.warn(
-      `[REPAIR ISOLATION 9.3.1] micro-repair esgotado | ` +
+      `[REPAIR ISOLATION 9.4.0] micro-repair esgotado | ` +
       `cue-surgery SOURCE-ONLY=${uniqueResidual.length} | ids=[${uniqueResidual.map(x => x.id).join(",")}].`
     );
     const surgicallyRepaired = await runCueSurgery927(
@@ -17041,7 +17109,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   }
 
   console.log(
-    `[REPAIR 9.3.1] FINAL | lotes OK=${successfulBatches}/${totalBatches} | ` +
+    `[REPAIR 9.4.0] FINAL | lotes OK=${successfulBatches}/${totalBatches} | ` +
     `lotes isolados=${failedBatches} | cues aceitos=${acceptedCues} | ` +
     `salvaged=${Number(job.stats.repairSalvagedCues928 || 0)} | ` +
     `micro=${Number(job.stats.repairIsolationMicroBatches928 || 0)} | ` +
@@ -19575,6 +19643,46 @@ const CANDIDATE_BEAM_SCHEMA_928 = {
   required: ["candidates"]
 };
 
+// 9.4.0 — salvage de strings completas do array candidates.
+// Se a resposta for truncada no último candidato, os candidatos completos
+// anteriores continuam utilizáveis; zero retry e zero loop.
+function parseCandidateBeamSalvage940(raw) {
+  const text = stripCodeFences(String(raw || ""));
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed?.candidates) ? parsed.candidates.map(String) : [];
+  } catch {}
+  const keyAt = text.indexOf('"candidates"');
+  if (keyAt < 0) return [];
+  const colonAt = text.indexOf(':', keyAt + 12);
+  const start = colonAt >= 0 ? text.indexOf('[', colonAt + 1) : -1;
+  if (start < 0) return [];
+  const out = [];
+  let i = start + 1;
+  while (i < text.length) {
+    while (i < text.length && /[\s,]/.test(text[i])) i++;
+    if (i >= text.length || text[i] === ']') break;
+    if (text[i] !== '"') { i++; continue; }
+    const s = i;
+    i++;
+    let escaped = false;
+    while (i < text.length) {
+      const ch = text[i];
+      if (escaped) { escaped = false; i++; continue; }
+      if (ch === '\\') { escaped = true; i++; continue; }
+      if (ch === '"') {
+        const fragment = text.slice(s, i + 1);
+        try { out.push(JSON.parse(fragment)); } catch {}
+        i++;
+        break;
+      }
+      i++;
+    }
+    if (i >= text.length && text[text.length - 1] !== '"') break;
+  }
+  return out;
+}
+
 const CANDIDATE_BEAM_PROMPT_928 = `
 Você é o CANDIDATE BEAM final de um único cue SOURCE→PT-BR.
 Gere exatamente ${QUALITY_BEAM_CANDIDATES_928} reconstruções REALMENTE diferentes entre si,
@@ -19617,15 +19725,15 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
           }),
           schema: CANDIDATE_BEAM_SCHEMA_928,
           thinkingLevel: "high",
-          maxOutputTokens: 2400,
+          maxOutputTokens: 8000,
           timeoutMs: 90000,
           maxRetries: 1,
           routeOverride: [GEMINI_MODELS.MAIN_FALLBACK, GEMINI_MODELS.MAIN_PRIMARY],
           job,
           metric: "repair"
-        }, job, `CANDIDATE BEAM 9.3.1 W${workerId} cue ${id}`);
-        const parsed = JSON.parse(stripCodeFences(response.text));
-        const list = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+        }, job, `CANDIDATE BEAM 9.4.0 W${workerId} cue ${id}`);
+        const list = parseCandidateBeamSalvage940(response.text);
+        if (!list.length) throw new Error("Candidate Beam sem candidato JSON completo após salvage.");
         let winner = "";
         for (const raw of list) {
           let candidate = String(raw || "").trim();
@@ -19650,14 +19758,12 @@ async function runCandidateBeam928(blocks, translations, issues, plan, job, opti
         }
         if (winner) {
           updated.set(id, winner);
-          if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
-          job.finalRepairLockedText923.set(id, winner);
-          console.log(`[CANDIDATE BEAM 9.3.1] cue=${id} vencedor local seguro selecionado.`);
+          console.log(`[CANDIDATE BEAM 9.4.0] cue=${id} vencedor local seguro selecionado; lock aguardará auditoria semântica.`);
         } else {
-          console.warn(`[CANDIDATE BEAM 9.3.1] cue=${id} sem candidata localmente segura; melhor anterior preservado.`);
+          console.warn(`[CANDIDATE BEAM 9.4.0] cue=${id} sem candidata localmente segura; melhor anterior preservado.`);
         }
       } catch (error) {
-        console.warn(`[CANDIDATE BEAM 9.3.1] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CANDIDATE BEAM 9.4.0] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19702,10 +19808,10 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
             after_source:blocks.slice(pos+1,Math.min(blocks.length,pos+2)).map(x=>({i:x.index,source:x.text}))
           }),
           schema: cueTranslationSchema(1),
-          thinkingLevel:"high", maxOutputTokens:1800, timeoutMs:90000, maxRetries:1,
+          thinkingLevel:"high", maxOutputTokens:7000, timeoutMs:90000, maxRetries:1,
           routeOverride:[GEMINI_MODELS.MAIN_PRIMARY,GEMINI_MODELS.MAIN_FALLBACK],
           job, metric:"repair"
-        },job,`CONSTRAINED 9.3.1 W${workerId} cue ${id}`);
+        },job,`CONSTRAINED 9.4.0 W${workerId} cue ${id}`);
         const repaired = parseCueTranslation([block],response.text,locksById);
         let candidate=String(repaired.get(id)||"").trim();
         const beforePt=String(updated.get(id)||"");
@@ -19720,15 +19826,13 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
         const layout=layoutCueResult(block,candidate);
         if(!layout.fits||layout.lines>LAYOUT_MAX_LINES) regressions.push("SUBTITLE_TOO_DENSE");
         if(regressions.length){
-          console.warn(`[CONSTRAINED 9.3.1] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CONSTRAINED 9.4.0] cue=${id} rejeitado | ${[...new Set(regressions)].join(", ")}.`);
           continue;
         }
         updated.set(id,candidate);
-        if(!job.finalRepairLockedText923) job.finalRepairLockedText923=new Map();
-        job.finalRepairLockedText923.set(id,candidate);
-        console.log(`[CONSTRAINED 9.3.1] cue=${id} candidato produzido e protegido.`);
+        console.log(`[CONSTRAINED 9.4.0] cue=${id} candidato produzido; lock aguardará auditoria semântica.`);
       } catch(error){
-        console.warn(`[CONSTRAINED 9.3.1] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CONSTRAINED 9.4.0] cue=${id} falhou; melhor anterior preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19765,7 +19869,7 @@ function betterScore927(a, b) {
 }
 
 function recordBestCandidate927(blocks, translations, residual, job, label) {
-  const laidOut = applySubtitleLayout(blocks, translations, `BEST-CANDIDATE-9.3.1-${label}`);
+  const laidOut = applySubtitleLayout(blocks, translations, `BEST-CANDIDATE-9.4.0-${label}`);
   const local = blockingLocalIssues(blocks, laidOut, job, job?.episodePlan || null);
   const merged = mergeIssueLists(local, Array.isArray(residual) ? residual : []);
   const score = issueScore927(merged);
@@ -19776,7 +19880,7 @@ function recordBestCandidate927(blocks, translations, residual, job, label) {
   job.bestAvailableSrt927 = srt;
   job.bestAvailableLabel927 = String(label || "candidate");
   job.bestCandidateIssues927 = merged;
-  console.log(`[BEST CANDIDATE LEDGER 9.3.1] ${job.bestAvailableLabel927} | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} ✅`);
+  console.log(`[BEST CANDIDATE LEDGER 9.4.0] ${job.bestAvailableLabel927} | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} ✅`);
   return true;
 }
 
@@ -19856,7 +19960,7 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
           user: `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\nBÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\nCUE:\n${JSON.stringify(payload)}`,
           schema: cueTranslationSchema(1),
           thinkingLevel: "high",
-          maxOutputTokens: 1800,
+          maxOutputTokens: 7000,
           timeoutMs: 90000,
           maxRetries: 1,
           routeOverride,
@@ -19877,15 +19981,13 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
           regressions = repairCandidateRegressionReasons(block, beforePt, candidate, job.filename, plan);
         }
         if (regressions.length) {
-          console.warn(`[CUE SURGERY 9.3.1] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
+          console.warn(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} rejeitado localmente | ${[...new Set(regressions)].join(", ")}.`);
           continue;
         }
         updated.set(id, candidate);
-        if (!job.finalRepairLockedText923) job.finalRepairLockedText923 = new Map();
-        job.finalRepairLockedText923.set(id, candidate);
-        console.log(`[CUE SURGERY 9.3.1] mode=${mode} cue=${id} candidato produzido e protegido.`);
+        console.log(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} candidato produzido; lock aguardará auditoria semântica.`);
       } catch (error) {
-        console.warn(`[CUE SURGERY 9.3.1] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
+        console.warn(`[CUE SURGERY 9.4.0] mode=${mode} cue=${id} falhou tecnicamente; melhor candidato preservado | ${errorMessage(error).slice(0,260)}`);
       }
     }
   }
@@ -19895,21 +19997,23 @@ async function runCueSurgery927(blocks, translations, issues, plan, job, mode = 
 }
 
 async function auditTargetSet927(blocks, translations, targetIds, plan, job, label) {
-  const laidOut = applySubtitleLayout(blocks, translations, `FINAL-TARGET-9.3.1-${label}`);
+  const laidOut = applySubtitleLayout(blocks, translations, `FINAL-TARGET-9.4.0-${label}`);
   const local = blockingLocalIssues(blocks, laidOut, job, plan)
     .filter(issue => targetIds.has(Number(issue?.id)));
   let semantic = [];
   try {
     semantic = await scanFinalPriorityAudit(blocks, translations, plan, job, targetIds);
   } catch (error) {
-    console.warn(`[FINAL TARGET AUDIT 9.3.1] ${label} falhou tecnicamente; selo canônico fica bloqueado e candidato não é degradado | ${errorMessage(error).slice(0,300)}`);
+    console.warn(`[FINAL TARGET AUDIT 9.4.0] ${label} falhou tecnicamente; selo canônico fica bloqueado e candidato não é degradado | ${errorMessage(error).slice(0,300)}`);
     semantic = [...targetIds].map(id => ({
       id,
       reasons: ["FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: a reauditoria focal não ficou disponível; preservar o melhor candidato e nunca declarar FINAL_PASS sem prova."]
     }));
     job.finalTargetAuditTechnicalFailure927 = true;
   }
-  return mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
+  const merged = mergeIssueLists(local, semantic).filter(issue => targetIds.has(Number(issue?.id)));
+  markSemanticResidualRejected940(job, translations, merged, `FINAL TARGET AUDIT ${label}`);
+  return merged;
 }
 
 async function verifyFinalTargets927(blocks, translations, targetIssues, plan, job) {
@@ -19947,7 +20051,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   let bestScore = issueScore927(residual);
   recordBestCandidate927(blocks, current, residual, job, "target-initial-9210");
   if (!residual.length) {
-    console.log(`[FINAL TARGET VERIFICATION 9.3.1] PASSOU ✅ | strategy=initial | residual=0.`);
+    console.log(`[FINAL TARGET VERIFICATION 9.4.0] PASSOU ✅ | strategy=initial | residual=0.`);
     return { translations: current, residual: [] };
   }
 
@@ -19955,10 +20059,10 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
   for (const strategy of strategies) {
     const eligible = eligibleForStrategy928(job, bestResidual, strategy);
     if (!eligible.length) {
-      console.log(`[UNIFIED ESCALATION 9.3.1] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} já esgotada para os blockers residuais; 0 chamadas repetidas. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.3.1] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
+    console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} | eligible=${eligible.length}/${bestResidual.length} | ids=[${eligible.map(x=>x.id).join(",")}].`);
 
     let candidate;
     if (strategy === "candidate_beam") {
@@ -19976,7 +20080,7 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       if (String(candidate.get(id) || "") !== String(best.get(id) || "")) changedIds.add(id);
     }
     if (!changedIds.size) {
-      console.warn(`[UNIFIED ESCALATION 9.3.1] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
+      console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} não alterou nenhum cue elegível; QA repetida evitada. ✅`);
       continue;
     }
 
@@ -19991,17 +20095,18 @@ async function verifyFinalTargets927(blocks, translations, targetIssues, plan, j
       best = new Map(candidate);
       bestResidual = candidateResidual;
       bestScore = score;
-      console.log(`[UNIFIED ESCALATION 9.3.1] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
+      commitVerifiedRepairLocks940(job, best, changedIds, bestResidual, `strategy=${strategy}`);
+      console.log(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} melhorou | hard=${score.hard} | weighted=${score.weighted} | residual=${score.count} | reaudited=${auditIds.size}.`);
     } else {
-      console.warn(`[UNIFIED ESCALATION 9.3.1] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
+      console.warn(`[UNIFIED ESCALATION 9.4.0] strategy=${strategy} não superou o melhor candidato; rollback lógico para ledger | reaudited=${auditIds.size}.`);
     }
     if (!bestResidual.length) {
-      console.log(`[FINAL TARGET VERIFICATION 9.3.1] PASSOU ✅ | strategy=${strategy} | residual=0.`);
+      console.log(`[FINAL TARGET VERIFICATION 9.4.0] PASSOU ✅ | strategy=${strategy} | residual=0.`);
       return { translations: best, residual: [] };
     }
   }
 
-  console.warn(`[FINAL TARGET VERIFICATION 9.3.1] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue como PROVISIONAL.`);
+  console.warn(`[FINAL TARGET VERIFICATION 9.4.0] estratégias bounded distintas esgotadas | residual=${bestResidual.length}; MELHOR candidato íntegro será entregue como PROVISIONAL.`);
   return { translations: best, residual: bestResidual };
 }
 
@@ -20039,7 +20144,7 @@ async function runBoundedFinalQuality88(
     initialFocus.add(block.index);
   }
   if (negationFocus926) {
-    console.log(`[NEGATION INTEGRITY FOCUS 9.3.1] +${negationFocus926} cue(s) com risco REAL de perda de negação (SOURCE negativa / PT sem marcador).`);
+    console.log(`[NEGATION INTEGRITY FOCUS 9.4.0] +${negationFocus926} cue(s) com risco REAL de perda de negação (SOURCE negativa / PT sem marcador).`);
   }
 
   for (const block of blocks) {
@@ -20165,7 +20270,7 @@ async function runBoundedFinalQuality88(
         job.qualityStatus = "best_available";
         job.noCacheFinal923 = true;
         console.error(
-          `[FINAL TARGET VERIFICATION 9.3.1] FAIL-CLOSED PARA SELO/CACHE | ` +
+          `[FINAL TARGET VERIFICATION 9.4.0] FAIL-CLOSED PARA SELO/CACHE | ` +
           `residual=${target927.residual.length}.`
         );
       } else {
@@ -20553,7 +20658,7 @@ if (finalClosure898.gender > 0) {
   );
 }
 
-// 9.3.1 UNIFIED ESCALATION: não reinicia source_only/contrastive cegamente.
+// 9.4.0 UNIFIED ESCALATION: não reinicia source_only/contrastive cegamente.
 // A ledger por cue + família de blocker sabe o que já foi tentado. Se houver uma
 // estratégia realmente nova (beam/constrained), ela pode entrar; repetição não.
 if (finalClosure898.gender > 0) {
@@ -20562,10 +20667,10 @@ if (finalClosure898.gender > 0) {
     if (!genderResidual928.length) break;
     const eligible928 = eligibleForStrategy928(job, genderResidual928, strategy928);
     if (!eligible928.length) {
-      console.log(`[UNIFIED ESCALATION 9.3.1][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
+      console.log(`[UNIFIED ESCALATION 9.4.0][GENDER] strategy=${strategy928} já esgotada; skip sem chamada. ✅`);
       continue;
     }
-    console.warn(`[UNIFIED ESCALATION 9.3.1][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
+    console.warn(`[UNIFIED ESCALATION 9.4.0][GENDER] strategy=${strategy928} | eligible=${eligible928.length}.`);
     if (strategy928 === "candidate_beam") {
       finalTranslations = await runCandidateBeam928(
         blocks, finalTranslations, eligible928, plan, job, { requireGenderZero: true }
@@ -20587,7 +20692,7 @@ if (finalClosure898.gender > 0) {
   finalClosure898 = finalClosureResidualSummary898(blocks, finalTranslations, job.filename, plan);
 }
 
-// 9.3.1 POST-CLOSURE FOCAL REAUDIT.
+// 9.4.0 POST-CLOSURE FOCAL REAUDIT.
 // finalTargetResidual927 foi medido antes do Gender Target Gate / deterministic closure.
 // Se algum desses cues mudou depois, a evidência antiga ficou stale. Reaudita UMA vez
 // somente esses IDs alterados; cues intocados mantêm o veredito anterior sem custo extra.
@@ -20605,7 +20710,7 @@ if (Array.isArray(job.finalTargetResidual927) && job.finalTargetResidual927.leng
   }
 
   if (changedResidualIds9210.size) {
-    console.log(`[POST-CLOSURE VERIFY 9.3.1] residual antigo=${job.finalTargetResidual927.length} | cues realmente alterados=${changedResidualIds9210.size}; UMA reauditoria focal HIGH.`);
+    console.log(`[POST-CLOSURE VERIFY 9.4.0] residual antigo=${job.finalTargetResidual927.length} | cues realmente alterados=${changedResidualIds9210.size}; UMA reauditoria focal HIGH.`);
     const postResidual9210 = await auditTargetSet927(
       blocks, finalTranslations, changedResidualIds9210, plan, job, "post-closure-9210"
     );
@@ -20615,9 +20720,9 @@ if (Array.isArray(job.finalTargetResidual927) && job.finalTargetResidual927.leng
     job.finalTargetResidualSnapshot9210 = new Map(
       job.finalTargetResidual927.map(issue => [Number(issue?.id), String(finalTranslations.get(Number(issue?.id)) || "")])
     );
-    console.log(`[POST-CLOSURE VERIFY 9.3.1] residual atualizado=${job.finalTargetResidual927.length}. ${job.finalTargetResidual927.length ? "⛔ selo continua bloqueado" : "✅ evidência stale eliminada"}`);
+    console.log(`[POST-CLOSURE VERIFY 9.4.0] residual atualizado=${job.finalTargetResidual927.length}. ${job.finalTargetResidual927.length ? "⛔ selo continua bloqueado" : "✅ evidência stale eliminada"}`);
   } else {
-    console.log(`[POST-CLOSURE VERIFY 9.3.1] nenhum cue residual mudou após a verificação anterior; 0 chamada QA repetida. ✅`);
+    console.log(`[POST-CLOSURE VERIFY 9.4.0] nenhum cue residual mudou após a verificação anterior; 0 chamada QA repetida. ✅`);
   }
 }
 
@@ -20627,7 +20732,7 @@ if (finalClosure898.gender > 0) {
   console.error(`[GENDER FINAL GATE 9.2.5] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro SERÁ entregue; selo canônico bloqueado e cache PROVISIONAL será usado.`);
 }
 console.log(
-  `[FINAL CLOSURE 9.3.1] layout=${finalClosure898.layout} | ` +
+  `[FINAL CLOSURE 9.4.0] layout=${finalClosure898.layout} | ` +
   `gender=${finalClosure898.gender} | ownership=${finalClosure898.ownership} | ` +
   `broadcast=${finalClosure898.broadcast} | repetition=${finalClosure898.repetition} | ` +
   `censor=${finalClosure898.censor} | ownership-gate-residual=${Number(job.ownershipFinalResidual900 || 0)} ` +
@@ -20689,14 +20794,14 @@ auditTimestamps(
     Number(job.ownershipFinalResidual900 || 0) === 0;
 
   if (finalHardClosureClean931 && semanticResidual927 === 0) {
-    // 9.3.1: noCacheFinal923 may have been raised by an earlier candidate that
+    // 9.4.0: noCacheFinal923 may have been raised by an earlier candidate that
     // was later repaired. A fresh FINAL closure is the only authority allowed
     // to clear that stale flag. This prevents FINAL_PASS from being persisted
     // as PROVISIONAL and avoids useless full retranslations on the next play.
     job.noCacheFinal923 = false;
     job.qualityStatus = "final_pass";
     console.log(
-      `[PIPELINE 9.3.1 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.4.0 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -20708,7 +20813,7 @@ auditTimestamps(
     );
   } else {
     console.warn(
-      `[PIPELINE 9.3.1 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
+      `[PIPELINE 9.4.0 ROUTED] SERVE BEST AVAILABLE + PROVISIONAL | ${blocks.length} source cues | ` +
       `gender-residual=${finalClosure898.gender} | semantic-residual=${semanticResidual927} | ` +
       `closure-clean=${finalHardClosureClean931 ? "sim" : "não"} | ` +
       `pipeline=${pipelineElapsedSeconds.toFixed(1)}s | job-total=${jobElapsedSeconds.toFixed(1)}s. FINAL OK bloqueado.`
@@ -20783,10 +20888,10 @@ async function processJob(
       // residual as canonical. Such results are served but never cached.
       if (!job.noCacheFinal923) {
         setCache(job.cacheKey, finalSrt, job);
-        console.log(`[CACHE 9.3.1] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
+        console.log(`[CACHE 9.4.0] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
       } else {
         setProvisionalCache927(job.cacheKey, finalSrt, job, "best_available");
-        console.warn(`[CACHE 9.3.1] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
+        console.warn(`[CACHE 9.4.0] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
       }
 
       job.result = finalSrt;
@@ -20817,7 +20922,7 @@ async function processJob(
       // own bounded strategy escalation. Preserve and deliver the best known result.
       if (job.safeDraft && Number(job.progress || 0) >= 92) {
         console.warn(
-          `[DELIVERY GUARANTEE 9.3.1] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
+          `[DELIVERY GUARANTEE 9.4.0] falha tardia após SAFE DRAFT; full-job restart proibido. ` +
           `Melhor candidato será entregue/provisionado | ${errorMessage(error).slice(0,320)}`
         );
         break;
@@ -20874,7 +20979,7 @@ async function processJob(
     null;
 
   if (deliveryCandidate927) {
-    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.3.1", job);
+    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-GUARANTEE-9.4.0", job);
     job.result = deliveryCandidate927;
     job.status = "completed";
     job.progress = 100;
@@ -20885,7 +20990,7 @@ async function processJob(
     setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "best_available_technical");
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
     console.warn(
-      `[DELIVERY GUARANTEE 9.3.1] cloud/estratégias encerradas sem selo canônico; ` +
+      `[DELIVERY GUARANTEE 9.4.0] cloud/estratégias encerradas sem selo canônico; ` +
       `melhor candidato íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) ` +
       `foi ENTREGUE e preservado como PROVISIONAL. Job não foi morto. ✅ | ${errorMessage(lastJobError).slice(0,360)}`
     );
@@ -21749,6 +21854,7 @@ async function localTranslateHandler(
 }
 
 
+const TIMING_COMPACT_VARIANTS_940 = 3;
 const TIMING_COMPACT_SCHEMA_928 = {
   type: "object",
   additionalProperties: false,
@@ -21760,9 +21866,9 @@ const TIMING_COMPACT_SCHEMA_928 = {
         additionalProperties: false,
         properties: {
           i: { type: "integer" },
-          pt: { type: "string" }
+          candidates: { type: "array", minItems: TIMING_COMPACT_VARIANTS_940, maxItems: TIMING_COMPACT_VARIANTS_940, items: { type: "string" } }
         },
-        required: ["i", "pt"]
+        required: ["i", "candidates"]
       }
     }
   },
@@ -21780,10 +21886,10 @@ const TIMING_COMPACT_AUDIT_SCHEMA_928 = {
         additionalProperties: false,
         properties: {
           i: { type: "integer" },
-          ok: { type: "boolean" },
+          chosen_index: { type: "integer" },
           reason: { type: "string" }
         },
-        required: ["i", "ok", "reason"]
+        required: ["i", "chosen_index", "reason"]
       }
     }
   },
@@ -21900,18 +22006,19 @@ async function timingAwareCompactSurgery928(items) {
     };
   });
 
-  // 9.3.1: batches de geração são pequenos DESDE O INÍCIO. Nunca esperamos um
-  // JSON gigante quebrar para então abrir dezenas de microchamadas.
+  // 9.4.0: 3 alternativas distintas são geradas NA MESMA chamada por parent.
+  // Isso aumenta a chance de caber com fidelidade sem criar retries/micro-loops.
   const generationGroups = chunks9210(protectedItems, 24);
   const generationResults = await runBoundedTasks9210(generationGroups.map(group => async () => {
     const response = await geminiRequest({
       system:`Você faz TIMING-AWARE COMPACT SURGERY de legendas SOURCE→PT-BR.\n`+
         `A janela disponível foi medida no áudio real e NÃO pode ser aumentada movendo START.\n`+
-        `Reescreva somente a FORMA do PT para caber fisicamente na janela, preservando 100% do significado, negação, referente, predicado, identidade, ownership, força pragmática, nomes e hard_locks.\n`+
-        `Não invente, não resuma informação essencial, não mova conteúdo entre cues, não altere timestamps.\n`+
-        `PT-BR natural. No máximo 2 linhas de 50 caracteres. Se impossível sem perda semântica, devolva current_pt inalterado.`,
+        `Para CADA cue, gere EXATAMENTE ${TIMING_COMPACT_VARIANTS_940} alternativas diferentes e concisas, ordenadas da mais fiel/natural para a mais agressiva.\n`+
+        `Todas devem preservar 100% do significado, negação, referente, predicado/ação, identidade, ownership, força pragmática, nomes e hard_locks.\n`+
+        `Não invente, não mova conteúdo entre cues, não altere timestamps. PT-BR natural, máximo 2x50.\n`+
+        `Se não houver forma segura de reduzir, repita current_pt nas alternativas necessárias.`,
       user:JSON.stringify({cues:group}), schema:TIMING_COMPACT_SCHEMA_928,
-      thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:TIMING_COMPACT_MAX_OUTPUT_TOKENS_928,
+      thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:22000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"repair"
     });
@@ -21922,35 +22029,45 @@ async function timingAwareCompactSurgery928(items) {
   for (const result of generationResults) {
     if (result?.error) continue;
     for (const x of (Array.isArray(result)?result:[])) {
-      const id=Number(x?.i), pt=String(x?.pt || "").trim();
-      if (Number.isInteger(id) && pt) returned.set(id,pt);
+      const id=Number(x?.i);
+      const variants=Array.isArray(x?.candidates)?x.candidates.map(v=>String(v||"").trim()).filter(Boolean):[];
+      if (Number.isInteger(id) && variants.length) returned.set(id,variants);
     }
   }
 
   const candidates=[];
   for (const item of clean) {
-    let candidate=returned.get(item.i)||"";
-    if(!candidate) continue;
-    try { candidate=restoreCulturalLocks(candidate,locksById.get(item.i)||[],item.i); } catch { continue; }
-    const block={index:item.i,text:item.source};
-    candidate=sanitizeFinalCue(block,candidate)||sanitizeFallbackCue(candidate)||candidate;
-    const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
-    const layout=layoutCueResult(block,candidate);
-    if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
-    candidates.push({...item,candidate});
+    const rawVariants=returned.get(item.i)||[];
+    const safe=[]; const seen=new Set();
+    for (const raw of rawVariants) {
+      let candidate=String(raw||"").trim();
+      if(!candidate) continue;
+      try { candidate=restoreCulturalLocks(candidate,locksById.get(item.i)||[],item.i); } catch { continue; }
+      const block={index:item.i,text:item.source};
+      candidate=sanitizeFinalCue(block,candidate)||sanitizeFallbackCue(candidate)||candidate;
+      const key=semanticTextKey940(candidate);
+      if(!key || seen.has(key) || key===semanticTextKey940(item.pt)) continue;
+      seen.add(key);
+      const regressions=repairCandidateRegressionReasons(block,item.pt,candidate,"",null);
+      const layout=layoutCueResult(block,candidate);
+      if(regressions.length||!layout.fits||layout.lines>LAYOUT_MAX_LINES||!timingCompactFitsWindow928(candidate,item.availableDisplayMs)) continue;
+      safe.push(candidate);
+    }
+    if(safe.length) candidates.push({...item,variants:safe.slice(0,TIMING_COMPACT_VARIANTS_940)});
   }
   if(!candidates.length) return clean.map(item=>({i:item.i,pt:item.pt,changed:false,verified:false}));
 
-  // Auditoria independente HIGH em grupos de 16. O budget de saída é grande
-  // o suficiente para os thought tokens não estrangularem o JSON final.
+  // Auditoria independente escolhe UMA das alternativas já validadas localmente.
+  // Mesmo número de itens de auditoria do 9.3.1; não há round extra.
   const auditGroups=chunks9210(candidates,16);
   const auditResults=await runBoundedTasks9210(auditGroups.map(group=>async()=>{
     const response=await geminiRequest({
-      system:`Você é o auditor final de Meaning Integrity de uma compactação PT-BR.\n`+
-        `Compare SOURCE, BEFORE_PT e CANDIDATE_PT. ok=true SOMENTE se CANDIDATE_PT preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e não inventar conteúdo.\n`+
+      system:`Você é o auditor final de Meaning Integrity de compactações PT-BR.\n`+
+        `Para cada item, compare SOURCE, BEFORE_PT e cada CANDIDATE_PT.\n`+
+        `chosen_index deve ser o índice 0-based da PRIMEIRA candidata totalmente segura, ou -1 se nenhuma preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e conteúdo.\n`+
         `Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
-      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pt:x.candidate,before:x.before,after:x.after}))}),
-      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:9000,
+      user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after}))}),
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
     });
@@ -21961,17 +22078,21 @@ async function timingAwareCompactSurgery928(items) {
   for(const result of auditResults){
     if(result?.error) continue;
     for(const x of (Array.isArray(result)?result:[])){
-      const id=Number(x?.i);
-      if(Number.isInteger(id)&&typeof x?.ok==="boolean") auditById.set(id,x);
+      const id=Number(x?.i), chosen=Number(x?.chosen_index);
+      if(Number.isInteger(id)&&Number.isInteger(chosen)) auditById.set(id,{...x,chosen_index:chosen});
     }
   }
   const candidateById=new Map(candidates.map(x=>[x.i,x]));
   const out=clean.map(item=>{
     const c=candidateById.get(item.i), a=auditById.get(item.i);
-    if(c&&a?.ok===true) return {i:item.i,pt:c.candidate,changed:c.candidate!==item.pt,verified:true};
+    const idx=Number(a?.chosen_index);
+    if(c&&Number.isInteger(idx)&&idx>=0&&idx<c.variants.length){
+      const chosen=c.variants[idx];
+      return {i:item.i,pt:chosen,changed:chosen!==item.pt,verified:true};
+    }
     return {i:item.i,pt:item.pt,changed:false,verified:false,reason:String(a?.reason||"semantic_audit_not_passed").slice(0,240)};
   });
-  console.log(`[TIMING COMPACT 9.3.1] generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
+  console.log(`[TIMING COMPACT 9.4.0] variants=${TIMING_COMPACT_VARIANTS_940} | generation=${generationGroups.length} batch(es) | audit=${auditGroups.length} batch(es) | verified=${out.filter(x=>x.verified).length}/${clean.length} | recursive-micro=0.`);
   return out;
 }
 
@@ -21996,7 +22117,7 @@ app.post(
     )
 );
 
-// 9.3.1 — compactação semântica acionada somente por impossibilidade física
+// 9.4.0 — compactação semântica acionada somente por impossibilidade física
 // comprovada pela geometria final local. Render NÃO recebe nem devolve timestamps.
 app.post(
   "/api/timing-compact",
@@ -22005,10 +22126,10 @@ app.post(
     try{
       const items=Array.isArray(req.body?.items)?req.body.items:[];
       const compacted=await timingAwareCompactSurgery928(items);
-      console.log(`[TIMING COMPACT API 9.3.1] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
-      return safeJson(res,{ok:true,version:"9.3.1",items:compacted});
+      console.log(`[TIMING COMPACT API 9.4.0] received=${items.length} | verified=${compacted.filter(x=>x?.verified===true).length} | changed=${compacted.filter(x=>x?.changed===true).length}.`);
+      return safeJson(res,{ok:true,version:"9.4.0",items:compacted});
     }catch(error){
-      console.error(`[TIMING COMPACT API 9.3.1] ${errorMessage(error).slice(0,500)}`);
+      console.error(`[TIMING COMPACT API 9.4.0] ${errorMessage(error).slice(0,500)}`);
       return safeJson(res,{error:errorMessage(error)},500);
     }
   }
@@ -22608,7 +22729,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.3.1 - FAST CONSOLIDATED PIPELINE + FAIL-CLOSED DELIVERY"
+        " STREMIO PT-BR 9.4.0 - INVARIANT CORE + FAST FAIL-CLOSED DELIVERY"
   );
 
   console.log(
@@ -22862,7 +22983,7 @@ console.log(
     `Job Liveness 8.4.6: até ${JOB_MAX_ATTEMPTS} tentativa(s); SAFE DRAFT íntegro encerra falha tardia; zero processing eterno ✅`
   );
   console.log("Final 9.0: pipeline bounded preservado; HARD SDH + neutral gender + router multimodelo ✅");
-  console.log("MAIN 9.0: 3.1 Flash-Lite MEDIUM + checkpoint por lote + fallback sem reiniciar o episódio ✅");
+  console.log("MAIN 9.4.0 runtime: 3.5 Flash-Lite MEDIUM primeiro; 3.1 é fallback; checkpoint por lote preservado ✅");
   console.log("MAIN Fail-Fast 9.0: erro determinístico não vira loop; payload adaptativo + rescue focal ✅");
   console.log("Final Bounded 9.0: zero loop aberto; auditoria/repair continuam focais e com fallback ✅");
   console.log("Semantic Sync API preservada para OpenSub; Embedded 2.6 não depende dela ✅");
@@ -22870,8 +22991,8 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-  console.log("Fast Escalation 9.3.1: no máximo source_only + candidate_beam; sem 4 estratégias em cascata ✅");
-  console.log("Timing Compact 9.3.1: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
+  console.log("Fast Escalation 9.4.0: no máximo source_only + candidate_beam; sem 4 estratégias em cascata ✅");
+  console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
     "Multilingual Audio-Sync API: /api/sync-align + /api/sync-proxy + language-aware Transcribe ATIVOS ✅"
@@ -22925,7 +23046,7 @@ console.log(
   );
 
   console.log(
-    "Model Router 9.2: MAIN=3.1 MEDIUM -> 3.5; QA/Repair=3.1 HIGH -> 3.5 HIGH; 3.7/3.8 fora do projeto ✅"
+    "Model Router 9.4.0: MAIN/QA/Repair usam 3.5 primeiro; 3.1 somente fallback; 3.7/3.8 fora do projeto ✅"
   );
 
   console.log(
@@ -23025,9 +23146,12 @@ console.log(
   console.log(
     "Gender Lock 9.1: proteções de gênero preservadas integralmente; ambiguidade humana continua fail-closed ✅"
   );
-  console.log("Post-Closure Verify 9.3.1: residual stale re-auditado uma vez somente nos cues alterados ✅");
-  console.log("Call Budget 9.3.1: Ownership local <=36 cues; Repair fallback <=2 batches; Timing Compact sem micro-loop ✅");
-  console.log("Canonical Cache Closure 9.3.1: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
+  console.log("Post-Closure Verify 9.4.0: residual stale re-auditado uma vez somente nos cues alterados ✅");
+  console.log("Call Budget 9.4.0: Ownership local <=36 cues; Repair fallback <=2 batches; Timing Compact sem micro-loop ✅");
+  console.log("Canonical Cache Closure 9.4.0: FINAL fresco limpa noCache stale somente com todos os guards zerados ✅");
+  console.log("Semantic Authority 9.4.0: auditoria HIGH invalida Repair Persistence reprovado; strategy lock só nasce após QA limpa ✅");
+  console.log("Target JSON Budget 9.4.0: source-only/candidate-beam com budget anti-truncamento + Candidate Beam salvage sem retry ✅");
+  console.log("Timing Compact Beam 9.4.0: 3 alternativas por parent na mesma chamada; auditor escolhe 1; zero micro-loop ✅");
 
   console.log(
     "Status: ONLINE"
