@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.1 - QUALITY CLOSURE + SINGLE REPAIR + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -40,7 +40,7 @@ const ROUTER_TRANSIENT_COOLDOWN_MS_942 = 10000;
 const ROUTER_RECOVERY_WAIT_MAX_MS_942 = 18000;
 
 const CACHE_VERSION =
-  "9.4.3-bounded-specialist-first-v1";
+  "9.7.1-quality-closure-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -3113,6 +3113,74 @@ function stripPseudoMusicOcrWrappers(value) {
   return text;
 }
 
+// ============================================================
+// SOURCE CORRUPTION GATE 9.7.1 — OCR / PSEUDO-LYRIC DAMAGE
+// ============================================================
+// Alguns releases trazem símbolos musicais/OCR quebrados como barras no meio
+// de palavras (be/is, eve/y, ho/io'ay/) e apóstrofos órfãos. O MAIN não deve
+// "traduzir" esse lixo. O detector é deliberadamente conservador: uma barra
+// normal (and/or, 24/7, datas) não basta.
+function looksLikeCorruptedSourceOcr971(value) {
+  const text = String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\{\\[^}]+\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return false;
+
+  const slashCount = (text.match(/[\\/]/g) || []).length;
+  const embeddedSplits = (text.match(/[\p{L}][\\/](?=\p{L})/gu) || []).length;
+  const shortSlashFragments = (text.match(/\b\p{L}{1,6}[\\/]\p{L}{1,8}\b/gu) || []).length;
+  const tinySlashFragment = /(?:\b\p{L}{2,}[\\/]\p{L}\b|\b\p{L}[\\/]\p{L}{2,}\b)/u.test(text);
+  const trailingSlash = /[\\/]\s*$/u.test(text);
+  const orphanApostrophe = (text.match(/\b\p{L}{1,6}['’](?=\s|$)/gu) || []).length;
+  const letterCount = (text.match(/\p{L}/gu) || []).length;
+
+  if (slashCount >= 2 && (embeddedSplits + shortSlashFragments >= 1 || trailingSlash)) {
+    return true;
+  }
+
+  if (trailingSlash && orphanApostrophe >= 1 && letterCount >= 6) {
+    return true;
+  }
+
+  if (tinySlashFragment && letterCount >= 6) {
+    return true;
+  }
+
+  return false;
+}
+
+function rawBlockHasCorruptedSourceOcr971(raw) {
+  const lines = String(raw || "").trim().split("\n");
+  const timingIndex = lines.findIndex(line => /-->/.test(line));
+  if (timingIndex < 0) return false;
+  const textLines = lines.slice(timingIndex + 1);
+  return (
+    textLines.some(looksLikeCorruptedSourceOcr971) ||
+    looksLikeCorruptedSourceOcr971(textLines.join(" "))
+  );
+}
+
+function corruptedSourceOcrCluster971(rawBlocks) {
+  const direct = new Set();
+  for (let i = 0; i < rawBlocks.length; i++) {
+    if (rawBlockHasCorruptedSourceOcr971(rawBlocks[i])) direct.add(i);
+  }
+
+  // Um cue isolado entre dois cues OCR-corrompidos pertence ao mesmo cluster.
+  // Isso captura uma linha intermediária aparentemente legível sem apagar
+  // diálogo normal ao redor de um único falso positivo.
+  const expanded = new Set(direct);
+  for (let i = 1; i + 1 < rawBlocks.length; i++) {
+    if (!direct.has(i) && direct.has(i - 1) && direct.has(i + 1)) {
+      expanded.add(i);
+    }
+  }
+  return expanded;
+}
+
 function looksLikeSourceGarbageLine(value) {
   const text = String(value || "")
     .replace(/<[^>]+>/g, "")
@@ -3121,6 +3189,8 @@ function looksLikeSourceGarbageLine(value) {
     .trim();
 
   if (!text) return true;
+
+  if (looksLikeCorruptedSourceOcr971(text)) return true;
 
   if (/^(?:f{2,4})$/iu.test(text)) return true;
 
@@ -4613,6 +4683,9 @@ function cleanSrtForTranslation(
       )
       .filter(Boolean);
 
+  const corruptedSourceOcrIndexes971 =
+    corruptedSourceOcrCluster971(rawBlocks);
+
   const {
     keep:
       performanceMusicIndexes
@@ -4632,6 +4705,7 @@ function cleanSrtForTranslation(
   let performanceLyricLinesKept = 0;
   let nonSemanticMusicVocalizationsRemoved = 0;
   let pureVocalizationsRemoved = 0;
+  let corruptedSourceOcrCuesRemoved971 = 0;
 
   for (
     let rawIndex = 0;
@@ -4643,6 +4717,12 @@ function cleanSrtForTranslation(
       rawBlocks[
         rawIndex
       ];
+
+    if (corruptedSourceOcrIndexes971.has(rawIndex)) {
+      removed++;
+      corruptedSourceOcrCuesRemoved971++;
+      continue;
+    }
 
     const lines =
       raw
@@ -4876,6 +4956,8 @@ function cleanSrtForTranslation(
       speakerHintsSuppressedMultiTurn
     }; bleepCues=${
       bleepCues
+    }; OCR-corrupt-cues=${
+      corruptedSourceOcrCuesRemoved971
     }.`
   );
 
@@ -6652,6 +6734,12 @@ NATURALIDADE PT-BR 2026 — REGRA DE ACEITAÇÃO
 
 NATURALNESS LOCK — REGRA INVIOLÁVEL
 - TRADUÇÃO LITERAL QUE SOA TRADUZIDA É TRADUÇÃO ERRADA, mesmo quando a gramática e o significado básico estiverem corretos.
+- ADVÉRBIO NÃO É APARÊNCIA: modo/intensidade (badly, deeply, strongly etc.) não pode virar adjetivo visual como "feio".
+- ATRIBUTOS COORDENADOS: se a SOURCE diz X E Y (soft and wide, warm and kind etc.), preserve as duas propriedades salvo redundância real em PT-BR.
+- MARCADOR IDIOMÁTICO: traduza a FUNÇÃO de believe it or not / as a matter of fact / by the way etc.; não troque por outro marcador de sentido diferente.
+- REGISTRO: se a SOURCE não tem palavrão/bleep nem força tabu equivalente, não aumente a vulgaridade do PT.
+- FIDELIDADE LEXICAL NÃO AUTORIZA CALQUE: pessoa "warm" raramente é "calorosa" por reflexo automático; escolha a intenção humana do contexto.
+- Se a SOURCE estiver visivelmente corrompida por OCR/símbolos, NÃO invente uma interpretação fluente para o lixo.
 - Fidelidade NÃO significa preservar sintaxe, ordem de palavras, verbo, substantivo ou metáfora do inglês.
 - Fidelidade significa preservar o que a pessoa QUER DIZER, o efeito social da fala, a emoção e a personalidade.
 - Antes de devolver o pt, imagine que a pessoa da cena é brasileira e está dizendo espontaneamente a mesma coisa. Escreva essa fala.
@@ -7086,7 +7174,14 @@ ${STYLE_PACK}
 Você receberá somente cues sinalizados por detectores locais e/ou pelo QA PT-BR.
 
 NATURALNESS REPAIR
-- Se o motivo incluir QA_PTBR, LITERAL, FALSE_COGNATE, IDIOM, UNNATURAL ou SUBTITLE_TOO_DENSE, não faça uma correção superficial.
+- Se o motivo incluir QA_PTBR, LITERAL, FALSE_COGNATE, IDIOM, UNNATURAL, MEANING_INTEGRITY ou SUBTITLE_TOO_DENSE, não faça uma correção superficial.
+- Preserve TODOS os atributos coordenados e advérbios de modo/intensidade; não converta "badly" em aparência nem apague uma propriedade de "X and Y".
+- Marcadores idiomáticos devem manter a mesma função discursiva, não apenas soar naturais isoladamente.
+- Se a SOURCE não contém palavrão/bleep nem força tabu equivalente, remova escalada vulgar inventada no PT.
+- Se o PT está lexicalmente correto mas calcado (pessoa warm=calorosa, replace it with love=substituí-la por amor etc.), reconstrua a intenção em português brasileiro espontâneo.
+- Nunca tente "salvar" texto SOURCE obviamente corrompido inventando significado.
+- Se há dois speakers/turnos na SOURCE, devolva dois turnos explícitos na mesma ordem.
+- Se o motivo incluir script misto/Unicode, devolva somente caracteres normais do PT-BR, exceto nomes estrangeiros genuínos presentes na SOURCE.
 - Remova filler, falso começo e repetição mecânica quando não carregarem intenção; preserve repetição deliberada/emocional.
 - Você NÃO vê o vídeo: não invente arma, objeto, pessoa ou ação visual que SOURCE + contexto textual não sustentem.
 - Releia EN + contexto + Character Ledger e reconstrua a fala em PT-BR espontâneo.
@@ -7204,6 +7299,15 @@ TESTE DE CALQUE:
 - Tente mentalmente reconstruir o inglês olhando apenas o PT.
 - Se a estrutura, metáfora, colocação ou ordem das ideias denunciar demais a frase inglesa, sinalize.
 - Não exija equivalência lexical quando a intenção pede localização.
+
+QUALITY CLOSURE 9.7.1 — SINALIZE TAMBÉM:
+- advérbio de modo/intensidade transformado em aparência/qualidade diferente;
+- qualquer atributo coordenado, negação, quantidade, referente ou relação perdido;
+- marcador idiomático trocado por outro de sentido diferente;
+- palavrão forte criado sem força equivalente na SOURCE;
+- PT gramatical porém calcado (inclusive adjetivos pessoais, pronomes oblíquos artificiais e colocação inglesa);
+- diálogo de dois speakers fundido ou ordem de turnos alterada;
+- lixo OCR, caracteres de script misto ou texto sem sentido sobrevivendo ao PT.
 
 TESTE DE ORALIDADE:
 - Leia mentalmente a frase em voz alta.
@@ -13081,6 +13185,16 @@ function hasExtendedVocalization(
   );
 }
 
+function sourceHasExplicitProfanity971(value) {
+  const text = String(value || "").toLocaleLowerCase();
+  if (text.includes(BLEEP_TOKEN.toLocaleLowerCase())) return true;
+  return /\b(?:fuck(?:ed|ing|er|ers)?|shit(?:ty)?|bullshit|bitch(?:es)?|asshole|motherfucker|cunt|dick|cock|pussy|bastard|goddamn|damn)\b/iu.test(text);
+}
+
+function targetHasStrongProfanity971(value) {
+  return /\b(?:porra|caralho|foda-se|foder|fodido|puta\s+que\s+pariu|merda|cu|pau)\b/iu.test(String(value || ""));
+}
+
 function literalCalqueReasons(
   en,
   pt
@@ -13273,6 +13387,50 @@ function literalCalqueReasons(
     reasons.push(
       "IDIOM_UNDER_THE_WEATHER_LITERAL"
     );
+  }
+
+  // 9.7.1 — regressões reais observadas são convertidas em regras linguísticas
+  // universais, nunca em hardcode por título/cue.
+  if (
+    /\b(?:hurt|injur(?:e|ed)|wound(?:ed)?)\b[^.!?]{0,35}\bbadly\b|\bbadly\b[^.!?]{0,35}\b(?:hurt|injur(?:e|ed)|wound(?:ed)?)\b/i.test(source) &&
+    /\bfei[oa]s?\b/iu.test(target)
+  ) {
+    reasons.push("MEANING_INTEGRITY_BADLY_AS_APPEARANCE");
+  }
+
+  if (
+    /\bbelieve\s+it\s+or\s+not\b/i.test(source) &&
+    /\bquerendo\s+ou\s+n[aã]o\b/iu.test(target)
+  ) {
+    reasons.push("MEANING_INTEGRITY_IDIOM_BELIEVE_IT_OR_NOT");
+  }
+
+  if (
+    /\b(?:you|he|she|they|we|i)\s+(?:was|were|am|is|are)\s+warm\b/i.test(source) &&
+    /\bcaloros[oa]s?\b/iu.test(target)
+  ) {
+    reasons.push("LITERALITY_PERSON_WARM_CALOROSO");
+  }
+
+  if (
+    /\breplace\s+(?:it|this|that)\s+with\s+love\b/i.test(source) &&
+    /\bsubstitu\p{L}{0,8}\b[^.!?]{0,24}\bpor\s+amor\b/iu.test(target)
+  ) {
+    reasons.push("LITERALITY_REPLACE_WITH_LOVE");
+  }
+
+  if (
+    /\bsoft\b[^.!?]{0,40}\bwide\b|\bwide\b[^.!?]{0,40}\bsoft\b/i.test(source) &&
+    !/\b(?:larg[oa]s?|ampl[oa]s?|abert[oa]s?|espa[cç]os[oa]s?)\b/iu.test(target)
+  ) {
+    reasons.push("MEANING_INTEGRITY_COORDINATED_ATTRIBUTE_LOSS");
+  }
+
+  if (
+    !sourceHasExplicitProfanity971(source) &&
+    targetHasStrongProfanity971(target)
+  ) {
+    reasons.push("MEANING_INTEGRITY_PROFANITY_ESCALATION");
   }
 
   return reasons;
@@ -14210,7 +14368,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
     !isGenderGrammaticalAdvisory970(reason) &&
-    /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -15169,8 +15327,44 @@ function applyDeterministicGenderNeutrality(block, value) {
   return pt.replace(/[ \t]{2,}/g, " ").trim();
 }
 
+const PTBR_CYRILLIC_CONFUSABLES_971 = Object.freeze({
+  "а": "a", "А": "A",
+  "е": "e", "Е": "E",
+  "о": "o", "О": "O",
+  "р": "p", "Р": "P",
+  "с": "c", "С": "C",
+  "х": "x", "Х": "X",
+  "і": "i", "І": "I",
+  "ј": "j", "Ј": "J"
+});
+
+function normalizePtbrMixedScript971(value) {
+  const chars = [...String(value || "")];
+  const isLatin = ch => Boolean(ch && /\p{Script=Latin}/u.test(ch));
+
+  for (let i = 0; i < chars.length; i++) {
+    const replacement = PTBR_CYRILLIC_CONFUSABLES_971[chars[i]];
+    if (!replacement) continue;
+
+    const prev = chars[i - 1] || "";
+    const next = chars[i + 1] || "";
+    if (isLatin(prev) || isLatin(next)) {
+      chars[i] = replacement;
+    }
+  }
+
+  return chars.join("");
+}
+
+function hasMixedScriptToken971(value) {
+  const tokens = String(value || "").match(/[\p{L}\p{M}]+/gu) || [];
+  return tokens.some(token =>
+    /\p{Script=Latin}/u.test(token) && /\p{Script=Cyrillic}/u.test(token)
+  );
+}
+
 function applyDeterministicOrthography(value) {
-  return String(value || "")
+  return normalizePtbrMixedScript971(String(value || ""))
     .replace(/\bemituiu\b/giu, "emitiu")
     .replace(/\bAgüenta\b/gu, "Aguenta")
     .replace(/\bagüenta\b/gu, "aguenta")
@@ -15287,6 +15481,10 @@ function localReasonsForCue(
     reasons.push(
       "FINAL_GARBAGE_OR_PLACEHOLDER"
     );
+  }
+
+  if (hasMixedScriptToken971(translated)) {
+    reasons.push("FINAL_MIXED_SCRIPT_CONFUSABLE");
   }
 
   for (
@@ -16910,7 +17108,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-9]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-9]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -18996,7 +19194,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -20177,7 +20375,7 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
 function finalIssueWeight927(issue) {
   const reasons = (issue?.reasons || []).map(x => String(x || ""));
   const joined = reasons.join(" | ");
-  if (/GENDER|MEANING_INTEGRITY|NEGATION|CUE_OWNERSHIP|OMISSION|REFERENT|DIALOGUE|CENSOR|BLEEP|GARBAGE|EMPTY|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|REPETITION_LOST|IDENTITY/i.test(joined)) return 100;
+  if (/GENDER|MEANING_INTEGRITY|FINAL_MIXED_SCRIPT_CONFUSABLE|NEGATION|CUE_OWNERSHIP|OMISSION|REFERENT|DIALOGUE|CENSOR|BLEEP|GARBAGE|EMPTY|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|REPETITION_LOST|IDENTITY/i.test(joined)) return 100;
   if (/LITERALITY|FORCED_OR_DATED_SLANG|SUBTITLE_TOO_DENSE|POSSIBLE_UNTRANSLATED/i.test(joined)) return 25;
   return /FINAL_PRIORITY/i.test(joined) ? 60 : 40;
 }
@@ -20765,7 +20963,7 @@ const preSafeHardIssues = splitGenderSeverity970(
   ).map(issue => ({
     id: issue.id,
     reasons: (issue.reasons || []).filter(reason =>
-      /^(?:EMPTY|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
     )
   })).filter(issue => issue.reasons.length),
   job,
@@ -23798,7 +23996,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.0 - SINGLE REPAIR + DETERMINISTIC FINAL GATE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.1 - QUALITY CLOSURE + SINGLE REPAIR | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -24060,6 +24258,7 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
+  console.log("Quality Closure 9.7.1: OCR-corrupt SOURCE + semantic fidelity + profanity escalation + mixed-script Unicode gates | ZERO rodada cloud extra ✅");
   console.log("Semantic Repair Budget 9.7.0: UMA rodada consolidada após PRE-AUDIT; Ownership não reescreve fora dela; pós-Repair cloud=0 ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
