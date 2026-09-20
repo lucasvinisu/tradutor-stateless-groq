@@ -20,7 +20,7 @@ const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim()
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 
 // ============================================================
-// BRIDGE GATEWAY 1.0 — endereço público estável sem domínio próprio
+// BRIDGE GATEWAY 1.1 — endereço público estável por redirect, sem domínio próprio
 // ============================================================
 const BRIDGE_GATEWAY_TTL_MS = 3 * 60 * 1000;
 const BRIDGE_GATEWAY_PUBLIC_KEY = crypto
@@ -56,7 +56,7 @@ function normalizeBridgeGatewayUrl(value) {
     throw new Error("Bridge Gateway aceita somente HTTPS.");
   }
   if (!parsed.hostname.toLowerCase().endsWith(".trycloudflare.com")) {
-    throw new Error("Bridge Gateway 1.0 aceita somente Quick Tunnel trycloudflare.com.");
+    throw new Error("Bridge Gateway 1.1 aceita somente Quick Tunnel trycloudflare.com.");
   }
   if (parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) {
     throw new Error("baseUrl inválida.");
@@ -68,36 +68,6 @@ function normalizeBridgeGatewayUrl(value) {
     throw new Error("baseUrl não pode conter query/hash.");
   }
   return `${parsed.protocol}//${parsed.host}`;
-}
-
-async function verifyBridgeGatewayTarget(baseUrl) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
-  try {
-    const response = await fetch(`${baseUrl}/manifest.json`, {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "Cache-Control": "no-cache",
-        "User-Agent": "stremio-ptbr-render-bridge-gateway/1.0"
-      },
-      signal: controller.signal
-    });
-    if (!response.ok) {
-      throw new Error(`manifest remoto HTTP ${response.status}`);
-    }
-    const data = await response.json();
-    if (
-      String(data?.id || "") !== "org.tradutor.gemini.sync.lab.embedded.v2staging" ||
-      !Array.isArray(data?.resources) ||
-      !data.resources.includes("subtitles")
-    ) {
-      throw new Error("manifest remoto não corresponde à Ponte PT-BR esperada.");
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 
@@ -22355,18 +22325,18 @@ app.get(
 );
 
 // ============================================================
-// BRIDGE GATEWAY 1.0 — gateway estável notebook + Samsung
+// BRIDGE GATEWAY 1.1 — gateway estável notebook + Samsung
+// Render NÃO faz fetch do Quick Tunnel: registra autenticado e redireciona o cliente.
 // ============================================================
 app.post(
   "/api/bridge/register",
-  async (req, res) => {
+  (req, res) => {
     if (!authorized(req)) {
       return safeJson(res, { error: "Unauthorized" }, 401);
     }
 
     try {
       const baseUrl = normalizeBridgeGatewayUrl(req.body?.baseUrl);
-      const remoteManifest = await verifyBridgeGatewayTarget(baseUrl);
       const now = Date.now();
 
       bridgeGatewayState.baseUrl = baseUrl;
@@ -22375,19 +22345,19 @@ app.post(
       bridgeGatewayState.lastOkAt = now;
 
       console.log(
-        `[BRIDGE GATEWAY 1.0] registrado ✅ | target=${baseUrl} | ` +
-        `ttl=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s.`
+        `[BRIDGE GATEWAY 1.1] registrado ✅ | target=${baseUrl} | ` +
+        `ttl=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s | mode=redirect.`
       );
 
       return safeJson(res, {
         ok: true,
         publicBase: bridgeGatewayPublicBase(),
         expiresInSeconds: Math.round(BRIDGE_GATEWAY_TTL_MS / 1000),
-        bridgeVersion: String(remoteManifest?.version || "")
+        mode: "redirect"
       });
     } catch (error) {
       console.warn(
-        `[BRIDGE GATEWAY 1.0] registro recusado | ${errorMessage(error).slice(0, 500)}`
+        `[BRIDGE GATEWAY 1.1] registro recusado | ${errorMessage(error).slice(0, 500)}`
       );
       return safeJson(res, { error: errorMessage(error) }, 400);
     }
@@ -22408,14 +22378,16 @@ app.get(
 
 app.use(
   "/bridge",
-  async (req, res) => {
+  (req, res) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       return safeJson(res, { error: "Method not allowed" }, 405);
     }
 
     try {
       const mountedPath = String(req.url || "/");
-      const pathOnly = mountedPath.split("?", 1)[0];
+      const queryIndex = mountedPath.indexOf("?");
+      const pathOnly = queryIndex === -1 ? mountedPath : mountedPath.slice(0, queryIndex);
+      const query = queryIndex === -1 ? "" : mountedPath.slice(queryIndex);
       const firstSlash = pathOnly.indexOf("/", 1);
       const suppliedKey = decodeURIComponent(
         firstSlash === -1 ? pathOnly.slice(1) : pathOnly.slice(1, firstSlash)
@@ -22432,35 +22404,19 @@ app.use(
         }, 503);
       }
 
-      const suffixStart = mountedPath.indexOf("/", 1);
-      const suffix = suffixStart === -1 ? "/" : mountedPath.slice(suffixStart);
-      const upstreamUrl = `${bridgeGatewayState.baseUrl}${suffix}`;
+      const suffixPath = firstSlash === -1 ? "/" : pathOnly.slice(firstSlash);
+      const upstreamUrl = `${bridgeGatewayState.baseUrl}${suffixPath}${query}`;
 
-      const upstream = await fetch(upstreamUrl, {
-        method: req.method,
-        headers: {
-          "Accept": String(req.headers.accept || "*/*"),
-          "Cache-Control": "no-cache",
-          "User-Agent": "stremio-ptbr-render-bridge-gateway/1.0"
-        }
-      });
-
-      res.status(upstream.status);
-      for (const header of ["content-type", "cache-control", "etag", "last-modified"]) {
-        const value = upstream.headers.get(header);
-        if (value) res.setHeader(header, value);
-      }
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
       res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("X-PTBR-Bridge-Gateway", "1.0");
-
-      if (req.method === "HEAD") return res.end();
-      const body = Buffer.from(await upstream.arrayBuffer());
-      return res.end(body);
+      res.setHeader("X-PTBR-Bridge-Gateway", "1.1-redirect");
+      res.setHeader("Location", upstreamUrl);
+      return res.status(307).end();
     } catch (error) {
       console.error(
-        `[BRIDGE GATEWAY 1.0] proxy falhou | ${errorMessage(error).slice(0, 500)}`
+        `[BRIDGE GATEWAY 1.1] redirect falhou | ${errorMessage(error).slice(0, 500)}`
       );
-      return safeJson(res, { error: "Ponte Local temporariamente inacessível." }, 502);
+      return safeJson(res, { error: "Gateway temporariamente indisponível." }, 502);
     }
   }
 );
@@ -24205,7 +24161,7 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    `Bridge Gateway 1.0: ${bridgeGatewayPublicBase()} | heartbeat TTL=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s ✅`
+    `Bridge Gateway 1.1 REDIRECT: ${bridgeGatewayPublicBase()} | heartbeat TTL=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s ✅`
   );
 
   console.log(
