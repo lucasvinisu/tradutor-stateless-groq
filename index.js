@@ -19,6 +19,88 @@ const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
 
+// ============================================================
+// BRIDGE GATEWAY 1.0 — endereço público estável sem domínio próprio
+// ============================================================
+const BRIDGE_GATEWAY_TTL_MS = 3 * 60 * 1000;
+const BRIDGE_GATEWAY_PUBLIC_KEY = crypto
+  .createHash("sha256")
+  .update(LOCAL_BRIDGE_SECRET || "bridge-gateway-unconfigured")
+  .digest("hex")
+  .slice(0, 24);
+
+const bridgeGatewayState = {
+  baseUrl: "",
+  registeredAt: 0,
+  expiresAt: 0,
+  lastOkAt: 0
+};
+
+function bridgeGatewayIsFresh() {
+  return Boolean(
+    bridgeGatewayState.baseUrl &&
+    bridgeGatewayState.expiresAt > Date.now()
+  );
+}
+
+function bridgeGatewayPublicBase() {
+  return `${PUBLIC_URL}/bridge/${BRIDGE_GATEWAY_PUBLIC_KEY}`;
+}
+
+function normalizeBridgeGatewayUrl(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) throw new Error("baseUrl ausente.");
+
+  const parsed = new URL(raw);
+  if (parsed.protocol !== "https:") {
+    throw new Error("Bridge Gateway aceita somente HTTPS.");
+  }
+  if (!parsed.hostname.toLowerCase().endsWith(".trycloudflare.com")) {
+    throw new Error("Bridge Gateway 1.0 aceita somente Quick Tunnel trycloudflare.com.");
+  }
+  if (parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) {
+    throw new Error("baseUrl inválida.");
+  }
+  if (parsed.pathname !== "/" && parsed.pathname !== "") {
+    throw new Error("baseUrl deve apontar para a raiz do túnel.");
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error("baseUrl não pode conter query/hash.");
+  }
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+async function verifyBridgeGatewayTarget(baseUrl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(`${baseUrl}/manifest.json`, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "User-Agent": "stremio-ptbr-render-bridge-gateway/1.0"
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      throw new Error(`manifest remoto HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    if (
+      String(data?.id || "") !== "org.tradutor.gemini.sync.lab.embedded.v2staging" ||
+      !Array.isArray(data?.resources) ||
+      !data.resources.includes("subtitles")
+    ) {
+      throw new Error("manifest remoto não corresponde à Ponte PT-BR esperada.");
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
 const GEMINI_MODELS = Object.freeze({
   MAIN_PRIMARY: "gemini-3.1-flash-lite",
   MAIN_FALLBACK: "gemini-3.5-flash-lite",
@@ -22273,6 +22355,117 @@ app.get(
 );
 
 // ============================================================
+// BRIDGE GATEWAY 1.0 — gateway estável notebook + Samsung
+// ============================================================
+app.post(
+  "/api/bridge/register",
+  async (req, res) => {
+    if (!authorized(req)) {
+      return safeJson(res, { error: "Unauthorized" }, 401);
+    }
+
+    try {
+      const baseUrl = normalizeBridgeGatewayUrl(req.body?.baseUrl);
+      const remoteManifest = await verifyBridgeGatewayTarget(baseUrl);
+      const now = Date.now();
+
+      bridgeGatewayState.baseUrl = baseUrl;
+      bridgeGatewayState.registeredAt = now;
+      bridgeGatewayState.expiresAt = now + BRIDGE_GATEWAY_TTL_MS;
+      bridgeGatewayState.lastOkAt = now;
+
+      console.log(
+        `[BRIDGE GATEWAY 1.0] registrado ✅ | target=${baseUrl} | ` +
+        `ttl=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s.`
+      );
+
+      return safeJson(res, {
+        ok: true,
+        publicBase: bridgeGatewayPublicBase(),
+        expiresInSeconds: Math.round(BRIDGE_GATEWAY_TTL_MS / 1000),
+        bridgeVersion: String(remoteManifest?.version || "")
+      });
+    } catch (error) {
+      console.warn(
+        `[BRIDGE GATEWAY 1.0] registro recusado | ${errorMessage(error).slice(0, 500)}`
+      );
+      return safeJson(res, { error: errorMessage(error) }, 400);
+    }
+  }
+);
+
+app.get(
+  "/bridge/status.json",
+  (req, res) => safeJson(res, {
+    status: bridgeGatewayIsFresh() ? "online" : "offline",
+    registered: Boolean(bridgeGatewayState.baseUrl),
+    fresh: bridgeGatewayIsFresh(),
+    expiresInSeconds: bridgeGatewayIsFresh()
+      ? Math.max(0, Math.ceil((bridgeGatewayState.expiresAt - Date.now()) / 1000))
+      : 0
+  })
+);
+
+app.use(
+  "/bridge",
+  async (req, res) => {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return safeJson(res, { error: "Method not allowed" }, 405);
+    }
+
+    try {
+      const mountedPath = String(req.url || "/");
+      const pathOnly = mountedPath.split("?", 1)[0];
+      const firstSlash = pathOnly.indexOf("/", 1);
+      const suppliedKey = decodeURIComponent(
+        firstSlash === -1 ? pathOnly.slice(1) : pathOnly.slice(1, firstSlash)
+      );
+
+      if (suppliedKey !== BRIDGE_GATEWAY_PUBLIC_KEY) {
+        return safeJson(res, { error: "Not found" }, 404);
+      }
+
+      if (!bridgeGatewayIsFresh()) {
+        return safeJson(res, {
+          error: "Ponte Local offline ou registro expirado.",
+          hint: "Ligue o notebook e aguarde a inicialização automática da Ponte."
+        }, 503);
+      }
+
+      const suffixStart = mountedPath.indexOf("/", 1);
+      const suffix = suffixStart === -1 ? "/" : mountedPath.slice(suffixStart);
+      const upstreamUrl = `${bridgeGatewayState.baseUrl}${suffix}`;
+
+      const upstream = await fetch(upstreamUrl, {
+        method: req.method,
+        headers: {
+          "Accept": String(req.headers.accept || "*/*"),
+          "Cache-Control": "no-cache",
+          "User-Agent": "stremio-ptbr-render-bridge-gateway/1.0"
+        }
+      });
+
+      res.status(upstream.status);
+      for (const header of ["content-type", "cache-control", "etag", "last-modified"]) {
+        const value = upstream.headers.get(header);
+        if (value) res.setHeader(header, value);
+      }
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("X-PTBR-Bridge-Gateway", "1.0");
+
+      if (req.method === "HEAD") return res.end();
+      const body = Buffer.from(await upstream.arrayBuffer());
+      return res.end(body);
+    } catch (error) {
+      console.error(
+        `[BRIDGE GATEWAY 1.0] proxy falhou | ${errorMessage(error).slice(0, 500)}`
+      );
+      return safeJson(res, { error: "Ponte Local temporariamente inacessível." }, 502);
+    }
+  }
+);
+
+// ============================================================
 // LOCAL APIs — PONTE LOCAL
 // ============================================================
 
@@ -24009,6 +24202,10 @@ app.listen(PORT, () => {
         ? "CONFIGURADA ✅"
         : "FALTANDO ❌"
     }`
+  );
+
+  console.log(
+    `Bridge Gateway 1.0: ${bridgeGatewayPublicBase()} | heartbeat TTL=${Math.round(BRIDGE_GATEWAY_TTL_MS / 1000)}s ✅`
   );
 
   console.log(
