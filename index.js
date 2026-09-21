@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.1 - QUALITY CLOSURE + SINGLE REPAIR + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.2 - BOUNDED POST-REPAIR CLOSURE + DETERMINISTIC FINAL GATE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -7352,7 +7352,7 @@ TESTE DE CALQUE:
 - Se a estrutura, metáfora, colocação ou ordem das ideias denunciar demais a frase inglesa, sinalize.
 - Não exija equivalência lexical quando a intenção pede localização.
 
-QUALITY CLOSURE 9.7.1 — SINALIZE TAMBÉM:
+QUALITY CLOSURE 9.7.2 — SINALIZE TAMBÉM:
 - advérbio de modo/intensidade transformado em aparência/qualidade diferente;
 - qualquer atributo coordenado, negação, quantidade, referente ou relação perdido;
 - marcador idiomático trocado por outro de sentido diferente;
@@ -20885,15 +20885,195 @@ async function runBoundedFinalQuality88(
 
   let current = sanitizeTranslationMap(blocks, translations, job);
 
-  // 9.6.0: ZERO auditoria semântica cloud após a única rodada de Repair.
-  // O modelo já recebeu global QA + Final Priority PRE-AUDIT antes da rewrite.
-  // Daqui em diante só invariantes determinísticos podem bloquear.
+  // 9.7.2: o primeiro gate continua determinístico e barato. A diferença é
+  // que um blocker semântico pré-Repair que permaneceu byte-idêntico não é
+  // mais condenado automaticamente. Ele recebe UMA reauditoria focal. Se a
+  // reauditoria confirmar defeito, existe UMA closure repair bounded e UMA
+  // verificação final. Nunca há loop/cascade.
   let residual = deterministicFinalResidual960(
     blocks,
     current,
     job,
     plan
   );
+
+  if (residual.length) {
+    const laidOutBefore972 = applySubtitleLayout(
+      blocks,
+      current,
+      "FINAL-972-PRE-CLOSURE"
+    );
+    const localBefore972 = splitGenderSeverity970(
+      blocks,
+      resolveGuardConflicts942(
+        blocks,
+        blockingLocalIssues(blocks, laidOutBefore972, job, plan),
+        job,
+        "POST-REPAIR CLOSURE LOCAL 9.7.2"
+      ),
+      job,
+      "post-repair-closure-local"
+    ).hard;
+    const localIds972 = new Set(
+      localBefore972.map(issue => Number(issue?.id)).filter(Number.isInteger)
+    );
+
+    // Semantic-only residuals are exactly the stale hard findings that 9.7.1
+    // could not prove resolved because the Repair chose to keep the same text.
+    // Verify them against SOURCE again instead of failing merely on equality.
+    const semanticOnly972 = residual.filter(issue => {
+      const id = Number(issue?.id);
+      return Number.isInteger(id) && !localIds972.has(id);
+    });
+
+    let confirmedSemantic972 = [];
+    if (semanticOnly972.length) {
+      const semanticIds972 = new Set(
+        semanticOnly972.map(issue => Number(issue?.id)).filter(Number.isInteger)
+      );
+      try {
+        confirmedSemantic972 = await scanFinalPriorityAudit(
+          blocks,
+          current,
+          plan,
+          job,
+          semanticIds972
+        );
+        confirmedSemantic972 = confirmedSemantic972.filter(issue =>
+          semanticIds972.has(Number(issue?.id))
+        );
+        console.log(
+          `[POST-REPAIR SEMANTIC VERIFY 9.7.2] candidatos=${semanticOnly972.length} | ` +
+          `confirmados=${confirmedSemantic972.length} | falsos/stale=${Math.max(0, semanticOnly972.length - confirmedSemantic972.length)}. ✅`
+        );
+      } catch (error) {
+        // Technical audit failure may never silently authorize FINAL_PASS.
+        confirmedSemantic972 = semanticOnly972;
+        console.warn(
+          `[POST-REPAIR SEMANTIC VERIFY 9.7.2] auditoria indisponível; ` +
+          `preservando ${confirmedSemantic972.length} blocker(s) fail-closed | ${errorMessage(error).slice(0,260)}`
+        );
+      }
+    }
+
+    let closureIssues972 = splitGenderSeverity970(
+      blocks,
+      resolveGuardConflicts942(
+        blocks,
+        mergeIssueLists(localBefore972, confirmedSemantic972),
+        job,
+        "POST-REPAIR CLOSURE 9.7.2"
+      ),
+      job,
+      "post-repair-closure"
+    ).hard;
+
+    if (closureIssues972.length) {
+      // The closure is deliberately finite. 48 cues = at most two 24-cue
+      // repair batches; anything larger remains fail-closed instead of
+      // exploding latency on a pathological job.
+      const MAX_CLOSURE_CUES_972 = 48;
+      const selectedClosure972 = closureIssues972.slice(0, MAX_CLOSURE_CUES_972);
+      const targetIds972 = new Set(
+        selectedClosure972.map(issue => Number(issue?.id)).filter(Number.isInteger)
+      );
+
+      if (closureIssues972.length > MAX_CLOSURE_CUES_972) {
+        console.warn(
+          `[POST-REPAIR CLOSURE 9.7.2] residual=${closureIssues972.length}; ` +
+          `repair bounded aos primeiros ${MAX_CLOSURE_CUES_972}; excedente continua fail-closed.`
+        );
+      }
+
+      const beforeClosure972 = new Map(current);
+      console.warn(
+        `[POST-REPAIR CLOSURE 9.7.2] repair único bounded | ` +
+        `alvos=${selectedClosure972.length} | batches<=${Math.ceil(selectedClosure972.length / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES)}.`
+      );
+
+      current = await runFinalPriorityEscalatedRepair(
+        blocks,
+        current,
+        selectedClosure972,
+        plan,
+        job
+      );
+      current = sanitizeTranslationMap(blocks, current, job);
+
+      const changed972 = [...targetIds972].filter(id =>
+        String(beforeClosure972.get(id) || "") !== String(current.get(id) || "")
+      );
+      console.log(
+        `[POST-REPAIR CLOSURE 9.7.2] alterados=${changed972.length}/${targetIds972.size}; ` +
+        `iniciando verificação final focal.`
+      );
+
+      // Re-run deterministic guards globally (cheap) and semantic QA only for
+      // closure targets (bounded). This is the final authority; no more repair.
+      const laidOutAfter972 = applySubtitleLayout(
+        blocks,
+        current,
+        "FINAL-972-POST-CLOSURE"
+      );
+      const localAfter972 = splitGenderSeverity970(
+        blocks,
+        resolveGuardConflicts942(
+          blocks,
+          blockingLocalIssues(blocks, laidOutAfter972, job, plan),
+          job,
+          "POST-REPAIR CLOSURE LOCAL FINAL 9.7.2"
+        ),
+        job,
+        "post-repair-closure-final-local"
+      ).hard;
+
+      let semanticAfter972 = [];
+      if (targetIds972.size) {
+        try {
+          semanticAfter972 = await scanFinalPriorityAudit(
+            blocks,
+            current,
+            plan,
+            job,
+            targetIds972
+          );
+          semanticAfter972 = semanticAfter972.filter(issue =>
+            targetIds972.has(Number(issue?.id))
+          );
+        } catch (error) {
+          semanticAfter972 = selectedClosure972.map(issue => ({
+            id: Number(issue?.id),
+            reasons: [
+              `FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: closure 9.7.2 não conseguiu provar resolução final (${errorMessage(error).slice(0,160)}).`
+            ]
+          }));
+        }
+      }
+
+      residual = splitGenderSeverity970(
+        blocks,
+        resolveGuardConflicts942(
+          blocks,
+          mergeIssueLists(localAfter972, semanticAfter972),
+          job,
+          "POST-REPAIR CLOSURE FINAL 9.7.2"
+        ),
+        job,
+        "post-repair-closure-final"
+      ).hard;
+
+      // Any residual beyond the bounded target set also remains authoritative.
+      if (closureIssues972.length > MAX_CLOSURE_CUES_972) {
+        residual = mergeIssueLists(
+          residual,
+          closureIssues972.slice(MAX_CLOSURE_CUES_972)
+        );
+      }
+    } else {
+      // All old semantic-only blockers were disproved by the focal audit.
+      residual = localBefore972;
+    }
+  }
 
   job.finalTargetResidual927 = residual;
   job.finalTargetResidualSnapshot9210 = new Map(
@@ -20907,20 +21087,20 @@ async function runBoundedFinalQuality88(
     job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[DETERMINISTIC FINAL GATE 9.7.0] FAIL-CLOSED | residual=${residual.length} | ` +
-      `0 QA pós-Repair / 0 Repair extra / 0 cascade.`
+      `[DETERMINISTIC FINAL GATE 9.7.2] FAIL-CLOSED | residual=${residual.length} | ` +
+      `post-repair closure esgotada; 0 loop adicional.`
     );
     for (const issue of residual.slice(0, 24)) {
       console.error(
-        `[DETERMINISTIC FINAL RESIDUAL 9.7.0] cue=${Number(issue?.id)} | ` +
+        `[DETERMINISTIC FINAL RESIDUAL 9.7.2] cue=${Number(issue?.id)} | ` +
         `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
       );
     }
   } else {
     job.qualityStatus = "final_pass";
     console.log(
-      `[DETERMINISTIC FINAL GATE 9.7.0] PASSOU ✅ | residual=0 | ` +
-      `semantic rewrite rounds=1 | post-repair cloud=0.`
+      `[DETERMINISTIC FINAL GATE 9.7.2] PASSOU ✅ | residual=0 | ` +
+      `post-repair semantic verification bounded; 0 cascade.`
     );
   }
 
@@ -21269,7 +21449,7 @@ let finalClosure898 = finalClosureResidualSummary898(
 // No model rewrite is allowed here; this prevents repair cascades.
 if (finalClosure898.gender > 0) {
   console.warn(
-    `[GENDER EVIDENCE 9.7.0][HARD] residual=${finalClosure898.gender} | ` +
+    `[GENDER EVIDENCE 9.7.2][HARD] residual=${finalClosure898.gender} | ` +
     `0 Repair adicional; fail-closed se a normalização determinística não bastou.`
   );
   job.qualityStatus = "best_available";
@@ -21298,11 +21478,11 @@ if (finalClosure898.gender > 0) {
     job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.7.0] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.2] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.7.0] residual=0 ✅ | 0 chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.2] residual=0 ✅ | 0 chamada cloud.`
     );
   }
 }
@@ -21310,7 +21490,7 @@ if (finalClosure898.gender > 0) {
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER HARD FINAL GATE 9.7.0] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
+  console.error(`[GENDER HARD FINAL GATE 9.7.2] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
 }
 console.log(
   `[FINAL CLOSURE 9.4.0] layout=${finalClosure898.layout} | ` +
@@ -24145,7 +24325,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.1 - QUALITY CLOSURE + SINGLE REPAIR | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.2 - BOUNDED POST-REPAIR CLOSURE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
