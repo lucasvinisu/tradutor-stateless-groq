@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.3 - SEMANTIC FIDELITY + IMPLICIT SPEAKER-TURN + CONTEXTUAL MUSIC POLISH (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.4 - SEMANTIC PROOF LEDGER + SINGLE FINAL AUTHORITY (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -92,7 +92,7 @@ const ROUTER_TRANSIENT_COOLDOWN_MS_942 = 10000;
 const ROUTER_RECOVERY_WAIT_MAX_MS_942 = 18000;
 
 const CACHE_VERSION =
-  "9.7.3-semantic-speaker-music-v1";
+  "9.7.4-semantic-proof-ledger-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -21098,6 +21098,141 @@ function sourceNegationRisk926(block) {
   return /(?:\bnot\b|n['’]t\b|\bnever\b|\bno\s+one\b|\bnothing\b|\bwithout\b|\bn[aã]o\b|\bnunca\b|\bjamais\b|\bno\b|\bnon\b|\bnicht\b|\bkein(?:e|en|er|es)?\b|\bniet\b|\bpas\b)/iu.test(text);
 }
 
+function semanticProofLedger974(
+  job,
+  create = false
+) {
+  if (!job) return null;
+
+  if (!(job.semanticCleanProof974 instanceof Map)) {
+    if (!create) return null;
+
+    job.semanticCleanProof974 =
+      new Map();
+  }
+
+  return job.semanticCleanProof974;
+}
+
+function semanticProofHash974(
+  value
+) {
+  return sha256(
+    semanticTextKey940(value)
+  ).slice(0, 24);
+}
+
+function recordSemanticCleanProof974(
+  job,
+  translations,
+  ids,
+  label = "audit"
+) {
+  if (
+    !job ||
+    !(translations instanceof Map)
+  ) {
+    return 0;
+  }
+
+  const ledger =
+    semanticProofLedger974(
+      job,
+      true
+    );
+
+  let recorded = 0;
+
+  for (
+    const rawId of
+      ids instanceof Set
+        ? ids
+        : (
+            Array.isArray(ids)
+              ? ids
+              : []
+          )
+  ) {
+    const id =
+      Number(rawId);
+
+    if (!Number.isInteger(id)) {
+      continue;
+    }
+
+    const text =
+      semanticTextKey940(
+        translations.get(id)
+      );
+
+    if (!text) {
+      continue;
+    }
+
+    ledger.set(
+      id,
+      {
+        hash:
+          semanticProofHash974(
+            text
+          ),
+
+        label:
+          String(
+            label ||
+            "audit"
+          ),
+
+        at:
+          Date.now()
+      }
+    );
+
+    recorded++;
+  }
+
+  if (recorded) {
+    console.log(
+      `[SEMANTIC PROOF LEDGER 9.7.4] recorded=${recorded} | ` +
+      `stage=${String(label || "audit")} | validity=same-text.`
+    );
+  }
+
+  return recorded;
+}
+
+function hasSemanticCleanProof974(
+  job,
+  id,
+  value
+) {
+  const ledger =
+    semanticProofLedger974(
+      job,
+      false
+    );
+
+  if (!(ledger instanceof Map)) {
+    return false;
+  }
+
+  const proof =
+    ledger.get(
+      Number(id)
+    );
+
+  if (!proof?.hash) {
+    return false;
+  }
+
+  return (
+    String(proof.hash) ===
+    semanticProofHash974(
+      value
+    )
+  );
+}
+
 function deterministicFinalResidual960(
   blocks,
   translations,
@@ -21135,6 +21270,7 @@ function deterministicFinalResidual960(
     : new Map();
 
   const unresolvedSemantic = [];
+  const semanticProofHits974 = [];
 
   for (const issue of preHard) {
     const id = Number(issue?.id);
@@ -21171,7 +21307,32 @@ function deterministicFinalResidual960(
 
     // Blocker semântico HARD que permaneceu byte-equivalente após a única
     // rewrite continua sem prova de resolução e permanece fail-closed.
-    unresolvedSemantic.push(issue);
+    if (
+      hasSemanticCleanProof974(
+        job,
+        id,
+        after
+      )
+    ) {
+      semanticProofHits974.push(
+        id
+      );
+
+      continue;
+    }
+
+    unresolvedSemantic.push(
+      issue
+    );
+  }
+
+  if (
+    semanticProofHits974.length
+  ) {
+    console.log(
+      `[SEMANTIC PROOF LEDGER 9.7.4] reused=${semanticProofHits974.length} | ` +
+      `ids=[${[...new Set(semanticProofHits974)].slice(0, 24).join(",")}].`
+    );
   }
 
   return splitGenderSeverity970(
@@ -21257,15 +21418,48 @@ async function runBoundedFinalQuality88(
         confirmedSemantic972 = confirmedSemantic972.filter(issue =>
           semanticIds972.has(Number(issue?.id))
         );
+
+        const confirmedIds974 =
+          new Set(
+            confirmedSemantic972
+              .map(
+                issue =>
+                  Number(
+                    issue?.id
+                  )
+              )
+              .filter(
+                Number.isInteger
+              )
+          );
+
+        const clearedIds974 =
+          new Set(
+            [...semanticIds972]
+              .filter(
+                id =>
+                  !confirmedIds974.has(
+                    id
+                  )
+              )
+          );
+
+        recordSemanticCleanProof974(
+          job,
+          current,
+          clearedIds974,
+          "post-repair-semantic-verify"
+        );
+
         console.log(
-          `[POST-REPAIR SEMANTIC VERIFY 9.7.3] candidatos=${semanticOnly972.length} | ` +
+          `[POST-REPAIR SEMANTIC VERIFY 9.7.4] candidatos=${semanticOnly972.length} | ` +
           `confirmados=${confirmedSemantic972.length} | falsos/stale=${Math.max(0, semanticOnly972.length - confirmedSemantic972.length)}. ✅`
         );
       } catch (error) {
         // Technical audit failure may never silently authorize FINAL_PASS.
         confirmedSemantic972 = semanticOnly972;
         console.warn(
-          `[POST-REPAIR SEMANTIC VERIFY 9.7.3] auditoria indisponível; ` +
+          `[POST-REPAIR SEMANTIC VERIFY 9.7.4] auditoria indisponível; ` +
           `preservando ${confirmedSemantic972.length} blocker(s) fail-closed | ${errorMessage(error).slice(0,260)}`
         );
       }
@@ -21295,14 +21489,14 @@ async function runBoundedFinalQuality88(
 
       if (closureIssues972.length > MAX_CLOSURE_CUES_972) {
         console.warn(
-          `[POST-REPAIR CLOSURE 9.7.3] residual=${closureIssues972.length}; ` +
+          `[POST-REPAIR CLOSURE 9.7.4] residual=${closureIssues972.length}; ` +
           `repair bounded aos primeiros ${MAX_CLOSURE_CUES_972}; excedente continua fail-closed.`
         );
       }
 
       const beforeClosure972 = new Map(current);
       console.warn(
-        `[POST-REPAIR CLOSURE 9.7.3] repair único bounded | ` +
+        `[POST-REPAIR CLOSURE 9.7.4] repair único bounded | ` +
         `alvos=${selectedClosure972.length} | batches<=${Math.ceil(selectedClosure972.length / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES)}.`
       );
 
@@ -21319,7 +21513,7 @@ async function runBoundedFinalQuality88(
         String(beforeClosure972.get(id) || "") !== String(current.get(id) || "")
       );
       console.log(
-        `[POST-REPAIR CLOSURE 9.7.3] alterados=${changed972.length}/${targetIds972.size}; ` +
+        `[POST-REPAIR CLOSURE 9.7.4] alterados=${changed972.length}/${targetIds972.size}; ` +
         `iniciando verificação final focal.`
       );
 
@@ -21355,6 +21549,39 @@ async function runBoundedFinalQuality88(
           semanticAfter972 = semanticAfter972.filter(issue =>
             targetIds972.has(Number(issue?.id))
           );
+
+          const failedSemanticIds974 =
+            new Set(
+              semanticAfter972
+                .map(
+                  issue =>
+                    Number(
+                      issue?.id
+                    )
+                )
+                .filter(
+                  Number.isInteger
+                )
+            );
+
+          const cleanSemanticIds974 =
+            new Set(
+              [...targetIds972]
+                .filter(
+                  id =>
+                    !failedSemanticIds974.has(
+                      id
+                    )
+                )
+            );
+
+          recordSemanticCleanProof974(
+            job,
+            current,
+            cleanSemanticIds974,
+            "post-closure-final-verify"
+          );
+
         } catch (error) {
           semanticAfter972 = selectedClosure972.map(issue => ({
             id: Number(issue?.id),
@@ -21402,19 +21629,19 @@ async function runBoundedFinalQuality88(
     job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[DETERMINISTIC FINAL GATE 9.7.3] FAIL-CLOSED | residual=${residual.length} | ` +
+      `[DETERMINISTIC FINAL GATE 9.7.4] FAIL-CLOSED | residual=${residual.length} | ` +
       `post-repair closure esgotada; 0 loop adicional.`
     );
     for (const issue of residual.slice(0, 24)) {
       console.error(
-        `[DETERMINISTIC FINAL RESIDUAL 9.7.3] cue=${Number(issue?.id)} | ` +
+        `[DETERMINISTIC FINAL RESIDUAL 9.7.4] cue=${Number(issue?.id)} | ` +
         `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
       );
     }
   } else {
     job.qualityStatus = "final_pass";
     console.log(
-      `[DETERMINISTIC FINAL GATE 9.7.3] PASSOU ✅ | residual=0 | ` +
+      `[DETERMINISTIC FINAL GATE 9.7.4] PASSOU ✅ | residual=0 | ` +
       `post-repair semantic verification bounded; 0 cascade.`
     );
   }
@@ -21764,7 +21991,7 @@ let finalClosure898 = finalClosureResidualSummary898(
 // No model rewrite is allowed here; this prevents repair cascades.
 if (finalClosure898.gender > 0) {
   console.warn(
-    `[GENDER EVIDENCE 9.7.3][HARD] residual=${finalClosure898.gender} | ` +
+    `[GENDER EVIDENCE 9.7.4][HARD] residual=${finalClosure898.gender} | ` +
     `0 Repair adicional; fail-closed se a normalização determinística não bastou.`
   );
   job.qualityStatus = "best_available";
@@ -21790,14 +22017,29 @@ if (finalClosure898.gender > 0) {
   );
 
   if (postResidual960.length) {
-    job.qualityStatus = "best_available";
+
+    for (
+      const issue of
+        postResidual960.slice(
+          0,
+          24
+        )
+    ) {
+      console.error(
+        `[POST-CLOSURE RESIDUAL 9.7.4] cue=${Number(issue?.id)} | ` +
+        `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
+      );
+    }
+
+    job.qualityStatus =
+      "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.7.3] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.4] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.7.3] residual=0 ✅ | 0 chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.7.4] residual=0 ✅ | 0 chamada cloud.`
     );
   }
 }
@@ -21805,7 +22047,7 @@ if (finalClosure898.gender > 0) {
 if (finalClosure898.gender > 0) {
   job.qualityStatus = "best_available";
   job.noCacheFinal923 = true;
-  console.error(`[GENDER HARD FINAL GATE 9.7.3] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
+  console.error(`[GENDER HARD FINAL GATE 9.7.4] FAIL-CLOSED PARA SELO/CACHE | gender=${finalClosure898.gender}; melhor candidato íntegro será preservado como CHECKPOINT; selo canônico bloqueado e NÃO será servido como FINAL.`);
 }
 console.log(
   `[FINAL CLOSURE 9.4.0] layout=${finalClosure898.layout} | ` +
@@ -24640,7 +24882,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.3 - SEMANTIC FIDELITY + SPEAKER-TURN + MUSIC POLISH | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.4 - SEMANTIC PROOF LEDGER + SINGLE FINAL AUTHORITY | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -24919,8 +25161,8 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-  console.log("Quality Closure 9.7.3: polarity + referent + implicit speaker-turn + language purity + contextual music typography | ZERO rodada cloud global extra ✅");
-  console.log("Semantic Repair Budget 9.7.0: UMA rodada consolidada após PRE-AUDIT; Ownership não reescreve fora dela; pós-Repair cloud=0 ✅");
+  console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
+  console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
