@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.4 - SEMANTIC PROOF LEDGER + SINGLE FINAL AUTHORITY (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.5 - ADAPTIVE MAIN CIRCUIT BREAKER + CHECKPOINT RESUME (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -90,6 +90,14 @@ const ROUTER_INVALID_RESPONSE_COOLDOWN_MS_942 = 8000;
 const ROUTER_TIMEOUT_COOLDOWN_MS_942 = 15000;
 const ROUTER_TRANSIENT_COOLDOWN_MS_942 = 10000;
 const ROUTER_RECOVERY_WAIT_MAX_MS_942 = 18000;
+
+// 9.7.5 — MAIN brownout resilience. Semantic behavior/cache remain 9.7.4.
+const MAIN_BROWNOUT_WINDOW_MS_975 = 15000;
+const MAIN_BROWNOUT_HOLD_MS_975 = 15000;
+const MAIN_BROWNOUT_RECOVERY_CONCURRENCY_975 = 2;
+const MAIN_BROWNOUT_STABLE_SUCCESSES_975 = 2;
+const MAIN_BROWNOUT_JOB_RECOVERY_MAX_975 = 2;
+const MAIN_BROWNOUT_SLOT_POLL_MS_975 = 120;
 
 const CACHE_VERSION =
   "9.7.4-semantic-proof-ledger-v1";
@@ -9089,6 +9097,180 @@ function setModelUnavailable(modelId, waitMs, reason) {
   }
 }
 
+function mainCircuitState975(job, create = true) {
+  if (!job) return null;
+  if (!job.mainCircuit975 && create) {
+    job.mainCircuit975 = {
+      mode: "normal",
+      failures: [],
+      holdUntil: 0,
+      activeRequests: 0,
+      successStreak: 0,
+      everOpened: false,
+      jobRecoveryRounds: 0,
+      openedCount: 0,
+      lastReason: ""
+    };
+  }
+  return job.mainCircuit975 || null;
+}
+
+function mainCircuitLimit975(job) {
+  const state = mainCircuitState975(job, false);
+  if (!state || state.mode === "normal") return MAIN_CONCURRENCY;
+  if (state.mode === "recovery") return MAIN_BROWNOUT_RECOVERY_CONCURRENCY_975;
+  if (state.mode === "probe") return 1;
+  return 0;
+}
+
+function syncMainCircuitFromRouteCooldown975(job, route) {
+  if (!job || !Array.isArray(route) || !route.length) return;
+  const now = Date.now();
+  const rows = route.map(modelId => {
+    const runtime = runtimeForGeminiModel(modelId);
+    return {
+      modelId,
+      until: Math.max(0, Number(runtime?.unavailableUntil || 0)),
+      reason: String(runtime?.unavailableReason || "")
+    };
+  });
+
+  const allTransientCooling = rows.every(row =>
+    row.until > now && /(?:503|504|timeout|high demand)/i.test(row.reason)
+  );
+  if (!allTransientCooling) return;
+
+  const state = mainCircuitState975(job, true);
+  const earliest = Math.min(...rows.map(row => row.until));
+  const wasNormal = state.mode === "normal";
+  state.mode = "open";
+  state.everOpened = true;
+  state.holdUntil = Math.max(Number(state.holdUntil || 0), earliest + 120);
+  state.successStreak = 0;
+  state.lastReason = "rotas MAIN herdadas em cooldown transitório";
+
+  if (wasNormal) {
+    console.warn(
+      `[MAIN CIRCUIT 9.7.5] OPEN por cooldown herdado | ` +
+      `aguardando rota saudável antes de liberar probe; checkpoint preservado.`
+    );
+  }
+}
+
+function noteMainTransientFailure975(job, modelId, statusLabel) {
+  if (!job) return;
+  const state = mainCircuitState975(job, true);
+  const now = Date.now();
+  state.failures = (Array.isArray(state.failures) ? state.failures : [])
+    .filter(row => now - Number(row?.at || 0) <= MAIN_BROWNOUT_WINDOW_MS_975);
+  state.failures.push({ at: now, modelId: String(modelId || ""), status: String(statusLabel || "transient") });
+
+  const distinctModels = new Set(
+    state.failures.map(row => String(row?.modelId || "")).filter(Boolean)
+  );
+  const shouldOpen = distinctModels.size >= 2 || state.failures.length >= 3;
+  if (!shouldOpen) return;
+
+  const wasOpen = state.mode !== "normal";
+  state.mode = "open";
+  state.holdUntil = Math.max(Number(state.holdUntil || 0), now + MAIN_BROWNOUT_HOLD_MS_975);
+  state.successStreak = 0;
+  state.everOpened = true;
+  state.openedCount = Number(state.openedCount || 0) + (wasOpen ? 0 : 1);
+  state.lastReason = `${distinctModels.size} modelo(s), ${state.failures.length} falha(s) em ${Math.round(MAIN_BROWNOUT_WINDOW_MS_975 / 1000)}s`;
+
+  if (!wasOpen) {
+    console.warn(
+      `[MAIN CIRCUIT 9.7.5] OPEN | ${state.lastReason} | ` +
+      `503/504/timeout detectado; novas chamadas MAIN serão serializadas após hold=${Math.round(MAIN_BROWNOUT_HOLD_MS_975 / 1000)}s. ` +
+      `Checkpoint preservado.`
+    );
+  }
+}
+
+function noteMainSuccess975(job, modelId) {
+  const state = mainCircuitState975(job, false);
+  if (!state || state.mode === "normal") return;
+
+  if (state.mode === "open" || state.mode === "probe") {
+    state.mode = "recovery";
+    state.holdUntil = 0;
+    state.successStreak = 1;
+    console.log(
+      `[MAIN CIRCUIT 9.7.5] PROBE OK ${String(modelId || "modelo")} | ` +
+      `RECOVERY concorrência=${MAIN_BROWNOUT_RECOVERY_CONCURRENCY_975}.`
+    );
+    return;
+  }
+
+  if (state.mode === "recovery") {
+    state.successStreak = Number(state.successStreak || 0) + 1;
+    if (state.successStreak >= MAIN_BROWNOUT_STABLE_SUCCESSES_975) {
+      state.mode = "normal";
+      state.failures = [];
+      state.holdUntil = 0;
+      state.successStreak = 0;
+      state.jobRecoveryRounds = 0;
+      console.log(
+        `[MAIN CIRCUIT 9.7.5] CLOSED | ${MAIN_BROWNOUT_STABLE_SUCCESSES_975} sucessos consecutivos; ` +
+        `concorrência normal=${MAIN_CONCURRENCY} restaurada.`
+      );
+    }
+  }
+}
+
+async function acquireMainCircuitSlot975(job) {
+  if (!job) return () => {};
+  const state = mainCircuitState975(job, true);
+
+  while (true) {
+    const now = Date.now();
+
+    if (state.mode === "open") {
+      const remaining = Number(state.holdUntil || 0) - now;
+      if (remaining > 0) {
+        await sleep(Math.min(Math.max(remaining, MAIN_BROWNOUT_SLOT_POLL_MS_975), 750));
+        continue;
+      }
+      state.mode = "probe";
+      console.warn(`[MAIN CIRCUIT 9.7.5] HALF-OPEN | liberando UMA chamada-probe.`);
+    }
+
+    const limit = mainCircuitLimit975(job);
+    if (limit > 0 && Number(state.activeRequests || 0) < limit) {
+      state.activeRequests = Number(state.activeRequests || 0) + 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        state.activeRequests = Math.max(0, Number(state.activeRequests || 0) - 1);
+      };
+    }
+
+    await sleep(MAIN_BROWNOUT_SLOT_POLL_MS_975);
+  }
+}
+
+function mainBrownoutRecoveryWait975(job) {
+  const now = Date.now();
+  const state = mainCircuitState975(job, false);
+  const route = geminiRouteForMetric("main");
+  const waits = route
+    .filter(modelId => !modelSkippedForJob(job, modelId))
+    .map(modelId => Math.max(
+      Number(runtimeForGeminiModel(modelId).unavailableUntil || 0),
+      modelMetricCooldownUntil942(job, "main", modelId)
+    ) - now)
+    .filter(ms => ms > 0);
+
+  const stateWait = Math.max(0, Number(state?.holdUntil || 0) - now);
+  const routeWait = waits.length ? Math.min(...waits) + 180 : 0;
+  return Math.min(
+    ROUTER_RECOVERY_WAIT_MAX_MS_942,
+    Math.max(1200, stateWait, routeWait)
+  );
+}
+
 function routedQuotaKind(data) {
   const rows = extractGeminiQuotaDetails(data);
   const joined = rows
@@ -9393,6 +9575,10 @@ async function geminiRequest({
   const errors = [];
   let recoveryPass = 0;
 
+  if (String(metric || "").toLowerCase() === "main") {
+    syncMainCircuitFromRouteCooldown975(job, route);
+  }
+
   while (recoveryPass <= 1) {
     clearExpiredMetricCooldowns942(job);
     for (let routeIndex = 0; routeIndex < route.length; routeIndex++) {
@@ -9424,7 +9610,12 @@ async function geminiRequest({
           job.stats.modelFallbacks = Number(job.stats.modelFallbacks || 0) + 1;
         }
 
+        let releaseMainCircuitSlot975 = null;
         try {
+          if (String(metric || "").toLowerCase() === "main") {
+            releaseMainCircuitSlot975 = await acquireMainCircuitSlot975(job);
+          }
+
           console.log(
             `[MODEL ROUTER ${String(metric).toUpperCase()}] ${modelId} | ` +
             `route=${routeIndex + 1}/${route.length} | thinking=${thinkingLevel} | ` +
@@ -9446,6 +9637,9 @@ async function geminiRequest({
 
           markSuccess(job, metric, { usage: result.usage });
           setJobModelHealth(job, modelId, "healthy", `${metric} OK`);
+          if (String(metric || "").toLowerCase() === "main") {
+            noteMainSuccess975(job, modelId);
+          }
 
           console.log(
             `[MODEL ROUTER ${String(metric).toUpperCase()}] OK ${modelId} | ` +
@@ -9458,6 +9652,14 @@ async function geminiRequest({
         } catch (error) {
           const status = Number(error?.status || 0);
           errors.push(`${modelId}:${status || error?.code || "ERR"}`);
+
+          if (String(metric || "").toLowerCase() === "main") {
+            if (status === 503) {
+              noteMainTransientFailure975(job, modelId, "503");
+            } else if (error?.isRouterTimeout || status === 504) {
+              noteMainTransientFailure975(job, modelId, "504/timeout");
+            }
+          }
 
           if (status === 429) {
             mark429(job, metric);
@@ -9542,6 +9744,10 @@ async function geminiRequest({
           }
 
           throw error;
+        } finally {
+          if (typeof releaseMainCircuitSlot975 === "function") {
+            releaseMainCircuitSlot975();
+          }
         }
       }
     }
@@ -9582,6 +9788,10 @@ async function geminiRequest({
   error.routerExhausted = true;
   error.code = "MODEL_ROUTE_EXHAUSTED";
   error.metric = metric;
+  if (String(metric || "").toLowerCase() === "main") {
+    const state975 = mainCircuitState975(job, false);
+    error.mainBrownout975 = Boolean(state975?.everOpened);
+  }
   throw error;
 }
 
@@ -12494,6 +12704,14 @@ async function translateAllMain(
     `pendentes=${work.length} | checkpoint=${translations.size}/${blocks.length} | ` +
     `concorrência=${MAIN_CONCURRENCY} | até ${MAIN_BATCH_MAX_CUES} cues. `
   );
+
+  const circuit975 = mainCircuitState975(job, false);
+  if (circuit975?.everOpened) {
+    console.warn(
+      `[MAIN CIRCUIT 9.7.5] RESUME | checkpoint=${translations.size}/${blocks.length} | ` +
+      `mode=${String(circuit975.mode || "normal")} | requests reais serão limitados dinamicamente.`
+    );
+  }
 
   if (!work.length) {
     return translations;
@@ -22249,6 +22467,37 @@ async function processJob(
     } catch (error) {
       lastJobError = error;
 
+      if (
+        error?.routerExhausted &&
+        String(error?.metric || "").toLowerCase() === "main" &&
+        error?.mainBrownout975
+      ) {
+        const state975 = mainCircuitState975(job, true);
+        const checkpoint975 = job.mainCheckpoint instanceof Map ? job.mainCheckpoint.size : 0;
+        const rounds975 = Number(state975.jobRecoveryRounds || 0);
+
+        if (rounds975 < MAIN_BROWNOUT_JOB_RECOVERY_MAX_975) {
+          state975.jobRecoveryRounds = rounds975 + 1;
+          const waitMs975 = mainBrownoutRecoveryWait975(job);
+          job.status = "processing";
+          job.qualityStatus = "recovering_main_brownout";
+          job.error = `MAIN BROWNOUT: checkpoint ${checkpoint975}; retomada em ${(waitMs975 / 1000).toFixed(1)}s`;
+          job.updatedAt = Date.now();
+          console.warn(
+            `[MAIN BROWNOUT RECOVERY 9.7.5] rodada=${state975.jobRecoveryRounds}/${MAIN_BROWNOUT_JOB_RECOVERY_MAX_975} | ` +
+            `checkpoint=${checkpoint975} | wait=${(waitMs975 / 1000).toFixed(1)}s | ` +
+            `PLAN/MAIN já concluídos serão reutilizados; zero limpeza/restart do checkpoint.`
+          );
+          await sleep(waitMs975);
+          continue;
+        }
+
+        console.error(
+          `[MAIN BROWNOUT RECOVERY 9.7.5] limite bounded atingido | checkpoint=${checkpoint975}; ` +
+          `seguindo política terminal normal sem falsificar SAFE/FINAL.`
+        );
+      }
+
       if (error?.routerExhausted && job.safeDraft) {
         attempt++;
         job.stats.jobRetries = (job.stats.jobRetries || 0) + 1;
@@ -24882,7 +25131,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.4 - SEMANTIC PROOF LEDGER + SINGLE FINAL AUTHORITY | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.5 - ADAPTIVE MAIN CIRCUIT BREAKER + CHECKPOINT RESUME | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -25163,6 +25412,8 @@ console.log(
   );
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
+  console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
+  console.log("Semantic cache namespace permanece 9.7.4: mudança é somente de transporte/roteamento; qualidade e contratos textuais intactos ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
@@ -25221,7 +25472,7 @@ console.log(
   );
 
   console.log(
-    "Model Health 9.4.2: RPD diário hard-skip; timeout/503/RPM/TPM/JSON inválido usam cooldown e podem voltar no mesmo job ✅"
+    "Model Health 9.7.5: 503/504/timeout no MAIN acionam circuit breaker adaptativo; RPD diário continua hard-skip; checkpoint é preservado ✅"
   );
 
   console.log(
