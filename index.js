@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.9 - PROVIDER-LOCAL EMERGENCY SCOPE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -9950,6 +9950,18 @@ function groqEmergencyAllowedMetric976(metric) {
   );
 }
 
+// 9.7.9 — emergency scope is LOCAL to the exact call that actually fails over.
+// Historical/pending job flags are telemetry/routing only and NEVER pre-shrink
+// future Gemini QA/Repair/Final batches. Direct Groq paths split themselves.
+function groqGenerationShapeError979(error) {
+  const status = Number(error?.status || 0);
+  const message = String(error?.message || error || "");
+  return Boolean(
+    status === 400 &&
+    /failed to generate json|failed_generation|generate json|structured output/i.test(message)
+  );
+}
+
 function shouldEnterGroqEmergency976(route, availabilityFailures, job, metric) {
   if (!GROQ_API_KEY || !groqEmergencyAllowedMetric976(metric)) return false;
   const usable = (Array.isArray(route) ? route : []).filter(Boolean);
@@ -10405,6 +10417,19 @@ async function geminiRequest({
         markSuccess(job, metric, { usage: emergency.usage });
         return emergency;
       } catch (groqError) {
+        if (groqGenerationShapeError979(groqError)) {
+          if (job) {
+            job.groqEmergencyPending976 = true;
+            job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+          }
+          groqError.groqSplitRequired976 = true;
+          groqError.routerCanSplit = true;
+          console.warn(
+            `[GROQ ADAPTIVE JSON 9.7.9] ${String(metric).toUpperCase()} recebeu HTTP 400 failed_generation; ` +
+            `redução focal de payload será tentada antes de declarar rota esgotada.`
+          );
+          throw groqError;
+        }
         if (groqError?.groqSplitRequired976 || groqError?.routerCanSplit) {
           throw groqError;
         }
@@ -13462,9 +13487,10 @@ function buildQaBatches(
   plan,
   job = null
 ) {
-  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
-  const maxCues976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CUES_976 : QA_BATCH_MAX_CUES;
-  const maxChars976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CHARS_976 : QA_BATCH_MAX_CHARS;
+  // 9.7.9: build for the primary Gemini route. If this exact request later
+  // falls over to Groq and is too large, scanQaBatchGroq976() splits only it.
+  const maxCues976 = QA_BATCH_MAX_CUES;
+  const maxChars976 = QA_BATCH_MAX_CHARS;
   const batches = [];
   let current = [];
   let chars = 0;
@@ -13625,7 +13651,7 @@ async function scanQaBatchGroq976(batch, plan, job) {
         metric: "qa"
       });
     } catch (error) {
-      if (error?.groqSplitRequired976 && part.length > 1) {
+      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && part.length > 1) {
         job.groqEmergencyPending976 = true;
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const mid = Math.ceil(part.length / 2);
@@ -13634,7 +13660,7 @@ async function scanQaBatchGroq976(batch, plan, job) {
         for (const issue of [...left, ...right]) {
           if (!seen.has(issue.id)) { seen.add(issue.id); out.push(issue); }
         }
-        console.warn(`[GROQ QA 9.7.7] split recursivo ${part.length}->${mid}+${part.length-mid}.`);
+        console.warn(`[GROQ QA 9.7.9] split recursivo ${part.length}->${mid}+${part.length-mid}.`);
         continue;
       }
       throw error;
@@ -18084,11 +18110,11 @@ async function repairBatch(
       lastError =
         error;
 
-      if (error?.groqSplitRequired976 && issues.length > 1) {
+      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && issues.length > 1) {
         job.groqEmergencyPending976 = true;
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const mid = Math.ceil(issues.length / 2);
-        console.warn(`[GROQ REPAIR 9.7.7] split ${issues.length}->${mid}+${issues.length-mid}, sem repetir MAIN.`);
+        console.warn(`[GROQ REPAIR 9.7.9] split ${issues.length}->${mid}+${issues.length-mid}, sem repetir MAIN.`);
         const left = await repairBatch(blocks, posMap, translations, issues.slice(0, mid), plan, job);
         const mergedReference977 = new Map(translations);
         for (const [id, pt] of left.translations || []) mergedReference977.set(Number(id), pt);
@@ -18681,14 +18707,11 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     );
 
   const repairBatches = [];
-  const repairBatchCap976 = (job?.groqEmergency976 || job?.groqEmergencyPending976)
-    ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
-    : REPAIR_BATCH_MAX_CUES;
+  // 9.7.9: provider-neutral pre-batching. A real Groq payload/JSON failure is
+  // split recursively inside repairBatch(); historical emergency state is ignored.
+  const repairBatchCap976 = REPAIR_BATCH_MAX_CUES;
   for (let i = 0; i < selected.length; i += repairBatchCap976) {
     repairBatches.push(selected.slice(i, i + repairBatchCap976));
-  }
-  if (job?.groqEmergency976 || job?.groqEmergencyPending976) {
-    console.warn(`[GROQ REPAIR 9.7.7] emergency batching=${repairBatchCap976} cues/lote | 120B focal.`);
   }
 
   const totalBatches = repairBatches.length;
@@ -20655,9 +20678,12 @@ function buildFinalPriorityAuditBatches(
   translations,
   plan,
   focusIds = null,
-  job = null
+  job = null,
+  forceGroqEmergency979 = false
 ) {
-  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
+  // Only the direct Groq audit path may request emergency-sized batches.
+  // Normal/focused Gemini audits never inherit historical job-level Groq state.
+  const emergency976 = Boolean(forceGroqEmergency979);
   const maxCues976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CUES_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES;
   const maxChars976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS;
   const hasExplicitFocus =
@@ -20890,7 +20916,7 @@ async function scanFinalPriorityAuditGroq977(
   }
 
   job.groqEmergencyPending976 = true;
-  const batches = buildFinalPriorityAuditBatches(blocks, translations, plan, new Set(ids), job);
+  const batches = buildFinalPriorityAuditBatches(blocks, translations, plan, new Set(ids), job, true);
   const out = [];
 
   for (const batch of batches) {
@@ -20914,11 +20940,11 @@ async function scanFinalPriorityAuditGroq977(
       job.stats.finalPriorityAuditCalls = (job.stats.finalPriorityAuditCalls || 0) + 1;
       out.push(...parseFinalPriorityAudit(response.text, batch.targetIds));
     } catch (error) {
-      if (error?.groqSplitRequired976 && batch.targetIds.size > 1) {
+      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && batch.targetIds.size > 1) {
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const targetIds = [...batch.targetIds];
         const mid = Math.ceil(targetIds.length / 2);
-        console.warn(`[GROQ FINAL AUDIT 9.7.7] split ${targetIds.length}->${mid}+${targetIds.length-mid} | depth=${depth+1}.`);
+        console.warn(`[GROQ FINAL AUDIT 9.7.9] split ${targetIds.length}->${mid}+${targetIds.length-mid} | depth=${depth+1}.`);
         out.push(
           ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(0, mid)), depth + 1),
           ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(mid)), depth + 1)
@@ -21142,10 +21168,8 @@ async function runFinalPriorityEscalatedRepair(
   const updated = new Map(translations);
   const selected = [...issues].sort((a, b) => issuePriority(a) - issuePriority(b));
 
-  const escalatedBatchCap977 =
-    (job?.groqEmergency976 || job?.groqEmergencyPending976)
-      ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
-      : FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES;
+  // 9.7.9: keep normal focal size; actual Groq failures split this exact batch.
+  const escalatedBatchCap977 = FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES;
 
   for (
     let offset = 0;
@@ -21293,11 +21317,11 @@ async function runFinalPriorityEscalatedRepair(
 
         completed = true;
       } catch (error) {
-        if (error?.groqSplitRequired976 && batchIssues.length > 1) {
+        if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && batchIssues.length > 1) {
           job.groqEmergencyPending976 = true;
           job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
           const mid = Math.ceil(batchIssues.length / 2);
-          console.warn(`[GROQ FINAL REPAIR 9.7.7] split ${batchIssues.length}->${mid}+${batchIssues.length-mid}.`);
+          console.warn(`[GROQ FINAL REPAIR 9.7.9] split ${batchIssues.length}->${mid}+${batchIssues.length-mid}.`);
           const leftUpdated = await runFinalPriorityEscalatedRepair(blocks, updated, batchIssues.slice(0, mid), plan, job, options);
           const rightUpdated = await runFinalPriorityEscalatedRepair(blocks, leftUpdated, batchIssues.slice(mid), plan, job, options);
           for (const issue of batchIssues) {
@@ -26121,7 +26145,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.9 - PROVIDER-LOCAL EMERGENCY SCOPE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -26403,8 +26427,10 @@ console.log(
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
-  console.log(`Groq Emergency 9.7.8: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
-  console.log("Groq TPM 9.7.8: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
+  console.log(`Groq Emergency 9.7.9: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
+  console.log("Groq Scope 9.7.9: uso histórico de Groq NÃO reduz lotes Gemini posteriores; micro-batching existe apenas na tentativa de failover atual ✅");
+  console.log("Groq Adaptive JSON 9.7.9: HTTP 400 failed_generation vira split focal recursivo antes de esgotar a rota ✅");
+  console.log("Groq TPM 9.7.9: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
   console.log("Residual Accountability 9.7.8: residual só desaparece com proof hash-bound ou resolução determinística; unaccounted=HARD ✅");
   console.log("Immutable Timeline + Global Ownership 9.7.8: ID/order/timestamp digest + long duplicate/transplant seal bloqueiam FINAL/cache ✅");
   console.log("Spoken SDH Guard 9.7.8: sintagmas lexicais curtos como The TV./A TV./O rádio nunca viram SDH por keyword isolada ✅");
