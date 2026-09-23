@@ -10,8 +10,10 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.6 - GEMINI-FIRST + GROQ EMERGENCY + RESIDUAL ACCOUNTABILITY (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.7 - IMMUTABLE TIMELINE + GLOBAL OWNERSHIP SEAL + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
+// 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
+// on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
 // ============================================================
 
 const PORT = Number(process.env.PORT || 10000);
@@ -119,8 +121,22 @@ const GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 = 16000;
 const GROQ_REPAIR_EMERGENCY_BATCH_CUES_976 = 5;
 const GROQ_RESET_WAIT_MAX_MS_976 = 65000;
 
+// 9.7.7 — Groq free-tier reliability envelope.
+const GROQ_TOTAL_SAFE_TOKENS_977 = 7400;
+const GROQ_MAIN_OUTPUT_RESERVE_977 = 2400;
+const GROQ_QUALITY_OUTPUT_RESERVE_977 = 1500;
+const GROQ_REPAIR_OUTPUT_RESERVE_977 = 1050;
+const GROQ_SAFETY_MARGIN_TOKENS_977 = 350;
+
+// 9.7.7 — FINAL immutable-coordinate + global ownership seal.
+const FINAL_COORDINATE_SEAL_VERSION_977 = "immutable-coordinate-global-ownership-v1";
+const GLOBAL_OWNERSHIP_MIN_CHARS_977 = 34;
+const GLOBAL_OWNERSHIP_MIN_TOKENS_977 = 6;
+const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
+const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
+
 const CACHE_VERSION =
-  "9.7.4-semantic-proof-ledger-v1";
+  "9.7.7-immutable-coordinate-global-ownership-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -1281,6 +1297,10 @@ function createJob({
     escalationAttempts928: new Set(),
     error: null,
     qualityStatus: "pending",
+    coordinateSeal977: null,
+    globalOwnershipResidual977: 0,
+    repairResidualSnapshot977: new Map(),
+    groqEmergencyPending976: false,
 
     // IDs removidos por regra SDH multilíngue ou por consenso de duas
     // respostas independentes. O Set nunca é exposto diretamente na API.
@@ -1380,6 +1400,10 @@ function createJob({
       groqEmergency429976: 0,
       groqEmergencyWaitMs976: 0,
       groqEmergencySplitSignals976: 0,
+      groqEmergencyRebatches977: 0,
+      globalOwnershipFlags977: 0,
+      coordinateSealFailures977: 0,
+      cacheIntegrityEvictions977: 0,
 
       inputTokens: 0,
       outputTokens: 0,
@@ -1441,32 +1465,70 @@ function getOrCreateJob(
         cacheKey
       );
 
-    if (!job) {
-      job =
-        createJob({
-          ...args,
-          lazy: false
-        });
+    try {
+      // 9.7.7: nenhum atalho de cache pode contornar os selos finais.
+      // O SRT armazenado precisa preservar a geometria ordenada da SOURCE e
+      // continuar livre de duplicação/transplante global antes de ser marcado
+      // cache_verified ou exposto ao cliente. O audit pode rodar sem job; assim
+      // um cache ruim nunca cria um objeto "processing" que não foi iniciado.
+      auditTimestamps(
+        args.sourceSrt,
+        cached,
+        "CACHE-LOOKUP-9.7.7",
+        job || null
+      );
+      auditGlobalOwnershipSrt977(
+        args.sourceSrt,
+        cached,
+        "CACHE-LOOKUP-9.7.7",
+        job || null
+      );
+
+      if (!job) {
+        job =
+          createJob({
+            ...args,
+            lazy: false
+          });
+      }
+
+      restoreIntentionalEmptyIdsFromCache(
+        cacheKey,
+        job
+      );
+
+      job.status =
+        "completed";
+
+      job.progress =
+        100;
+
+      job.qualityStatus =
+        "cache_verified";
+
+      job.result =
+        cached;
+
+      return job;
+    } catch (cacheLookupIntegrityError977) {
+      translationCache.delete(cacheKey);
+      if (job?.stats) {
+        job.stats.cacheIntegrityEvictions977 =
+          Number(job.stats.cacheIntegrityEvictions977 || 0) + 1;
+      }
+
+      console.error(
+        `[CACHE LOOKUP INTEGRITY 9.7.7] cache recusado antes da entrega; ` +
+        `reconstruindo da SOURCE | ${errorMessage(cacheLookupIntegrityError977).slice(0,320)}`
+      );
+
+      // Um job já concluído que apontava para o mesmo canonical inválido não
+      // pode reaparecer pelo findReusableJob abaixo. Jobs realmente em andamento
+      // continuam vivos e serão retomados normalmente.
+      if (job?.status === "completed") {
+        jobs.delete(job.id);
+      }
     }
-
-    restoreIntentionalEmptyIdsFromCache(
-      cacheKey,
-      job
-    );
-
-    job.status =
-      "completed";
-
-    job.progress =
-      100;
-
-    job.qualityStatus =
-      "cache_verified";
-
-    job.result =
-      cached;
-
-    return job;
   }
 
   const existing =
@@ -6785,6 +6847,142 @@ function buildSrt(
     : "";
 }
 
+
+function coordinateDigest977(items) {
+  return sha256(
+    (Array.isArray(items) ? items : [])
+      .map((item, position) =>
+        `${position}|${Number(item?.index)}|${String(item?.timing || "").trim()}`
+      )
+      .join("\n")
+  );
+}
+
+function ownershipTextKey977(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .replace(/<[^>]*>/gu, " ")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function ownershipTokens977(value) {
+  const key = ownershipTextKey977(value);
+  return key ? key.split(" ").filter(Boolean) : [];
+}
+
+function ownershipTokenSimilarity977(a, b) {
+  const left = new Set(ownershipTokens977(a));
+  const right = new Set(ownershipTokens977(b));
+  if (!left.size || !right.size) return 0;
+  let intersection = 0;
+  for (const token of left) if (right.has(token)) intersection++;
+  const union = new Set([...left, ...right]).size;
+  return union ? intersection / union : 0;
+}
+
+function globalOwnershipIntegrityIssues977(blocks, translations, referenceTranslations = null) {
+  const issueMap = new Map();
+  const rows = [];
+
+  for (let position = 0; position < blocks.length; position++) {
+    const block = blocks[position];
+    const id = Number(block?.index);
+    if (!Number.isInteger(id)) continue;
+    const target = String(translations instanceof Map ? translations.get(id) ?? "" : "").trim();
+    const targetKey = ownershipTextKey977(target);
+    const targetTokens = targetKey ? targetKey.split(" ").filter(Boolean) : [];
+    rows.push({ id, position, block, target, targetKey, targetTokens });
+  }
+
+  const groups = new Map();
+  for (const row of rows) {
+    if (
+      row.block?.musicPerformance ||
+      row.targetKey.length < GLOBAL_OWNERSHIP_MIN_CHARS_977 ||
+      row.targetTokens.length < GLOBAL_OWNERSHIP_MIN_TOKENS_977
+    ) continue;
+    if (!groups.has(row.targetKey)) groups.set(row.targetKey, []);
+    groups.get(row.targetKey).push(row);
+  }
+
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (let a = 0; a < group.length; a++) {
+      for (let b = a + 1; b < group.length; b++) {
+        const left = group[a];
+        const right = group[b];
+        if (Math.abs(left.position - right.position) < GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977) continue;
+        const sourceSimilarity = ownershipTokenSimilarity977(left.block?.text, right.block?.text);
+        if (sourceSimilarity > GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977) continue;
+        addIssue(issueMap, left.id, "CUE_OWNERSHIP_GLOBAL_DUPLICATION_977");
+        addIssue(issueMap, right.id, "CUE_OWNERSHIP_GLOBAL_DUPLICATION_977");
+      }
+    }
+  }
+
+  if (referenceTranslations instanceof Map) {
+    const referenceOwners = new Map();
+    for (const block of blocks) {
+      const id = Number(block?.index);
+      const reference = ownershipTextKey977(referenceTranslations.get(id));
+      const tokens = reference ? reference.split(" ").filter(Boolean) : [];
+      if (
+        !reference ||
+        reference.length < GLOBAL_OWNERSHIP_MIN_CHARS_977 ||
+        tokens.length < GLOBAL_OWNERSHIP_MIN_TOKENS_977
+      ) continue;
+      if (!referenceOwners.has(reference)) referenceOwners.set(reference, []);
+      referenceOwners.get(reference).push(id);
+    }
+
+    const blockById = new Map(blocks.map(block => [Number(block?.index), block]));
+    for (const row of rows) {
+      if (
+        !row.targetKey ||
+        row.targetKey.length < GLOBAL_OWNERSHIP_MIN_CHARS_977 ||
+        row.targetTokens.length < GLOBAL_OWNERSHIP_MIN_TOKENS_977
+      ) continue;
+      const ownReference = ownershipTextKey977(referenceTranslations.get(row.id));
+      if (row.targetKey === ownReference) continue;
+      const owners = (referenceOwners.get(row.targetKey) || []).filter(otherId => Number(otherId) !== row.id);
+      for (const otherId of owners) {
+        const otherBlock = blockById.get(Number(otherId));
+        if (!otherBlock) continue;
+        if (ownershipTokenSimilarity977(row.block?.text, otherBlock?.text) > GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977) continue;
+        addIssue(issueMap, row.id, "CUE_OWNERSHIP_GLOBAL_TRANSPLANT_977");
+        break;
+      }
+    }
+  }
+
+  return [...issueMap.entries()]
+    .map(([id, reasons]) => ({ id: Number(id), reasons: [...reasons] }))
+    .sort((a, b) => Number(a.id) - Number(b.id));
+}
+
+function auditGlobalOwnershipSrt977(sourceSrt, finalSrt, label, job = null) {
+  const blocks = parseSrt(sourceSrt);
+  const finalItems = parseSrt(finalSrt);
+  const translations = new Map(finalItems.map(item => [Number(item.index), String(item.text || "")]));
+  const issues = globalOwnershipIntegrityIssues977(blocks, translations, null);
+
+  if (issues.length) {
+    if (job?.stats) job.stats.globalOwnershipFlags977 = Number(job.stats.globalOwnershipFlags977 || 0) + issues.length;
+    const sample = issues.slice(0, 12).map(issue => `${issue.id}:${(issue.reasons || []).join("+")}`).join(", ");
+    const error = new Error(`GLOBAL OWNERSHIP SEAL 9.7.7 ${label}: ${issues.length} cue(s) com duplicação/transplante forte | ${sample}`);
+    error.code = "GLOBAL_OWNERSHIP_SEAL_977";
+    error.noJobRetry = true;
+    throw error;
+  }
+
+  console.log(`[GLOBAL OWNERSHIP SEAL 9.7.7] ${label}: PASSOU ✅ | long-duplicate/transplant residual=0.`);
+  return true;
+}
+
 function auditTimestamps(
   sourceSrt,
   finalSrt,
@@ -6796,6 +6994,18 @@ function auditTimestamps(
 
   const final =
     parseSrt(finalSrt);
+
+  const sourceIds977 = new Set();
+  for (const item of source) {
+    const id = Number(item?.index);
+    if (sourceIds977.has(id)) {
+      const error = new Error(`IMMUTABLE COORDINATE SEAL 9.7.7 ${label}: SOURCE contém ID duplicado ${id}.`);
+      error.code = "SOURCE_COORDINATE_DUPLICATE_977";
+      error.noJobRetry = true;
+      throw error;
+    }
+    sourceIds977.add(id);
+  }
 
   const finalById =
     new Map();
@@ -6822,6 +7032,7 @@ function auditTimestamps(
   }
 
   let intentionalOmitted = 0;
+  const expectedVisible977 = [];
 
   for (const sourceItem of source) {
     const finalItem =
@@ -6848,6 +7059,8 @@ function auditTimestamps(
         } ausente sem autorização de vazio intencional.`
       );
     }
+
+    expectedVisible977.push(sourceItem);
 
     if (
       sourceItem.timing !==
@@ -6876,6 +7089,43 @@ function auditTimestamps(
       } cue(s) extra(s) inexistente(s) na SOURCE.`
     );
   }
+
+  const expectedOrder977 = expectedVisible977.map(item => Number(item.index));
+  const finalOrder977 = final.map(item => Number(item.index));
+  if (
+    expectedOrder977.length !== finalOrder977.length ||
+    expectedOrder977.some((id, position) => finalOrder977[position] !== id)
+  ) {
+    if (job?.stats) job.stats.coordinateSealFailures977 = Number(job.stats.coordinateSealFailures977 || 0) + 1;
+    const error = new Error(`IMMUTABLE COORDINATE SEAL 9.7.7 ${label}: ordem de IDs mudou.`);
+    error.code = "COORDINATE_ORDER_CHANGED_977";
+    error.noJobRetry = true;
+    throw error;
+  }
+
+  const sourceDigest977 = coordinateDigest977(expectedVisible977);
+  const finalDigest977 = coordinateDigest977(final);
+  if (sourceDigest977 !== finalDigest977) {
+    if (job?.stats) job.stats.coordinateSealFailures977 = Number(job.stats.coordinateSealFailures977 || 0) + 1;
+    const error = new Error(`IMMUTABLE COORDINATE SEAL 9.7.7 ${label}: digest ID+timestamp divergiu.`);
+    error.code = "COORDINATE_DIGEST_CHANGED_977";
+    error.noJobRetry = true;
+    throw error;
+  }
+
+  if (job) {
+    job.coordinateSeal977 = {
+      version: FINAL_COORDINATE_SEAL_VERSION_977,
+      digest: sourceDigest977,
+      visibleCues: final.length,
+      sourceCues: source.length,
+      intentionalOmitted,
+      label: String(label || ""),
+      at: Date.now()
+    };
+  }
+
+  console.log(`[IMMUTABLE COORDINATE SEAL 9.7.7] ${label}: PASSOU ✅ | digest=${sourceDigest977.slice(0,16)} | ordem=${final.length}/${source.length}.`);
 
   console.log(
     `[TIMING LOCK] ${
@@ -9734,36 +9984,51 @@ async function callGroqEmergency976({
   const modelId = groqModelForMetric976(normalizedMetric);
   const effectiveSystem976 = groqCompactSystem976(normalizedMetric);
   const inputEstimate = estimateGroqInputTokens976(effectiveSystem976, user, schema);
+  const requestedOutput = groqOutputCapForMetric976(normalizedMetric, maxOutputTokens);
+  const outputReserve977 =
+    normalizedMetric === "main"
+      ? GROQ_MAIN_OUTPUT_RESERVE_977
+      : (normalizedMetric === "repair" || normalizedMetric === "compact"
+          ? GROQ_REPAIR_OUTPUT_RESERVE_977
+          : GROQ_QUALITY_OUTPUT_RESERVE_977);
+  const totalNeed977 = inputEstimate + outputReserve977 + GROQ_SAFETY_MARGIN_TOKENS_977;
 
-  if (inputEstimate > GROQ_INPUT_SAFE_TOKENS_976) {
+  if (
+    inputEstimate > GROQ_INPUT_SAFE_TOKENS_976 ||
+    totalNeed977 > GROQ_TOTAL_SAFE_TOKENS_977
+  ) {
+    if (job) {
+      job.groqEmergencyPending976 = true;
+      job.stats.groqEmergencySplitSignals976 = Number(job.stats.groqEmergencySplitSignals976 || 0) + 1;
+    }
     const error = new Error(
-      `GROQ 9.7.6: payload estimado ${inputEstimate} input-tokens excede margem segura ${GROQ_INPUT_SAFE_TOKENS_976}; split focal necessário.`
+      `GROQ 9.7.7: payload input≈${inputEstimate} + output-reserve≈${outputReserve977} excede envelope total ${GROQ_TOTAL_SAFE_TOKENS_977}; split focal necessário.`
     );
     error.status = 413;
     error.routerCanSplit = true;
     error.groqSplitRequired976 = true;
     error.modelId = modelId;
-    if (job) job.stats.groqEmergencySplitSignals976 = Number(job.stats.groqEmergencySplitSignals976 || 0) + 1;
     throw error;
   }
 
   const release = await acquireGroqGate976();
   try {
-    const requestedOutput = groqOutputCapForMetric976(normalizedMetric, maxOutputTokens);
-    const conservativeNeed = inputEstimate + Math.min(requestedOutput, 2200) + GROQ_RATE_HEADROOM_976;
+    const conservativeNeed = inputEstimate + outputReserve977 + GROQ_SAFETY_MARGIN_TOKENS_977;
 
     if (
       Number.isFinite(Number(groqRuntime976.remainingTokens)) &&
-      Number(groqRuntime976.remainingTokens) < conservativeNeed &&
-      Number(groqRuntime976.resetAt || 0) > Date.now()
+      Number(groqRuntime976.remainingTokens) < conservativeNeed
     ) {
+      const inferredReset977 = Number(groqRuntime976.resetAt || 0) > Date.now()
+        ? Number(groqRuntime976.resetAt)
+        : Date.now() + 60000;
       const waitMs = Math.min(
         GROQ_RESET_WAIT_MAX_MS_976,
-        Math.max(250, Number(groqRuntime976.resetAt) - Date.now() + 120)
+        Math.max(250, inferredReset977 - Date.now() + 120)
       );
       if (job) job.stats.groqEmergencyWaitMs976 = Number(job.stats.groqEmergencyWaitMs976 || 0) + waitMs;
       console.warn(
-        `[GROQ PACER 9.7.6] remaining=${groqRuntime976.remainingTokens}/${GROQ_TPM_LIMIT_976} | ` +
+        `[GROQ PACER 9.7.7] remaining=${groqRuntime976.remainingTokens}/${GROQ_TPM_LIMIT_976} | ` +
         `need≈${conservativeNeed} | aguardando ${(waitMs / 1000).toFixed(1)}s pelo reset real.`
       );
       await sleep(waitMs);
@@ -9839,7 +10104,7 @@ async function callGroqEmergency976({
             Math.max(500, Number.isFinite(retryHeader) && retryHeader > 0 ? retryHeader * 1000 : resetMs || 3000)
           );
           if (job) job.stats.groqEmergencyWaitMs976 = Number(job.stats.groqEmergencyWaitMs976 || 0) + waitMs;
-          console.warn(`[GROQ EMERGENCY 9.7.6] 429 | aguardando ${(waitMs / 1000).toFixed(1)}s e fazendo UMA reprova bounded.`);
+          console.warn(`[GROQ EMERGENCY 9.7.7] 429 | aguardando ${(waitMs / 1000).toFixed(1)}s e fazendo UMA reprova bounded.`);
           await sleep(waitMs + 120);
           continue;
         }
@@ -9864,6 +10129,7 @@ async function callGroqEmergency976({
 
       groqRuntime976.calls++;
       if (job) {
+        job.groqEmergencyPending976 = false;
         job.groqEmergency976 = true;
         if (!(job.groqEmergencyMetrics976 instanceof Set)) job.groqEmergencyMetrics976 = new Set();
         job.groqEmergencyMetrics976.add(normalizedMetric);
@@ -9876,7 +10142,7 @@ async function callGroqEmergency976({
       }
 
       console.warn(
-        `[GROQ EMERGENCY 9.7.6] OK ${modelId} | metric=${normalizedMetric} | ` +
+        `[GROQ EMERGENCY 9.7.7] OK ${modelId} | metric=${normalizedMetric} | ` +
         `input=${usage.total_input_tokens} | output=${usage.total_output_tokens} | thought=${usage.total_thought_tokens} | ` +
         `remaining=${groqRuntime976.lastHeaders.remainingTokens ?? "?"}.`
       );
@@ -10110,7 +10376,7 @@ async function geminiRequest({
     ) {
       groqEmergencyAttempted976 = true;
       console.warn(
-        `[GROQ EMERGENCY 9.7.6] ambos Gemini indisponíveis por brownout em ${String(metric).toUpperCase()} | ` +
+        `[GROQ EMERGENCY 9.7.7] ambos Gemini indisponíveis por brownout em ${String(metric).toUpperCase()} | ` +
         `acionando ${groqModelForMetric976(metric)} sem esperar o cooldown Gemini.`
       );
       try {
@@ -10131,7 +10397,7 @@ async function geminiRequest({
         }
         errors.push(`groq:${Number(groqError?.status || 0) || groqError?.code || "ERR"}`);
         console.warn(
-          `[GROQ EMERGENCY 9.7.6] falhou em ${String(metric).toUpperCase()} | ` +
+          `[GROQ EMERGENCY 9.7.7] falhou em ${String(metric).toUpperCase()} | ` +
           `${errorMessage(groqError).slice(0, 320)} | Gemini ainda terá no máximo a recuperação bounded antiga.`
         );
       }
@@ -13183,7 +13449,7 @@ function buildQaBatches(
   plan,
   job = null
 ) {
-  const emergency976 = Boolean(job?.groqEmergency976);
+  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
   const maxCues976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CUES_976 : QA_BATCH_MAX_CUES;
   const maxChars976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CHARS_976 : QA_BATCH_MAX_CHARS;
   const batches = [];
@@ -13330,19 +13596,36 @@ async function scanQaBatchGroq976(batch, plan, job) {
     const part = chunks[index];
     const allowed = new Set(part.map(item => Number(item.i)));
     markAttempt(job, "qa");
-    const response = await callGroqEmergency976({
-      system: QA_PROMPT,
-      user:
-        `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
-        `BÍBLIA EDITORIAL DO EPISÓDIO:\n${JSON.stringify(plan || {})}\n\n` +
-        `SEQUÊNCIA CRONOLÓGICA FONTE×PT PARA AUDITORIA:\n${JSON.stringify(part)}\n\n` +
-        `Retorne SOMENTE IDs que realmente merecem repair. Compare SOURCE[i]×PT[i]; preserve ownership, gênero/referente, polaridade, speaker-turn, idioma e naturalidade PT-BR.`,
-      schema: QA_SCHEMA,
-      maxOutputTokens: GROQ_QUALITY_MAX_OUTPUT_TOKENS_976,
-      timeoutMs: QA_TIMEOUT_MS,
-      job,
-      metric: "qa"
-    });
+    let response;
+    try {
+      response = await callGroqEmergency976({
+        system: QA_PROMPT,
+        user:
+          `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+          `BÍBLIA EDITORIAL DO EPISÓDIO:\n${JSON.stringify(plan || {})}\n\n` +
+          `SEQUÊNCIA CRONOLÓGICA FONTE×PT PARA AUDITORIA:\n${JSON.stringify(part)}\n\n` +
+          `Retorne SOMENTE IDs que realmente merecem repair. Compare SOURCE[i]×PT[i]; preserve ownership, gênero/referente, polaridade, speaker-turn, idioma e naturalidade PT-BR.`,
+        schema: QA_SCHEMA,
+        maxOutputTokens: GROQ_QUALITY_MAX_OUTPUT_TOKENS_976,
+        timeoutMs: QA_TIMEOUT_MS,
+        job,
+        metric: "qa"
+      });
+    } catch (error) {
+      if (error?.groqSplitRequired976 && part.length > 1) {
+        job.groqEmergencyPending976 = true;
+        job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+        const mid = Math.ceil(part.length / 2);
+        const left = await scanQaBatchGroq976(part.slice(0, mid), plan, job);
+        const right = await scanQaBatchGroq976(part.slice(mid), plan, job);
+        for (const issue of [...left, ...right]) {
+          if (!seen.has(issue.id)) { seen.add(issue.id); out.push(issue); }
+        }
+        console.warn(`[GROQ QA 9.7.7] split recursivo ${part.length}->${mid}+${part.length-mid}.`);
+        continue;
+      }
+      throw error;
+    }
     markSuccess(job, "qa", { usage: response.usage });
     const parsed = parseQaIssues(response.text, allowed);
     for (const issue of parsed) {
@@ -13351,7 +13634,7 @@ async function scanQaBatchGroq976(batch, plan, job) {
         out.push(issue);
       }
     }
-    console.log(`[GROQ QA 9.7.6] chunk ${index + 1}/${chunks.length} | cues=${part.length} | flags=${parsed.length}.`);
+    console.log(`[GROQ QA 9.7.7] chunk ${index + 1}/${chunks.length} | cues=${part.length} | flags=${parsed.length}.`);
   }
   return out;
 }
@@ -13502,7 +13785,7 @@ async function scanPtbrQuality(
 
           if (error?.groqSplitRequired976 && GROQ_API_KEY) {
             console.warn(
-              `[GROQ QA 9.7.6] lote ${index + 1} grande demais para 8K TPM; ` +
+              `[GROQ QA 9.7.7] lote ${index + 1} grande demais para 8K TPM; ` +
               `rebatching focal sem repetir MAIN.`
             );
             parsedIssues = await scanQaBatchGroq976(batch, plan, job);
@@ -13677,7 +13960,7 @@ function ownershipIssue900(issue) {
   const joined = Array.isArray(issue?.reasons)
     ? issue.reasons.map(String).join(" | ")
     : String(issue?.reason || "");
-  return /POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined);
+  return /POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_SHIFT|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)/i.test(joined);
 }
 
 function ownershipSeal900(block) {
@@ -17144,7 +17427,7 @@ function issuePriority(issue) {
     /FINAL_PRIORITY/i.test(joined) ||
     /GENDER_V[2-9]_/i.test(joined) ||
     /FINAL_GARBAGE_OR_PLACEHOLDER/i.test(joined) ||
-    /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(joined) ||
+    /CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)/i.test(joined) ||
     /UNKNOWN_SPEAKER_GENDER_MARKED/i.test(joined) ||
     /POSSIBLE_OMISSION/i.test(joined) ||
     /POSSIBLE_CUE_SHIFT_PAIR/i.test(joined) ||
@@ -17788,6 +18071,28 @@ async function repairBatch(
       lastError =
         error;
 
+      if (error?.groqSplitRequired976 && issues.length > 1) {
+        job.groqEmergencyPending976 = true;
+        job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+        const mid = Math.ceil(issues.length / 2);
+        console.warn(`[GROQ REPAIR 9.7.7] split ${issues.length}->${mid}+${issues.length-mid}, sem repetir MAIN.`);
+        const left = await repairBatch(blocks, posMap, translations, issues.slice(0, mid), plan, job);
+        const mergedReference977 = new Map(translations);
+        for (const [id, pt] of left.translations || []) mergedReference977.set(Number(id), pt);
+        const right = await repairBatch(blocks, posMap, mergedReference977, issues.slice(mid), plan, job);
+        return {
+          translations: new Map([...(left.translations || new Map()), ...(right.translations || new Map())]),
+          unresolvedIds: [
+            ...(Array.isArray(left.unresolvedIds) ? left.unresolvedIds : []),
+            ...(Array.isArray(right.unresolvedIds) ? right.unresolvedIds : [])
+          ],
+          rejected: new Map([
+            ...(left.rejected instanceof Map ? left.rejected : new Map()),
+            ...(right.rejected instanceof Map ? right.rejected : new Map())
+          ])
+        };
+      }
+
       if (
         parseAttempt >=
         REPAIR_PARSE_ATTEMPTS
@@ -18124,7 +18429,7 @@ function repairCandidateRegressionReasons(
 
   for (const reason of afterReasons) {
     const isPriorityRegression =
-      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-9]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
+      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|POSSIBLE_OMISSION|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|MISSING_DIALOGUE_BREAK|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|SDH_RESIDUE|KNOWN_PTBR_CORRUPTION_OR_UNNATURALNESS|UNKNOWN_SPEAKER_GENDER_MARK|GENDER_V[2-9]_|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(
         reason
       );
 
@@ -18243,7 +18548,7 @@ const ownershipAuditIds =
         ) &&
         issue.reasons.some(
           reason =>
-            /POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)/i.test(
+            /POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)/i.test(
               String(
                 reason || ""
               )
@@ -18363,14 +18668,14 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     );
 
   const repairBatches = [];
-  const repairBatchCap976 = job?.groqEmergency976
+  const repairBatchCap976 = (job?.groqEmergency976 || job?.groqEmergencyPending976)
     ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
     : REPAIR_BATCH_MAX_CUES;
   for (let i = 0; i < selected.length; i += repairBatchCap976) {
     repairBatches.push(selected.slice(i, i + repairBatchCap976));
   }
-  if (job?.groqEmergency976) {
-    console.warn(`[GROQ REPAIR 9.7.6] emergency batching=${repairBatchCap976} cues/lote | 120B focal.`);
+  if (job?.groqEmergency976 || job?.groqEmergencyPending976) {
+    console.warn(`[GROQ REPAIR 9.7.7] emergency batching=${repairBatchCap976} cues/lote | 120B focal.`);
   }
 
   const totalBatches = repairBatches.length;
@@ -18559,6 +18864,15 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
   job.repairResidualIds976 = uniqueResidual
     .map(issue => Number(issue?.id))
     .filter(Number.isInteger);
+  job.repairResidualSnapshot977 = new Map(
+    uniqueResidual.map(issue => [
+      Number(issue?.id),
+      {
+        text: String(updated.get(Number(issue?.id)) || ""),
+        reasons: [...new Set((Array.isArray(issue?.reasons) ? issue.reasons : []).map(reason => String(reason || "")).filter(Boolean))]
+      }
+    ]).filter(([id]) => Number.isInteger(id))
+  );
   job.residualAccountability976 = {
     repairResidualInitial: job.repairResidualIds976.length,
     repairResidualIds: [...job.repairResidualIds976],
@@ -18566,7 +18880,7 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     remainingHard: []
   };
   console.warn(
-    `[RESIDUAL ACCOUNTABILITY 9.7.6] repair-residual=${job.repairResidualIds976.length} | ` +
+    `[RESIDUAL ACCOUNTABILITY 9.7.7] repair-residual=${job.repairResidualIds976.length} | ` +
     `ids=[${job.repairResidualIds976.join(",")}].`
   );
 
@@ -20244,7 +20558,7 @@ function finalPriorityIssueSignature(issues) {
 // JavaScript não suporta flag /x. Mantemos a expressão acima legível
 // através desta implementação real equivalente.
 function finalReasonBlocks(reason) {
-  return /FINAL_PRIORITY|MEANING_INTEGRITY_|NEGATION_|REFERENT_INTEGRITY_|PTBR_ORTHOGRAPHY_ERROR|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
+  return /FINAL_PRIORITY|MEANING_INTEGRITY_|NEGATION_|REFERENT_INTEGRITY_|PTBR_ORTHOGRAPHY_ERROR|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|FINAL_GARBAGE_OR_PLACEHOLDER|^EMPTY$|POSSIBLE_OMISSION|POSSIBLE_CUE_SHIFT_PAIR|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|BLEEP_CREATED_DANGLING_SENTENCE|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION|ARTIFICIAL_PROFANITY_CENSORSHIP|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|SUBTITLE_TOO_DENSE/i.test(
     String(reason || "")
   );
 }
@@ -20330,7 +20644,7 @@ function buildFinalPriorityAuditBatches(
   focusIds = null,
   job = null
 ) {
-  const emergency976 = Boolean(job?.groqEmergency976);
+  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
   const maxCues976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CUES_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES;
   const maxChars976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS;
   const hasExplicitFocus =
@@ -20425,6 +20739,11 @@ async function finalPriorityGeminiRequest(args, job, label) {
     try {
       return await geminiRequest(activeArgs);
     } catch (error) {
+      if (error?.groqSplitRequired976) {
+        job.groqEmergencyPending976 = true;
+        throw error;
+      }
+
       failures++;
       job.stats.finalPriorityTechnicalRetries =
         (job.stats.finalPriorityTechnicalRetries || 0) + 1;
@@ -20536,6 +20855,70 @@ function parseFinalPriorityAudit(text, allowedIds) {
   return out;
 }
 
+
+async function scanFinalPriorityAuditGroq977(
+  blocks,
+  translations,
+  plan,
+  job,
+  focusIds,
+  depth = 0
+) {
+  const ids = [...new Set(
+    (focusIds instanceof Set ? [...focusIds] : Array.isArray(focusIds) ? focusIds : [])
+      .map(Number)
+      .filter(Number.isInteger)
+  )];
+  if (!ids.length) return [];
+  if (depth > 8) {
+    const error = new Error("GROQ FINAL AUDIT 9.7.7: split depth excedido.");
+    error.noJobRetry = true;
+    throw error;
+  }
+
+  job.groqEmergencyPending976 = true;
+  const batches = buildFinalPriorityAuditBatches(blocks, translations, plan, new Set(ids), job);
+  const out = [];
+
+  for (const batch of batches) {
+    try {
+      markAttempt(job, "qa");
+      const response = await callGroqEmergency976({
+        system: FINAL_PRIORITY_AUDIT_PROMPT,
+        user:
+          `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
+          `IMPORTANTE: use o idioma REAL encontrado em SOURCE; não presuma inglês.\n\n` +
+          `BÍBLIA EDITORIAL:\n${JSON.stringify(plan || {})}\n\n` +
+          `CUES EM ORDEM CRONOLÓGICA:\n${JSON.stringify(batch.cues)}\n\n` +
+          `Audite SOMENTE context_only=false. context_only=true existe apenas para comparar vizinhos.`,
+        schema: FINAL_PRIORITY_AUDIT_SCHEMA,
+        maxOutputTokens: GROQ_QUALITY_MAX_OUTPUT_TOKENS_976,
+        timeoutMs: FINAL_PRIORITY_AUDIT_TIMEOUT_MS,
+        job,
+        metric: "qa"
+      });
+      markSuccess(job, "qa", { usage: response.usage });
+      job.stats.finalPriorityAuditCalls = (job.stats.finalPriorityAuditCalls || 0) + 1;
+      out.push(...parseFinalPriorityAudit(response.text, batch.targetIds));
+    } catch (error) {
+      if (error?.groqSplitRequired976 && batch.targetIds.size > 1) {
+        job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+        const targetIds = [...batch.targetIds];
+        const mid = Math.ceil(targetIds.length / 2);
+        console.warn(`[GROQ FINAL AUDIT 9.7.7] split ${targetIds.length}->${mid}+${targetIds.length-mid} | depth=${depth+1}.`);
+        out.push(
+          ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(0, mid)), depth + 1),
+          ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(mid)), depth + 1)
+        );
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  return mergeIssueLists(out);
+}
+
 async function scanFinalPriorityAudit(
   blocks,
   translations,
@@ -20578,7 +20961,9 @@ async function scanFinalPriorityAudit(
         parseFailures <
           FINAL_PRIORITY_PARSE_MAX_FAILURES
       ) {
-        const response = await finalPriorityGeminiRequest(
+        let response;
+        try {
+          response = await finalPriorityGeminiRequest(
           {
             system: FINAL_PRIORITY_AUDIT_PROMPT,
             user:
@@ -20598,6 +20983,16 @@ async function scanFinalPriorityAudit(
           job,
           `AUDIT W${workerId} lote ${index + 1}`
         );
+        } catch (error) {
+          if (error?.groqSplitRequired976) {
+            job.groqEmergencyPending976 = true;
+            job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+            console.warn(`[GROQ FINAL AUDIT 9.7.7] lote ${index + 1} grande após failover; rebatching focal.`);
+            parsed = await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, batch.targetIds);
+            break;
+          }
+          throw error;
+        }
 
         job.stats.finalPriorityAuditCalls =
           (job.stats.finalPriorityAuditCalls || 0) + 1;
@@ -20734,14 +21129,19 @@ async function runFinalPriorityEscalatedRepair(
   const updated = new Map(translations);
   const selected = [...issues].sort((a, b) => issuePriority(a) - issuePriority(b));
 
+  const escalatedBatchCap977 =
+    (job?.groqEmergency976 || job?.groqEmergencyPending976)
+      ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
+      : FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES;
+
   for (
     let offset = 0;
     offset < selected.length;
-    offset += FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES
+    offset += escalatedBatchCap977
   ) {
     const batchIssues = selected.slice(
       offset,
-      offset + FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES
+      offset + escalatedBatchCap977
     );
 
     let completed = false;
@@ -20803,7 +21203,7 @@ async function runFinalPriorityEscalatedRepair(
             metric: "repair"
           },
           job,
-          `ESCALATED REPAIR ${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1}`
+          `ESCALATED REPAIR ${Math.floor(offset / escalatedBatchCap977) + 1}`
         );
 
         let repaired;
@@ -20874,12 +21274,27 @@ async function runFinalPriorityEscalatedRepair(
 
         console.log(
           `[FINAL PRIORITY ESCALATED] lote ` +
-          `${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1} | ` +
+          `${Math.floor(offset / escalatedBatchCap977) + 1} | ` +
           `aceitos=${accepted}/${batchIssues.length}.`
         );
 
         completed = true;
       } catch (error) {
+        if (error?.groqSplitRequired976 && batchIssues.length > 1) {
+          job.groqEmergencyPending976 = true;
+          job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
+          const mid = Math.ceil(batchIssues.length / 2);
+          console.warn(`[GROQ FINAL REPAIR 9.7.7] split ${batchIssues.length}->${mid}+${batchIssues.length-mid}.`);
+          const leftUpdated = await runFinalPriorityEscalatedRepair(blocks, updated, batchIssues.slice(0, mid), plan, job, options);
+          const rightUpdated = await runFinalPriorityEscalatedRepair(blocks, leftUpdated, batchIssues.slice(mid), plan, job, options);
+          for (const issue of batchIssues) {
+            const id = Number(issue?.id);
+            if (Number.isInteger(id) && rightUpdated.has(id)) updated.set(id, rightUpdated.get(id));
+          }
+          completed = true;
+          break;
+        }
+
         parseFailures++;
         job.stats.finalPriorityTechnicalRetries =
           (job.stats.finalPriorityTechnicalRetries || 0) + 1;
@@ -20902,7 +21317,7 @@ async function runFinalPriorityEscalatedRepair(
     if (!completed) {
       console.warn(
         `[FINAL PRIORITY ESCALATED] lote ` +
-        `${Math.floor(offset / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES) + 1} ` +
+        `${Math.floor(offset / escalatedBatchCap977) + 1} ` +
         `atingiu o limite de ${FINAL_PRIORITY_ESCALATED_MAX_FAILURES} falhas; ` +
         `candidato anterior preservado sem loop.`
       );
@@ -21939,13 +22354,15 @@ function deterministicFinalResidual960(
     "FINAL-97-DETERMINISTIC"
   );
 
+  const globalOwnership977 = globalOwnershipIntegrityIssues977(blocks, current, null);
+
   const local = splitGenderSeverity970(
     blocks,
     resolveGuardConflicts942(
       blocks,
-      blockingLocalIssues(blocks, laidOut, job, plan),
+      mergeIssueLists(blockingLocalIssues(blocks, laidOut, job, plan), globalOwnership977),
       job,
-      "DETERMINISTIC FINAL LOCAL 9.7.0"
+      "DETERMINISTIC FINAL LOCAL 9.7.7"
     ),
     job,
     "deterministic-final"
@@ -22310,31 +22727,56 @@ async function runBoundedFinalQuality88(
     }
   }
 
-  job.finalTargetResidual927 = residual;
-
   if (Array.isArray(job.repairResidualIds976)) {
-    const finalIds976 = new Set(
-      residual.map(issue => Number(issue?.id)).filter(Number.isInteger)
-    );
-    const initial976 = [...new Set(job.repairResidualIds976.map(Number).filter(Number.isInteger))];
-    const remainingHard976 = initial976.filter(id => finalIds976.has(id));
-    const cleared976 = initial976.filter(id => !finalIds976.has(id));
+    const initial977 = [...new Set(job.repairResidualIds976.map(Number).filter(Number.isInteger))];
+    const finalIds977 = new Set(residual.map(issue => Number(issue?.id)).filter(Number.isInteger));
+    const proofCleared977 = [];
+    const deterministicCleared977 = [];
+    const remainingHard977 = [];
+    const unaccounted977 = [];
+    const snapshot977 = job.repairResidualSnapshot977 instanceof Map ? job.repairResidualSnapshot977 : new Map();
+    const objectiveFamilies977 = new Set(["GENDER","NEGATION","OWNERSHIP","CENSOR","DIALOGUE","LAYOUT","SDH","REPETITION"]);
+
+    for (const id of initial977) {
+      if (finalIds977.has(id)) { remainingHard977.push(id); continue; }
+      const finalText = String(current.get(id) || "");
+      if (hasSemanticCleanProof974(job, id, finalText)) { proofCleared977.push(id); continue; }
+      const snap = snapshot977.get(id) || {};
+      const families = blockerFamilies928({ reasons: Array.isArray(snap.reasons) ? snap.reasons : [] });
+      const onlyObjective = families.length > 0 && families.every(family => objectiveFamilies977.has(family));
+      if (onlyObjective) { deterministicCleared977.push(id); continue; }
+      unaccounted977.push(id);
+    }
+
+    if (unaccounted977.length) {
+      const hardIssues977 = unaccounted977.map(id => ({
+        id,
+        reasons: ["RESIDUAL_ACCOUNTABILITY_UNPROVEN_977: Repair residual desapareceu sem prova semântica hash-bound nem resolução puramente determinística."]
+      }));
+      residual = mergeIssueLists(residual, hardIssues977);
+      for (const issue of hardIssues977) finalIds977.add(Number(issue.id));
+    }
+
     job.residualAccountability976 = {
       ...(job.residualAccountability976 || {}),
-      repairResidualInitial: initial976.length,
-      repairResidualIds: initial976,
-      clearedBySubsequentVerification: cleared976,
-      remainingHard: remainingHard976,
+      repairResidualInitial: initial977.length,
+      repairResidualIds: initial977,
+      clearedBySemanticProof: proofCleared977,
+      clearedDeterministically: deterministicCleared977,
+      remainingHard: remainingHard977,
+      unaccountedHard: unaccounted977,
       finalResidualTotal: residual.length,
-      finalResidualIds: [...finalIds976]
+      finalResidualIds: [...finalIds977]
     };
+
     console.log(
-      `[RESIDUAL ACCOUNTABILITY 9.7.6] initial=${initial976.length} | ` +
-      `cleared-by-subsequent-verification=${cleared976.length} ids=[${cleared976.join(",")}] | ` +
-      `remaining-hard=${remainingHard976.length} ids=[${remainingHard976.join(",")}] | ` +
-      `final-total=${residual.length}.`
+      `[RESIDUAL ACCOUNTABILITY 9.7.7] initial=${initial977.length} | ` +
+      `semantic-proof=${proofCleared977.length} | deterministic=${deterministicCleared977.length} | ` +
+      `remaining=${remainingHard977.length} | unaccounted-hard=${unaccounted977.length} | final-total=${residual.length}.`
     );
   }
+
+  job.finalTargetResidual927 = residual;
 
   job.finalTargetResidualSnapshot9210 = new Map(
     residual.map(issue => [
@@ -22455,7 +22897,7 @@ const preSafeHardIssues = splitGenderSeverity970(
   ).map(issue => ({
     id: issue.id,
     reasons: (issue.reasons || []).filter(reason =>
-      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+      /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|CUE_OWNERSHIP_(?:SHIFT|BOUNDARY_MISMATCH|BOUNDARY_DUPLICATION|GLOBAL_DUPLICATION_977|GLOBAL_TRANSPLANT_977)|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
     )
   })).filter(issue => issue.reasons.length),
   job,
@@ -22550,11 +22992,18 @@ let qaIssues =
 // Final Priority is therefore not allowed to discover a blocker later and
 // trigger another rewrite cascade.
 {
-  const preClosureLocal950 = detectLocalIssues(
-    blocks,
-    mainTranslations,
-    job.filename,
-    plan
+  const preClosureLocal950 = mergeIssueLists(
+    detectLocalIssues(
+      blocks,
+      mainTranslations,
+      job.filename,
+      plan
+    ),
+    globalOwnershipIntegrityIssues977(
+      blocks,
+      mainTranslations,
+      null
+    )
   );
   const preClosureFocus950 = new Set([
     ...idsFromIssues(qaIssues, blocks),
@@ -22775,6 +23224,22 @@ console.log(
   `${finalClosure898.gender === 0 ? "✅" : "⛔"}`
 );
 
+const globalOwnershipFinal977 = globalOwnershipIntegrityIssues977(blocks, finalTranslations, mainTranslations);
+job.globalOwnershipResidual977 = globalOwnershipFinal977.length;
+
+if (globalOwnershipFinal977.length) {
+  job.stats.globalOwnershipFlags977 = Number(job.stats.globalOwnershipFlags977 || 0) + globalOwnershipFinal977.length;
+  job.finalTargetResidual927 = mergeIssueLists(job.finalTargetResidual927, globalOwnershipFinal977);
+  job.noCacheFinal923 = true;
+  job.qualityStatus = "best_available";
+  console.error(
+    `[GLOBAL OWNERSHIP SEAL 9.7.7] FAIL-CLOSED | residual=${globalOwnershipFinal977.length} | ` +
+    `ids=[${globalOwnershipFinal977.slice(0,24).map(issue => Number(issue.id)).join(",")}].`
+  );
+} else {
+  console.log(`[GLOBAL OWNERSHIP SEAL 9.7.7] PRE-FINAL PASSOU ✅ | residual=0.`);
+}
+
 const authorizedLayoutTranslations =
   applySubtitleLayout(
     blocks,
@@ -22794,6 +23259,7 @@ auditTimestamps(
   "FINAL",
   job
 );
+auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
   const pipelineElapsedSeconds =
     (
       (
@@ -22827,7 +23293,8 @@ auditTimestamps(
     Number(finalClosure898.broadcast || 0) === 0 &&
     Number(finalClosure898.repetition || 0) === 0 &&
     Number(finalClosure898.censor || 0) === 0 &&
-    Number(job.ownershipFinalResidual900 || 0) === 0;
+    Number(job.ownershipFinalResidual900 || 0) === 0 &&
+    Number(job.globalOwnershipResidual977 || 0) === 0;
 
   if (finalHardClosureClean931 && semanticResidual927 === 0) {
     // 9.4.0: noCacheFinal923 may have been raised by an earlier candidate that
@@ -22899,20 +23366,23 @@ async function processJob(
           job
         );
 
-        auditTimestamps(
-          job.sourceSrt,
-          cached,
-          "CACHE",
-          job
-        );
-
-        job.result = cached;
-        job.status = "completed";
-        job.progress = 100;
-        job.error = null;
-        job.qualityStatus =
-          "cache_verified";
-        return;
+        try {
+          auditTimestamps(job.sourceSrt, cached, "CACHE", job);
+          auditGlobalOwnershipSrt977(job.sourceSrt, cached, "CACHE", job);
+          job.result = cached;
+          job.status = "completed";
+          job.progress = 100;
+          job.error = null;
+          job.qualityStatus = "cache_verified";
+          return;
+        } catch (cacheIntegrityError977) {
+          translationCache.delete(job.cacheKey);
+          job.stats.cacheIntegrityEvictions977 = Number(job.stats.cacheIntegrityEvictions977 || 0) + 1;
+          console.error(
+            `[CACHE INTEGRITY 9.7.7] canonical inválido removido da memória; reconstruindo da SOURCE | ` +
+            `${errorMessage(cacheIntegrityError977).slice(0,320)}`
+          );
+        }
       }
 
       const finalSrt = await translateSrt(
@@ -22945,8 +23415,10 @@ async function processJob(
       // 9.2.3: strict final gate may allow availability without freezing a
       // residual as canonical. Such results are served but never cached.
       if (!job.noCacheFinal923) {
+        auditTimestamps(job.sourceSrt, finalSrt, "PRE-CACHE-9.7.7", job);
+        auditGlobalOwnershipSrt977(job.sourceSrt, finalSrt, "PRE-CACHE-9.7.7", job);
         setCache(job.cacheKey, finalSrt, job);
-        console.log(`[CACHE 9.4.0] CANONICAL salvo | quality=${job.qualityStatus || "final_pass"}.`);
+        console.log(`[CACHE 9.7.7] CANONICAL salvo após coordinate+ownership seal | quality=${job.qualityStatus || "final_pass"}.`);
       } else {
         setProvisionalCache927(job.cacheKey, finalSrt, job, "best_available");
         console.warn(`[CACHE 9.4.0] CANONICAL bloqueado; PROVISIONAL preservado | quality=${job.qualityStatus || "best_available"}.`);
@@ -25636,7 +26108,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.6 - GEMINI-FIRST + GROQ EMERGENCY + RESIDUAL ACCOUNTABILITY | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.7 - IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -25918,10 +26390,11 @@ console.log(
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
-  console.log(`Groq Emergency 9.7.6: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
-  console.log("Groq TPM 9.7.6: header-aware pacing + split focal + Repair<=5 cues no modo emergencial ✅");
-  console.log("Residual Accountability 9.7.6: residual do Repair recebe IDs e reconciliação explícita no gate final ✅");
-  console.log("Semantic cache namespace permanece 9.7.4: mudança é somente de transporte/roteamento; qualidade e contratos textuais intactos ✅");
+  console.log(`Groq Emergency 9.7.7: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
+  console.log("Groq TPM 9.7.7: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
+  console.log("Residual Accountability 9.7.7: residual só desaparece com proof hash-bound ou resolução determinística; unaccounted=HARD ✅");
+  console.log("Immutable Timeline + Global Ownership 9.7.7: ID/order/timestamp digest + long duplicate/transplant seal bloqueiam FINAL/cache ✅");
+  console.log("Semantic cache namespace 9.7.7: coordinate+ownership seal faz parte do cache canônico; timing da SOURCE permanece imutável ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
@@ -25980,7 +26453,7 @@ console.log(
   );
 
   console.log(
-    "Model Health 9.7.6: Gemini 503/504/timeout aciona breaker/failover; ambos indisponíveis liberam Groq emergency; 429/RPD NÃO troca provedor; checkpoint preservado ✅"
+    "Model Health 9.7.7: Gemini 503/504/timeout aciona breaker/failover; ambos indisponíveis liberam Groq emergency; 429/RPD NÃO troca provedor; checkpoint preservado ✅"
   );
 
   console.log(
