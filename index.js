@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.7 - IMMUTABLE TIMELINE + GLOBAL OWNERSHIP SEAL + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -136,7 +136,7 @@ const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
 const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
 
 const CACHE_VERSION =
-  "9.7.7-immutable-coordinate-global-ownership-v1";
+  "9.7.8-spoken-sdh-guard-immutable-ownership-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -2148,6 +2148,13 @@ function looksLikeClearlySpokenBareLine(value) {
 
   // Fala curta + hesitação/vocalização (ex.: "Oi. Hum...") continua sendo fala.
   if (/^(?:hi|hello|hey|oi|olá|ola)[,!?.…]*\s+(?:mm-?hmm|mhm|uh-?huh|uhum|aham|hmm+|hm+|hum+|mm+|uh+|um+|ahn|ãh|ah)[.!?…]*$/iu.test(text)) {
+    return true;
+  }
+
+  // 9.7.8 — SPOKEN NOUN PHRASE GUARD.
+  // Palavras como TV/radio também aparecem no vocabulário SDH, mas um sintagma
+  // nominal curto ("The TV.", "A TV.", "O rádio.") é fala lexical, não evento.
+  if (/^(?:(?:the|a|an|this|that|my|your|our|his|her|their|o|a|os|as|um|uma|esse|essa|este|esta|meu|minha|seu|sua|nosso|nossa)\s+)(?:tv|television|televisão|televisao|radio|rádio)$/iu.test(text)) {
     return true;
   }
 
@@ -5839,6 +5846,12 @@ function stripOutputAccessibilityLine(
         ""
       )
       .trim();
+
+  // 9.7.8: antes de promover ALL-CAPS/keyword para SDH, preserve fala lexical
+  // inequívoca. Isso evita apagar "The TV." -> "A TV." e casos universais análogos.
+  if (looksLikeClearlySpokenBareLine(text)) {
+    return text;
+  }
 
   // 9.2.6 UNIVERSAL FINAL HYGIENE. Pure accessibility events never belong
   // in the visible final subtitle, even when a model recreated them without []/().
@@ -26108,7 +26121,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.7 - IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -26390,11 +26403,12 @@ console.log(
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
-  console.log(`Groq Emergency 9.7.7: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
-  console.log("Groq TPM 9.7.7: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
-  console.log("Residual Accountability 9.7.7: residual só desaparece com proof hash-bound ou resolução determinística; unaccounted=HARD ✅");
-  console.log("Immutable Timeline + Global Ownership 9.7.7: ID/order/timestamp digest + long duplicate/transplant seal bloqueiam FINAL/cache ✅");
-  console.log("Semantic cache namespace 9.7.7: coordinate+ownership seal faz parte do cache canônico; timing da SOURCE permanece imutável ✅");
+  console.log(`Groq Emergency 9.7.8: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
+  console.log("Groq TPM 9.7.8: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
+  console.log("Residual Accountability 9.7.8: residual só desaparece com proof hash-bound ou resolução determinística; unaccounted=HARD ✅");
+  console.log("Immutable Timeline + Global Ownership 9.7.8: ID/order/timestamp digest + long duplicate/transplant seal bloqueiam FINAL/cache ✅");
+  console.log("Spoken SDH Guard 9.7.8: sintagmas lexicais curtos como The TV./A TV./O rádio nunca viram SDH por keyword isolada ✅");
+  console.log("Semantic cache namespace 9.7.8: coordinate+ownership seal faz parte do cache canônico; timing da SOURCE permanece imutável ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
   console.log(
