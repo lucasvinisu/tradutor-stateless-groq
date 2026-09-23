@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.5 - ADAPTIVE MAIN CIRCUIT BREAKER + CHECKPOINT RESUME (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.7.6 - GEMINI-FIRST + GROQ EMERGENCY + RESIDUAL ACCOUNTABILITY (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // ============================================================
 
@@ -18,6 +18,7 @@ const PORT = Number(process.env.PORT || 10000);
 const PUBLIC_URL = String(process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const LOCAL_BRIDGE_SECRET = String(process.env.LOCAL_BRIDGE_SECRET || "").trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
+const GROQ_API_KEY = String(process.env.GROQ_API_KEY || "").trim();
 
 // ============================================================
 // BRIDGE GATEWAY 1.1 — endereço público estável por redirect, sem domínio próprio
@@ -98,6 +99,25 @@ const MAIN_BROWNOUT_RECOVERY_CONCURRENCY_975 = 2;
 const MAIN_BROWNOUT_STABLE_SUCCESSES_975 = 2;
 const MAIN_BROWNOUT_JOB_RECOVERY_MAX_975 = 2;
 const MAIN_BROWNOUT_SLOT_POLL_MS_975 = 120;
+
+// 9.7.6 — Gemini-first, Groq emergency only after BOTH Gemini routes are
+// unavailable by 5xx/timeout brownout. 429/RPD never triggers provider escape.
+const GROQ_MODELS_976 = Object.freeze({
+  MAIN: "openai/gpt-oss-20b",
+  QUALITY: "openai/gpt-oss-120b"
+});
+const GROQ_TPM_LIMIT_976 = 8000;
+const GROQ_INPUT_SAFE_TOKENS_976 = 5200;
+const GROQ_RATE_HEADROOM_976 = 700;
+const GROQ_MAIN_MAX_OUTPUT_TOKENS_976 = 3200;
+const GROQ_QUALITY_MAX_OUTPUT_TOKENS_976 = 2400;
+const GROQ_REPAIR_MAX_OUTPUT_TOKENS_976 = 1600;
+const GROQ_QA_EMERGENCY_BATCH_CUES_976 = 15;
+const GROQ_QA_EMERGENCY_BATCH_CHARS_976 = 16000;
+const GROQ_FINAL_EMERGENCY_BATCH_CUES_976 = 18;
+const GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 = 16000;
+const GROQ_REPAIR_EMERGENCY_BATCH_CUES_976 = 5;
+const GROQ_RESET_WAIT_MAX_MS_976 = 65000;
 
 const CACHE_VERSION =
   "9.7.4-semantic-proof-ledger-v1";
@@ -1353,6 +1373,13 @@ function createJob({
       model429Rate: 0,
       modelTimeouts: 0,
       modelCallsById: {},
+
+      groqEmergencyCalls976: 0,
+      groqEmergencyMainCalls976: 0,
+      groqEmergencyQualityCalls976: 0,
+      groqEmergency429976: 0,
+      groqEmergencyWaitMs976: 0,
+      groqEmergencySplitSignals976: 0,
 
       inputTokens: 0,
       outputTokens: 0,
@@ -9550,6 +9577,324 @@ async function callGenerateContentModel({
   }
 }
 
+
+// ============================================================
+// GROQ EMERGENCY ROUTER 9.7.6
+// ============================================================
+
+let groqGate976 = Promise.resolve();
+const groqRuntime976 = {
+  remainingTokens: null,
+  resetAt: 0,
+  lastHeaders: {},
+  calls: 0
+};
+
+function groqModelForMetric976(metric) {
+  return String(metric || "main").toLowerCase() === "main"
+    ? GROQ_MODELS_976.MAIN
+    : GROQ_MODELS_976.QUALITY;
+}
+
+function groqReasoningForMetric976(metric) {
+  const normalized = String(metric || "main").toLowerCase();
+  return normalized === "qa" || normalized === "semantic" || normalized === "preconfirm"
+    ? "medium"
+    : "low";
+}
+
+function groqCompactSystem976(metric) {
+  const normalized = String(metric || "main").toLowerCase();
+  const shared = `
+UNIVERSAL SUBTITLE CONTRACT — SOURCE -> Brazilian Portuguese (pt-BR)
+- SOURCE is authoritative. Never invent visual context.
+- Preserve exact cue IDs/order and cue ownership. Never move content across IDs.
+- Preserve polarity/negation, subject/object, referents, possession, numbers, names and concrete entities.
+- Preserve who did what to whom. Do not create reflexive/reciprocal meaning absent from SOURCE.
+- Gender is evidence-locked: when SOURCE does not prove gender, use genuinely neutral Brazilian Portuguese.
+- Preserve speaker-turn count/order when turn metadata exists.
+- Real speech must not become empty. Pure disposable SDH/noise may be empty.
+- Preserve meaningful performance lyrics; preserve narrative meaning and musical intent.
+- Keep hard-lock tokens exactly when supplied. Never expose internal metadata tokens in final prose.
+- Natural contemporary pt-BR is mandatory: avoid calques, false cognates, accidental English, robotic syntax and invented slang.
+- Be concise for subtitles without deleting semantic units.
+- Output ONLY the required JSON schema. No markdown. No explanations. No visible reasoning.
+`.trim();
+
+  if (normalized === "main") {
+    return `${shared}
+MAIN: translate only each target/en field into pt for the SAME id. before/after are context only. Preserve fragments as fragments and never complete a cue using its neighbor.`;
+  }
+  if (normalized === "qa" || normalized === "semantic" || normalized === "preconfirm") {
+    return `${shared}
+QA: do not rewrite for taste. Flag ONLY real semantic, ownership, gender, speaker-turn, omission, hallucination, SDH/music, residual-English or serious naturalness defects.`;
+  }
+  if (normalized === "repair" || normalized === "compact") {
+    return `${shared}
+REPAIR: fix only the proven defect/reasons for each cue. Preserve everything already correct. Never introduce gender or information not proven by SOURCE/context.`;
+  }
+  return shared;
+}
+
+function groqOutputCapForMetric976(metric, requested) {
+  const normalized = String(metric || "main").toLowerCase();
+  const cap = normalized === "main"
+    ? GROQ_MAIN_MAX_OUTPUT_TOKENS_976
+    : normalized === "repair" || normalized === "compact"
+      ? GROQ_REPAIR_MAX_OUTPUT_TOKENS_976
+      : GROQ_QUALITY_MAX_OUTPUT_TOKENS_976;
+  return Math.max(256, Math.min(Number(requested || cap), cap));
+}
+
+function estimateGroqInputTokens976(system, user, schema) {
+  let schemaText = "";
+  try { schemaText = JSON.stringify(schema || {}); } catch {}
+  const chars = Buffer.byteLength(String(system || ""), "utf8") +
+    Buffer.byteLength(String(user || ""), "utf8") +
+    Buffer.byteLength(schemaText, "utf8") + 500;
+  return Math.max(128, Math.ceil(chars / 3.5));
+}
+
+function groqResetMs976(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return 0;
+  if (/^\d+(?:\.\d+)?$/.test(text)) return Math.max(0, Math.ceil(Number(text) * 1000));
+  let total = 0;
+  const h = text.match(/(\d+(?:\.\d+)?)h/);
+  const m = text.match(/(\d+(?:\.\d+)?)m/);
+  const sec = text.match(/(\d+(?:\.\d+)?)s/);
+  if (h) total += Number(h[1]) * 3600000;
+  if (m) total += Number(m[1]) * 60000;
+  if (sec) total += Number(sec[1]) * 1000;
+  return Math.max(0, Math.ceil(total));
+}
+
+async function acquireGroqGate976() {
+  const previous = groqGate976;
+  let release;
+  groqGate976 = new Promise(resolve => { release = resolve; });
+  await previous;
+  return release;
+}
+
+function groqAvailabilityReason976(reason) {
+  return /(?:503|504|timeout|high demand|http\s*(?:500|502|503|504|408|425))/i.test(String(reason || ""));
+}
+
+function groqEmergencyAllowedMetric976(metric) {
+  return ["main", "qa", "repair", "compact", "semantic", "preconfirm"].includes(
+    String(metric || "main").toLowerCase()
+  );
+}
+
+function shouldEnterGroqEmergency976(route, availabilityFailures, job, metric) {
+  if (!GROQ_API_KEY || !groqEmergencyAllowedMetric976(metric)) return false;
+  const usable = (Array.isArray(route) ? route : []).filter(Boolean);
+  if (usable.length < 2) return false;
+  const now = Date.now();
+
+  return usable.every(modelId => {
+    // RPD/daily hard-skip and quota locks are NOT provider-failover signals.
+    if (modelSkippedForJob(job, modelId)) return false;
+    if (availabilityFailures instanceof Set && availabilityFailures.has(modelId)) return true;
+    const runtime = runtimeForGeminiModel(modelId);
+    return Number(runtime?.unavailableUntil || 0) > now &&
+      groqAvailabilityReason976(runtime?.unavailableReason || "");
+  });
+}
+
+function updateGroqRate976(response) {
+  const remaining = Number(response.headers.get("x-ratelimit-remaining-tokens"));
+  const resetMs = groqResetMs976(response.headers.get("x-ratelimit-reset-tokens"));
+  groqRuntime976.remainingTokens = Number.isFinite(remaining) ? remaining : null;
+  groqRuntime976.resetAt = resetMs > 0 ? Date.now() + resetMs : 0;
+  groqRuntime976.lastHeaders = {
+    remainingTokens: Number.isFinite(remaining) ? remaining : null,
+    resetTokens: String(response.headers.get("x-ratelimit-reset-tokens") || ""),
+    remainingRequests: String(response.headers.get("x-ratelimit-remaining-requests") || "")
+  };
+}
+
+async function callGroqEmergency976({
+  system,
+  user,
+  schema,
+  maxOutputTokens,
+  timeoutMs,
+  job,
+  metric
+}) {
+  if (!GROQ_API_KEY) {
+    const error = new Error("GROQ_API_KEY não configurada.");
+    error.code = "GROQ_DISABLED_976";
+    throw error;
+  }
+
+  const normalizedMetric = String(metric || "main").toLowerCase();
+  const modelId = groqModelForMetric976(normalizedMetric);
+  const effectiveSystem976 = groqCompactSystem976(normalizedMetric);
+  const inputEstimate = estimateGroqInputTokens976(effectiveSystem976, user, schema);
+
+  if (inputEstimate > GROQ_INPUT_SAFE_TOKENS_976) {
+    const error = new Error(
+      `GROQ 9.7.6: payload estimado ${inputEstimate} input-tokens excede margem segura ${GROQ_INPUT_SAFE_TOKENS_976}; split focal necessário.`
+    );
+    error.status = 413;
+    error.routerCanSplit = true;
+    error.groqSplitRequired976 = true;
+    error.modelId = modelId;
+    if (job) job.stats.groqEmergencySplitSignals976 = Number(job.stats.groqEmergencySplitSignals976 || 0) + 1;
+    throw error;
+  }
+
+  const release = await acquireGroqGate976();
+  try {
+    const requestedOutput = groqOutputCapForMetric976(normalizedMetric, maxOutputTokens);
+    const conservativeNeed = inputEstimate + Math.min(requestedOutput, 2200) + GROQ_RATE_HEADROOM_976;
+
+    if (
+      Number.isFinite(Number(groqRuntime976.remainingTokens)) &&
+      Number(groqRuntime976.remainingTokens) < conservativeNeed &&
+      Number(groqRuntime976.resetAt || 0) > Date.now()
+    ) {
+      const waitMs = Math.min(
+        GROQ_RESET_WAIT_MAX_MS_976,
+        Math.max(250, Number(groqRuntime976.resetAt) - Date.now() + 120)
+      );
+      if (job) job.stats.groqEmergencyWaitMs976 = Number(job.stats.groqEmergencyWaitMs976 || 0) + waitMs;
+      console.warn(
+        `[GROQ PACER 9.7.6] remaining=${groqRuntime976.remainingTokens}/${GROQ_TPM_LIMIT_976} | ` +
+        `need≈${conservativeNeed} | aguardando ${(waitMs / 1000).toFixed(1)}s pelo reset real.`
+      );
+      await sleep(waitMs);
+    }
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const controller = new AbortController();
+      const effectiveTimeout = Math.max(5000, Math.min(Number(timeoutMs || 90000), 120000));
+      const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+      let response;
+      let raw = "";
+      let data = null;
+
+      try {
+        response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${GROQ_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [
+              { role: "system", content: effectiveSystem976 },
+              { role: "user", content: String(user || "") }
+            ],
+            reasoning_effort: groqReasoningForMetric976(normalizedMetric),
+            reasoning_format: "hidden",
+            max_completion_tokens: requestedOutput,
+            ...(schema ? {
+              response_format: {
+                type: "json_schema",
+                json_schema: {
+                  name: `stremio_${normalizedMetric}_976`,
+                  strict: true,
+                  schema
+                }
+              }
+            } : {})
+          }),
+          signal: controller.signal
+        });
+
+        raw = await response.text();
+        try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
+        updateGroqRate976(response);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          const timeoutError = new Error(`GROQ ${modelId} ${normalizedMetric}: timeout em ${effectiveTimeout}ms.`);
+          timeoutError.status = 504;
+          timeoutError.modelId = modelId;
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!response.ok) {
+        const status = Number(response.status || 0);
+        const error = new Error(
+          `GROQ ${modelId} HTTP ${status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1400)}`
+        );
+        error.status = status;
+        error.modelId = modelId;
+
+        if (status === 429 && attempt < 2) {
+          if (job) job.stats.groqEmergency429976 = Number(job.stats.groqEmergency429976 || 0) + 1;
+          const retryHeader = Number(response.headers.get("retry-after"));
+          const resetMs = groqResetMs976(response.headers.get("x-ratelimit-reset-tokens"));
+          const waitMs = Math.min(
+            GROQ_RESET_WAIT_MAX_MS_976,
+            Math.max(500, Number.isFinite(retryHeader) && retryHeader > 0 ? retryHeader * 1000 : resetMs || 3000)
+          );
+          if (job) job.stats.groqEmergencyWaitMs976 = Number(job.stats.groqEmergencyWaitMs976 || 0) + waitMs;
+          console.warn(`[GROQ EMERGENCY 9.7.6] 429 | aguardando ${(waitMs / 1000).toFixed(1)}s e fazendo UMA reprova bounded.`);
+          await sleep(waitMs + 120);
+          continue;
+        }
+
+        throw error;
+      }
+
+      const text = String(data?.choices?.[0]?.message?.content || "").trim();
+      if (!text) {
+        const error = new Error(`GROQ ${modelId} retornou conteúdo vazio.`);
+        error.status = 502;
+        error.modelId = modelId;
+        throw error;
+      }
+
+      const rawUsage = data?.usage || {};
+      const usage = {
+        total_input_tokens: Number(rawUsage?.prompt_tokens || 0),
+        total_output_tokens: Number(rawUsage?.completion_tokens || 0),
+        total_thought_tokens: Number(rawUsage?.completion_tokens_details?.reasoning_tokens || 0)
+      };
+
+      groqRuntime976.calls++;
+      if (job) {
+        job.groqEmergency976 = true;
+        if (!(job.groqEmergencyMetrics976 instanceof Set)) job.groqEmergencyMetrics976 = new Set();
+        job.groqEmergencyMetrics976.add(normalizedMetric);
+        job.stats.groqEmergencyCalls976 = Number(job.stats.groqEmergencyCalls976 || 0) + 1;
+        if (normalizedMetric === "main") {
+          job.stats.groqEmergencyMainCalls976 = Number(job.stats.groqEmergencyMainCalls976 || 0) + 1;
+        } else {
+          job.stats.groqEmergencyQualityCalls976 = Number(job.stats.groqEmergencyQualityCalls976 || 0) + 1;
+        }
+      }
+
+      console.warn(
+        `[GROQ EMERGENCY 9.7.6] OK ${modelId} | metric=${normalizedMetric} | ` +
+        `input=${usage.total_input_tokens} | output=${usage.total_output_tokens} | thought=${usage.total_thought_tokens} | ` +
+        `remaining=${groqRuntime976.lastHeaders.remainingTokens ?? "?"}.`
+      );
+
+      return {
+        text,
+        status: "completed",
+        usage,
+        modelId,
+        provider: "groq",
+        raw: data
+      };
+    }
+  } finally {
+    release();
+  }
+}
+
 async function geminiRequest({
   system,
   user,
@@ -9573,6 +9918,8 @@ async function geminiRequest({
     ? [...new Set(routeOverride.filter(modelId => GEMINI_MODEL_PROFILES[modelId]))]
     : defaultRoute;
   const errors = [];
+  const availabilityFailures976 = new Set();
+  let groqEmergencyAttempted976 = false;
   let recoveryPass = 0;
 
   if (String(metric || "").toLowerCase() === "main") {
@@ -9690,6 +10037,7 @@ async function geminiRequest({
           }
 
           if (status === 503) {
+            availabilityFailures976.add(modelId);
             if (job) job.stats.model503 = Number(job.stats.model503 || 0) + 1;
 
             if (sameModelAttempt < sameModelRetryBudget) {
@@ -9707,6 +10055,7 @@ async function geminiRequest({
           }
 
           if (error?.isRouterTimeout || status === 504) {
+            availabilityFailures976.add(modelId);
             if (job) job.stats.modelTimeouts = Number(job.stats.modelTimeouts || 0) + 1;
             const waitMs = GEMINI_MODEL_PROFILES[modelId]?.family === "gemma"
               ? 300000
@@ -9730,6 +10079,7 @@ async function geminiRequest({
           }
 
           if (status >= 500 || [408, 409, 425].includes(status)) {
+            if ([500, 502, 503, 504, 408, 425].includes(status)) availabilityFailures976.add(modelId);
             const shortTransient = [500, 502, 408, 425].includes(status);
             if (shortTransient && sameModelAttempt < sameModelRetryBudget) {
               if (job) job.stats.modelTransientRetries = Number(job.stats.modelTransientRetries || 0) + 1;
@@ -9749,6 +10099,41 @@ async function geminiRequest({
             releaseMainCircuitSlot975();
           }
         }
+      }
+    }
+
+    // 9.7.6: somente brownout real de disponibilidade nos DOIS Gemini abre o
+    // provedor de emergência. Quota 429/RPD não atravessa provedor silenciosamente.
+    if (
+      !groqEmergencyAttempted976 &&
+      shouldEnterGroqEmergency976(route, availabilityFailures976, job, metric)
+    ) {
+      groqEmergencyAttempted976 = true;
+      console.warn(
+        `[GROQ EMERGENCY 9.7.6] ambos Gemini indisponíveis por brownout em ${String(metric).toUpperCase()} | ` +
+        `acionando ${groqModelForMetric976(metric)} sem esperar o cooldown Gemini.`
+      );
+      try {
+        const emergency = await callGroqEmergency976({
+          system,
+          user,
+          schema,
+          maxOutputTokens,
+          timeoutMs,
+          job,
+          metric
+        });
+        markSuccess(job, metric, { usage: emergency.usage });
+        return emergency;
+      } catch (groqError) {
+        if (groqError?.groqSplitRequired976 || groqError?.routerCanSplit) {
+          throw groqError;
+        }
+        errors.push(`groq:${Number(groqError?.status || 0) || groqError?.code || "ERR"}`);
+        console.warn(
+          `[GROQ EMERGENCY 9.7.6] falhou em ${String(metric).toUpperCase()} | ` +
+          `${errorMessage(groqError).slice(0, 320)} | Gemini ainda terá no máximo a recuperação bounded antiga.`
+        );
       }
     }
 
@@ -12485,7 +12870,10 @@ async function translateMainBatch({
         const explicitSize400 = deterministicStatus === 400 &&
           /(?:request|payload|input|context).{0,40}(?:too large|too long|size|limit|max(?:imum)?|tokens?)|(?:too large|too long).{0,40}(?:request|payload|input|context)/i.test(deterministicText);
         const mayShrinkRequest = [413, 422].includes(deterministicStatus) || explicitSize400;
-        if (mayShrinkRequest && batch.length > 40 && splitDepth < 2) {
+        const groqSplit976 = Boolean(error?.groqSplitRequired976);
+        const splitFloor976 = groqSplit976 ? 8 : 40;
+        const splitDepthMax976 = groqSplit976 ? 4 : 2;
+        if (mayShrinkRequest && batch.length > splitFloor976 && splitDepth < splitDepthMax976) {
           const mid = Math.ceil(batch.length / 2);
           const leftBatch = batch.slice(0, mid);
           const rightBatch = batch.slice(mid);
@@ -12493,7 +12881,7 @@ async function translateMainBatch({
           console.warn(
             `[MAIN ADAPTIVE 9.0] request grande recebeu limite de payload; ` +
             `dividindo ${batch.length} cues em ${leftBatch.length}+${rightBatch.length} ` +
-            `(depth=${splitDepth + 1}/2), sem reiniciar o job.`
+            `(depth=${splitDepth + 1}/${splitDepthMax976}), sem reiniciar o job.`
           );
 
           const left = await translateMainBatch({ blocks, posMap, batch: leftBatch, plan, job, splitDepth: splitDepth + 1 });
@@ -12792,8 +13180,12 @@ async function translateAllMain(
 function buildQaBatches(
   blocks,
   translations,
-  plan
+  plan,
+  job = null
 ) {
+  const emergency976 = Boolean(job?.groqEmergency976);
+  const maxCues976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CUES_976 : QA_BATCH_MAX_CUES;
+  const maxChars976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CHARS_976 : QA_BATCH_MAX_CHARS;
   const batches = [];
   let current = [];
   let chars = 0;
@@ -12821,8 +13213,8 @@ function buildQaBatches(
     if (
       current.length &&
       (
-        current.length >= QA_BATCH_MAX_CUES ||
-        chars + size > QA_BATCH_MAX_CHARS
+        current.length >= maxCues976 ||
+        chars + size > maxChars976
       )
     ) {
       batches.push(current);
@@ -12915,6 +13307,55 @@ out.push({
   return out;
 }
 
+
+async function scanQaBatchGroq976(batch, plan, job) {
+  const chunks = [];
+  let current = [];
+  let chars = 0;
+  for (const item of batch) {
+    const size = JSON.stringify(item).length;
+    if (current.length && (current.length >= GROQ_QA_EMERGENCY_BATCH_CUES_976 || chars + size > GROQ_QA_EMERGENCY_BATCH_CHARS_976)) {
+      chunks.push(current);
+      current = [];
+      chars = 0;
+    }
+    current.push(item);
+    chars += size;
+  }
+  if (current.length) chunks.push(current);
+
+  const out = [];
+  const seen = new Set();
+  for (let index = 0; index < chunks.length; index++) {
+    const part = chunks[index];
+    const allowed = new Set(part.map(item => Number(item.i)));
+    markAttempt(job, "qa");
+    const response = await callGroqEmergency976({
+      system: QA_PROMPT,
+      user:
+        `IDIOMA DA FONTE: ${job.sourceLang || "auto"}\n\n` +
+        `BÍBLIA EDITORIAL DO EPISÓDIO:\n${JSON.stringify(plan || {})}\n\n` +
+        `SEQUÊNCIA CRONOLÓGICA FONTE×PT PARA AUDITORIA:\n${JSON.stringify(part)}\n\n` +
+        `Retorne SOMENTE IDs que realmente merecem repair. Compare SOURCE[i]×PT[i]; preserve ownership, gênero/referente, polaridade, speaker-turn, idioma e naturalidade PT-BR.`,
+      schema: QA_SCHEMA,
+      maxOutputTokens: GROQ_QUALITY_MAX_OUTPUT_TOKENS_976,
+      timeoutMs: QA_TIMEOUT_MS,
+      job,
+      metric: "qa"
+    });
+    markSuccess(job, "qa", { usage: response.usage });
+    const parsed = parseQaIssues(response.text, allowed);
+    for (const issue of parsed) {
+      if (!seen.has(issue.id)) {
+        seen.add(issue.id);
+        out.push(issue);
+      }
+    }
+    console.log(`[GROQ QA 9.7.6] chunk ${index + 1}/${chunks.length} | cues=${part.length} | flags=${parsed.length}.`);
+  }
+  return out;
+}
+
 async function scanPtbrQuality(
   blocks,
   translations,
@@ -12929,7 +13370,8 @@ async function scanPtbrQuality(
     buildQaBatches(
       blocks,
       translations,
-      plan
+      plan,
+      job
     );
 
   job.stats.qaBatches =
@@ -13057,6 +13499,15 @@ async function scanPtbrQuality(
         } catch (error) {
           lastError =
             error;
+
+          if (error?.groqSplitRequired976 && GROQ_API_KEY) {
+            console.warn(
+              `[GROQ QA 9.7.6] lote ${index + 1} grande demais para 8K TPM; ` +
+              `rebatching focal sem repetir MAIN.`
+            );
+            parsedIssues = await scanQaBatchGroq976(batch, plan, job);
+            break;
+          }
 
           if (
             attempt >=
@@ -17912,8 +18363,14 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     );
 
   const repairBatches = [];
-  for (let i = 0; i < selected.length; i += REPAIR_BATCH_MAX_CUES) {
-    repairBatches.push(selected.slice(i, i + REPAIR_BATCH_MAX_CUES));
+  const repairBatchCap976 = job?.groqEmergency976
+    ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
+    : REPAIR_BATCH_MAX_CUES;
+  for (let i = 0; i < selected.length; i += repairBatchCap976) {
+    repairBatches.push(selected.slice(i, i + repairBatchCap976));
+  }
+  if (job?.groqEmergency976) {
+    console.warn(`[GROQ REPAIR 9.7.6] emergency batching=${repairBatchCap976} cues/lote | 120B focal.`);
   }
 
   const totalBatches = repairBatches.length;
@@ -18099,6 +18556,19 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     isolationResidual.map(issue => [Number(issue?.id), issue])
   ).values()].filter(issue => Number.isInteger(Number(issue?.id)));
   job.stats.repairIsolationResidual928 = uniqueResidual.length;
+  job.repairResidualIds976 = uniqueResidual
+    .map(issue => Number(issue?.id))
+    .filter(Number.isInteger);
+  job.residualAccountability976 = {
+    repairResidualInitial: job.repairResidualIds976.length,
+    repairResidualIds: [...job.repairResidualIds976],
+    clearedBySubsequentVerification: [],
+    remainingHard: []
+  };
+  console.warn(
+    `[RESIDUAL ACCOUNTABILITY 9.7.6] repair-residual=${job.repairResidualIds976.length} | ` +
+    `ids=[${job.repairResidualIds976.join(",")}].`
+  );
 
   if (uniqueResidual.length) {
     job.stats.repairIsolationCueSurgery928 = 0;
@@ -19857,8 +20327,12 @@ function buildFinalPriorityAuditBatches(
   blocks,
   translations,
   plan,
-  focusIds = null
+  focusIds = null,
+  job = null
 ) {
+  const emergency976 = Boolean(job?.groqEmergency976);
+  const maxCues976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CUES_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES;
+  const maxChars976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS;
   const hasExplicitFocus =
     focusIds instanceof Set;
 
@@ -19927,8 +20401,8 @@ function buildFinalPriorityAuditBatches(
     if (
       current.length &&
       (
-        current.length >= FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES ||
-        chars + size > FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS
+        current.length >= maxCues976 ||
+        chars + size > maxChars976
       )
     ) {
       flush();
@@ -20075,7 +20549,8 @@ async function scanFinalPriorityAudit(
     blocks,
     translations,
     plan,
-    focusIds
+    focusIds,
+    job
   );
 
   if (!batches.length) return [];
@@ -21836,6 +22311,31 @@ async function runBoundedFinalQuality88(
   }
 
   job.finalTargetResidual927 = residual;
+
+  if (Array.isArray(job.repairResidualIds976)) {
+    const finalIds976 = new Set(
+      residual.map(issue => Number(issue?.id)).filter(Number.isInteger)
+    );
+    const initial976 = [...new Set(job.repairResidualIds976.map(Number).filter(Number.isInteger))];
+    const remainingHard976 = initial976.filter(id => finalIds976.has(id));
+    const cleared976 = initial976.filter(id => !finalIds976.has(id));
+    job.residualAccountability976 = {
+      ...(job.residualAccountability976 || {}),
+      repairResidualInitial: initial976.length,
+      repairResidualIds: initial976,
+      clearedBySubsequentVerification: cleared976,
+      remainingHard: remainingHard976,
+      finalResidualTotal: residual.length,
+      finalResidualIds: [...finalIds976]
+    };
+    console.log(
+      `[RESIDUAL ACCOUNTABILITY 9.7.6] initial=${initial976.length} | ` +
+      `cleared-by-subsequent-verification=${cleared976.length} ids=[${cleared976.join(",")}] | ` +
+      `remaining-hard=${remainingHard976.length} ids=[${remainingHard976.join(",")}] | ` +
+      `final-total=${residual.length}.`
+    );
+  }
+
   job.finalTargetResidualSnapshot9210 = new Map(
     residual.map(issue => [
       Number(issue?.id),
@@ -23273,6 +23773,11 @@ app.get(
         mainFallback: geminiRouteForMetric("main")[1],
         qaPreferred: geminiRouteForMetric("qa")[0],
         qaFallback: geminiRouteForMetric("qa")[1],
+        groqEmergencyConfigured976: Boolean(GROQ_API_KEY),
+        groqMain976: GROQ_MODELS_976.MAIN,
+        groqQuality976: GROQ_MODELS_976.QUALITY,
+        groqRemainingTokens976: groqRuntime976.remainingTokens,
+        groqLastResetAt976: groqRuntime976.resetAt || null,
         repairPreferred: geminiRouteForMetric("repair")[0],
         repairFallback: geminiRouteForMetric("repair")[1]
       },
@@ -25131,7 +25636,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.5 - ADAPTIVE MAIN CIRCUIT BREAKER + CHECKPOINT RESUME | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.6 - GEMINI-FIRST + GROQ EMERGENCY + RESIDUAL ACCOUNTABILITY | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -25413,6 +25918,9 @@ console.log(
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
+  console.log(`Groq Emergency 9.7.6: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
+  console.log("Groq TPM 9.7.6: header-aware pacing + split focal + Repair<=5 cues no modo emergencial ✅");
+  console.log("Residual Accountability 9.7.6: residual do Repair recebe IDs e reconciliação explícita no gate final ✅");
   console.log("Semantic cache namespace permanece 9.7.4: mudança é somente de transporte/roteamento; qualidade e contratos textuais intactos ✅");
   console.log("Timing Compact 9.4.0: geração <=24 + auditoria <=16; zero micro-recursão; HIGH com output budget anti-truncamento ✅");
 
@@ -25472,7 +25980,7 @@ console.log(
   );
 
   console.log(
-    "Model Health 9.7.5: 503/504/timeout no MAIN acionam circuit breaker adaptativo; RPD diário continua hard-skip; checkpoint é preservado ✅"
+    "Model Health 9.7.6: Gemini 503/504/timeout aciona breaker/failover; ambos indisponíveis liberam Groq emergency; 429/RPD NÃO troca provedor; checkpoint preservado ✅"
   );
 
   console.log(
