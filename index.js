@@ -25506,69 +25506,85 @@ async function timingAwareCompactSurgery928(items) {
 
 
 // ============================================================
-// LAB 15.2 — MAPEADOR SEMÂNTICO UNIVERSAL / MONOTONICIDADE + TURN PURITY
-// Base 9.7.9 intacta. Nenhuma autoridade de timestamp para modelo.
+// LAB 15.3 — BOUNDARY INTEGRITY + EXPLICIT TURN SPLIT
+// Base 9.7.9 intacta. Modelo sem autoridade de timestamp.
 // ============================================================
 
-const SEMMAP_LAB_VERSION_152 = "15.2";
-const SEMMAP_LAB_MAX_ITEMS_152 = 120;
-const SEMMAP_LAB_MAX_PAYLOAD_CHARS_152 = 120000;
-const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_152 = 12000;
-const SEMMAP_LAB_CHUNK_SIZE_152 = 13;
+const SEMMAP_LAB_VERSION_153 = "15.3";
+const SEMMAP_LAB_MAX_ITEMS_153 = 120;
+const SEMMAP_LAB_MAX_PAYLOAD_CHARS_153 = 120000;
+const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_153 = 12000;
+const SEMMAP_LAB_CHUNK_SIZE_153 = 13;
 
-function semanticMapLabText152(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_152) {
+function semanticMapLabText153(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_153) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .slice(0, Math.max(0, Number(maxChars || 0)));
 }
 
-function semanticMapLabFiniteNumber152(value, fallback = null) {
+function semanticMapLabFiniteNumber153(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function semanticMapLabMultiTurn152(text) {
-  const normalized = String(text || "")
-    .replace(/\r/g, "")
+function semanticMapLabNorm153(value) {
+  return String(value || "")
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
-
-  if (!normalized) return false;
-
-  // Dois ou mais turnos explícitos no MESMO cue, em linhas separadas.
-  const lineTurns = normalized
-    .split("\n")
-    .filter(line => /^\s*[-–—]\s*\S/u.test(line))
-    .length;
-
-  if (lineTurns >= 2) return true;
-
-  // Formato compactado comum: "-fala do A. -fala do B."
-  // Exige marcador de diálogo no começo e um segundo marcador após whitespace.
-  if (
-    /^\s*[-–—]\s*\S/u.test(normalized) &&
-    /(?:\s|^)[-–—]\s*\S/gu.test(normalized)
-  ) {
-    const markers =
-      normalized.match(/(?:^|\s)[-–—]\s*\S/gu) || [];
-
-    if (markers.length >= 2) return true;
-  }
-
-  return false;
 }
 
-function sanitizeSemanticMapCases152(rawCases) {
+function semanticMapLabDialogueTurns153(text) {
+  const raw = String(text || "").replace(/\r/g, "");
+  const re = /(^|\s)([-–—])\s*(?=\S)/gu;
+  const matches = [];
+  let m;
+
+  while ((m = re.exec(raw)) !== null) {
+    matches.push({
+      markerStart: m.index + m[1].length,
+      contentStart: re.lastIndex
+    });
+  }
+
+  if (matches.length < 2) return [];
+
+  const turns = [];
+
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].markerStart;
+    const end = i + 1 < matches.length
+      ? matches[i + 1].markerStart
+      : raw.length;
+
+    const full = raw.slice(start, end).trim();
+    const content = full.replace(/^[-–—]\s*/u, "").trim();
+
+    turns.push({
+      full,
+      content
+    });
+  }
+
+  return turns;
+}
+
+function semanticMapLabMultiTurn153(text) {
+  return semanticMapLabDialogueTurns153(text).length >= 2;
+}
+
+function sanitizeSemanticMapCases153(rawCases) {
   if (!Array.isArray(rawCases)) {
     const error = new Error("cases deve ser um array.");
-    error.labInputError152 = true;
+    error.labInputError153 = true;
     throw error;
   }
 
-  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_152) {
+  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_153) {
     const error = new Error(
-      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_152} itens.`
+      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_153} itens.`
     );
-    error.labInputError152 = true;
+    error.labInputError153 = true;
     throw error;
   }
 
@@ -25579,25 +25595,25 @@ function sanitizeSemanticMapCases152(rawCases) {
 
     if (!/^[A-Za-z0-9_-]{1,32}$/.test(caseKey)) {
       const error = new Error(`case_key inválido no item ${index + 1}.`);
-      error.labInputError152 = true;
+      error.labInputError153 = true;
       throw error;
     }
 
     if (seen.has(caseKey)) {
       const error = new Error(`case_key duplicado: ${caseKey}.`);
-      error.labInputError152 = true;
+      error.labInputError153 = true;
       throw error;
     }
     seen.add(caseKey);
 
-    const currentSource = semanticMapLabText152(raw?.current_source);
-    const currentPt = semanticMapLabText152(raw?.current_pt);
+    const currentSource = semanticMapLabText153(raw?.current_source);
+    const currentPt = semanticMapLabText153(raw?.current_pt);
 
     if (!currentSource || !currentPt) {
       const error = new Error(
         `current_source/current_pt ausente em ${caseKey}.`
       );
-      error.labInputError152 = true;
+      error.labInputError153 = true;
       throw error;
     }
 
@@ -25610,8 +25626,8 @@ function sanitizeSemanticMapCases152(rawCases) {
       candidate_merge: candidateMerge,
       current_source: currentSource,
       current_pt: currentPt,
-      prosody: semanticMapLabText152(raw?.prosody, 1000),
-      risk_flags: semanticMapLabText152(raw?.risk_flags, 1200)
+      prosody: semanticMapLabText153(raw?.prosody, 1000),
+      risk_flags: semanticMapLabText153(raw?.risk_flags, 1200)
     };
 
     if (candidateSplit) {
@@ -25620,31 +25636,30 @@ function sanitizeSemanticMapCases152(rawCases) {
         : [];
 
       item.split_options = options.map(option => ({
-        source_left: semanticMapLabText152(option?.source_left, 6000),
-        source_right: semanticMapLabText152(option?.source_right, 6000),
+        source_left: semanticMapLabText153(option?.source_left, 6000),
+        source_right: semanticMapLabText153(option?.source_right, 6000),
         pause_ms: Math.max(
           0,
           Math.min(
             15000,
-            semanticMapLabFiniteNumber152(option?.pause_ms, 0)
+            semanticMapLabFiniteNumber153(option?.pause_ms, 0)
           )
         ),
         dramatic: option?.dramatic === true,
-        punctuation: semanticMapLabText152(option?.punctuation, 200)
+        punctuation: semanticMapLabText153(option?.punctuation, 200)
       }));
     }
 
     if (candidateMerge) {
-      item.next_source = semanticMapLabText152(raw?.next_source, 12000);
-      item.next_pt = semanticMapLabText152(raw?.next_pt, 12000);
-      item.phonetic_gap_ms = semanticMapLabFiniteNumber152(
+      item.next_source = semanticMapLabText153(raw?.next_source, 12000);
+      item.next_pt = semanticMapLabText153(raw?.next_pt, 12000);
+      item.phonetic_gap_ms = semanticMapLabFiniteNumber153(
         raw?.phonetic_gap_ms,
         null
       );
-
       item.next_has_multiple_dialogue_turns =
-        semanticMapLabMultiTurn152(item.next_source) ||
-        semanticMapLabMultiTurn152(item.next_pt);
+        semanticMapLabMultiTurn153(item.next_source) ||
+        semanticMapLabMultiTurn153(item.next_pt);
     }
 
     return item;
@@ -25652,77 +25667,80 @@ function sanitizeSemanticMapCases152(rawCases) {
 
   const chars = JSON.stringify(cases).length;
 
-  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_152) {
+  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_153) {
     const error = new Error(
-      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_152} chars.`
+      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_153} chars.`
     );
-    error.labInputError152 = true;
+    error.labInputError153 = true;
     throw error;
   }
 
   return cases;
 }
 
-function semanticMapLabSystem152() {
+function semanticMapLabSystem153() {
   return `
-MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_152}
+MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_153}
 
 FUNÇÃO
-Você NÃO controla timing nem legibilidade. Você decide SOMENTE a correspondência semântica
-para KEEP, SPLIT ou MERGE. Um estágio determinístico separado cuida de duração mínima,
-CPS, Anti-Piscada, colisões e timestamps.
+Você NÃO controla timing nem legibilidade.
+Você decide SOMENTE se uma fronteira acústica já medida pode ser transportada semanticamente
+para o texto PT-BR existente, ou se dois cues podem formar uma unidade de handoff.
 
 DECISÕES
 KEEP  = preservar a organização atual.
-SPLIT = a pausa acústica já fornecida separa duas unidades semânticas cujo conteúdo
-        pode ser mapeado de forma monotônica para duas partes contíguas do PT-BR.
+SPLIT = a pausa acústica separa unidades cujo significado pode ser dividido em duas partes
+        contíguas e semanticamente fiéis no PT-BR.
 MERGE = current e next formam uma única unidade semântica para handoff visual;
-        nunca significa concatenar cues ou antecipar next_pt.
+        nunca concatena cues e nunca antecipa next_pt.
 
 REGRAS ABSOLUTAS
 1. Nunca traduza, reescreva, corrija, resuma, expanda ou melhore o PT-BR.
 2. Nunca crie timestamps.
 3. Nunca antecipe conteúdo, revelação, nome, punchline, resposta ou próximo turno.
-4. candidate_split=true E candidate_merge=true => KEEP nesta versão.
-5. next_has_multiple_dialogue_turns=true => KEEP. Um cue misto não pode ser MERGE inteiro.
+4. candidate_split=true E candidate_merge=true => KEEP.
+5. next_has_multiple_dialogue_turns=true => KEEP para MERGE.
 6. Troca de locutor => nunca MERGE.
 7. Na dúvida => KEEP.
 8. AMBIGUOUS só pode acompanhar KEEP.
 
-REGRA-CHAVE DE SPLIT — MONOTONICIDADE SEMÂNTICA
-A fronteira deve sobreviver à tradução.
-Para aceitar SPLIT, deve existir pt_left | pt_right tal que:
-- pt_left + espaço + pt_right recompõe exatamente current_pt;
-- TODO o significado de source_left pertence a pt_left;
-- TODO o significado de source_right pertence a pt_right;
-- nenhum elemento semântico atravessa a fronteira por reordenação EN→PT.
-Se algo que está em source_right aparece naturalmente antes da fronteira em PT-BR,
-ou algo de source_left aparece depois, responda KEEP.
+INTEGRIDADE DA FRONTEIRA — REGRA CENTRAL DE SPLIT
+Uma pausa do source só pode virar SPLIT em PT-BR se a fronteira sobreviver à tradução.
 
-Exemplo abstrato de risco:
-source_left = "ver meu"
-source_right = "amor nos olhos"
-PT reordena para "olhar nos olhos do meu amor".
-"nos olhos" veio do lado direito mas aparece antes de "meu amor"; portanto a pausa
-inglesa não possui corte PT-BR contíguo semanticamente fiel => KEEP.
+Aceite SPLIT somente quando existir pt_left | pt_right tal que:
+- pt_left + espaço + pt_right recompõe exatamente current_pt;
+- o conteúdo de source_left é realizado integralmente em pt_left;
+- o conteúdo de source_right é realizado integralmente em pt_right;
+- nenhum significado precisa atravessar a fronteira por reordenação, compressão ou fusão gramatical.
+
+REJEITE SPLIT quando a pausa cortar uma dependência interna que a tradução realiza como
+uma única construção atravessando a fronteira. Exemplos abstratos:
+- marcador de infinitivo | verbo lexical;
+- auxiliar/modal | verbo principal;
+- preposição | complemento;
+- determinante | núcleo nominal;
+- verbo de movimento/intenção | infinitivo que completa esse mesmo predicado;
+- qualquer construção em que a tradução de source_left só fique semanticamente fiel
+  se puxar uma palavra/conceito de source_right, ou vice-versa.
+
+Isto é diferente de sujeito | predicado:
+uma pausa dramática entre sujeito e predicado PODE ser SPLIT quando os dois lados continuam
+mapeáveis de forma contígua em PT-BR.
+
+MONOTONICIDADE
+Se um elemento de source_right aparece antes da fronteira natural em PT-BR,
+ou um elemento de source_left aparece depois, KEEP.
 
 PAUSA DRAMÁTICA E FRAGMENTOS CURTOS
-A ausência de pontuação NÃO invalida SPLIT.
-Uma pausa dramática forte pode separar sujeito/predicado, núcleo/complemento,
-revelação, vocativo ou outro constituinte mesmo sem vírgula/ponto.
+Ausência de pontuação NÃO invalida SPLIT.
+Uma metade curta NÃO invalida SPLIT.
+Anti-Piscada, CPS e duração mínima pertencem a outro estágio determinístico.
 
-NÃO rejeite SPLIT apenas porque uma metade tem uma ou duas palavras.
-Ex.: sujeito curto | verbo curto pode ser semanticamente perfeito.
-O estágio posterior de Anti-Piscada decidirá se existe duração suficiente para exibir.
-Sua função aqui é SEMÂNTICA, não CPS nem duração visual.
-
-Também aceite fragmentos linguísticos deliberados quando a pausa acústica/prosódica
-os transforma em dois beats naturais e a correspondência EN→PT é monotônica.
-
-MERGE — PUREZA DE UNIDADE
-MERGE exige que TODO current e TODO next pertençam à mesma continuação semântica.
-Se next mistura a continuação do locutor atual com resposta/interjeição de outro locutor,
-responda KEEP, mesmo com gap fonético mínimo.
+TURNOS EXPLÍCITOS
+Quando um cue contém duas falas explicitamente separadas por marcadores de diálogo,
+isso é evidência semântica fortíssima de duas unidades.
+Se a fronteira acústica coincide com a troca de turno e o PT-BR também preserva exatamente
+dois turnos, SPLIT é apropriado. O estágio determinístico pode confirmar esse caso sem LLM.
 
 SAÍDA
 Preserve case_key exatamente.
@@ -25733,7 +25751,7 @@ Retorne somente JSON.
 `.trim();
 }
 
-function semanticMapLabSchema152(count) {
+function semanticMapLabSchema153(count) {
   return {
     type: "array",
     minItems: count,
@@ -25764,7 +25782,7 @@ function semanticMapLabSchema152(count) {
   };
 }
 
-function semanticMapLabUser152(cases) {
+function semanticMapLabUser153(cases) {
   return (
     "CASOS PARA CLASSIFICAR. Cada item é independente. " +
     `Retorne exatamente ${cases.length} objetos, um por case_key, ` +
@@ -25773,7 +25791,7 @@ function semanticMapLabUser152(cases) {
   );
 }
 
-function semanticMapLabParse152(text, expectedCount, label) {
+function semanticMapLabParse153(text, expectedCount, label) {
   let parsed;
 
   try {
@@ -25795,7 +25813,7 @@ function semanticMapLabParse152(text, expectedCount, label) {
   return parsed;
 }
 
-function semanticMapLabBrownout152(error) {
+function semanticMapLabBrownout153(error) {
   const text = String(error?.message || error || "");
   return Boolean(
     /MODEL ROUTER esgotou/i.test(text) &&
@@ -25803,7 +25821,7 @@ function semanticMapLabBrownout152(error) {
   );
 }
 
-async function callGroqSemanticMap152(cases) {
+async function callGroqSemanticMap153(cases) {
   if (!GROQ_API_KEY) {
     const error = new Error(
       "Gemini em brownout e GROQ_API_KEY não está configurada."
@@ -25812,9 +25830,9 @@ async function callGroqSemanticMap152(cases) {
     throw error;
   }
 
-  const system = semanticMapLabSystem152();
-  const user = semanticMapLabUser152(cases);
-  const schema = semanticMapLabSchema152(cases.length);
+  const system = semanticMapLabSystem153();
+  const user = semanticMapLabUser153(cases);
+  const schema = semanticMapLabSchema153(cases.length);
   const modelId = GROQ_MODELS_976.QUALITY;
 
   const inputEstimate =
@@ -25830,7 +25848,7 @@ async function callGroqSemanticMap152(cases) {
     conservativeNeed > GROQ_TOTAL_SAFE_TOKENS_977
   ) {
     const error = new Error(
-      `SEMMAP LAB 15.2: lote grande para Groq; input≈${inputEstimate}, total≈${conservativeNeed}.`
+      `SEMMAP LAB 15.3: lote grande para Groq; input≈${inputEstimate}, total≈${conservativeNeed}.`
     );
     error.status = 413;
     throw error;
@@ -25868,7 +25886,7 @@ async function callGroqSemanticMap152(cases) {
             response_format: {
               type: "json_schema",
               json_schema: {
-                name: "stremio_semmap_lab_152",
+                name: "stremio_semmap_lab_153",
                 strict: true,
                 schema
               }
@@ -25937,10 +25955,10 @@ async function callGroqSemanticMap152(cases) {
   }
 }
 
-async function classifySemanticMapChunk152(cases, preferGroq = false) {
-  const system = semanticMapLabSystem152();
-  const user = semanticMapLabUser152(cases);
-  const schema = semanticMapLabSchema152(cases.length);
+async function classifySemanticMapChunk153(cases, preferGroq = false) {
+  const system = semanticMapLabSystem153();
+  const user = semanticMapLabUser153(cases);
+  const schema = semanticMapLabSchema153(cases.length);
 
   if (!preferGroq) {
     try {
@@ -25957,7 +25975,7 @@ async function classifySemanticMapChunk152(cases, preferGroq = false) {
       });
 
       return {
-        items: semanticMapLabParse152(
+        items: semanticMapLabParse153(
           result.text,
           cases.length,
           result.modelId
@@ -25967,20 +25985,20 @@ async function classifySemanticMapChunk152(cases, preferGroq = false) {
         usage: result.usage || null
       };
     } catch (error) {
-      if (!semanticMapLabBrownout152(error)) {
+      if (!semanticMapLabBrownout153(error)) {
         throw error;
       }
 
       console.warn(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] Gemini brownout; LAB -> Groq QUALITY.`
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] Gemini brownout; LAB -> Groq QUALITY.`
       );
     }
   }
 
-  const groq = await callGroqSemanticMap152(cases);
+  const groq = await callGroqSemanticMap153(cases);
 
   return {
-    items: semanticMapLabParse152(
+    items: semanticMapLabParse153(
       groq.text,
       cases.length,
       groq.modelId
@@ -25991,7 +26009,93 @@ async function classifySemanticMapChunk152(cases, preferGroq = false) {
   };
 }
 
-function semanticMapLabHardKeep152(cases) {
+function semanticMapLabExplicitTurnSplit153(item) {
+  if (
+    item.candidate_split !== true ||
+    item.candidate_merge === true
+  ) {
+    return null;
+  }
+
+  const sourceTurns =
+    semanticMapLabDialogueTurns153(
+      item.current_source
+    );
+
+  const ptTurns =
+    semanticMapLabDialogueTurns153(
+      item.current_pt
+    );
+
+  if (
+    sourceTurns.length !== 2 ||
+    ptTurns.length !== 2
+  ) {
+    return null;
+  }
+
+  const options =
+    Array.isArray(
+      item.split_options
+    )
+      ? item.split_options
+      : [];
+
+  const matching =
+    options.find(
+      option =>
+        semanticMapLabNorm153(
+          option?.source_left
+        ) ===
+          semanticMapLabNorm153(
+            sourceTurns[0].content
+          ) &&
+        semanticMapLabNorm153(
+          option?.source_right
+        ) ===
+          semanticMapLabNorm153(
+            sourceTurns[1].content
+          )
+    );
+
+  if (!matching) {
+    return null;
+  }
+
+  const ptLeft =
+    ptTurns[0].full;
+
+  const ptRight =
+    ptTurns[1].full;
+
+  if (
+    semanticMapLabNorm153(
+      `${ptLeft} ${ptRight}`
+    ) !==
+    semanticMapLabNorm153(
+      item.current_pt
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    case_key:
+      item.case_key,
+    decision:
+      "SPLIT",
+    confidence:
+      "VERY_STRONG",
+    pt_left:
+      ptLeft,
+    pt_right:
+      ptRight,
+    deterministic_guard:
+      "EXPLICIT_TWO_TURN_SPLIT"
+  };
+}
+
+function semanticMapLabDeterministic153(cases) {
   const fixed = new Map();
   const toModel = [];
 
@@ -26004,28 +26108,72 @@ function semanticMapLabHardKeep152(cases) {
       item.candidate_merge === true &&
       item.next_has_multiple_dialogue_turns === true;
 
-    if (compound || impureMerge) {
-      fixed.set(item.case_key, {
-        case_key: item.case_key,
-        decision: "KEEP",
-        confidence: "VERY_STRONG",
-        pt_left: "",
-        pt_right: "",
-        deterministic_guard:
-          compound
-            ? "COMPOUND_SPLIT_MERGE_KEEP"
-            : "NEXT_MULTI_TURN_KEEP"
-      });
-    } else {
-      toModel.push(item);
+    if (compound) {
+      fixed.set(
+        item.case_key,
+        {
+          case_key:
+            item.case_key,
+          decision:
+            "KEEP",
+          confidence:
+            "VERY_STRONG",
+          pt_left:
+            "",
+          pt_right:
+            "",
+          deterministic_guard:
+            "COMPOUND_SPLIT_MERGE_KEEP"
+        }
+      );
+      continue;
     }
+
+    if (impureMerge) {
+      fixed.set(
+        item.case_key,
+        {
+          case_key:
+            item.case_key,
+          decision:
+            "KEEP",
+          confidence:
+            "VERY_STRONG",
+          pt_left:
+            "",
+          pt_right:
+            "",
+          deterministic_guard:
+            "NEXT_MULTI_TURN_KEEP"
+        }
+      );
+      continue;
+    }
+
+    const explicitTurnSplit =
+      semanticMapLabExplicitTurnSplit153(
+        item
+      );
+
+    if (explicitTurnSplit) {
+      fixed.set(
+        item.case_key,
+        explicitTurnSplit
+      );
+      continue;
+    }
+
+    toModel.push(item);
   }
 
-  return { fixed, toModel };
+  return {
+    fixed,
+    toModel
+  };
 }
 
 app.get(
-  "/api/lab/semantic-map-15-2/status",
+  "/api/lab/semantic-map-15-3/status",
   (req, res) => {
     if (!authorized(req)) {
       return safeJson(res, { error: "Unauthorized" }, 401);
@@ -26033,23 +26181,24 @@ app.get(
 
     return safeJson(res, {
       ok: true,
-      version: SEMMAP_LAB_VERSION_152,
-      mode: "UNIVERSAL_SEMANTIC_MAP_MONOTONICITY_TURN_PURITY",
+      version: SEMMAP_LAB_VERSION_153,
+      mode: "BOUNDARY_INTEGRITY_EXPLICIT_TURN_SPLIT",
       productionPipelineChanged: false,
       timestampsAuthority: "LOCAL_ACOUSTIC_PIPELINE_ONLY",
       geminiRoute: geminiRouteForMetric("semmaplab"),
       groqLabFallbackConfigured: Boolean(GROQ_API_KEY),
-      chunkSize: SEMMAP_LAB_CHUNK_SIZE_152,
+      chunkSize: SEMMAP_LAB_CHUNK_SIZE_153,
       hardGuards: [
         "COMPOUND_SPLIT_MERGE_KEEP",
-        "NEXT_MULTI_TURN_KEEP"
+        "NEXT_MULTI_TURN_KEEP",
+        "EXPLICIT_TWO_TURN_SPLIT"
       ]
     });
   }
 );
 
 app.post(
-  "/api/lab/semantic-map-15-2",
+  "/api/lab/semantic-map-15-3",
   async (req, res) => {
     if (!authorized(req)) {
       return safeJson(res, { error: "Unauthorized" }, 401);
@@ -26060,30 +26209,48 @@ app.post(
     try {
       if (
         String(req.body?.contractVersion || "").trim() !==
-        SEMMAP_LAB_VERSION_152
+        SEMMAP_LAB_VERSION_153
       ) {
         const error = new Error(
-          `contractVersion deve ser ${SEMMAP_LAB_VERSION_152}.`
+          `contractVersion deve ser ${SEMMAP_LAB_VERSION_153}.`
         );
-        error.labInputError152 = true;
+        error.labInputError153 = true;
         throw error;
       }
 
-      const allCases = sanitizeSemanticMapCases152(req.body?.cases);
-      const expectedKeys = allCases.map(item => item.case_key);
+      const allCases =
+        sanitizeSemanticMapCases153(
+          req.body?.cases
+        );
 
-      const guarded = semanticMapLabHardKeep152(allCases);
-      const fixed = guarded.fixed;
-      const modelCases = guarded.toModel;
+      const expectedKeys =
+        allCases.map(
+          item => item.case_key
+        );
+
+      const deterministic =
+        semanticMapLabDeterministic153(
+          allCases
+        );
+
+      const fixed =
+        deterministic.fixed;
+
+      const modelCases =
+        deterministic.toModel;
 
       const chunks = [];
+
       for (
         let i = 0;
         i < modelCases.length;
-        i += SEMMAP_LAB_CHUNK_SIZE_152
+        i += SEMMAP_LAB_CHUNK_SIZE_153
       ) {
         chunks.push(
-          modelCases.slice(i, i + SEMMAP_LAB_CHUNK_SIZE_152)
+          modelCases.slice(
+            i,
+            i + SEMMAP_LAB_CHUNK_SIZE_153
+          )
         );
       }
 
@@ -26094,10 +26261,11 @@ app.post(
       let preferGroq = false;
 
       for (let i = 0; i < chunks.length; i++) {
-        const result = await classifySemanticMapChunk152(
-          chunks[i],
-          preferGroq
-        );
+        const result =
+          await classifySemanticMapChunk153(
+            chunks[i],
+            preferGroq
+          );
 
         if (result.provider === "groq") {
           preferGroq = true;
@@ -26119,26 +26287,56 @@ app.post(
       const byKey = new Map();
 
       for (const item of modelItems) {
-        byKey.set(String(item?.case_key || "").trim(), item);
+        byKey.set(
+          String(item?.case_key || "").trim(),
+          item
+        );
       }
 
       for (const [key, item] of fixed.entries()) {
         byKey.set(key, item);
       }
 
-      const items = expectedKeys.map(key => byKey.get(key)).filter(Boolean);
-      const returnedKeys = items.map(
-        item => String(item?.case_key || "").trim()
-      );
+      const items =
+        expectedKeys
+          .map(key => byKey.get(key))
+          .filter(Boolean);
+
+      const returnedKeys =
+        items.map(
+          item =>
+            String(
+              item?.case_key ||
+              ""
+            ).trim()
+        );
 
       const coverageOk =
         returnedKeys.length === expectedKeys.length &&
         new Set(returnedKeys).size === expectedKeys.length &&
-        expectedKeys.every(key => returnedKeys.includes(key));
+        expectedKeys.every(
+          key => returnedKeys.includes(key)
+        );
+
+      const deterministicCounts = {};
+
+      for (const item of fixed.values()) {
+        const g =
+          String(
+            item?.deterministic_guard ||
+            "UNKNOWN"
+          );
+
+        deterministicCounts[g] =
+          Number(
+            deterministicCounts[g] ||
+            0
+          ) + 1;
+      }
 
       console.log(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] COMPLETE | ` +
-        `all=${allCases.length} | model=${modelCases.length} | hardKeep=${fixed.size} | ` +
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] COMPLETE | ` +
+        `all=${allCases.length} | model=${modelCases.length} | deterministic=${fixed.size} | ` +
         `chunks=${chunks.length} | providers=${providers.join(",") || "none"} | ` +
         `models=${models.join(",") || "none"} | coverage=${coverageOk ? "OK" : "INVALID"} | ` +
         `elapsed=${Date.now() - startedAt}ms.`
@@ -26146,12 +26344,13 @@ app.post(
 
       return safeJson(res, {
         ok: true,
-        version: SEMMAP_LAB_VERSION_152,
+        version: SEMMAP_LAB_VERSION_153,
         provider: [...new Set(providers)].join("+") || "deterministic",
         model: [...new Set(models)].join("+") || "none",
         elapsedMs: Date.now() - startedAt,
         coverageOk,
-        hardKeepCount: fixed.size,
+        deterministicCount: fixed.size,
+        deterministicCounts,
         modelCaseCount: modelCases.length,
         chunks: chunkTelemetry,
         expectedKeys,
@@ -26159,22 +26358,29 @@ app.post(
       });
     } catch (error) {
       const status =
-        error?.labInputError152
+        error?.labInputError153
           ? 400
           : Math.max(
               500,
-              Math.min(599, Number(error?.status || 502))
+              Math.min(
+                599,
+                Number(
+                  error?.status ||
+                  502
+                )
+              )
             );
 
       console.error(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] ${errorMessage(error).slice(0, 1400)}`
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] ` +
+        `${errorMessage(error).slice(0, 1400)}`
       );
 
       return safeJson(
         res,
         {
           ok: false,
-          version: SEMMAP_LAB_VERSION_152,
+          version: SEMMAP_LAB_VERSION_153,
           error: errorMessage(error)
         },
         status
