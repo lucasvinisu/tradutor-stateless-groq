@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.1 - REPAIR POSTCONDITION RETRY + TARGET-ELIMINATION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.2 - EXACT REPETITION FIDELITY + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -136,7 +136,7 @@ const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
 const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
 
 const CACHE_VERSION =
-  "9.8.1-repair-postcondition-closure-v1";
+  "9.8.2-exact-repetition-fidelity-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -15933,9 +15933,12 @@ function targetRepeatCount896(block, pt) {
 }
 
 function sourceExactRepetitionLost896(block, pt) {
+  // 9.8.2: apesar do nome legado "Lost", o invariant agora e simetrico.
+  // Se a SOURCE repete exatamente N>=3 vezes, o PT precisa preservar N:
+  // nem perder repeticoes, nem inflar a quantidade.
   const needed = sourceRepeatNeed896(block);
   if (needed < 3) return false;
-  return targetRepeatCount896(block, pt) < needed;
+  return targetRepeatCount896(block, pt) !== needed;
 }
 
 function bareImperativeConcreteReferentRisk92(block, pt) {
@@ -15992,12 +15995,23 @@ function restoreExactRepetitionLocally896(block, value) {
       while (i + c < clauses.length && repeatSimilarity896(clauses[i], clauses[i + c]) >= 0.72) c++;
       if (c > runCount) { runStart = i; runCount = c; }
     }
-    if (runStart < 0 || runCount >= srcNeed || runCount < 2) continue;
+    if (runStart < 0 || runCount < 2 || runCount === srcNeed) continue;
 
     const candidates = clauses.slice(runStart, runStart + runCount).map(x => x.trim());
     const shortest = [...candidates].sort((a,b) => a.length - b.length)[0];
     const rebuilt = [...clauses];
-    for (let k = runCount; k < srcNeed; k++) rebuilt.splice(runStart + k, 0, ` ${shortest}`);
+
+    if (runCount < srcNeed) {
+      // SOURCE tem mais repeticoes: completa somente ate a contagem autoritativa.
+      for (let k = runCount; k < srcNeed; k++) {
+        rebuilt.splice(runStart + k, 0, ` ${shortest}`);
+      }
+    } else {
+      // 9.8.2: PT inflou a repeticao. Remove somente o excedente do mesmo run
+      // sem reescrever vocabulario, ownership ou timestamps.
+      rebuilt.splice(runStart + srcNeed, runCount - srcNeed);
+    }
+
     let candidateLine = prefix + rebuilt.join("").replace(/[ \t]{2,}/g, " ").trim();
     let candidateAll = [...out];
     candidateAll[idx] = candidateLine;
@@ -18436,8 +18450,10 @@ function repairCandidateRegressionReasons(
   const sourceRepeat896 = sourceRepeatNeed896(block);
   const beforeRepeat896 = targetRepeatCount896(block, before);
   const candidateRepeat896 = targetRepeatCount896(block, candidate);
-  if (sourceRepeat896 >= 2 && beforeRepeat896 >= sourceRepeat896 && candidateRepeat896 < beforeRepeat896) {
-    regressions.push("SOURCE_EXACT_REPETITION_REGRESSION");
+  // 9.8.2: a SOURCE, nao o candidato anterior, define a quantidade correta.
+  // Ex.: SOURCE=4, BEFORE=6, REPAIR=4 e uma CORRECAO, nao regressao.
+  if (sourceRepeat896 >= 3 && candidateRepeat896 !== sourceRepeat896) {
+    regressions.push("SOURCE_EXACT_REPETITION_TARGET_MISMATCH_9_8_2");
   }
 
   for (const reason of afterReasons) {
@@ -26241,7 +26257,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.1 - REPAIR POSTCONDITION RETRY + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.2 - EXACT REPETITION FIDELITY + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -26623,6 +26639,7 @@ console.log(
   console.log(
     "Exact Repetition Lock 9.0: repetição dramática não pode ser compactada nem perdida por Repair ✅"
   );
+  console.log("Exact Repetition Fidelity 9.8.2: SOURCE N>=3 governa contagem exata; excesso/deficit e reconciliado localmente; Repair N->N e aceito ✅");
   console.log(
     "Visible Censor Zero 9.0: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
   );
