@@ -25506,42 +25506,69 @@ async function timingAwareCompactSurgery928(items) {
 
 
 // ============================================================
-// LAB 15.1D — MAPEADOR SEMÂNTICO UNIVERSAL / BROWNOUT-SAFE
-// Isolado: não altera tradução, jobs, cache, canonical ou timestamps.
-// Gemini é preferido. Se os DOIS Gemini entrarem em brownout 5xx/timeout,
-// SOMENTE esta rota LAB pode usar Groq QUALITY com contrato KEEP/SPLIT/MERGE.
+// LAB 15.2 — MAPEADOR SEMÂNTICO UNIVERSAL / MONOTONICIDADE + TURN PURITY
+// Base 9.7.9 intacta. Nenhuma autoridade de timestamp para modelo.
 // ============================================================
 
-const SEMMAP_LAB_VERSION_151D = "15.1D";
-const SEMMAP_LAB_MAX_ITEMS_151D = 120;
-const SEMMAP_LAB_MAX_PAYLOAD_CHARS_151D = 120000;
-const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_151D = 12000;
-const SEMMAP_LAB_CHUNK_SIZE_151D = 13;
-const SEMMAP_LAB_GROQ_MAX_OUTPUT_151D = 2200;
+const SEMMAP_LAB_VERSION_152 = "15.2";
+const SEMMAP_LAB_MAX_ITEMS_152 = 120;
+const SEMMAP_LAB_MAX_PAYLOAD_CHARS_152 = 120000;
+const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_152 = 12000;
+const SEMMAP_LAB_CHUNK_SIZE_152 = 13;
 
-function semanticMapLabText151D(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_151D) {
+function semanticMapLabText152(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_152) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .slice(0, Math.max(0, Number(maxChars || 0)));
 }
 
-function semanticMapLabFiniteNumber151D(value, fallback = null) {
+function semanticMapLabFiniteNumber152(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function sanitizeSemanticMapCases151D(rawCases) {
+function semanticMapLabMultiTurn152(text) {
+  const normalized = String(text || "")
+    .replace(/\r/g, "")
+    .trim();
+
+  if (!normalized) return false;
+
+  // Dois ou mais turnos explícitos no MESMO cue, em linhas separadas.
+  const lineTurns = normalized
+    .split("\n")
+    .filter(line => /^\s*[-–—]\s*\S/u.test(line))
+    .length;
+
+  if (lineTurns >= 2) return true;
+
+  // Formato compactado comum: "-fala do A. -fala do B."
+  // Exige marcador de diálogo no começo e um segundo marcador após whitespace.
+  if (
+    /^\s*[-–—]\s*\S/u.test(normalized) &&
+    /(?:\s|^)[-–—]\s*\S/gu.test(normalized)
+  ) {
+    const markers =
+      normalized.match(/(?:^|\s)[-–—]\s*\S/gu) || [];
+
+    if (markers.length >= 2) return true;
+  }
+
+  return false;
+}
+
+function sanitizeSemanticMapCases152(rawCases) {
   if (!Array.isArray(rawCases)) {
     const error = new Error("cases deve ser um array.");
-    error.labInputError151D = true;
+    error.labInputError152 = true;
     throw error;
   }
 
-  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_151D) {
+  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_152) {
     const error = new Error(
-      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_151D} itens.`
+      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_152} itens.`
     );
-    error.labInputError151D = true;
+    error.labInputError152 = true;
     throw error;
   }
 
@@ -25552,25 +25579,25 @@ function sanitizeSemanticMapCases151D(rawCases) {
 
     if (!/^[A-Za-z0-9_-]{1,32}$/.test(caseKey)) {
       const error = new Error(`case_key inválido no item ${index + 1}.`);
-      error.labInputError151D = true;
+      error.labInputError152 = true;
       throw error;
     }
 
     if (seen.has(caseKey)) {
       const error = new Error(`case_key duplicado: ${caseKey}.`);
-      error.labInputError151D = true;
+      error.labInputError152 = true;
       throw error;
     }
     seen.add(caseKey);
 
-    const currentSource = semanticMapLabText151D(raw?.current_source);
-    const currentPt = semanticMapLabText151D(raw?.current_pt);
+    const currentSource = semanticMapLabText152(raw?.current_source);
+    const currentPt = semanticMapLabText152(raw?.current_pt);
 
     if (!currentSource || !currentPt) {
       const error = new Error(
         `current_source/current_pt ausente em ${caseKey}.`
       );
-      error.labInputError151D = true;
+      error.labInputError152 = true;
       throw error;
     }
 
@@ -25583,8 +25610,8 @@ function sanitizeSemanticMapCases151D(rawCases) {
       candidate_merge: candidateMerge,
       current_source: currentSource,
       current_pt: currentPt,
-      prosody: semanticMapLabText151D(raw?.prosody, 1000),
-      risk_flags: semanticMapLabText151D(raw?.risk_flags, 1200)
+      prosody: semanticMapLabText152(raw?.prosody, 1000),
+      risk_flags: semanticMapLabText152(raw?.risk_flags, 1200)
     };
 
     if (candidateSplit) {
@@ -25593,27 +25620,31 @@ function sanitizeSemanticMapCases151D(rawCases) {
         : [];
 
       item.split_options = options.map(option => ({
-        source_left: semanticMapLabText151D(option?.source_left, 6000),
-        source_right: semanticMapLabText151D(option?.source_right, 6000),
+        source_left: semanticMapLabText152(option?.source_left, 6000),
+        source_right: semanticMapLabText152(option?.source_right, 6000),
         pause_ms: Math.max(
           0,
           Math.min(
             15000,
-            semanticMapLabFiniteNumber151D(option?.pause_ms, 0)
+            semanticMapLabFiniteNumber152(option?.pause_ms, 0)
           )
         ),
         dramatic: option?.dramatic === true,
-        punctuation: semanticMapLabText151D(option?.punctuation, 200)
+        punctuation: semanticMapLabText152(option?.punctuation, 200)
       }));
     }
 
     if (candidateMerge) {
-      item.next_source = semanticMapLabText151D(raw?.next_source, 12000);
-      item.next_pt = semanticMapLabText151D(raw?.next_pt, 12000);
-      item.phonetic_gap_ms = semanticMapLabFiniteNumber151D(
+      item.next_source = semanticMapLabText152(raw?.next_source, 12000);
+      item.next_pt = semanticMapLabText152(raw?.next_pt, 12000);
+      item.phonetic_gap_ms = semanticMapLabFiniteNumber152(
         raw?.phonetic_gap_ms,
         null
       );
+
+      item.next_has_multiple_dialogue_turns =
+        semanticMapLabMultiTurn152(item.next_source) ||
+        semanticMapLabMultiTurn152(item.next_pt);
     }
 
     return item;
@@ -25621,66 +25652,94 @@ function sanitizeSemanticMapCases151D(rawCases) {
 
   const chars = JSON.stringify(cases).length;
 
-  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_151D) {
+  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_152) {
     const error = new Error(
-      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_151D} chars.`
+      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_152} chars.`
     );
-    error.labInputError151D = true;
+    error.labInputError152 = true;
     throw error;
   }
 
   return cases;
 }
 
-function semanticMapLabSystem151D() {
+function semanticMapLabSystem152() {
   return `
-MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_151D}
+MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_152}
 
-Você recebe casos independentes de legenda.
-Não use nem infira título, série, filme, episódio, gênero, personagem ou programa além do texto fornecido.
-
-OBJETIVO
-Decidir SOMENTE a organização de exibição do texto PT-BR JÁ EXISTENTE.
+FUNÇÃO
+Você NÃO controla timing nem legibilidade. Você decide SOMENTE a correspondência semântica
+para KEEP, SPLIT ou MERGE. Um estágio determinístico separado cuida de duração mínima,
+CPS, Anti-Piscada, colisões e timestamps.
 
 DECISÕES
-KEEP  = preservar o bloco como está.
-SPLIT = dividir o PT-BR exatamente em duas partes usando uma fronteira fonética já fornecida.
-MERGE = marcar current + next como uma única unidade semântica para handoff visual.
-MERGE NÃO cola os textos num único cue e NÃO autoriza mostrar next_pt antes da hora.
+KEEP  = preservar a organização atual.
+SPLIT = a pausa acústica já fornecida separa duas unidades semânticas cujo conteúdo
+        pode ser mapeado de forma monotônica para duas partes contíguas do PT-BR.
+MERGE = current e next formam uma única unidade semântica para handoff visual;
+        nunca significa concatenar cues ou antecipar next_pt.
 
 REGRAS ABSOLUTAS
 1. Nunca traduza, reescreva, corrija, resuma, expanda ou melhore o PT-BR.
 2. Nunca crie timestamps.
-3. Nunca antecipe conteúdo do lado direito, próximo cue, revelação, nome, punchline ou resposta.
-4. SPLIT só é válido quando pt_left + espaço + pt_right recompõe exatamente current_pt
-   (ignorando somente espaços repetidos) e corresponde semanticamente a source_left/source_right
-   de uma split_option recebida.
-5. MERGE só é válido quando current e next pertencem claramente à mesma unidade semântica,
-   sem troca de locutor e sem antecipar next_pt.
-6. candidate_split=true E candidate_merge=true => KEEP nesta versão.
-7. SPLIT que cria fragmento artificial, como conjunção isolada => KEEP.
-8. Mudança de ordem EN→PT-BR que torne inseguro mapear a pausa => KEEP.
-9. Troca de locutor => nunca MERGE.
-10. Na dúvida => KEEP.
-11. AMBIGUOUS só pode acompanhar KEEP.
+3. Nunca antecipe conteúdo, revelação, nome, punchline, resposta ou próximo turno.
+4. candidate_split=true E candidate_merge=true => KEEP nesta versão.
+5. next_has_multiple_dialogue_turns=true => KEEP. Um cue misto não pode ser MERGE inteiro.
+6. Troca de locutor => nunca MERGE.
+7. Na dúvida => KEEP.
+8. AMBIGUOUS só pode acompanhar KEEP.
+
+REGRA-CHAVE DE SPLIT — MONOTONICIDADE SEMÂNTICA
+A fronteira deve sobreviver à tradução.
+Para aceitar SPLIT, deve existir pt_left | pt_right tal que:
+- pt_left + espaço + pt_right recompõe exatamente current_pt;
+- TODO o significado de source_left pertence a pt_left;
+- TODO o significado de source_right pertence a pt_right;
+- nenhum elemento semântico atravessa a fronteira por reordenação EN→PT.
+Se algo que está em source_right aparece naturalmente antes da fronteira em PT-BR,
+ou algo de source_left aparece depois, responda KEEP.
+
+Exemplo abstrato de risco:
+source_left = "ver meu"
+source_right = "amor nos olhos"
+PT reordena para "olhar nos olhos do meu amor".
+"nos olhos" veio do lado direito mas aparece antes de "meu amor"; portanto a pausa
+inglesa não possui corte PT-BR contíguo semanticamente fiel => KEEP.
+
+PAUSA DRAMÁTICA E FRAGMENTOS CURTOS
+A ausência de pontuação NÃO invalida SPLIT.
+Uma pausa dramática forte pode separar sujeito/predicado, núcleo/complemento,
+revelação, vocativo ou outro constituinte mesmo sem vírgula/ponto.
+
+NÃO rejeite SPLIT apenas porque uma metade tem uma ou duas palavras.
+Ex.: sujeito curto | verbo curto pode ser semanticamente perfeito.
+O estágio posterior de Anti-Piscada decidirá se existe duração suficiente para exibir.
+Sua função aqui é SEMÂNTICA, não CPS nem duração visual.
+
+Também aceite fragmentos linguísticos deliberados quando a pausa acústica/prosódica
+os transforma em dois beats naturais e a correspondência EN→PT é monotônica.
+
+MERGE — PUREZA DE UNIDADE
+MERGE exige que TODO current e TODO next pertençam à mesma continuação semântica.
+Se next mistura a continuação do locutor atual com resposta/interjeição de outro locutor,
+responda KEEP, mesmo com gap fonético mínimo.
 
 SAÍDA
 Preserve case_key exatamente.
-KEEP:  pt_left="" e pt_right="".
+KEEP: pt_left="" e pt_right="".
 SPLIT: pt_left e pt_right recompõem exatamente current_pt.
 MERGE: pt_left=current_pt e pt_right=next_pt.
-Retorne apenas o JSON exigido.
+Retorne somente JSON.
 `.trim();
 }
 
-function semanticMapLabSchema151D(count) {
+function semanticMapLabSchema152(count) {
   return {
     type: "array",
     minItems: count,
     maxItems: count,
     items: {
       type: "object",
-      additionalProperties: false,
       properties: {
         case_key: { type: "string" },
         decision: {
@@ -25705,7 +25764,7 @@ function semanticMapLabSchema151D(count) {
   };
 }
 
-function semanticMapLabUser151D(cases) {
+function semanticMapLabUser152(cases) {
   return (
     "CASOS PARA CLASSIFICAR. Cada item é independente. " +
     `Retorne exatamente ${cases.length} objetos, um por case_key, ` +
@@ -25714,30 +25773,20 @@ function semanticMapLabUser151D(cases) {
   );
 }
 
-function semanticMapLabBrownout151D(error) {
-  const text = String(error?.message || error || "");
-  return Boolean(
-    /MODEL ROUTER esgotou/i.test(text) &&
-    /(?:503|504|timeout|high demand)/i.test(text)
-  );
-}
-
-function semanticMapLabParseItems151D(text, expectedCount, providerLabel) {
+function semanticMapLabParse152(text, expectedCount, label) {
   let parsed;
 
   try {
     parsed = JSON.parse(stripCodeFences(text));
   } catch {
-    const error = new Error(
-      `${providerLabel}: resposta semântica não é JSON válido.`
-    );
+    const error = new Error(`${label}: JSON inválido.`);
     error.status = 502;
     throw error;
   }
 
   if (!Array.isArray(parsed) || parsed.length !== expectedCount) {
     const error = new Error(
-      `${providerLabel}: resposta incompleta; esperado=${expectedCount}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`
+      `${label}: resposta incompleta; esperado=${expectedCount}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`
     );
     error.status = 502;
     throw error;
@@ -25746,26 +25795,30 @@ function semanticMapLabParseItems151D(text, expectedCount, providerLabel) {
   return parsed;
 }
 
-async function callGroqSemanticMap151D(cases) {
+function semanticMapLabBrownout152(error) {
+  const text = String(error?.message || error || "");
+  return Boolean(
+    /MODEL ROUTER esgotou/i.test(text) &&
+    /(?:503|504|timeout|high demand)/i.test(text)
+  );
+}
+
+async function callGroqSemanticMap152(cases) {
   if (!GROQ_API_KEY) {
     const error = new Error(
-      "Gemini em brownout e GROQ_API_KEY não está configurada no Render."
+      "Gemini em brownout e GROQ_API_KEY não está configurada."
     );
     error.status = 503;
     throw error;
   }
 
-  const system = semanticMapLabSystem151D();
-  const user = semanticMapLabUser151D(cases);
-  const schema = semanticMapLabSchema151D(cases.length);
+  const system = semanticMapLabSystem152();
+  const user = semanticMapLabUser152(cases);
+  const schema = semanticMapLabSchema152(cases.length);
   const modelId = GROQ_MODELS_976.QUALITY;
 
   const inputEstimate =
-    estimateGroqInputTokens976(
-      system,
-      user,
-      schema
-    );
+    estimateGroqInputTokens976(system, user, schema);
 
   const conservativeNeed =
     inputEstimate +
@@ -25773,636 +25826,356 @@ async function callGroqSemanticMap151D(cases) {
     GROQ_SAFETY_MARGIN_TOKENS_977;
 
   if (
-    inputEstimate >
-      GROQ_INPUT_SAFE_TOKENS_976 ||
-    conservativeNeed >
-      GROQ_TOTAL_SAFE_TOKENS_977
+    inputEstimate > GROQ_INPUT_SAFE_TOKENS_976 ||
+    conservativeNeed > GROQ_TOTAL_SAFE_TOKENS_977
   ) {
     const error = new Error(
-      `SEMMAP LAB 15.1D: lote ainda grande para Groq; input≈${inputEstimate}, total≈${conservativeNeed}.`
+      `SEMMAP LAB 15.2: lote grande para Groq; input≈${inputEstimate}, total≈${conservativeNeed}.`
     );
     error.status = 413;
-    error.routerCanSplit = true;
     throw error;
   }
 
   const release = await acquireGroqGate976();
 
   try {
-    if (
-      Number.isFinite(
-        Number(
-          groqRuntime976.remainingTokens
-        )
-      ) &&
-      Number(
-        groqRuntime976.remainingTokens
-      ) < conservativeNeed
-    ) {
-      const inferredReset =
-        Number(
-          groqRuntime976.resetAt ||
-          0
-        ) > Date.now()
-          ? Number(
-              groqRuntime976.resetAt
-            )
-          : Date.now() + 60000;
+    const controller = new AbortController();
+    const timeoutMs = 90000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-      const waitMs =
-        Math.min(
-          GROQ_RESET_WAIT_MAX_MS_976,
-          Math.max(
-            250,
-            inferredReset -
-            Date.now() +
-            120
-          )
-        );
+    let response;
+    let raw = "";
+    let data = null;
 
-      console.warn(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] Groq pacer | ` +
-        `remaining=${groqRuntime976.remainingTokens} | need≈${conservativeNeed} | ` +
-        `wait=${(waitMs / 1000).toFixed(1)}s.`
+    try {
+      response = await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${GROQ_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content: user }
+            ],
+            reasoning_effort: "medium",
+            reasoning_format: "hidden",
+            max_completion_tokens: 2200,
+            response_format: {
+              type: "json_schema",
+              json_schema: {
+                name: "stremio_semmap_lab_152",
+                strict: true,
+                schema
+              }
+            }
+          }),
+          signal: controller.signal
+        }
       );
 
-      await sleep(waitMs);
-    }
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const controller = new AbortController();
-      const timeoutMs = 90000;
-      const timer =
-        setTimeout(
-          () => controller.abort(),
-          timeoutMs
-        );
-
-      let response;
-      let raw = "";
-      let data = null;
+      raw = await response.text();
 
       try {
-        response =
-          await fetch(
-            "https://api.groq.com/openai/v1/chat/completions",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type":
-                  "application/json",
-                "Authorization":
-                  `Bearer ${GROQ_API_KEY}`
-              },
-              body:
-                JSON.stringify({
-                  model:
-                    modelId,
-                  messages: [
-                    {
-                      role:
-                        "system",
-                      content:
-                        system
-                    },
-                    {
-                      role:
-                        "user",
-                      content:
-                        user
-                    }
-                  ],
-                  reasoning_effort:
-                    "medium",
-                  reasoning_format:
-                    "hidden",
-                  max_completion_tokens:
-                    SEMMAP_LAB_GROQ_MAX_OUTPUT_151D,
-                  response_format: {
-                    type:
-                      "json_schema",
-                    json_schema: {
-                      name:
-                        "stremio_semmap_lab_151d",
-                      strict:
-                        true,
-                      schema
-                    }
-                  }
-                }),
-              signal:
-                controller.signal
-            }
-          );
-
-        raw =
-          await response.text();
-
-        try {
-          data =
-            raw
-              ? JSON.parse(raw)
-              : {};
-        } catch {
-          data = {};
-        }
-
-        updateGroqRate976(
-          response
-        );
-      } catch (error) {
-        if (
-          error?.name ===
-          "AbortError"
-        ) {
-          const timeoutError =
-            new Error(
-              `GROQ ${modelId} semmaplab: timeout em ${timeoutMs}ms.`
-            );
-          timeoutError.status = 504;
-          throw timeoutError;
-        }
-
-        throw error;
-      } finally {
-        clearTimeout(timer);
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = {};
       }
 
-      if (!response.ok) {
-        const status =
-          Number(
-            response.status ||
-            0
-          );
-
-        const error =
-          new Error(
-            `GROQ ${modelId} HTTP ${status}: ` +
-            `${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1600)}`
-          );
-
-        error.status = status;
-
-        if (
-          status === 429 &&
-          attempt < 2
-        ) {
-          const retryHeader =
-            Number(
-              response.headers.get(
-                "retry-after"
-              )
-            );
-
-          const resetMs =
-            groqResetMs976(
-              response.headers.get(
-                "x-ratelimit-reset-tokens"
-              )
-            );
-
-          const waitMs =
-            Math.min(
-              GROQ_RESET_WAIT_MAX_MS_976,
-              Math.max(
-                500,
-                Number.isFinite(
-                  retryHeader
-                ) &&
-                retryHeader > 0
-                  ? retryHeader * 1000
-                  : resetMs ||
-                    3000
-              )
-            );
-
-          console.warn(
-            `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] Groq 429 | ` +
-            `wait=${(waitMs / 1000).toFixed(1)}s | retry bounded.`
-          );
-
-          await sleep(
-            waitMs + 120
-          );
-
-          continue;
-        }
-
-        throw error;
+      updateGroqRate976(response);
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const e = new Error(`GROQ ${modelId}: timeout.`);
+        e.status = 504;
+        throw e;
       }
-
-      const text =
-        String(
-          data
-            ?.choices?.[0]
-            ?.message
-            ?.content ||
-          ""
-        ).trim();
-
-      if (!text) {
-        const error =
-          new Error(
-            `GROQ ${modelId} retornou conteúdo vazio.`
-          );
-        error.status = 502;
-        throw error;
-      }
-
-      const rawUsage =
-        data?.usage ||
-        {};
-
-      const usage = {
-        total_input_tokens:
-          Number(
-            rawUsage
-              ?.prompt_tokens ||
-            0
-          ),
-
-        total_output_tokens:
-          Number(
-            rawUsage
-              ?.completion_tokens ||
-            0
-          ),
-
-        total_thought_tokens:
-          Number(
-            rawUsage
-              ?.completion_tokens_details
-              ?.reasoning_tokens ||
-            0
-          )
-      };
-
-      groqRuntime976.calls++;
-
-      console.warn(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] GROQ OK ${modelId} | ` +
-        `cases=${cases.length} | input=${usage.total_input_tokens} | ` +
-        `output=${usage.total_output_tokens} | thought=${usage.total_thought_tokens} | ` +
-        `remaining=${groqRuntime976.lastHeaders.remainingTokens ?? "?"}.`
-      );
-
-      return {
-        text,
-        usage,
-        modelId,
-        provider:
-          "groq"
-      };
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
+
+    if (!response.ok) {
+      const status = Number(response.status || 0);
+      const error = new Error(
+        `GROQ ${modelId} HTTP ${status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1600)}`
+      );
+      error.status = status;
+      throw error;
+    }
+
+    const text = String(
+      data?.choices?.[0]?.message?.content || ""
+    ).trim();
+
+    if (!text) {
+      const error = new Error(`GROQ ${modelId} retornou conteúdo vazio.`);
+      error.status = 502;
+      throw error;
+    }
+
+    const u = data?.usage || {};
+    const usage = {
+      total_input_tokens: Number(u?.prompt_tokens || 0),
+      total_output_tokens: Number(u?.completion_tokens || 0),
+      total_thought_tokens: Number(
+        u?.completion_tokens_details?.reasoning_tokens || 0
+      )
+    };
+
+    return {
+      text,
+      usage,
+      modelId,
+      provider: "groq"
+    };
   } finally {
     release();
   }
 }
 
-async function classifySemanticMapChunk151D(
-  cases,
-  preferGroq = false
-) {
-  const system =
-    semanticMapLabSystem151D();
-
-  const user =
-    semanticMapLabUser151D(
-      cases
-    );
-
-  const schema =
-    semanticMapLabSchema151D(
-      cases.length
-    );
+async function classifySemanticMapChunk152(cases, preferGroq = false) {
+  const system = semanticMapLabSystem152();
+  const user = semanticMapLabUser152(cases);
+  const schema = semanticMapLabSchema152(cases.length);
 
   if (!preferGroq) {
     try {
-      const result =
-        await geminiRequest({
-          system,
-          user,
-          schema,
-          thinkingLevel:
-            "medium",
-          maxOutputTokens:
-            7000,
-          timeoutMs:
-            90000,
-          maxRetries:
-            1,
-          job:
-            null,
-          metric:
-            "semmaplab"
-        });
+      const result = await geminiRequest({
+        system,
+        user,
+        schema,
+        thinkingLevel: "medium",
+        maxOutputTokens: 7000,
+        timeoutMs: 90000,
+        maxRetries: 1,
+        job: null,
+        metric: "semmaplab"
+      });
 
       return {
-        items:
-          semanticMapLabParseItems151D(
-            result.text,
-            cases.length,
-            result.modelId
-          ),
-        model:
-          result.modelId,
-        provider:
-          result.provider ||
-          "gemini",
-        usage:
-          result.usage ||
-          null,
-        brownout:
-          false
+        items: semanticMapLabParse152(
+          result.text,
+          cases.length,
+          result.modelId
+        ),
+        model: result.modelId,
+        provider: result.provider || "gemini",
+        usage: result.usage || null
       };
     } catch (error) {
-      if (
-        !semanticMapLabBrownout151D(
-          error
-        )
-      ) {
+      if (!semanticMapLabBrownout152(error)) {
         throw error;
       }
 
       console.warn(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] Gemini brownout confirmado; ` +
-        `somente o LAB muda para Groq QUALITY.`
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] Gemini brownout; LAB -> Groq QUALITY.`
       );
     }
   }
 
-  const groq =
-    await callGroqSemanticMap151D(
-      cases
-    );
+  const groq = await callGroqSemanticMap152(cases);
 
   return {
-    items:
-      semanticMapLabParseItems151D(
-        groq.text,
-        cases.length,
-        groq.modelId
-      ),
-    model:
-      groq.modelId,
-    provider:
-      "groq",
-    usage:
-      groq.usage ||
-      null,
-    brownout:
-      true
+    items: semanticMapLabParse152(
+      groq.text,
+      cases.length,
+      groq.modelId
+    ),
+    model: groq.modelId,
+    provider: "groq",
+    usage: groq.usage || null
   };
 }
 
+function semanticMapLabHardKeep152(cases) {
+  const fixed = new Map();
+  const toModel = [];
+
+  for (const item of cases) {
+    const compound =
+      item.candidate_split === true &&
+      item.candidate_merge === true;
+
+    const impureMerge =
+      item.candidate_merge === true &&
+      item.next_has_multiple_dialogue_turns === true;
+
+    if (compound || impureMerge) {
+      fixed.set(item.case_key, {
+        case_key: item.case_key,
+        decision: "KEEP",
+        confidence: "VERY_STRONG",
+        pt_left: "",
+        pt_right: "",
+        deterministic_guard:
+          compound
+            ? "COMPOUND_SPLIT_MERGE_KEEP"
+            : "NEXT_MULTI_TURN_KEEP"
+      });
+    } else {
+      toModel.push(item);
+    }
+  }
+
+  return { fixed, toModel };
+}
+
 app.get(
-  "/api/lab/semantic-map-15-1d/status",
+  "/api/lab/semantic-map-15-2/status",
   (req, res) => {
     if (!authorized(req)) {
-      return safeJson(
-        res,
-        {
-          error:
-            "Unauthorized"
-        },
-        401
-      );
+      return safeJson(res, { error: "Unauthorized" }, 401);
     }
 
-    return safeJson(
-      res,
-      {
-        ok:
-          true,
-        version:
-          SEMMAP_LAB_VERSION_151D,
-        mode:
-          "UNIVERSAL_SEMANTIC_MAP_BROWNOUT_SAFE",
-        productionPipelineChanged:
-          false,
-        timestampsAuthority:
-          "LOCAL_ACOUSTIC_PIPELINE_ONLY",
-        geminiRoute:
-          geminiRouteForMetric(
-            "semmaplab"
-          ),
-        groqLabFallbackConfigured:
-          Boolean(
-            GROQ_API_KEY
-          ),
-        chunkSize:
-          SEMMAP_LAB_CHUNK_SIZE_151D
-      }
-    );
+    return safeJson(res, {
+      ok: true,
+      version: SEMMAP_LAB_VERSION_152,
+      mode: "UNIVERSAL_SEMANTIC_MAP_MONOTONICITY_TURN_PURITY",
+      productionPipelineChanged: false,
+      timestampsAuthority: "LOCAL_ACOUSTIC_PIPELINE_ONLY",
+      geminiRoute: geminiRouteForMetric("semmaplab"),
+      groqLabFallbackConfigured: Boolean(GROQ_API_KEY),
+      chunkSize: SEMMAP_LAB_CHUNK_SIZE_152,
+      hardGuards: [
+        "COMPOUND_SPLIT_MERGE_KEEP",
+        "NEXT_MULTI_TURN_KEEP"
+      ]
+    });
   }
 );
 
 app.post(
-  "/api/lab/semantic-map-15-1d",
+  "/api/lab/semantic-map-15-2",
   async (req, res) => {
     if (!authorized(req)) {
-      return safeJson(
-        res,
-        {
-          error:
-            "Unauthorized"
-        },
-        401
-      );
+      return safeJson(res, { error: "Unauthorized" }, 401);
     }
 
-    const startedAt =
-      Date.now();
+    const startedAt = Date.now();
 
     try {
       if (
-        String(
-          req.body
-            ?.contractVersion ||
-          ""
-        ).trim() !==
-        SEMMAP_LAB_VERSION_151D
+        String(req.body?.contractVersion || "").trim() !==
+        SEMMAP_LAB_VERSION_152
       ) {
-        const error =
-          new Error(
-            `contractVersion deve ser ${SEMMAP_LAB_VERSION_151D}.`
-          );
-
-        error.labInputError151D =
-          true;
-
+        const error = new Error(
+          `contractVersion deve ser ${SEMMAP_LAB_VERSION_152}.`
+        );
+        error.labInputError152 = true;
         throw error;
       }
 
-      const cases =
-        sanitizeSemanticMapCases151D(
-          req.body?.cases
-        );
+      const allCases = sanitizeSemanticMapCases152(req.body?.cases);
+      const expectedKeys = allCases.map(item => item.case_key);
 
-      const expectedKeys =
-        cases.map(
-          item =>
-            item.case_key
-        );
+      const guarded = semanticMapLabHardKeep152(allCases);
+      const fixed = guarded.fixed;
+      const modelCases = guarded.toModel;
 
       const chunks = [];
-
       for (
         let i = 0;
-        i < cases.length;
-        i +=
-          SEMMAP_LAB_CHUNK_SIZE_151D
+        i < modelCases.length;
+        i += SEMMAP_LAB_CHUNK_SIZE_152
       ) {
         chunks.push(
-          cases.slice(
-            i,
-            i +
-            SEMMAP_LAB_CHUNK_SIZE_151D
-          )
+          modelCases.slice(i, i + SEMMAP_LAB_CHUNK_SIZE_152)
         );
       }
 
-      const items = [];
+      const modelItems = [];
       const providers = [];
       const models = [];
       const chunkTelemetry = [];
       let preferGroq = false;
 
-      for (
-        let i = 0;
-        i < chunks.length;
-        i++
-      ) {
-        const chunk =
-          chunks[i];
+      for (let i = 0; i < chunks.length; i++) {
+        const result = await classifySemanticMapChunk152(
+          chunks[i],
+          preferGroq
+        );
 
-        const result =
-          await classifySemanticMapChunk151D(
-            chunk,
-            preferGroq
-          );
-
-        if (
-          result.provider ===
-          "groq"
-        ) {
+        if (result.provider === "groq") {
           preferGroq = true;
         }
 
-        items.push(
-          ...result.items
-        );
-
-        providers.push(
-          result.provider
-        );
-
-        models.push(
-          result.model
-        );
+        modelItems.push(...result.items);
+        providers.push(result.provider);
+        models.push(result.model);
 
         chunkTelemetry.push({
-          chunk:
-            i + 1,
-          cases:
-            chunk.length,
-          provider:
-            result.provider,
-          model:
-            result.model,
-          usage:
-            result.usage ||
-            null
+          chunk: i + 1,
+          cases: chunks[i].length,
+          provider: result.provider,
+          model: result.model,
+          usage: result.usage || null
         });
       }
 
-      const returnedKeys =
-        items.map(
-          item =>
-            String(
-              item?.case_key ||
-              ""
-            ).trim()
-        );
+      const byKey = new Map();
+
+      for (const item of modelItems) {
+        byKey.set(String(item?.case_key || "").trim(), item);
+      }
+
+      for (const [key, item] of fixed.entries()) {
+        byKey.set(key, item);
+      }
+
+      const items = expectedKeys.map(key => byKey.get(key)).filter(Boolean);
+      const returnedKeys = items.map(
+        item => String(item?.case_key || "").trim()
+      );
 
       const coverageOk =
-        returnedKeys.length ===
-          expectedKeys.length &&
-        new Set(
-          returnedKeys
-        ).size ===
-          expectedKeys.length &&
-        expectedKeys.every(
-          key =>
-            returnedKeys.includes(
-              key
-            )
-        );
+        returnedKeys.length === expectedKeys.length &&
+        new Set(returnedKeys).size === expectedKeys.length &&
+        expectedKeys.every(key => returnedKeys.includes(key));
 
       console.log(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] COMPLETE | ` +
-        `cases=${cases.length} | chunks=${chunks.length} | ` +
-        `providers=${providers.join(",")} | models=${models.join(",")} | ` +
-        `coverage=${coverageOk ? "OK" : "INVALID"} | ` +
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] COMPLETE | ` +
+        `all=${allCases.length} | model=${modelCases.length} | hardKeep=${fixed.size} | ` +
+        `chunks=${chunks.length} | providers=${providers.join(",") || "none"} | ` +
+        `models=${models.join(",") || "none"} | coverage=${coverageOk ? "OK" : "INVALID"} | ` +
         `elapsed=${Date.now() - startedAt}ms.`
       );
 
-      return safeJson(
-        res,
-        {
-          ok:
-            true,
-          version:
-            SEMMAP_LAB_VERSION_151D,
-          provider:
-            [...new Set(
-              providers
-            )].join("+"),
-          model:
-            [...new Set(
-              models
-            )].join("+"),
-          elapsedMs:
-            Date.now() -
-            startedAt,
-          coverageOk,
-          chunks:
-            chunkTelemetry,
-          expectedKeys,
-          items
-        }
-      );
+      return safeJson(res, {
+        ok: true,
+        version: SEMMAP_LAB_VERSION_152,
+        provider: [...new Set(providers)].join("+") || "deterministic",
+        model: [...new Set(models)].join("+") || "none",
+        elapsedMs: Date.now() - startedAt,
+        coverageOk,
+        hardKeepCount: fixed.size,
+        modelCaseCount: modelCases.length,
+        chunks: chunkTelemetry,
+        expectedKeys,
+        items
+      });
     } catch (error) {
       const status =
-        error?.labInputError151D
+        error?.labInputError152
           ? 400
           : Math.max(
               500,
-              Math.min(
-                599,
-                Number(
-                  error?.status ||
-                  502
-                )
-              )
+              Math.min(599, Number(error?.status || 502))
             );
 
       console.error(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151D}] ` +
-        `${errorMessage(error).slice(0, 1400)}`
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_152}] ${errorMessage(error).slice(0, 1400)}`
       );
 
       return safeJson(
         res,
         {
-          ok:
-            false,
-          version:
-            SEMMAP_LAB_VERSION_151D,
-          error:
-            errorMessage(
-              error
-            )
+          ok: false,
+          version: SEMMAP_LAB_VERSION_152,
+          error: errorMessage(error)
         },
         status
       );
