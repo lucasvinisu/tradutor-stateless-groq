@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.2 - EXACT REPETITION FIDELITY + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.3 - LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -136,7 +136,7 @@ const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
 const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
 
 const CACHE_VERSION =
-  "9.8.2-exact-repetition-fidelity-v1";
+  "9.8.3-logical-turn-repetition-closure-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -15486,38 +15486,47 @@ function compactExactRepetitionLayout898(block, value) {
   if (!original || layoutCueResult(block, original).fits) return original;
 
   const sourceTurns = logicalSourceTurns896(block);
-  const targetLines = original.split("\n");
   const sourceNeeds = sourceTurns.map(maxConsecutiveRepeat896);
   if (sourceNeeds.every(n => n < 3)) return original;
-  if (sourceDialogueDashCount(block) >= 2 && targetLines.length !== sourceTurns.length) return original;
 
-  const out = [...targetLines];
+  const targetTurns = logicalTargetTurns896(block, original);
+  const multiTurn = sourceDialogueDashCount(block) >= 2;
+  if (multiTurn && targetTurns.length !== sourceTurns.length) return original;
+  if (!targetTurns.length) return original;
+
+  const outTurns = [...targetTurns];
   let changed = false;
 
-  for (let idx = 0; idx < Math.min(out.length, sourceNeeds.length); idx++) {
+  for (let idx = 0; idx < Math.min(outTurns.length, sourceNeeds.length); idx++) {
     if (sourceNeeds[idx] < 3) continue;
 
-    const rawLine = out[idx];
-    const marker = rawLine.match(/^\s*([-–—]\s*)/u);
-    const prefix = marker ? marker[1] : "";
-    const body = marker ? rawLine.slice(marker[0].length) : rawLine;
-    const clauses = body.match(/[^!?]+[!?]+|[^!?]+$/g) || [];
+    const clauses = String(outTurns[idx] || "").match(/[^!?]+[!?]+|[^!?]+$/g) || [];
     if (clauses.length < sourceNeeds[idx]) continue;
 
     const compacted = clauses.map(clause => compactRepeatClause898(clause));
-    const candidateLine = `${prefix}${compacted.join(" ")}`.replace(/[ \t]{2,}/g, " ").trim();
-    if (candidateLine !== rawLine) {
-      out[idx] = candidateLine;
+    const candidateTurn = compacted.join(" ")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
+
+    if (candidateTurn !== outTurns[idx]) {
+      outTurns[idx] = candidateTurn;
       changed = true;
     }
   }
 
   if (!changed) return original;
-  const candidate = out.join("\n").trim();
-  if (targetRepeatCount896(block, candidate) < sourceRepeatNeed896(block)) return original;
+
+  const candidate = rebuildLogicalTargetTurns896(block, outTurns);
+  if (
+    sourceRepeatNeed896(block) >= 3 &&
+    targetRepeatCount896(block, candidate) !== sourceRepeatNeed896(block)
+  ) return original;
   if (!layoutCueResult(block, candidate).fits) return original;
 
-  console.log(`[REPETITION LAYOUT LOCAL 9.0] cue ${block?.index}: repetição íntegra compactada para 2x50 | 0 Gemini.`);
+  console.log(
+    `[REPETITION LAYOUT LOCAL 9.0] cue ${block?.index}: ` +
+    `repetição íntegra compactada por fala lógica para 2x50 | 0 Gemini.`
+  );
   return candidate;
 }
 
@@ -15821,22 +15830,256 @@ function applyFinalStrictLayoutFallback898(blocks, finalTranslations, mainTransl
   return out;
 }
 
-function finalClosureResidualSummary898(blocks, translations, filename, plan) {
+
+function canonicalFinalCandidate983(block, value) {
+  let out = sanitizeFinalCue(block, String(value || "").trim()) || String(value || "").trim();
+  if (!out) return "";
+
+  out = applyDeterministicGenderClosure898(block, out);
+  out = applyContextSemanticPostconditions898(block, out);
+  out = normalizeSourceAwareInterjections973(
+    block,
+    applyDeterministicOrthography(out)
+  );
+  out = applyNaturalPtClosure898(block, out);
+  out = sanitizeFinalCue(block, out) || out;
+  return String(out || "").trim();
+}
+
+function applyFinalVerifiedCueRollback983(
+  blocks,
+  finalTranslations,
+  mainTranslations,
+  job,
+  filename,
+  plan
+) {
+  const out = new Map(finalTranslations);
+  const byId = new Map(blocks.map(block => [Number(block.index), block]));
+  let restored = 0;
+
+  for (const block of blocks) {
+    const id = Number(block.index);
+    const current = String(out.get(id) || "").trim();
+    const currentReasons = priorityLocalReasons898(block, current, filename, plan);
+    if (!currentReasons.length) continue;
+
+    const candidates = [];
+
+    if (job?.finalRepairLockedText923 instanceof Map) {
+      const locked = String(job.finalRepairLockedText923.get(id) || "").trim();
+      if (locked) candidates.push({ label: "verified-repair", text: locked });
+    }
+
+    const main = String(mainTranslations?.get?.(id) || "").trim();
+    if (main) candidates.push({ label: "main-safe", text: main });
+
+    for (const candidateInfo of candidates) {
+      const candidate = canonicalFinalCandidate983(block, candidateInfo.text);
+      if (!candidate || candidate === current) continue;
+      if (!layoutCueResult(block, candidate).fits) continue;
+      if (isSemanticallyRejectedText940(job, id, candidate)) continue;
+
+      const candidateReasons = priorityLocalReasons898(block, candidate, filename, plan);
+      if (candidateReasons.length) continue;
+
+      const ownershipAfter = ownershipReasonsAroundCandidate898(
+        blocks,
+        new Map(blocks.map((b, pos) => [Number(b.index), pos])),
+        out,
+        id,
+        candidate
+      );
+      if (ownershipAfter.length) continue;
+
+      out.set(id, candidate);
+      restored++;
+      console.warn(
+        `[FINAL SELECTIVE SEMANTIC FALLBACK 9.8.3] cue ${id}: ` +
+        `${candidateInfo.label} restaurado; residual local removido sem afetar outros cues. ✅`
+      );
+      break;
+    }
+  }
+
+  if (restored) {
+    console.warn(
+      `[FINAL SELECTIVE SEMANTIC FALLBACK 9.8.3] restaurados=${restored} cue(s); ` +
+      `rollback estritamente por caso.`
+    );
+  }
+  return out;
+}
+
+function enforceExactRepetitionFidelity983(blocks, translations, filename, plan, job = null) {
+  const out = new Map(translations);
+  let corrected = 0;
+  const unresolved = [];
+
+  for (const block of blocks) {
+    const need = sourceRepeatNeed896(block);
+    if (need < 3) continue;
+
+    const id = Number(block.index);
+    const before = String(out.get(id) || "").trim();
+    const gotBefore = targetRepeatCount896(block, before);
+    if (gotBefore === need) continue;
+
+    const candidate = canonicalFinalCandidate983(
+      block,
+      restoreExactRepetitionLocally896(block, before)
+    );
+    const gotAfter = targetRepeatCount896(block, candidate);
+
+    const beforeReasons = new Set(
+      priorityLocalReasons898(block, before, filename, plan)
+    );
+    const afterReasons = priorityLocalReasons898(block, candidate, filename, plan);
+    const newReasons = afterReasons.filter(reason => !beforeReasons.has(reason));
+
+    if (
+      candidate &&
+      candidate !== before &&
+      gotAfter === need &&
+      layoutCueResult(block, candidate).fits &&
+      !newReasons.length
+    ) {
+      out.set(id, candidate);
+      corrected++;
+      if (job?.finalRepairLockedText923 instanceof Map) {
+        job.finalRepairLockedText923.set(id, candidate);
+      }
+      console.warn(
+        `[EXACT REPETITION FINAL 9.8.3] cue ${id}: ${gotBefore}->${need} ` +
+        `pela SOURCE, fala lógica inteira; 0 cloud. ✅`
+      );
+    } else {
+      unresolved.push({ id, expected: need, got: gotAfter || gotBefore });
+    }
+  }
+
+  if (corrected || unresolved.length) {
+    console.warn(
+      `[EXACT REPETITION FINAL 9.8.3] corrected=${corrected} | ` +
+      `unresolved=${unresolved.length}` +
+      `${unresolved.length ? ` | ids=[${unresolved.slice(0,24).map(x => x.id).join(",")}]` : ""}.`
+    );
+  }
+
+  return { translations: out, corrected, unresolved };
+}
+
+
+function structuralResidualReason983(reason) {
+  return /(?:CUE_OWNERSHIP_|OWNERSHIP_(?:BOUNDARY|GLOBAL)|GLOBAL_(?:DUPLICATION|TRANSPLANT)|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|^EMPTY$|FINAL_GARBAGE_OR_PLACEHOLDER|LAYOUT|COORDINATE|TIMESTAMP)/i
+    .test(String(reason || "").trim());
+}
+
+function selectiveSemanticIssue983(issue) {
+  const reasons = Array.isArray(issue?.reasons) ? issue.reasons : [];
+  return reasons.length > 0 && reasons.every(reason => !structuralResidualReason983(reason));
+}
+
+function applyFinalSemanticBaselineFallback983(
+  blocks,
+  finalTranslations,
+  baselineTranslations,
+  job,
+  filename,
+  plan
+) {
+  const out = new Map(finalTranslations);
+  const baseline = baselineTranslations instanceof Map ? baselineTranslations : new Map();
+  const posMap = new Map(blocks.map((block, pos) => [Number(block.index), pos]));
+  const currentResidual = deterministicFinalResidual960(blocks, out, job, plan);
+  const covered = new Set();
+  const telemetry = [];
+
+  for (const issue of currentResidual) {
+    const id = Number(issue?.id);
+    if (!Number.isInteger(id) || !selectiveSemanticIssue983(issue)) continue;
+
+    const blockPos = posMap.get(id);
+    if (!Number.isInteger(blockPos)) continue;
+    const block = blocks[blockPos];
+
+    const baselineRaw = String(baseline.get(id) || "").trim();
+    if (!baselineRaw) continue;
+
+    const candidate = canonicalFinalCandidate983(block, baselineRaw);
+    if (!candidate || !layoutCueResult(block, candidate).fits) continue;
+
+    const candidateStructural = priorityLocalReasons898(
+      block,
+      candidate,
+      filename,
+      plan
+    ).filter(structuralResidualReason983);
+
+    if (candidateStructural.length) continue;
+
+    const ownershipAfter = ownershipReasonsAroundCandidate898(
+      blocks,
+      posMap,
+      out,
+      id,
+      candidate
+    );
+    if (ownershipAfter.length) continue;
+
+    out.set(id, candidate);
+    covered.add(id);
+    telemetry.push({
+      id,
+      reasons: Array.isArray(issue?.reasons) ? [...issue.reasons] : [],
+      mode: "pre-repair-baseline"
+    });
+
+    console.warn(
+      `[FINAL SELECTIVE BASELINE 9.8.3] cue ${id}: ` +
+      `correção semântica não comprovada => baseline pré-Repair restaurado SOMENTE neste cue. ✅`
+    );
+  }
+
+  if (job) {
+    job.semanticFallbackCovered983 = covered;
+    job.semanticFallbackTelemetry983 = telemetry;
+    job.stats = job.stats || {};
+    job.stats.semanticFallbacks983 = telemetry.length;
+  }
+
+  if (telemetry.length) {
+    console.warn(
+      `[FINAL SELECTIVE BASELINE 9.8.3] fallbacks=${telemetry.length} | ` +
+      `ids=[${telemetry.slice(0, 24).map(x => x.id).join(",")}] | ` +
+      `demais cues aprovados permanecem inalterados.`
+    );
+  }
+
+  return { translations: out, covered, telemetry };
+}
+
+function finalClosureResidualSummary898(blocks, translations, filename, plan, ignoredSemanticIds = null) {
   let layout = 0, gender = 0, ownership = 0, broadcast = 0, repetition = 0, censor = 0, english = 0;
   for (const block of blocks) {
     const pt = String(translations.get(block.index) || "").trim();
     if (!layoutCueResult(block, pt).fits) layout++;
+
+    const ignoreSemantic = ignoredSemanticIds instanceof Set &&
+      ignoredSemanticIds.has(Number(block.index));
+
     const reasons = localReasonsForCue(block, pt, filename, plan);
-    if (reasons.some(r => isHardGenderReason970(r))) gender++;
-    if (reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
-    if (/\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
+    if (!ignoreSemantic && reasons.some(r => isHardGenderReason970(r))) gender++;
+    if (!ignoreSemantic && reasons.some(r => /SOURCE_EXACT_REPETITION_LOST/i.test(String(r)))) repetition++;
+    if (!ignoreSemantic && /\[(?:censurado|bleep)\]|__CENSORED_BLEEP__/iu.test(pt)) censor++;
+
     const source = String(block?.text || "");
-    if (sourceHasBroadcastTakeCommand898(source) && /\btake\b/iu.test(pt)) broadcast++;
-    if (sourceHasBroadcastRollCommand898(source) && /\broll\b/iu.test(pt)) broadcast++;
-    if (/\bokay\b/iu.test(source) && /\bokay\b/iu.test(pt)) english++;
-    if (/\bshot\s+of\b/iu.test(source) && /\btake\b/iu.test(pt)) english++;
-    if (/\bmove\b(?:[\s,.!?]+\bmove\b){2,}/iu.test(source) && /\bmove\b/iu.test(pt)) english++;
-    if (/\boh,?\s+my\.\.\./iu.test(source) && /\boh,?\s+meu\.\.\./iu.test(pt)) english++;
+    if (!ignoreSemantic && sourceHasBroadcastTakeCommand898(source) && /\btake\b/iu.test(pt)) broadcast++;
+    if (!ignoreSemantic && sourceHasBroadcastRollCommand898(source) && /\broll\b/iu.test(pt)) broadcast++;
+    if (!ignoreSemantic && /\bokay\b/iu.test(source) && /\bokay\b/iu.test(pt)) english++;
+    if (!ignoreSemantic && /\bshot\s+of\b/iu.test(source) && /\btake\b/iu.test(pt)) english++;
+    if (!ignoreSemantic && /\bmove\b(?:[\s,.!?]+\bmove\b){2,}/iu.test(source) && /\bmove\b/iu.test(pt)) english++;
+    if (!ignoreSemantic && /\boh,?\s+my\.\.\./iu.test(source) && /\boh,?\s+meu\.\.\./iu.test(pt)) english++;
   }
   for (let i = 0; i < blocks.length - 1; i++) {
     const a = blocks[i], b = blocks[i + 1];
@@ -15915,13 +16158,58 @@ function logicalSourceTurns896(block) {
 }
 
 function logicalTargetTurns896(block, pt) {
-  const text = String(pt || "").trim();
-  if (!text) return [];
-  if (sourceDialogueDashCount(block) < 2) return [text.replace(/\s+/g, " ").trim()];
-  return text
+  const lines = String(pt || "")
+    .replace(/\r/g, "")
     .split("\n")
-    .map(line => String(line || "").replace(/^\s*[-–—]\s*/u, "").trim())
+    .map(line => String(line || "").trim())
     .filter(Boolean);
+
+  if (!lines.length) return [];
+
+  // Visual line breaks are NOT semantic speaker turns.
+  // For a single-turn SOURCE, all display lines belong to the same utterance.
+  if (sourceDialogueDashCount(block) < 2) {
+    return [lines.join(" ").replace(/\s+/g, " ").trim()].filter(Boolean);
+  }
+
+  // For multi-speaker SOURCE, a leading dialogue marker opens a new turn;
+  // unmarked wrapped lines continue the current turn.
+  const turns = [];
+  let current = "";
+  let sawMarker = false;
+
+  for (const raw of lines) {
+    const marked = /^[-–—]\s*/u.test(raw);
+    if (marked) {
+      sawMarker = true;
+      if (current) turns.push(current.trim());
+      current = raw.replace(/^[-–—]\s*/u, "").trim();
+    } else {
+      current = current ? `${current} ${raw}` : raw;
+    }
+  }
+  if (current) turns.push(current.trim());
+
+  // Missing dialogue markers are handled by the dialogue invariant elsewhere.
+  // Do not invent semantic turn boundaries from arbitrary visual wrapping.
+  if (!sawMarker) {
+    return [lines.join(" ").replace(/\s+/g, " ").trim()].filter(Boolean);
+  }
+  return turns;
+}
+
+function rebuildLogicalTargetTurns896(block, turns) {
+  const clean = (Array.isArray(turns) ? turns : [])
+    .map(turn => String(turn || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  if (!clean.length) return "";
+
+  if (sourceDialogueDashCount(block) >= 2) {
+    return clean.map(turn => `- ${turn}`).join("\n").trim();
+  }
+
+  return clean.join(" ").replace(/\s+/g, " ").trim();
 }
 
 function sourceRepeatNeed896(block) {
@@ -15933,7 +16221,7 @@ function targetRepeatCount896(block, pt) {
 }
 
 function sourceExactRepetitionLost896(block, pt) {
-  // 9.8.2: apesar do nome legado "Lost", o invariant agora e simetrico.
+  // 9.8.3: apesar do nome legado "Lost", o invariant agora e simetrico.
   // Se a SOURCE repete exatamente N>=3 vezes, o PT precisa preservar N:
   // nem perder repeticoes, nem inflar a quantidade.
   const needed = sourceRepeatNeed896(block);
@@ -15966,74 +16254,102 @@ function contextualHaltImperativeRisk896(block, pt) {
 }
 
 function restoreExactRepetitionLocally896(block, value) {
+  const original = String(value || "").trim();
+  if (!original) return original;
+
   const sourceTurns = logicalSourceTurns896(block);
-  const targetLines = String(value || "").trim().split("\n");
-  if (!targetLines.length) return String(value || "").trim();
-
   const sourceNeeds = sourceTurns.map(maxConsecutiveRepeat896);
-  const expectedTurns = sourceDialogueDashCount(block) >= 2 ? sourceTurns.length : 1;
-  if (sourceNeeds.every(n => n < 3)) return String(value || "").trim();
-  if (expectedTurns >= 2 && targetLines.length !== expectedTurns) return String(value || "").trim();
+  if (sourceNeeds.every(n => n < 3)) return original;
 
+  const targetTurns = logicalTargetTurns896(block, original);
+  const multiTurn = sourceDialogueDashCount(block) >= 2;
+
+  // Multi-speaker correction is allowed only with preserved turn cardinality.
+  if (multiTurn && targetTurns.length !== sourceTurns.length) return original;
+  if (!targetTurns.length) return original;
+
+  const outTurns = [...targetTurns];
   let changed = false;
-  const out = [...targetLines];
 
-  for (let idx = 0; idx < Math.min(sourceNeeds.length, out.length); idx++) {
+  for (let idx = 0; idx < Math.min(sourceNeeds.length, outTurns.length); idx++) {
     const srcNeed = sourceNeeds[idx];
     if (srcNeed < 3) continue;
 
-    const line = out[idx];
-    const prefixMatch = line.match(/^\s*([-–—]\s*)/u);
-    const prefix = prefixMatch ? prefixMatch[1] : "";
-    const body = prefix ? line.slice(prefixMatch[0].length) : line;
+    const body = String(outTurns[idx] || "").trim();
     const clauses = body.match(/[^!?]+[!?]+|[^!?]+$/g) || [];
-    if (clauses.length < 2) continue;
+    if (!clauses.length) continue;
 
-    let runStart = -1, runCount = 1;
-    for (let i = 0; i < clauses.length - 1; i++) {
+    let runStart = -1;
+    let runCount = 1;
+
+    for (let i = 0; i < clauses.length; i++) {
       let c = 1;
-      while (i + c < clauses.length && repeatSimilarity896(clauses[i], clauses[i + c]) >= 0.72) c++;
-      if (c > runCount) { runStart = i; runCount = c; }
-    }
-    if (runStart < 0 || runCount < 2 || runCount === srcNeed) continue;
+      while (
+        i + c < clauses.length &&
+        repeatSimilarity896(clauses[i], clauses[i + c]) >= 0.72
+      ) c++;
 
-    const candidates = clauses.slice(runStart, runStart + runCount).map(x => x.trim());
-    const shortest = [...candidates].sort((a,b) => a.length - b.length)[0];
+      if (c > runCount) {
+        runStart = i;
+        runCount = c;
+      }
+    }
+
+    // With only one translated occurrence there is not enough target-side
+    // evidence to duplicate safely. Leave it for semantic Repair.
+    if (runStart < 0 || runCount < 2) continue;
+    if (runCount === srcNeed) continue;
+
+    const candidates = clauses
+      .slice(runStart, runStart + runCount)
+      .map(x => x.trim())
+      .filter(Boolean);
+    if (!candidates.length) continue;
+
+    const shortest = [...candidates].sort((a, b) => a.length - b.length)[0];
     const rebuilt = [...clauses];
 
     if (runCount < srcNeed) {
-      // SOURCE tem mais repeticoes: completa somente ate a contagem autoritativa.
       for (let k = runCount; k < srcNeed; k++) {
         rebuilt.splice(runStart + k, 0, ` ${shortest}`);
       }
     } else {
-      // 9.8.2: PT inflou a repeticao. Remove somente o excedente do mesmo run
-      // sem reescrever vocabulario, ownership ou timestamps.
       rebuilt.splice(runStart + srcNeed, runCount - srcNeed);
     }
 
-    let candidateLine = prefix + rebuilt.join("").replace(/[ \t]{2,}/g, " ").trim();
-    let candidateAll = [...out];
-    candidateAll[idx] = candidateLine;
-    let candidatePt = candidateAll.join("\n");
+    const candidateTurn = rebuilt.join("")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
 
+    const candidateTurns = [...outTurns];
+    candidateTurns[idx] = candidateTurn;
+    let candidatePt = rebuildLogicalTargetTurns896(block, candidateTurns);
+
+    // If the exact repetition is semantically right but verbose, compact only
+    // surface wording; NEVER change the source-authoritative repeat count.
     if (!layoutCueResult(block, candidatePt).fits) {
-      candidateLine = candidateLine
+      const compactedTurn = candidateTurn
         .replace(/(^|\s)O\s+que\s+(?:eu\s+)?(?=[^?]{1,32}\?)/giu, "$1Que ")
         .replace(/[ \t]{2,}/g, " ")
         .trim();
-      candidateAll = [...out];
-      candidateAll[idx] = candidateLine;
-      candidatePt = candidateAll.join("\n");
+      candidateTurns[idx] = compactedTurn;
+      candidatePt = rebuildLogicalTargetTurns896(block, candidateTurns);
     }
 
-    if (layoutCueResult(block, candidatePt).fits) {
-      out[idx] = candidateLine;
+    if (
+      targetRepeatCount896(block, candidatePt) === sourceRepeatNeed896(block) &&
+      layoutCueResult(block, candidatePt).fits
+    ) {
+      outTurns[idx] = candidateTurns[idx];
       changed = true;
     }
   }
 
-  return changed ? out.join("\n").trim() : String(value || "").trim();
+  if (!changed) return original;
+
+  const result = rebuildLogicalTargetTurns896(block, outTurns);
+  if (sourceExactRepetitionLost896(block, result)) return original;
+  return result;
 }
 
 function applyContextSemanticPostconditions896(block, value) {
@@ -18450,10 +18766,10 @@ function repairCandidateRegressionReasons(
   const sourceRepeat896 = sourceRepeatNeed896(block);
   const beforeRepeat896 = targetRepeatCount896(block, before);
   const candidateRepeat896 = targetRepeatCount896(block, candidate);
-  // 9.8.2: a SOURCE, nao o candidato anterior, define a quantidade correta.
+  // 9.8.3: a SOURCE, nao o candidato anterior, define a quantidade correta.
   // Ex.: SOURCE=4, BEFORE=6, REPAIR=4 e uma CORRECAO, nao regressao.
   if (sourceRepeat896 >= 3 && candidateRepeat896 !== sourceRepeat896) {
-    regressions.push("SOURCE_EXACT_REPETITION_TARGET_MISMATCH_9_8_2");
+    regressions.push("SOURCE_EXACT_REPETITION_TARGET_MISMATCH_9_8_3");
   }
 
   for (const reason of afterReasons) {
@@ -23297,8 +23613,51 @@ finalTranslations = applyRepairPersistenceLock923(
 );
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
+// 9.8.3 — FINAL TRANSACTIONAL CLOSURE.
+// Later formatting/persistence is never allowed to destroy a cue that already
+// had a verified semantic candidate. Roll back ONLY that cue, then enforce
+// SOURCE-authoritative exact repetition across the whole logical utterance.
+finalTranslations = applyFinalVerifiedCueRollback983(
+  blocks,
+  finalTranslations,
+  mainTranslations,
+  job,
+  job.filename,
+  plan
+);
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+
+const repetitionClosure983 = enforceExactRepetitionFidelity983(
+  blocks,
+  finalTranslations,
+  job.filename,
+  plan,
+  job
+);
+finalTranslations = repetitionClosure983.translations;
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+
+// 9.8.3 — SELECTIVE FAIL-SAFE POR CUE.
+// Se uma correção semântica continuar sem prova depois de toda a closure,
+// volta SOMENTE aquele cue ao baseline pré-Repair estruturalmente seguro.
+// Ownership/diálogo/layout continuam fatais e nunca são mascarados.
+const selectiveBaseline983 = applyFinalSemanticBaselineFallback983(
+  blocks,
+  finalTranslations,
+  preRewriteTranslations,
+  job,
+  job.filename,
+  plan
+);
+finalTranslations = selectiveBaseline983.translations;
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+
 let finalClosure898 = finalClosureResidualSummary898(
-  blocks, finalTranslations, job.filename, plan
+  blocks,
+  finalTranslations,
+  job.filename,
+  plan,
+  job.semanticFallbackCovered983
 );
 
 // 9.5.0 — GENDER FINAL GATE IS VERIFICATION-ONLY.
@@ -23356,6 +23715,45 @@ if (finalClosure898.gender > 0) {
   } else {
     console.log(
       `[POST-CLOSURE DETERMINISTIC 9.7.4] residual=0 ✅ | 0 chamada cloud.`
+    );
+  }
+}
+
+// 9.8.3 — issues cobertos pelo fallback seletivo continuam visíveis em
+// telemetria, mas não derrubam o episódio. Somente famílias estruturais
+// permanecem fatais.
+{
+  const covered983 = job.semanticFallbackCovered983 instanceof Set
+    ? job.semanticFallbackCovered983
+    : new Set();
+
+  const currentFatal983 = Array.isArray(job.finalTargetResidual927)
+    ? job.finalTargetResidual927
+    : [];
+
+  const advisory983 = [];
+  const fatal983 = [];
+
+  for (const issue of currentFatal983) {
+    const id = Number(issue?.id);
+    if (
+      covered983.has(id) &&
+      selectiveSemanticIssue983(issue)
+    ) {
+      advisory983.push(issue);
+    } else {
+      fatal983.push(issue);
+    }
+  }
+
+  job.semanticFallbackAdvisory983 = advisory983;
+  job.finalTargetResidual927 = fatal983;
+
+  if (advisory983.length) {
+    console.warn(
+      `[SEMANTIC FALLBACK ADVISORY 9.8.3] ${advisory983.length} residual(is) local(is) ` +
+      `cobertos por baseline seguro; não bloqueiam entrega | ` +
+      `ids=[${[...new Set(advisory983.map(x => Number(x?.id)).filter(Number.isInteger))].slice(0,24).join(",")}].`
     );
   }
 }
@@ -23446,14 +23844,21 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
     Number(job.globalOwnershipResidual977 || 0) === 0;
 
   if (finalHardClosureClean931 && semanticResidual927 === 0) {
-    // 9.4.0: noCacheFinal923 may have been raised by an earlier candidate that
-    // was later repaired. A fresh FINAL closure is the only authority allowed
-    // to clear that stale flag. This prevents FINAL_PASS from being persisted
-    // as PROVISIONAL and avoids useless full retranslations on the next play.
-    job.noCacheFinal923 = false;
+    const semanticFallbackCount983 = Array.isArray(job.semanticFallbackTelemetry983)
+      ? job.semanticFallbackTelemetry983.length
+      : 0;
+
+    // Sem fallback seletivo: FINAL canônico normal.
+    // Com fallback seletivo: SERVE como final_pass, mas fica PROVISIONAL para
+    // permitir melhora futura sem congelar um baseline semanticamente imperfeito.
+    job.noCacheFinal923 = semanticFallbackCount983 > 0;
     job.qualityStatus = "final_pass";
+    job.finalPassMode983 = semanticFallbackCount983 > 0
+      ? "selective_semantic_fallback"
+      : "canonical";
+
     console.log(
-      `[PIPELINE 9.4.3 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.8.3 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -23461,7 +23866,11 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
         jobElapsedSeconds.toFixed(1)
       }s | full-job-retries=${
         job.stats.jobRetries || 0
-      } | canonical-eligible=sim.`
+      } | semantic-fallbacks=${
+        semanticFallbackCount983
+      } | canonical-eligible=${
+        semanticFallbackCount983 > 0 ? "não" : "sim"
+      }.`
     );
   } else {
     console.warn(
@@ -26257,7 +26666,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.2 - EXACT REPETITION FIDELITY + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.3 - LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -26639,7 +27048,7 @@ console.log(
   console.log(
     "Exact Repetition Lock 9.0: repetição dramática não pode ser compactada nem perdida por Repair ✅"
   );
-  console.log("Exact Repetition Fidelity 9.8.2: SOURCE N>=3 governa contagem exata; excesso/deficit e reconciliado localmente; Repair N->N e aceito ✅");
+  console.log("Exact Repetition Fidelity 9.8.3: contagem por FALA LÓGICA; SOURCE N>=3 governa exatamente; fallback semântico seletivo por cue serve o episódio sem congelar baseline imperfeito ✅");
   console.log(
     "Visible Censor Zero 9.0: [censurado]/BLEEP_TOKEN nunca chegam ao SRT final; naturalização contextual ✅"
   );
