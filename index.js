@@ -25504,6 +25504,400 @@ async function timingAwareCompactSurgery928(items) {
   return out;
 }
 
+
+// ============================================================
+// LAB 15.1B — MAPEADOR SEMÂNTICO UNIVERSAL (ISOLADO)
+// Não traduz SRT, não altera timestamps, cache, jobs ou canonical.
+// Usa somente LOCAL_BRIDGE_SECRET + router Gemini já existente.
+// ============================================================
+
+const SEMMAP_LAB_VERSION_151B = "15.1B";
+const SEMMAP_LAB_MAX_ITEMS_151B = 120;
+const SEMMAP_LAB_MAX_PAYLOAD_CHARS_151B = 120000;
+const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_151B = 12000;
+
+function semanticMapLabText151B(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_151B) {
+  return String(value || "")
+    .replace(/\u0000/g, "")
+    .slice(0, Math.max(0, Number(maxChars || 0)));
+}
+
+function semanticMapLabFiniteNumber151B(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function sanitizeSemanticMapCases151B(rawCases) {
+  if (!Array.isArray(rawCases)) {
+    const error = new Error("cases deve ser um array.");
+    error.labInputError151B = true;
+    throw error;
+  }
+
+  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_151B) {
+    const error = new Error(
+      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_151B} itens.`
+    );
+    error.labInputError151B = true;
+    throw error;
+  }
+
+  const seen = new Set();
+
+  const cases = rawCases.map((raw, index) => {
+    const caseKey = String(raw?.case_key || "").trim();
+
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(caseKey)) {
+      const error = new Error(`case_key inválido no item ${index + 1}.`);
+      error.labInputError151B = true;
+      throw error;
+    }
+
+    if (seen.has(caseKey)) {
+      const error = new Error(`case_key duplicado: ${caseKey}.`);
+      error.labInputError151B = true;
+      throw error;
+    }
+    seen.add(caseKey);
+
+    const currentSource = semanticMapLabText151B(raw?.current_source);
+    const currentPt = semanticMapLabText151B(raw?.current_pt);
+
+    if (!currentSource || !currentPt) {
+      const error = new Error(
+        `current_source/current_pt ausente em ${caseKey}.`
+      );
+      error.labInputError151B = true;
+      throw error;
+    }
+
+    const candidateSplit = raw?.candidate_split === true;
+    const candidateMerge = raw?.candidate_merge === true;
+
+    const item = {
+      case_key: caseKey,
+      candidate_split: candidateSplit,
+      candidate_merge: candidateMerge,
+      current_source: currentSource,
+      current_pt: currentPt,
+      prosody: semanticMapLabText151B(raw?.prosody, 1000),
+      risk_flags: semanticMapLabText151B(raw?.risk_flags, 1200)
+    };
+
+    if (candidateSplit) {
+      const options = Array.isArray(raw?.split_options)
+        ? raw.split_options.slice(0, 6)
+        : [];
+
+      item.split_options = options.map(option => ({
+        source_left: semanticMapLabText151B(option?.source_left, 6000),
+        source_right: semanticMapLabText151B(option?.source_right, 6000),
+        pause_ms: Math.max(
+          0,
+          Math.min(
+            15000,
+            semanticMapLabFiniteNumber151B(option?.pause_ms, 0)
+          )
+        ),
+        dramatic: option?.dramatic === true,
+        punctuation: semanticMapLabText151B(option?.punctuation, 200)
+      }));
+    }
+
+    if (candidateMerge) {
+      item.next_source = semanticMapLabText151B(raw?.next_source, 12000);
+      item.next_pt = semanticMapLabText151B(raw?.next_pt, 12000);
+      item.phonetic_gap_ms = semanticMapLabFiniteNumber151B(
+        raw?.phonetic_gap_ms,
+        null
+      );
+    }
+
+    return item;
+  });
+
+  const chars = JSON.stringify(cases).length;
+  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_151B) {
+    const error = new Error(
+      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_151B} chars.`
+    );
+    error.labInputError151B = true;
+    throw error;
+  }
+
+  return cases;
+}
+
+function semanticMapLabSystem151B() {
+  return `
+MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_151B}
+
+Você recebe casos independentes de legenda.
+Não use nem infira título, série, filme, episódio, gênero, personagem ou programa além do texto fornecido.
+
+OBJETIVO
+Decidir somente a organização de exibição do texto PT-BR JÁ EXISTENTE.
+
+DECISÕES PERMITIDAS
+KEEP  = preservar o bloco como está.
+SPLIT = dividir o PT-BR exatamente em duas partes usando uma fronteira fonética já fornecida.
+MERGE = marcar dois cues consecutivos como uma única unidade semântica para handoff visual.
+MERGE NÃO significa juntar os textos em um cue e NÃO autoriza mostrar o segundo texto cedo.
+
+REGRAS ABSOLUTAS
+1. Nunca traduza, reescreva, corrija, resuma, expanda ou melhore o PT-BR.
+2. Nunca crie timestamps. As fronteiras acústicas já foram medidas por outro componente.
+3. Nunca antecipe conteúdo do lado direito, próximo cue, revelação, nome, punchline ou resposta.
+4. SPLIT só é válido quando pt_left + espaço + pt_right recompõe exatamente current_pt,
+   ignorando somente espaços repetidos, e quando a divisão corresponde semanticamente
+   a source_left/source_right de uma split_option recebida.
+5. MERGE só é válido quando current e next pertencem claramente à mesma unidade semântica,
+   sem troca de locutor e sem antecipar next_pt.
+6. Se candidate_split=true E candidate_merge=true, responda KEEP nesta versão.
+7. Se um SPLIT criar fragmento linguisticamente artificial, como conjunção isolada,
+   responda KEEP mesmo que exista pausa acústica.
+8. Mudança de ordem EN→PT-BR que torne inseguro mapear a pausa => KEEP.
+9. Troca de locutor => nunca MERGE.
+10. Na dúvida => KEEP.
+11. Use AMBIGUOUS quando houver dúvida real. AMBIGUOUS deve acompanhar KEEP.
+
+SAÍDA
+Preserve cada case_key exatamente.
+Para KEEP: pt_left="" e pt_right="".
+Para SPLIT: pt_left e pt_right recompõem exatamente current_pt.
+Para MERGE: pt_left=current_pt e pt_right=next_pt.
+Não inclua explicações fora do JSON.
+`.trim();
+}
+
+function semanticMapLabSchema151B(count) {
+  return {
+    type: "array",
+    minItems: count,
+    maxItems: count,
+    items: {
+      type: "object",
+      properties: {
+        case_key: {
+          type: "string"
+        },
+        decision: {
+          type: "string",
+          enum: [
+            "KEEP",
+            "SPLIT",
+            "MERGE"
+          ]
+        },
+        confidence: {
+          type: "string",
+          enum: [
+            "VERY_STRONG",
+            "STRONG",
+            "AMBIGUOUS"
+          ]
+        },
+        pt_left: {
+          type: "string"
+        },
+        pt_right: {
+          type: "string"
+        }
+      },
+      required: [
+        "case_key",
+        "decision",
+        "confidence",
+        "pt_left",
+        "pt_right"
+      ]
+    }
+  };
+}
+
+app.get(
+  "/api/lab/semantic-map-15-1/status",
+  (req, res) => {
+    if (!authorized(req)) {
+      return safeJson(res, { error: "Unauthorized" }, 401);
+    }
+
+    return safeJson(res, {
+      ok: true,
+      version: SEMMAP_LAB_VERSION_151B,
+      mode: "UNIVERSAL_SEMANTIC_MAP_LAB",
+      productionPipelineChanged: false,
+      timestampsAuthority: "LOCAL_ACOUSTIC_PIPELINE_ONLY",
+      route: geminiRouteForMetric("semmaplab")
+    });
+  }
+);
+
+app.post(
+  "/api/lab/semantic-map-15-1",
+  async (req, res) => {
+    if (!authorized(req)) {
+      return safeJson(res, { error: "Unauthorized" }, 401);
+    }
+
+    const startedAt = Date.now();
+
+    try {
+      if (
+        String(req.body?.contractVersion || "").trim() !==
+        SEMMAP_LAB_VERSION_151B
+      ) {
+        const error = new Error(
+          `contractVersion deve ser ${SEMMAP_LAB_VERSION_151B}.`
+        );
+        error.labInputError151B = true;
+        throw error;
+      }
+
+      const cases =
+        sanitizeSemanticMapCases151B(
+          req.body?.cases
+        );
+
+      const expectedKeys =
+        cases.map(item => item.case_key);
+
+      const system =
+        semanticMapLabSystem151B();
+
+      const user =
+        "CASOS PARA CLASSIFICAR. " +
+        "Cada item é independente. " +
+        `Retorne exatamente ${cases.length} objetos, um por case_key, ` +
+        "sem omitir, duplicar ou renomear chaves.\n\n" +
+        JSON.stringify(cases);
+
+      const result =
+        await geminiRequest({
+          system,
+          user,
+          schema:
+            semanticMapLabSchema151B(
+              cases.length
+            ),
+          thinkingLevel:
+            "medium",
+          maxOutputTokens:
+            12000,
+          timeoutMs:
+            90000,
+          maxRetries:
+            1,
+          job:
+            null,
+          metric:
+            "semmaplab"
+        });
+
+      let parsed;
+
+      try {
+        parsed =
+          JSON.parse(
+            stripCodeFences(
+              result.text
+            )
+          );
+      } catch {
+        const error =
+          new Error(
+            "Mapeador semântico retornou JSON inválido."
+          );
+        error.status = 502;
+        throw error;
+      }
+
+      if (!Array.isArray(parsed)) {
+        const error =
+          new Error(
+            "Mapeador semântico retornou formato não-array."
+          );
+        error.status = 502;
+        throw error;
+      }
+
+      const returnedKeys =
+        parsed.map(
+          item =>
+            String(
+              item?.case_key ||
+              ""
+            ).trim()
+        );
+
+      const coverageOk =
+        returnedKeys.length ===
+          expectedKeys.length &&
+        new Set(returnedKeys).size ===
+          expectedKeys.length &&
+        expectedKeys.every(
+          key =>
+            returnedKeys.includes(key)
+        );
+
+      console.log(
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151B}] ` +
+        `cases=${cases.length} | model=${result.modelId} | ` +
+        `coverage=${coverageOk ? "OK" : "INVALID"} | ` +
+        `elapsed=${Date.now() - startedAt}ms.`
+      );
+
+      return safeJson(res, {
+        ok: true,
+        version:
+          SEMMAP_LAB_VERSION_151B,
+        model:
+          result.modelId,
+        usage:
+          result.usage || null,
+        elapsedMs:
+          Date.now() - startedAt,
+        coverageOk,
+        expectedKeys,
+        items:
+          parsed
+      });
+    } catch (error) {
+      const status =
+        error?.labInputError151B
+          ? 400
+          : Math.max(
+              500,
+              Math.min(
+                599,
+                Number(
+                  error?.status ||
+                  502
+                )
+              )
+            );
+
+      console.error(
+        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_151B}] ` +
+        `${errorMessage(error).slice(0, 900)}`
+      );
+
+      return safeJson(
+        res,
+        {
+          ok: false,
+          version:
+            SEMMAP_LAB_VERSION_151B,
+          error:
+            errorMessage(error)
+        },
+        status
+      );
+    }
+  }
+);
+
+
 app.post(
   "/api/translate-embedded",
 
