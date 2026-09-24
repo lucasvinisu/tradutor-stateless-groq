@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.0 - REPAIR TARGET-ELIMINATION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.1 - REPAIR POSTCONDITION RETRY + TARGET-ELIMINATION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -136,7 +136,7 @@ const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
 const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
 
 const CACHE_VERSION =
-  "9.8.0-repair-target-elimination-v1";
+  "9.8.1-repair-postcondition-closure-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -15588,7 +15588,7 @@ function ownershipReasonsAroundCandidate898(blocks, posMap, translations, id, ca
 function priorityLocalReasons898(block, pt, filename, plan) {
   return localReasonsForCue(block, pt, filename, plan).filter(reason =>
     !isGenderGrammaticalAdvisory970(reason) &&
-    /^(?:EMPTY|MEANING_INTEGRITY_|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
+    /^(?:EMPTY|MEANING_INTEGRITY_|NEGATION_EXPLICIT_MISSING_973|REFERENT_INTEGRITY_OBJECT_TO_REFLEXIVE_RISK_973|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_|UNKNOWN_SPEAKER_GENDER_MARKED|SPEAKER_LABEL_RESIDUE|SDH_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|ARTIFICIAL_PROFANITY_CENSORSHIP|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|FINAL_GARBAGE_OR_PLACEHOLDER|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|CONTEXTUAL_IMPERATIVE_REFERENT_INVENTION|BARE_IMPERATIVE_CONCRETE_REFERENT_INVENTION)/i.test(String(reason || ""))
   );
 }
 
@@ -20497,6 +20497,7 @@ Para cada item:
 - se source contiver ${BLEEP_TOKEN}, NÃO devolva token/placeholder; reconstrua pragmaticamente uma fala natural em PT-BR com intensidade contextual compatível;
 - preserve exatamente turns de diálogo quando dialogue_turn_count >= 2; esses turns podem ter sido inferidos com alta confiança mesmo sem hífen na SOURCE. Um por linha, começando com "- ";
 - preserve polaridade explícita e sujeito→verbo→objeto; nunca transforme objeto externo em "se" reflexivo/recíproco;
+- se reasons contiver NEGATION_EXPLICIT_MISSING_973, UNRESOLVED_NEGATION_CONSTRAINT ou UNRESOLVED_NEGATION_TARGET, a saída DEVE preservar a negação lexical de forma explícita em PT-BR (ex.: não, nunca, jamais, ninguém, nada, nem, sem); não substitua a negação por uma paráfrase afirmativa;
 - preserve a identidade semântica de bebidas, comidas, objetos e termos específicos; não troque por item apenas parecido;
 - devolva PT-BR ortograficamente limpo, sem resíduo estrangeiro acidental nem "--" cru; nomes/loanwords genuínos permanecem;
 - não altere timestamp, não crie cue e não mova conteúdo.
@@ -21237,11 +21238,15 @@ async function runFinalPriorityEscalatedRepair(
         }
 
         let accepted = 0;
+        const rejectedPostconditions981 = [];
 
         for (const [id, candidate] of repaired) {
           const block = blocks[posMap.get(id)];
           const beforePt = String(updated.get(id) || "");
           let candidatePt = String(candidate || "").trim();
+          const issueForCandidate981 = batchIssues.find(
+            issue => Number(issue?.id) === Number(id)
+          );
 
           let regressions = [];
           if (options?.requireGenderZero) {
@@ -21259,6 +21264,15 @@ async function runFinalPriorityEscalatedRepair(
                 `[GENDER TARGET ACCEPTANCE 9.2.5] cue ${id} REJEITADO: ` +
                 `candidato ainda contém ${target.remainingGender.join(", ")}.`
               );
+              if (issueForCandidate981 && !options?.targetPostconditionRetry981) {
+                rejectedPostconditions981.push({
+                  ...issueForCandidate981,
+                  reasons: [
+                    ...(Array.isArray(issueForCandidate981?.reasons) ? issueForCandidate981.reasons : []),
+                    ...target.remainingGender.map(reason => `POSTCONDITION_9_8_1:${reason}`)
+                  ]
+                });
+              }
               continue;
             }
           } else {
@@ -21271,7 +21285,7 @@ async function runFinalPriorityEscalatedRepair(
             );
           }
 
-          // 9.8.0 — REPAIR TARGET-ELIMINATION CLOSURE.
+          // 9.8.1 — REPAIR TARGET-ELIMINATION + ONE-SHOT POSTCONDITION RETRY.
           // Gender puramente gramatical/advisory nao pode bloquear a correcao
           // de um defeito textual/semantico HARD.
           regressions = [...new Set(regressions)]
@@ -21291,9 +21305,7 @@ async function runFinalPriorityEscalatedRepair(
           // A familia HARD que motivou ESTE Repair precisa desaparecer.
           // Isso impede aceitar/restaurar candidato que ainda carrega, por
           // exemplo, MEANING_INTEGRITY_PROFANITY_ESCALATION.
-          const issueForCandidate980 = batchIssues.find(
-            issue => Number(issue?.id) === Number(id)
-          );
+          const issueForCandidate980 = issueForCandidate981;
 
           const requiredFamilies980 = new Set(
             blockerFamilies928(issueForCandidate980 || {})
@@ -21309,7 +21321,7 @@ async function runFinalPriorityEscalatedRepair(
 
           for (const family of requiredFamilies980) {
             if (candidateFamilies980.has(family)) {
-              regressions.push(`UNRESOLVED_${family}_TARGET_9_8_0`);
+              regressions.push(`UNRESOLVED_${family}_TARGET_9_8_1`);
             }
           }
 
@@ -21333,7 +21345,7 @@ async function runFinalPriorityEscalatedRepair(
             String(candidatePt || "").replace(/\s+/g, " ").trim() ===
               String(beforePt || "").replace(/\s+/g, " ").trim()
           ) {
-            regressions.push("UNRESOLVED_SAME_TEXT_TARGET_9_8_0");
+            regressions.push("UNRESOLVED_SAME_TEXT_TARGET_9_8_1");
           }
 
           regressions = [...new Set(regressions)];
@@ -21343,6 +21355,15 @@ async function runFinalPriorityEscalatedRepair(
               `[FINAL PRIORITY ESCALATED] cue ${id} rejeitado localmente | ` +
               `${regressions.join(", ")}.`
             );
+            if (issueForCandidate981 && !options?.targetPostconditionRetry981) {
+              rejectedPostconditions981.push({
+                ...issueForCandidate981,
+                reasons: [
+                  ...(Array.isArray(issueForCandidate981?.reasons) ? issueForCandidate981.reasons : []),
+                  ...regressions.map(reason => `POSTCONDITION_9_8_1:${reason}`)
+                ]
+              });
+            }
             continue;
           }
 
@@ -21357,6 +21378,38 @@ async function runFinalPriorityEscalatedRepair(
           `${Math.floor(offset / escalatedBatchCap977) + 1} | ` +
           `aceitos=${accepted}/${batchIssues.length}.`
         );
+
+        if (
+          rejectedPostconditions981.length &&
+          !options?.targetPostconditionRetry981
+        ) {
+          const retryIssues981 = mergeIssueLists(rejectedPostconditions981)
+            .slice(0, FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES);
+
+          console.warn(
+            `[REPAIR POSTCONDITION RETRY 9.8.1] alvos=${retryIssues981.length} | ` +
+            `uma única segunda chance focal; sem loop adicional.`
+          );
+
+          const retried981 = await runFinalPriorityEscalatedRepair(
+            blocks,
+            updated,
+            retryIssues981,
+            plan,
+            job,
+            {
+              ...options,
+              targetPostconditionRetry981: true
+            }
+          );
+
+          for (const issue of retryIssues981) {
+            const retryId981 = Number(issue?.id);
+            if (Number.isInteger(retryId981) && retried981.has(retryId981)) {
+              updated.set(retryId981, retried981.get(retryId981));
+            }
+          }
+        }
 
         completed = true;
       } catch (error) {
@@ -26188,7 +26241,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.1 - REPAIR POSTCONDITION RETRY + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
