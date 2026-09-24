@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.7.9 - PROVIDER-LOCAL EMERGENCY SCOPE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.0 - REPAIR TARGET-ELIMINATION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -136,7 +136,7 @@ const GLOBAL_OWNERSHIP_SOURCE_SIMILARITY_MAX_977 = 0.56;
 const GLOBAL_OWNERSHIP_MIN_POSITION_GAP_977 = 2;
 
 const CACHE_VERSION =
-  "9.7.8-spoken-sdh-guard-immutable-ownership-v1";
+  "9.8.0-repair-target-elimination-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -9950,18 +9950,6 @@ function groqEmergencyAllowedMetric976(metric) {
   );
 }
 
-// 9.7.9 — emergency scope is LOCAL to the exact call that actually fails over.
-// Historical/pending job flags are telemetry/routing only and NEVER pre-shrink
-// future Gemini QA/Repair/Final batches. Direct Groq paths split themselves.
-function groqGenerationShapeError979(error) {
-  const status = Number(error?.status || 0);
-  const message = String(error?.message || error || "");
-  return Boolean(
-    status === 400 &&
-    /failed to generate json|failed_generation|generate json|structured output/i.test(message)
-  );
-}
-
 function shouldEnterGroqEmergency976(route, availabilityFailures, job, metric) {
   if (!GROQ_API_KEY || !groqEmergencyAllowedMetric976(metric)) return false;
   const usable = (Array.isArray(route) ? route : []).filter(Boolean);
@@ -10417,19 +10405,6 @@ async function geminiRequest({
         markSuccess(job, metric, { usage: emergency.usage });
         return emergency;
       } catch (groqError) {
-        if (groqGenerationShapeError979(groqError)) {
-          if (job) {
-            job.groqEmergencyPending976 = true;
-            job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
-          }
-          groqError.groqSplitRequired976 = true;
-          groqError.routerCanSplit = true;
-          console.warn(
-            `[GROQ ADAPTIVE JSON 9.7.9] ${String(metric).toUpperCase()} recebeu HTTP 400 failed_generation; ` +
-            `redução focal de payload será tentada antes de declarar rota esgotada.`
-          );
-          throw groqError;
-        }
         if (groqError?.groqSplitRequired976 || groqError?.routerCanSplit) {
           throw groqError;
         }
@@ -13487,10 +13462,9 @@ function buildQaBatches(
   plan,
   job = null
 ) {
-  // 9.7.9: build for the primary Gemini route. If this exact request later
-  // falls over to Groq and is too large, scanQaBatchGroq976() splits only it.
-  const maxCues976 = QA_BATCH_MAX_CUES;
-  const maxChars976 = QA_BATCH_MAX_CHARS;
+  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
+  const maxCues976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CUES_976 : QA_BATCH_MAX_CUES;
+  const maxChars976 = emergency976 ? GROQ_QA_EMERGENCY_BATCH_CHARS_976 : QA_BATCH_MAX_CHARS;
   const batches = [];
   let current = [];
   let chars = 0;
@@ -13651,7 +13625,7 @@ async function scanQaBatchGroq976(batch, plan, job) {
         metric: "qa"
       });
     } catch (error) {
-      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && part.length > 1) {
+      if (error?.groqSplitRequired976 && part.length > 1) {
         job.groqEmergencyPending976 = true;
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const mid = Math.ceil(part.length / 2);
@@ -13660,7 +13634,7 @@ async function scanQaBatchGroq976(batch, plan, job) {
         for (const issue of [...left, ...right]) {
           if (!seen.has(issue.id)) { seen.add(issue.id); out.push(issue); }
         }
-        console.warn(`[GROQ QA 9.7.9] split recursivo ${part.length}->${mid}+${part.length-mid}.`);
+        console.warn(`[GROQ QA 9.7.7] split recursivo ${part.length}->${mid}+${part.length-mid}.`);
         continue;
       }
       throw error;
@@ -18110,11 +18084,11 @@ async function repairBatch(
       lastError =
         error;
 
-      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && issues.length > 1) {
+      if (error?.groqSplitRequired976 && issues.length > 1) {
         job.groqEmergencyPending976 = true;
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const mid = Math.ceil(issues.length / 2);
-        console.warn(`[GROQ REPAIR 9.7.9] split ${issues.length}->${mid}+${issues.length-mid}, sem repetir MAIN.`);
+        console.warn(`[GROQ REPAIR 9.7.7] split ${issues.length}->${mid}+${issues.length-mid}, sem repetir MAIN.`);
         const left = await repairBatch(blocks, posMap, translations, issues.slice(0, mid), plan, job);
         const mergedReference977 = new Map(translations);
         for (const [id, pt] of left.translations || []) mergedReference977.set(Number(id), pt);
@@ -18707,11 +18681,14 @@ if (!extraOnly) job.stats.localFlags = localOnlyCount;
     );
 
   const repairBatches = [];
-  // 9.7.9: provider-neutral pre-batching. A real Groq payload/JSON failure is
-  // split recursively inside repairBatch(); historical emergency state is ignored.
-  const repairBatchCap976 = REPAIR_BATCH_MAX_CUES;
+  const repairBatchCap976 = (job?.groqEmergency976 || job?.groqEmergencyPending976)
+    ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
+    : REPAIR_BATCH_MAX_CUES;
   for (let i = 0; i < selected.length; i += repairBatchCap976) {
     repairBatches.push(selected.slice(i, i + repairBatchCap976));
+  }
+  if (job?.groqEmergency976 || job?.groqEmergencyPending976) {
+    console.warn(`[GROQ REPAIR 9.7.7] emergency batching=${repairBatchCap976} cues/lote | 120B focal.`);
   }
 
   const totalBatches = repairBatches.length;
@@ -20678,12 +20655,9 @@ function buildFinalPriorityAuditBatches(
   translations,
   plan,
   focusIds = null,
-  job = null,
-  forceGroqEmergency979 = false
+  job = null
 ) {
-  // Only the direct Groq audit path may request emergency-sized batches.
-  // Normal/focused Gemini audits never inherit historical job-level Groq state.
-  const emergency976 = Boolean(forceGroqEmergency979);
+  const emergency976 = Boolean(job?.groqEmergency976 || job?.groqEmergencyPending976);
   const maxCues976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CUES_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES;
   const maxChars976 = emergency976 ? GROQ_FINAL_EMERGENCY_BATCH_CHARS_976 : FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS;
   const hasExplicitFocus =
@@ -20916,7 +20890,7 @@ async function scanFinalPriorityAuditGroq977(
   }
 
   job.groqEmergencyPending976 = true;
-  const batches = buildFinalPriorityAuditBatches(blocks, translations, plan, new Set(ids), job, true);
+  const batches = buildFinalPriorityAuditBatches(blocks, translations, plan, new Set(ids), job);
   const out = [];
 
   for (const batch of batches) {
@@ -20940,11 +20914,11 @@ async function scanFinalPriorityAuditGroq977(
       job.stats.finalPriorityAuditCalls = (job.stats.finalPriorityAuditCalls || 0) + 1;
       out.push(...parseFinalPriorityAudit(response.text, batch.targetIds));
     } catch (error) {
-      if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && batch.targetIds.size > 1) {
+      if (error?.groqSplitRequired976 && batch.targetIds.size > 1) {
         job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
         const targetIds = [...batch.targetIds];
         const mid = Math.ceil(targetIds.length / 2);
-        console.warn(`[GROQ FINAL AUDIT 9.7.9] split ${targetIds.length}->${mid}+${targetIds.length-mid} | depth=${depth+1}.`);
+        console.warn(`[GROQ FINAL AUDIT 9.7.7] split ${targetIds.length}->${mid}+${targetIds.length-mid} | depth=${depth+1}.`);
         out.push(
           ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(0, mid)), depth + 1),
           ...await scanFinalPriorityAuditGroq977(blocks, translations, plan, job, new Set(targetIds.slice(mid)), depth + 1)
@@ -21168,8 +21142,10 @@ async function runFinalPriorityEscalatedRepair(
   const updated = new Map(translations);
   const selected = [...issues].sort((a, b) => issuePriority(a) - issuePriority(b));
 
-  // 9.7.9: keep normal focal size; actual Groq failures split this exact batch.
-  const escalatedBatchCap977 = FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES;
+  const escalatedBatchCap977 =
+    (job?.groqEmergency976 || job?.groqEmergencyPending976)
+      ? GROQ_REPAIR_EMERGENCY_BATCH_CUES_976
+      : FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES;
 
   for (
     let offset = 0;
@@ -21295,6 +21271,73 @@ async function runFinalPriorityEscalatedRepair(
             );
           }
 
+          // 9.8.0 — REPAIR TARGET-ELIMINATION CLOSURE.
+          // Gender puramente gramatical/advisory nao pode bloquear a correcao
+          // de um defeito textual/semantico HARD.
+          regressions = [...new Set(regressions)]
+            .filter(reason => !isGenderGrammaticalAdvisory970(reason));
+
+          // O candidato FINAL precisa estar limpo nos guards determinísticos
+          // de prioridade ANTES de receber Repair Persistence lock.
+          const candidatePriorityReasons980 = priorityLocalReasons898(
+            block,
+            candidatePt,
+            job.filename,
+            plan
+          ).filter(reason => !isGenderGrammaticalAdvisory970(reason));
+
+          regressions.push(...candidatePriorityReasons980);
+
+          // A familia HARD que motivou ESTE Repair precisa desaparecer.
+          // Isso impede aceitar/restaurar candidato que ainda carrega, por
+          // exemplo, MEANING_INTEGRITY_PROFANITY_ESCALATION.
+          const issueForCandidate980 = batchIssues.find(
+            issue => Number(issue?.id) === Number(id)
+          );
+
+          const requiredFamilies980 = new Set(
+            blockerFamilies928(issueForCandidate980 || {})
+              .filter(family => [
+                "GENDER", "NEGATION", "OWNERSHIP", "MEANING",
+                "CENSOR", "DIALOGUE", "LAYOUT", "SDH", "REPETITION"
+              ].includes(family))
+          );
+
+          const candidateFamilies980 = new Set(
+            blockerFamilies928({ reasons: candidatePriorityReasons980 })
+          );
+
+          for (const family of requiredFamilies980) {
+            if (candidateFamilies980.has(family)) {
+              regressions.push(`UNRESOLVED_${family}_TARGET_9_8_0`);
+            }
+          }
+
+          // Ownership contextual continua obrigatorio.
+          const ownershipBefore980 = new Set(
+            ownershipReasonsAroundCandidate898(
+              blocks, posMap, updated, id, beforePt
+            )
+          );
+          const ownershipAfter980 = ownershipReasonsAroundCandidate898(
+            blocks, posMap, updated, id, candidatePt
+          );
+
+          for (const reason of ownershipAfter980) {
+            if (!ownershipBefore980.has(reason)) regressions.push(reason);
+          }
+
+          // Resposta byte-equivalente ao texto defeituoso nao recebe lock.
+          if (
+            issueForCandidate980 &&
+            String(candidatePt || "").replace(/\s+/g, " ").trim() ===
+              String(beforePt || "").replace(/\s+/g, " ").trim()
+          ) {
+            regressions.push("UNRESOLVED_SAME_TEXT_TARGET_9_8_0");
+          }
+
+          regressions = [...new Set(regressions)];
+
           if (regressions.length) {
             console.warn(
               `[FINAL PRIORITY ESCALATED] cue ${id} rejeitado localmente | ` +
@@ -21317,11 +21360,11 @@ async function runFinalPriorityEscalatedRepair(
 
         completed = true;
       } catch (error) {
-        if ((error?.groqSplitRequired976 || groqGenerationShapeError979(error)) && batchIssues.length > 1) {
+        if (error?.groqSplitRequired976 && batchIssues.length > 1) {
           job.groqEmergencyPending976 = true;
           job.stats.groqEmergencyRebatches977 = Number(job.stats.groqEmergencyRebatches977 || 0) + 1;
           const mid = Math.ceil(batchIssues.length / 2);
-          console.warn(`[GROQ FINAL REPAIR 9.7.9] split ${batchIssues.length}->${mid}+${batchIssues.length-mid}.`);
+          console.warn(`[GROQ FINAL REPAIR 9.7.7] split ${batchIssues.length}->${mid}+${batchIssues.length-mid}.`);
           const leftUpdated = await runFinalPriorityEscalatedRepair(blocks, updated, batchIssues.slice(0, mid), plan, job, options);
           const rightUpdated = await runFinalPriorityEscalatedRepair(blocks, leftUpdated, batchIssues.slice(mid), plan, job, options);
           for (const issue of batchIssues) {
@@ -25504,892 +25547,6 @@ async function timingAwareCompactSurgery928(items) {
   return out;
 }
 
-
-// ============================================================
-// LAB 15.3 — BOUNDARY INTEGRITY + EXPLICIT TURN SPLIT
-// Base 9.7.9 intacta. Modelo sem autoridade de timestamp.
-// ============================================================
-
-const SEMMAP_LAB_VERSION_153 = "15.3";
-const SEMMAP_LAB_MAX_ITEMS_153 = 120;
-const SEMMAP_LAB_MAX_PAYLOAD_CHARS_153 = 120000;
-const SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_153 = 12000;
-const SEMMAP_LAB_CHUNK_SIZE_153 = 13;
-
-function semanticMapLabText153(value, maxChars = SEMMAP_LAB_MAX_TEXT_FIELD_CHARS_153) {
-  return String(value || "")
-    .replace(/\u0000/g, "")
-    .slice(0, Math.max(0, Number(maxChars || 0)));
-}
-
-function semanticMapLabFiniteNumber153(value, fallback = null) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function semanticMapLabNorm153(value) {
-  return String(value || "")
-    .replace(/\r?\n/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function semanticMapLabDialogueTurns153(text) {
-  const raw = String(text || "").replace(/\r/g, "");
-  const re = /(^|\s)([-–—])\s*(?=\S)/gu;
-  const matches = [];
-  let m;
-
-  while ((m = re.exec(raw)) !== null) {
-    matches.push({
-      markerStart: m.index + m[1].length,
-      contentStart: re.lastIndex
-    });
-  }
-
-  if (matches.length < 2) return [];
-
-  const turns = [];
-
-  for (let i = 0; i < matches.length; i++) {
-    const start = matches[i].markerStart;
-    const end = i + 1 < matches.length
-      ? matches[i + 1].markerStart
-      : raw.length;
-
-    const full = raw.slice(start, end).trim();
-    const content = full.replace(/^[-–—]\s*/u, "").trim();
-
-    turns.push({
-      full,
-      content
-    });
-  }
-
-  return turns;
-}
-
-function semanticMapLabMultiTurn153(text) {
-  return semanticMapLabDialogueTurns153(text).length >= 2;
-}
-
-function sanitizeSemanticMapCases153(rawCases) {
-  if (!Array.isArray(rawCases)) {
-    const error = new Error("cases deve ser um array.");
-    error.labInputError153 = true;
-    throw error;
-  }
-
-  if (rawCases.length < 1 || rawCases.length > SEMMAP_LAB_MAX_ITEMS_153) {
-    const error = new Error(
-      `cases deve conter entre 1 e ${SEMMAP_LAB_MAX_ITEMS_153} itens.`
-    );
-    error.labInputError153 = true;
-    throw error;
-  }
-
-  const seen = new Set();
-
-  const cases = rawCases.map((raw, index) => {
-    const caseKey = String(raw?.case_key || "").trim();
-
-    if (!/^[A-Za-z0-9_-]{1,32}$/.test(caseKey)) {
-      const error = new Error(`case_key inválido no item ${index + 1}.`);
-      error.labInputError153 = true;
-      throw error;
-    }
-
-    if (seen.has(caseKey)) {
-      const error = new Error(`case_key duplicado: ${caseKey}.`);
-      error.labInputError153 = true;
-      throw error;
-    }
-    seen.add(caseKey);
-
-    const currentSource = semanticMapLabText153(raw?.current_source);
-    const currentPt = semanticMapLabText153(raw?.current_pt);
-
-    if (!currentSource || !currentPt) {
-      const error = new Error(
-        `current_source/current_pt ausente em ${caseKey}.`
-      );
-      error.labInputError153 = true;
-      throw error;
-    }
-
-    const candidateSplit = raw?.candidate_split === true;
-    const candidateMerge = raw?.candidate_merge === true;
-
-    const item = {
-      case_key: caseKey,
-      candidate_split: candidateSplit,
-      candidate_merge: candidateMerge,
-      current_source: currentSource,
-      current_pt: currentPt,
-      prosody: semanticMapLabText153(raw?.prosody, 1000),
-      risk_flags: semanticMapLabText153(raw?.risk_flags, 1200)
-    };
-
-    if (candidateSplit) {
-      const options = Array.isArray(raw?.split_options)
-        ? raw.split_options.slice(0, 6)
-        : [];
-
-      item.split_options = options.map(option => ({
-        source_left: semanticMapLabText153(option?.source_left, 6000),
-        source_right: semanticMapLabText153(option?.source_right, 6000),
-        pause_ms: Math.max(
-          0,
-          Math.min(
-            15000,
-            semanticMapLabFiniteNumber153(option?.pause_ms, 0)
-          )
-        ),
-        dramatic: option?.dramatic === true,
-        punctuation: semanticMapLabText153(option?.punctuation, 200)
-      }));
-    }
-
-    if (candidateMerge) {
-      item.next_source = semanticMapLabText153(raw?.next_source, 12000);
-      item.next_pt = semanticMapLabText153(raw?.next_pt, 12000);
-      item.phonetic_gap_ms = semanticMapLabFiniteNumber153(
-        raw?.phonetic_gap_ms,
-        null
-      );
-      item.next_has_multiple_dialogue_turns =
-        semanticMapLabMultiTurn153(item.next_source) ||
-        semanticMapLabMultiTurn153(item.next_pt);
-    }
-
-    return item;
-  });
-
-  const chars = JSON.stringify(cases).length;
-
-  if (chars > SEMMAP_LAB_MAX_PAYLOAD_CHARS_153) {
-    const error = new Error(
-      `payload semântico grande demais: ${chars}/${SEMMAP_LAB_MAX_PAYLOAD_CHARS_153} chars.`
-    );
-    error.labInputError153 = true;
-    throw error;
-  }
-
-  return cases;
-}
-
-function semanticMapLabSystem153() {
-  return `
-MAPEADOR SEMÂNTICO UNIVERSAL DE LEGENDAS EN→PT-BR — CONTRATO ${SEMMAP_LAB_VERSION_153}
-
-FUNÇÃO
-Você NÃO controla timing nem legibilidade.
-Você decide SOMENTE se uma fronteira acústica já medida pode ser transportada semanticamente
-para o texto PT-BR existente, ou se dois cues podem formar uma unidade de handoff.
-
-DECISÕES
-KEEP  = preservar a organização atual.
-SPLIT = a pausa acústica separa unidades cujo significado pode ser dividido em duas partes
-        contíguas e semanticamente fiéis no PT-BR.
-MERGE = current e next formam uma única unidade semântica para handoff visual;
-        nunca concatena cues e nunca antecipa next_pt.
-
-REGRAS ABSOLUTAS
-1. Nunca traduza, reescreva, corrija, resuma, expanda ou melhore o PT-BR.
-2. Nunca crie timestamps.
-3. Nunca antecipe conteúdo, revelação, nome, punchline, resposta ou próximo turno.
-4. candidate_split=true E candidate_merge=true => KEEP.
-5. next_has_multiple_dialogue_turns=true => KEEP para MERGE.
-6. Troca de locutor => nunca MERGE.
-7. Na dúvida => KEEP.
-8. AMBIGUOUS só pode acompanhar KEEP.
-
-INTEGRIDADE DA FRONTEIRA — REGRA CENTRAL DE SPLIT
-Uma pausa do source só pode virar SPLIT em PT-BR se a fronteira sobreviver à tradução.
-
-Aceite SPLIT somente quando existir pt_left | pt_right tal que:
-- pt_left + espaço + pt_right recompõe exatamente current_pt;
-- o conteúdo de source_left é realizado integralmente em pt_left;
-- o conteúdo de source_right é realizado integralmente em pt_right;
-- nenhum significado precisa atravessar a fronteira por reordenação, compressão ou fusão gramatical.
-
-REJEITE SPLIT quando a pausa cortar uma dependência interna que a tradução realiza como
-uma única construção atravessando a fronteira. Exemplos abstratos:
-- marcador de infinitivo | verbo lexical;
-- auxiliar/modal | verbo principal;
-- preposição | complemento;
-- determinante | núcleo nominal;
-- verbo de movimento/intenção | infinitivo que completa esse mesmo predicado;
-- qualquer construção em que a tradução de source_left só fique semanticamente fiel
-  se puxar uma palavra/conceito de source_right, ou vice-versa.
-
-Isto é diferente de sujeito | predicado:
-uma pausa dramática entre sujeito e predicado PODE ser SPLIT quando os dois lados continuam
-mapeáveis de forma contígua em PT-BR.
-
-MONOTONICIDADE
-Se um elemento de source_right aparece antes da fronteira natural em PT-BR,
-ou um elemento de source_left aparece depois, KEEP.
-
-PAUSA DRAMÁTICA E FRAGMENTOS CURTOS
-Ausência de pontuação NÃO invalida SPLIT.
-Uma metade curta NÃO invalida SPLIT.
-Anti-Piscada, CPS e duração mínima pertencem a outro estágio determinístico.
-
-TURNOS EXPLÍCITOS
-Quando um cue contém duas falas explicitamente separadas por marcadores de diálogo,
-isso é evidência semântica fortíssima de duas unidades.
-Se a fronteira acústica coincide com a troca de turno e o PT-BR também preserva exatamente
-dois turnos, SPLIT é apropriado. O estágio determinístico pode confirmar esse caso sem LLM.
-
-SAÍDA
-Preserve case_key exatamente.
-KEEP: pt_left="" e pt_right="".
-SPLIT: pt_left e pt_right recompõem exatamente current_pt.
-MERGE: pt_left=current_pt e pt_right=next_pt.
-Retorne somente JSON.
-`.trim();
-}
-
-function semanticMapLabSchema153(count) {
-  return {
-    type: "array",
-    minItems: count,
-    maxItems: count,
-    items: {
-      type: "object",
-      properties: {
-        case_key: { type: "string" },
-        decision: {
-          type: "string",
-          enum: ["KEEP", "SPLIT", "MERGE"]
-        },
-        confidence: {
-          type: "string",
-          enum: ["VERY_STRONG", "STRONG", "AMBIGUOUS"]
-        },
-        pt_left: { type: "string" },
-        pt_right: { type: "string" }
-      },
-      required: [
-        "case_key",
-        "decision",
-        "confidence",
-        "pt_left",
-        "pt_right"
-      ]
-    }
-  };
-}
-
-function semanticMapLabUser153(cases) {
-  return (
-    "CASOS PARA CLASSIFICAR. Cada item é independente. " +
-    `Retorne exatamente ${cases.length} objetos, um por case_key, ` +
-    "sem omitir, duplicar ou renomear chaves.\n\n" +
-    JSON.stringify(cases)
-  );
-}
-
-function semanticMapLabParse153(text, expectedCount, label) {
-  let parsed;
-
-  try {
-    parsed = JSON.parse(stripCodeFences(text));
-  } catch {
-    const error = new Error(`${label}: JSON inválido.`);
-    error.status = 502;
-    throw error;
-  }
-
-  if (!Array.isArray(parsed) || parsed.length !== expectedCount) {
-    const error = new Error(
-      `${label}: resposta incompleta; esperado=${expectedCount}, recebido=${Array.isArray(parsed) ? parsed.length : 0}.`
-    );
-    error.status = 502;
-    throw error;
-  }
-
-  return parsed;
-}
-
-function semanticMapLabBrownout153(error) {
-  const text = String(error?.message || error || "");
-  return Boolean(
-    /MODEL ROUTER esgotou/i.test(text) &&
-    /(?:503|504|timeout|high demand)/i.test(text)
-  );
-}
-
-async function callGroqSemanticMap153(cases) {
-  if (!GROQ_API_KEY) {
-    const error = new Error(
-      "Gemini em brownout e GROQ_API_KEY não está configurada."
-    );
-    error.status = 503;
-    throw error;
-  }
-
-  const system = semanticMapLabSystem153();
-  const user = semanticMapLabUser153(cases);
-  const schema = semanticMapLabSchema153(cases.length);
-  const modelId = GROQ_MODELS_976.QUALITY;
-
-  const inputEstimate =
-    estimateGroqInputTokens976(system, user, schema);
-
-  const conservativeNeed =
-    inputEstimate +
-    GROQ_QUALITY_OUTPUT_RESERVE_977 +
-    GROQ_SAFETY_MARGIN_TOKENS_977;
-
-  if (
-    inputEstimate > GROQ_INPUT_SAFE_TOKENS_976 ||
-    conservativeNeed > GROQ_TOTAL_SAFE_TOKENS_977
-  ) {
-    const error = new Error(
-      `SEMMAP LAB 15.3: lote grande para Groq; input≈${inputEstimate}, total≈${conservativeNeed}.`
-    );
-    error.status = 413;
-    throw error;
-  }
-
-  const release = await acquireGroqGate976();
-
-  try {
-    const controller = new AbortController();
-    const timeoutMs = 90000;
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    let response;
-    let raw = "";
-    let data = null;
-
-    try {
-      response = await fetch(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${GROQ_API_KEY}`
-          },
-          body: JSON.stringify({
-            model: modelId,
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: user }
-            ],
-            reasoning_effort: "medium",
-            reasoning_format: "hidden",
-            max_completion_tokens: 2200,
-            response_format: {
-              type: "json_schema",
-              json_schema: {
-                name: "stremio_semmap_lab_153",
-                strict: true,
-                schema
-              }
-            }
-          }),
-          signal: controller.signal
-        }
-      );
-
-      raw = await response.text();
-
-      try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch {
-        data = {};
-      }
-
-      updateGroqRate976(response);
-    } catch (error) {
-      if (error?.name === "AbortError") {
-        const e = new Error(`GROQ ${modelId}: timeout.`);
-        e.status = 504;
-        throw e;
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
-
-    if (!response.ok) {
-      const status = Number(response.status || 0);
-      const error = new Error(
-        `GROQ ${modelId} HTTP ${status}: ${String(data?.error?.message || data?.message || raw || "erro").slice(0, 1600)}`
-      );
-      error.status = status;
-      throw error;
-    }
-
-    const text = String(
-      data?.choices?.[0]?.message?.content || ""
-    ).trim();
-
-    if (!text) {
-      const error = new Error(`GROQ ${modelId} retornou conteúdo vazio.`);
-      error.status = 502;
-      throw error;
-    }
-
-    const u = data?.usage || {};
-    const usage = {
-      total_input_tokens: Number(u?.prompt_tokens || 0),
-      total_output_tokens: Number(u?.completion_tokens || 0),
-      total_thought_tokens: Number(
-        u?.completion_tokens_details?.reasoning_tokens || 0
-      )
-    };
-
-    return {
-      text,
-      usage,
-      modelId,
-      provider: "groq"
-    };
-  } finally {
-    release();
-  }
-}
-
-async function classifySemanticMapChunk153(cases, preferGroq = false) {
-  const system = semanticMapLabSystem153();
-  const user = semanticMapLabUser153(cases);
-  const schema = semanticMapLabSchema153(cases.length);
-
-  if (!preferGroq) {
-    try {
-      const result = await geminiRequest({
-        system,
-        user,
-        schema,
-        thinkingLevel: "medium",
-        maxOutputTokens: 7000,
-        timeoutMs: 90000,
-        maxRetries: 1,
-        job: null,
-        metric: "semmaplab"
-      });
-
-      return {
-        items: semanticMapLabParse153(
-          result.text,
-          cases.length,
-          result.modelId
-        ),
-        model: result.modelId,
-        provider: result.provider || "gemini",
-        usage: result.usage || null
-      };
-    } catch (error) {
-      if (!semanticMapLabBrownout153(error)) {
-        throw error;
-      }
-
-      console.warn(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] Gemini brownout; LAB -> Groq QUALITY.`
-      );
-    }
-  }
-
-  const groq = await callGroqSemanticMap153(cases);
-
-  return {
-    items: semanticMapLabParse153(
-      groq.text,
-      cases.length,
-      groq.modelId
-    ),
-    model: groq.modelId,
-    provider: "groq",
-    usage: groq.usage || null
-  };
-}
-
-function semanticMapLabExplicitTurnSplit153(item) {
-  if (
-    item.candidate_split !== true ||
-    item.candidate_merge === true
-  ) {
-    return null;
-  }
-
-  const sourceTurns =
-    semanticMapLabDialogueTurns153(
-      item.current_source
-    );
-
-  const ptTurns =
-    semanticMapLabDialogueTurns153(
-      item.current_pt
-    );
-
-  if (
-    sourceTurns.length !== 2 ||
-    ptTurns.length !== 2
-  ) {
-    return null;
-  }
-
-  const options =
-    Array.isArray(
-      item.split_options
-    )
-      ? item.split_options
-      : [];
-
-  const matching =
-    options.find(
-      option =>
-        semanticMapLabNorm153(
-          option?.source_left
-        ) ===
-          semanticMapLabNorm153(
-            sourceTurns[0].content
-          ) &&
-        semanticMapLabNorm153(
-          option?.source_right
-        ) ===
-          semanticMapLabNorm153(
-            sourceTurns[1].content
-          )
-    );
-
-  if (!matching) {
-    return null;
-  }
-
-  const ptLeft =
-    ptTurns[0].full;
-
-  const ptRight =
-    ptTurns[1].full;
-
-  if (
-    semanticMapLabNorm153(
-      `${ptLeft} ${ptRight}`
-    ) !==
-    semanticMapLabNorm153(
-      item.current_pt
-    )
-  ) {
-    return null;
-  }
-
-  return {
-    case_key:
-      item.case_key,
-    decision:
-      "SPLIT",
-    confidence:
-      "VERY_STRONG",
-    pt_left:
-      ptLeft,
-    pt_right:
-      ptRight,
-    deterministic_guard:
-      "EXPLICIT_TWO_TURN_SPLIT"
-  };
-}
-
-function semanticMapLabDeterministic153(cases) {
-  const fixed = new Map();
-  const toModel = [];
-
-  for (const item of cases) {
-    const compound =
-      item.candidate_split === true &&
-      item.candidate_merge === true;
-
-    const impureMerge =
-      item.candidate_merge === true &&
-      item.next_has_multiple_dialogue_turns === true;
-
-    if (compound) {
-      fixed.set(
-        item.case_key,
-        {
-          case_key:
-            item.case_key,
-          decision:
-            "KEEP",
-          confidence:
-            "VERY_STRONG",
-          pt_left:
-            "",
-          pt_right:
-            "",
-          deterministic_guard:
-            "COMPOUND_SPLIT_MERGE_KEEP"
-        }
-      );
-      continue;
-    }
-
-    if (impureMerge) {
-      fixed.set(
-        item.case_key,
-        {
-          case_key:
-            item.case_key,
-          decision:
-            "KEEP",
-          confidence:
-            "VERY_STRONG",
-          pt_left:
-            "",
-          pt_right:
-            "",
-          deterministic_guard:
-            "NEXT_MULTI_TURN_KEEP"
-        }
-      );
-      continue;
-    }
-
-    const explicitTurnSplit =
-      semanticMapLabExplicitTurnSplit153(
-        item
-      );
-
-    if (explicitTurnSplit) {
-      fixed.set(
-        item.case_key,
-        explicitTurnSplit
-      );
-      continue;
-    }
-
-    toModel.push(item);
-  }
-
-  return {
-    fixed,
-    toModel
-  };
-}
-
-app.get(
-  "/api/lab/semantic-map-15-3/status",
-  (req, res) => {
-    if (!authorized(req)) {
-      return safeJson(res, { error: "Unauthorized" }, 401);
-    }
-
-    return safeJson(res, {
-      ok: true,
-      version: SEMMAP_LAB_VERSION_153,
-      mode: "BOUNDARY_INTEGRITY_EXPLICIT_TURN_SPLIT",
-      productionPipelineChanged: false,
-      timestampsAuthority: "LOCAL_ACOUSTIC_PIPELINE_ONLY",
-      geminiRoute: geminiRouteForMetric("semmaplab"),
-      groqLabFallbackConfigured: Boolean(GROQ_API_KEY),
-      chunkSize: SEMMAP_LAB_CHUNK_SIZE_153,
-      hardGuards: [
-        "COMPOUND_SPLIT_MERGE_KEEP",
-        "NEXT_MULTI_TURN_KEEP",
-        "EXPLICIT_TWO_TURN_SPLIT"
-      ]
-    });
-  }
-);
-
-app.post(
-  "/api/lab/semantic-map-15-3",
-  async (req, res) => {
-    if (!authorized(req)) {
-      return safeJson(res, { error: "Unauthorized" }, 401);
-    }
-
-    const startedAt = Date.now();
-
-    try {
-      if (
-        String(req.body?.contractVersion || "").trim() !==
-        SEMMAP_LAB_VERSION_153
-      ) {
-        const error = new Error(
-          `contractVersion deve ser ${SEMMAP_LAB_VERSION_153}.`
-        );
-        error.labInputError153 = true;
-        throw error;
-      }
-
-      const allCases =
-        sanitizeSemanticMapCases153(
-          req.body?.cases
-        );
-
-      const expectedKeys =
-        allCases.map(
-          item => item.case_key
-        );
-
-      const deterministic =
-        semanticMapLabDeterministic153(
-          allCases
-        );
-
-      const fixed =
-        deterministic.fixed;
-
-      const modelCases =
-        deterministic.toModel;
-
-      const chunks = [];
-
-      for (
-        let i = 0;
-        i < modelCases.length;
-        i += SEMMAP_LAB_CHUNK_SIZE_153
-      ) {
-        chunks.push(
-          modelCases.slice(
-            i,
-            i + SEMMAP_LAB_CHUNK_SIZE_153
-          )
-        );
-      }
-
-      const modelItems = [];
-      const providers = [];
-      const models = [];
-      const chunkTelemetry = [];
-      let preferGroq = false;
-
-      for (let i = 0; i < chunks.length; i++) {
-        const result =
-          await classifySemanticMapChunk153(
-            chunks[i],
-            preferGroq
-          );
-
-        if (result.provider === "groq") {
-          preferGroq = true;
-        }
-
-        modelItems.push(...result.items);
-        providers.push(result.provider);
-        models.push(result.model);
-
-        chunkTelemetry.push({
-          chunk: i + 1,
-          cases: chunks[i].length,
-          provider: result.provider,
-          model: result.model,
-          usage: result.usage || null
-        });
-      }
-
-      const byKey = new Map();
-
-      for (const item of modelItems) {
-        byKey.set(
-          String(item?.case_key || "").trim(),
-          item
-        );
-      }
-
-      for (const [key, item] of fixed.entries()) {
-        byKey.set(key, item);
-      }
-
-      const items =
-        expectedKeys
-          .map(key => byKey.get(key))
-          .filter(Boolean);
-
-      const returnedKeys =
-        items.map(
-          item =>
-            String(
-              item?.case_key ||
-              ""
-            ).trim()
-        );
-
-      const coverageOk =
-        returnedKeys.length === expectedKeys.length &&
-        new Set(returnedKeys).size === expectedKeys.length &&
-        expectedKeys.every(
-          key => returnedKeys.includes(key)
-        );
-
-      const deterministicCounts = {};
-
-      for (const item of fixed.values()) {
-        const g =
-          String(
-            item?.deterministic_guard ||
-            "UNKNOWN"
-          );
-
-        deterministicCounts[g] =
-          Number(
-            deterministicCounts[g] ||
-            0
-          ) + 1;
-      }
-
-      console.log(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] COMPLETE | ` +
-        `all=${allCases.length} | model=${modelCases.length} | deterministic=${fixed.size} | ` +
-        `chunks=${chunks.length} | providers=${providers.join(",") || "none"} | ` +
-        `models=${models.join(",") || "none"} | coverage=${coverageOk ? "OK" : "INVALID"} | ` +
-        `elapsed=${Date.now() - startedAt}ms.`
-      );
-
-      return safeJson(res, {
-        ok: true,
-        version: SEMMAP_LAB_VERSION_153,
-        provider: [...new Set(providers)].join("+") || "deterministic",
-        model: [...new Set(models)].join("+") || "none",
-        elapsedMs: Date.now() - startedAt,
-        coverageOk,
-        deterministicCount: fixed.size,
-        deterministicCounts,
-        modelCaseCount: modelCases.length,
-        chunks: chunkTelemetry,
-        expectedKeys,
-        items
-      });
-    } catch (error) {
-      const status =
-        error?.labInputError153
-          ? 400
-          : Math.max(
-              500,
-              Math.min(
-                599,
-                Number(
-                  error?.status ||
-                  502
-                )
-              )
-            );
-
-      console.error(
-        `[SEMMAP LAB ${SEMMAP_LAB_VERSION_153}] ` +
-        `${errorMessage(error).slice(0, 1400)}`
-      );
-
-      return safeJson(
-        res,
-        {
-          ok: false,
-          version: SEMMAP_LAB_VERSION_153,
-          error: errorMessage(error)
-        },
-        status
-      );
-    }
-  }
-);
-
-
 app.post(
   "/api/translate-embedded",
 
@@ -27031,7 +26188,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.7.9 - PROVIDER-LOCAL EMERGENCY SCOPE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.7.8 - SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -27313,10 +26470,8 @@ console.log(
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
-  console.log(`Groq Emergency 9.7.9: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
-  console.log("Groq Scope 9.7.9: uso histórico de Groq NÃO reduz lotes Gemini posteriores; micro-batching existe apenas na tentativa de failover atual ✅");
-  console.log("Groq Adaptive JSON 9.7.9: HTTP 400 failed_generation vira split focal recursivo antes de esgotar a rota ✅");
-  console.log("Groq TPM 9.7.9: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
+  console.log(`Groq Emergency 9.7.8: ${GROQ_API_KEY ? "ATIVO" : "DESATIVADO (GROQ_API_KEY ausente)"} | MAIN=${GROQ_MODELS_976.MAIN} | QA/Repair=${GROQ_MODELS_976.QUALITY} | somente 5xx/timeout após ambos Gemini ✅`);
+  console.log("Groq TPM 9.7.8: 8K total-envelope + header-aware single-flight + split recursivo QA/Repair/Final ✅");
   console.log("Residual Accountability 9.7.8: residual só desaparece com proof hash-bound ou resolução determinística; unaccounted=HARD ✅");
   console.log("Immutable Timeline + Global Ownership 9.7.8: ID/order/timestamp digest + long duplicate/transplant seal bloqueiam FINAL/cache ✅");
   console.log("Spoken SDH Guard 9.7.8: sintagmas lexicais curtos como The TV./A TV./O rádio nunca viram SDH por keyword isolada ✅");
