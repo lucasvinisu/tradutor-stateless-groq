@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.5 - ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.6 - FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -146,8 +146,17 @@ const CANONICAL_ZERO_RESIDUAL_MAX_CYCLES_985 = 6;
 const CANONICAL_ZERO_RESIDUAL_MAX_CUES_985 = 36;
 const CANONICAL_ZERO_RESIDUAL_SINGLE_PASSES_985 = 3;
 
+// 9.8.6 — authoritative SOURCE→FINAL postcondition.
+// Full episode audit runs after every textual closure, then repairs only flagged
+// cues. Subsequent cycles are focal; a last full audit is mandatory.
+const FINAL_SOURCE_SEMANTIC_MAX_CYCLES_986 = 4;
+const FINAL_SOURCE_SEMANTIC_SINGLE_PASSES_986 = 2;
+const SHORT_OWNERSHIP_RADIUS_986 = 3;
+const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
+const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
+
 const CACHE_VERSION =
-  "9.8.3-logical-turn-repetition-closure-v1";
+  "9.8.6-final-source-semantic-seal-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -9910,6 +9919,21 @@ REPAIR: fix only the proven defect/reasons for each cue. Preserve everything alr
   return shared;
 }
 
+
+const FINAL_SOURCE_SEMANTIC_SEAL_ADDENDUM_986 = `
+
+FINAL SOURCE SEMANTIC SEAL 9.8.6 — OBRIGATÓRIO:
+- Julgue cada target SOMENTE contra o SOURCE do MESMO id.
+- before/after são contexto; NUNCA podem fornecer conteúdo novo ao target.
+- Marque HARD qualquer EARLY REVEAL: conteúdo do próximo cue aparecendo antes.
+- Marque HARD qualquer TRANSPLANTE: target expressa fala pertencente a outro id.
+- Marque HARD qualquer OMISSÃO de unidade semântica relevante do SOURCE.
+- Marque HARD qualquer duplicação criada no PT quando a SOURCE não repete.
+- Marque HARD qualquer resíduo do idioma-fonte dentro do PT-BR, salvo nome/termo realmente preservável.
+- Se SOURCE for apenas stage direction/SDH/CC entre [] ou (), o target visível deve ser vazio; não transforme descrição sonora/ação em diálogo.
+- Respostas curtas também têm ownership absoluto; tamanho pequeno NÃO reduz a severidade.
+`.trim();
+
 function groqOutputCapForMetric976(metric, requested) {
   const normalized = String(metric || "main").toLowerCase();
   const cap = normalized === "main"
@@ -16158,6 +16182,295 @@ function finalSdhHardIssues985(blocks, translations) {
   return out;
 }
 
+
+// ============================================================
+// 9.8.6 — FINAL SOURCE SEMANTIC SEAL + SOURCE-SDH PROVENANCE
+// ============================================================
+
+function sourcePureSdhProvenance986(block) {
+  const raw = String(block?.text || "").replace(/\r/g, "").trim();
+  if (!raw || /[♪♫♬]/u.test(raw)) return false;
+
+  const lines = raw.split("\n").map(x => x.trim()).filter(Boolean);
+  if (!lines.length) return false;
+
+  // Pure bracket/parenthesis metadata is never spoken dialogue. This rule is
+  // provenance-based: once SOURCE says "[turns faucet off]", later translation
+  // cannot strip brackets and promote it to visible dialogue.
+  const structuredOnly = lines.every(line =>
+    /^(?:\[[\s\S]{1,180}\]|\([\s\S]{1,180}\))$/u.test(line)
+  );
+  if (structuredOnly) return true;
+
+  // Bare SDH classifier is used only if EVERY line is independently SDH-like.
+  return lines.every(line =>
+    looksLikeSdhDescriptor(line) ||
+    looksLikeBareSdhLine(line)
+  );
+}
+
+function applySourceSdhProvenance986(blocks, translations, job) {
+  const out = new Map(translations);
+  const removed = [];
+  if (!(job?.intentionalEmptyCueIds instanceof Set) && job) {
+    job.intentionalEmptyCueIds = new Set();
+  }
+
+  for (const block of blocks) {
+    const id = Number(block?.index);
+    if (!Number.isInteger(id) || !sourcePureSdhProvenance986(block)) continue;
+    const before = String(out.get(id) || "").trim();
+    if (before) removed.push(id);
+    out.set(id, "");
+    if (job?.intentionalEmptyCueIds instanceof Set) job.intentionalEmptyCueIds.add(id);
+  }
+
+  if (removed.length) {
+    if (job?.stats) {
+      job.stats.sourceSdhProvenanceRemoved986 =
+        Number(job.stats.sourceSdhProvenanceRemoved986 || 0) + removed.length;
+    }
+    console.warn(
+      `[SOURCE SDH PROVENANCE 9.8.6] ${removed.length} cue(s) não-dialogados zerados deterministicamente | ` +
+      `ids=[${removed.slice(0,40).join(",")}]. ✅`
+    );
+  }
+  return out;
+}
+
+function shortBoundaryOwnershipIssues986(blocks, translations) {
+  const issues = new Map();
+  const add = (id, reason) => {
+    if (!issues.has(id)) issues.set(id, new Set());
+    issues.get(id).add(reason);
+  };
+
+  const rows = blocks.map((block, pos) => {
+    const id = Number(block?.index);
+    const target = String(translations.get(id) || "").trim();
+    return {
+      id, pos, block, target,
+      targetKey: ownershipTextKey977(target),
+      targetTokens: words(target),
+      sourceTokens: words(block?.text || "")
+    };
+  });
+
+  for (let i = 0; i < rows.length; i++) {
+    const a = rows[i];
+    if (!a.target || a.targetTokens.length < 3) continue;
+
+    const lo = Math.max(0, i - SHORT_OWNERSHIP_RADIUS_986);
+    const hi = Math.min(rows.length - 1, i + SHORT_OWNERSHIP_RADIUS_986);
+
+    for (let j = lo; j <= hi; j++) {
+      if (j === i) continue;
+      const b = rows[j];
+      if (!b.target || b.targetTokens.length < 3) continue;
+
+      const targetSim = ownershipTokenSimilarity977(a.target, b.target);
+      const contain =
+        a.targetKey.length >= 12 &&
+        b.targetKey.length >= 12 &&
+        (a.targetKey.includes(b.targetKey) || b.targetKey.includes(a.targetKey));
+
+      if (targetSim < SHORT_OWNERSHIP_TARGET_SIM_986 && !contain) continue;
+
+      const sourceSim = ownershipTokenSimilarity977(a.block?.text, b.block?.text);
+      if (sourceSim > SHORT_OWNERSHIP_SOURCE_SIM_MAX_986) continue;
+
+      add(a.id, `CUE_OWNERSHIP_SHORT_BOUNDARY_986 neighbor=${b.id}`);
+      add(b.id, `CUE_OWNERSHIP_SHORT_BOUNDARY_986 neighbor=${a.id}`);
+    }
+  }
+
+  return [...issues.entries()]
+    .map(([id, reasons]) => ({ id:Number(id), reasons:[...reasons] }))
+    .sort((a,b)=>a.id-b.id);
+}
+
+async function finalSourceSemanticAudit986(blocks, translations, plan, job, focusIds = null) {
+  const semantic = await scanFinalPriorityAudit(
+    blocks,
+    translations,
+    plan,
+    job,
+    focusIds
+  );
+  const shortOwnership = shortBoundaryOwnershipIssues986(blocks, translations);
+  const sdh = finalSdhHardIssues985(blocks, translations);
+
+  const scopedShort = focusIds instanceof Set
+    ? shortOwnership.filter(issue => focusIds.has(Number(issue?.id)))
+    : shortOwnership;
+
+  const scopedSdh = focusIds instanceof Set
+    ? sdh.filter(issue => focusIds.has(Number(issue?.id)))
+    : sdh;
+
+  return mergeIssueLists(semantic, scopedShort, scopedSdh);
+}
+
+async function applyFinalSourceSemanticSeal986(
+  blocks,
+  translations,
+  plan,
+  job
+) {
+  let out = applySourceSdhProvenance986(blocks, new Map(translations), job);
+  out = sanitizeTranslationMap(blocks, out, job);
+
+  let issues = await finalSourceSemanticAudit986(
+    blocks,
+    out,
+    plan,
+    job,
+    null
+  );
+
+  console.log(
+    `[FINAL SOURCE SEMANTIC SEAL 9.8.6] auditoria completa inicial | residual=${issues.length}.`
+  );
+
+  for (
+    let cycle = 1;
+    cycle <= FINAL_SOURCE_SEMANTIC_MAX_CYCLES_986 && issues.length;
+    cycle++
+  ) {
+    const before = new Map(out);
+    const beforeCount = issues.length;
+
+    const repairIssues = issues.map(issue => ({
+      id:Number(issue?.id),
+      reasons:[
+        ...(Array.isArray(issue?.reasons) ? issue.reasons : []),
+        "FINAL_PRIORITY:SOURCE_FINAL_SEAL_986: reconstrua SOMENTE a fala do SOURCE deste id; vizinhos são contexto, nunca conteúdo; zero early reveal/transplante/omissão; SDH puro deve ficar vazio."
+      ]
+    }));
+
+    out = await runFinalPriorityEscalatedRepair(
+      blocks,
+      out,
+      repairIssues,
+      plan,
+      job
+    );
+    out = applySourceSdhProvenance986(blocks, out, job);
+    out = sanitizeTranslationMap(blocks, out, job);
+
+    const changed = new Set();
+    for (const block of blocks) {
+      const id = Number(block?.index);
+      if (
+        semanticTextKey940(before.get(id)) !==
+        semanticTextKey940(out.get(id))
+      ) changed.add(id);
+    }
+
+    const focus = idsFromIssues(issues, blocks, 2);
+    for (const id of changed) focus.add(id);
+
+    issues = await finalSourceSemanticAudit986(
+      blocks,
+      out,
+      plan,
+      job,
+      focus
+    );
+
+    console.log(
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] cycle=${cycle} | before=${beforeCount} | ` +
+      `changed=${changed.size} | focal-after=${issues.length}.`
+    );
+
+    if (!issues.length) break;
+
+    // Strategy change: cues still failing after a batch get isolated high-reasoning
+    // repair. This avoids one malformed neighbor/batch keeping the whole episode bad.
+    const isolated = [...new Set(issues.map(x => Number(x?.id)).filter(Number.isInteger))];
+    for (const id of isolated) {
+      for (
+        let pass = 1;
+        pass <= FINAL_SOURCE_SEMANTIC_SINGLE_PASSES_986;
+        pass++
+      ) {
+        const oneIssue = issues.find(x => Number(x?.id) === id);
+        if (!oneIssue) break;
+
+        const candidate = await runFinalPriorityEscalatedRepair(
+          blocks,
+          out,
+          [{
+            id,
+            reasons:[
+              ...(Array.isArray(oneIssue?.reasons) ? oneIssue.reasons : []),
+              `FINAL_PRIORITY:SOURCE_FINAL_SINGLE_986_PASS_${pass}: use APENAS SOURCE[id=${id}] como conteúdo; before/after servem apenas para interpretar referência/turno.`
+            ]
+          }],
+          plan,
+          job
+        );
+
+        const trial = applySourceSdhProvenance986(blocks, candidate, job);
+        const audit = await finalSourceSemanticAudit986(
+          blocks,
+          trial,
+          plan,
+          job,
+          new Set([id])
+        );
+
+        if (!audit.some(x => Number(x?.id) === id)) {
+          out = trial;
+          issues = issues.filter(x => Number(x?.id) !== id);
+          console.warn(
+            `[FINAL SOURCE SEMANTIC SEAL 9.8.6] cue=${id} isolated pass=${pass} PASSOU ✅`
+          );
+          break;
+        }
+      }
+    }
+
+    // Recompute focal residual after isolated strategy.
+    const remainingFocus = idsFromIssues(issues, blocks, 2);
+    issues = remainingFocus.size
+      ? await finalSourceSemanticAudit986(blocks, out, plan, job, remainingFocus)
+      : [];
+  }
+
+  // Mandatory final FULL episode audit after all repairs/rollbacks.
+  const fullFinal = await finalSourceSemanticAudit986(
+    blocks,
+    out,
+    plan,
+    job,
+    null
+  );
+
+  job.finalSourceSemanticResidual986 = fullFinal.length;
+  job.finalSourceSemanticIssues986 = fullFinal;
+
+  if (fullFinal.length) {
+    job.finalTargetResidual927 = mergeIssueLists(
+      job.finalTargetResidual927,
+      fullFinal
+    );
+    job.noCacheFinal923 = true;
+    job.qualityStatus = "best_available";
+    console.error(
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] HARD residual=${fullFinal.length} | ` +
+      `ids=[${[...new Set(fullFinal.map(x=>Number(x?.id)).filter(Number.isInteger))].slice(0,40).join(",")}].`
+    );
+  } else {
+    console.log(
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] PASSOU ✅ | SOURCE×FINAL=0 | early-reveal=0 | transplant=0 | ` +
+      `omission=0 | residual-English=0 | source-SDH-visible=0.`
+    );
+  }
+
+  return { translations:out, issues:fullFinal };
+}
+
 function canonicalResidual985(blocks, translations, mainTranslations, job, plan) {
   const deterministic = deterministicFinalResidual960(
     blocks,
@@ -16174,9 +16487,14 @@ function canonicalResidual985(blocks, translations, mainTranslations, job, plan)
     blocks,
     translations
   );
+  const shortOwnership986 = shortBoundaryOwnershipIssues986(
+    blocks,
+    translations
+  );
   return mergeIssueLists(
     deterministic,
     ownership,
+    shortOwnership986,
     sdh
   );
 }
@@ -17804,6 +18122,15 @@ function localReasonsForCue(
   ) {
     reasons.push(
       "EMPTY"
+    );
+  }
+
+  if (
+    translated.trim() &&
+    sourcePureSdhProvenance986(block)
+  ) {
+    reasons.push(
+      "SOURCE_SDH_PROVENANCE_986"
     );
   }
 
@@ -21943,7 +22270,7 @@ async function scanFinalPriorityAuditGroq977(
     try {
       markAttempt(job, "qa");
       const response = await callGroqEmergency976({
-        system: FINAL_PRIORITY_AUDIT_PROMPT,
+        system: FINAL_PRIORITY_AUDIT_PROMPT + "\n\n" + FINAL_SOURCE_SEMANTIC_SEAL_ADDENDUM_986,
         user:
           `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
           `IMPORTANTE: use o idioma REAL encontrado em SOURCE; não presuma inglês.\n\n` +
@@ -22024,7 +22351,7 @@ async function scanFinalPriorityAudit(
         try {
           response = await finalPriorityGeminiRequest(
           {
-            system: FINAL_PRIORITY_AUDIT_PROMPT,
+            system: FINAL_PRIORITY_AUDIT_PROMPT + "\n\n" + FINAL_SOURCE_SEMANTIC_SEAL_ADDENDUM_986,
             user:
               `IDIOMA DECLARADO DA FONTE: ${job.sourceLang || "auto"}\n` +
               `IMPORTANTE: use o idioma REAL encontrado em SOURCE; não presuma inglês.\n\n` +
@@ -23028,7 +23355,7 @@ async function runConstrainedReconstruction928(blocks, translations, issues, pla
 function finalIssueWeight927(issue) {
   const reasons = (issue?.reasons || []).map(x => String(x || ""));
   const joined = reasons.join(" | ");
-  if (/GENDER|MEANING_INTEGRITY|FINAL_MIXED_SCRIPT_CONFUSABLE|NEGATION|CUE_OWNERSHIP|OMISSION|REFERENT|DIALOGUE|CENSOR|BLEEP|GARBAGE|EMPTY|SDH_RESIDUE|SPEAKER_LABEL_RESIDUE|REPETITION_LOST|IDENTITY/i.test(joined)) return 100;
+  if (/GENDER|MEANING_INTEGRITY|FINAL_MIXED_SCRIPT_CONFUSABLE|NEGATION|CUE_OWNERSHIP|OMISSION|REFERENT|DIALOGUE|CENSOR|BLEEP|GARBAGE|EMPTY|SDH_RESIDUE|SOURCE_SDH_PROVENANCE_986|SPEAKER_LABEL_RESIDUE|REPETITION_LOST|IDENTITY/i.test(joined)) return 100;
   if (/LITERALITY|FORCED_OR_DATED_SLANG|SUBTITLE_TOO_DENSE|POSSIBLE_UNTRANSLATED/i.test(joined)) return 25;
   return /FINAL_PRIORITY/i.test(joined) ? 60 : 40;
 }
@@ -24377,6 +24704,14 @@ const ownershipClosure984 = await applyCanonicalOwnershipClosure984(
 finalTranslations = ownershipClosure984.translations;
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
+// 9.8.6 — SOURCE provenance is authoritative for pure SDH/action captions.
+finalTranslations = applySourceSdhProvenance986(
+  blocks,
+  finalTranslations,
+  job
+);
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+
 // 9.8.5 — do not stop merely because a final gate found a blocker.
 // Switch correction strategy, revalidate, and continue toward zero.
 const canonicalZero985 = await applyCanonicalZeroResidualClosure985(
@@ -24389,6 +24724,16 @@ const canonicalZero985 = await applyCanonicalZeroResidualClosure985(
   plan
 );
 finalTranslations = canonicalZero985.translations;
+finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
+
+// 9.8.6 — authoritative postcondition after ALL previous rewrites/closures.
+const finalSourceSemantic986 = await applyFinalSourceSemanticSeal986(
+  blocks,
+  finalTranslations,
+  plan,
+  job
+);
+finalTranslations = finalSourceSemantic986.translations;
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
 let finalClosure898 = finalClosureResidualSummary898(
@@ -24583,7 +24928,8 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
     Number(job.globalOwnershipResidual977 || 0) === 0 &&
     Number(job.canonicalZeroResidual985 || 0) === 0 &&
     Number(job.canonicalSdhResidual985 || 0) === 0 &&
-    Number(job.canonicalOwnershipResidual985 || 0) === 0;
+    Number(job.canonicalOwnershipResidual985 || 0) === 0 &&
+    Number(job.finalSourceSemanticResidual986 || 0) === 0;
 
   if (finalHardClosureClean931 && semanticResidual927 === 0) {
     const semanticFallbackCount983 = Array.isArray(job.semanticFallbackTelemetry983)
@@ -24600,7 +24946,7 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
       : "canonical";
 
     console.log(
-      `[PIPELINE 9.8.5 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.8.6 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -27408,7 +27754,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.5 - ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.6 - FINAL SOURCE SEMANTIC SEAL + SOURCE-SDH PROVENANCE + SHORT OWNERSHIP + ZERO-RESIDUAL CANONICAL CONVERGENCE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -27687,6 +28033,9 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
+console.log("Final SOURCE Semantic Seal 9.8.6: auditoria SOURCE×FINAL completa ocorre APÓS todas as rewrites; falha volta para Repair focal e reauditoria ✅");
+console.log("SOURCE SDH Provenance 9.8.6: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Short Ownership 9.8.6: frases curtas também detectam transplant/early-reveal por vizinhança; thresholds antigos de texto longo não se aplicam ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
