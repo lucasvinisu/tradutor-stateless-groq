@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.7 - CONSENSUS FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.8 - CONSENSUS PROOF LEDGER + LATE POST-CLOSURE RESCUE + CONSENSUS FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -156,7 +156,7 @@ const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
 const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
 
 const CACHE_VERSION =
-  "9.8.7-consensus-final-source-semantic-seal-v1";
+  "9.8.8-consensus-proof-ledger-late-closure-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -16359,6 +16359,23 @@ async function finalSourceSemanticAudit987(blocks, translations, plan, job, focu
       .map(([id]) => id)
   );
 
+  // 9.8.8 CONSENSUS PROOF LEDGER:
+  // If a candidate received the full 2-of-3 semantic process and did NOT
+  // reach two votes, that exact current text has a hash-bound clean proof.
+  // Older pre-Repair semantic blockers must never resurrect later merely
+  // because the text stayed byte-identical.
+  const consensusClearedIds988 = new Set(
+    [...candidateIds].filter(id => !confirmedIds.has(Number(id)))
+  );
+  if (consensusClearedIds988.size) {
+    recordSemanticCleanProof974(
+      job,
+      translations,
+      consensusClearedIds988,
+      "final-source-consensus-9.8.8"
+    );
+  }
+
   const semanticMerged = mergeIssueLists(first, second, third)
     .filter(issue => confirmedIds.has(Number(issue?.id)));
 
@@ -24883,23 +24900,120 @@ if (finalClosure898.gender > 0) {
   job.noCacheFinal923 = true;
 }
 
-// 9.6.0 POST-CLOSURE DETERMINISTIC RECHECK.
-// Fechamentos locais podem alterar texto depois do gate anterior; reavaliamos
-// somente invariantes determinísticos. ZERO Gemini, ZERO nova rewrite.
+// 9.8.8 POST-CLOSURE ZERO-RESIDUAL RECHECK.
+// The full SOURCE×FINAL seal already passed. A late deterministic blocker may
+// be either (a) stale semantic state, now cleared by hash-bound consensus proof,
+// or (b) a genuinely new local regression. Case (b) gets at most two focal
+// repair+revalidation passes. No open loop and no global re-audit cascade.
 {
-  const postResidual960 = deterministicFinalResidual960(
+  let postResidual960 = deterministicFinalResidual960(
     blocks,
     finalTranslations,
     job,
     plan
   );
+
+  for (
+    let latePass988 = 1;
+    postResidual960.length && latePass988 <= 2;
+    latePass988++
+  ) {
+    const before988 = new Map(finalTranslations);
+    const repairIssues988 = postResidual960.map(issue => ({
+      id:Number(issue?.id),
+      reasons:[
+        ...(Array.isArray(issue?.reasons) ? issue.reasons : []),
+        `FINAL_PRIORITY:POST_CLOSURE_988_PASS_${latePass988}: corrija SOMENTE o cue atual com fidelidade à SOURCE; vizinhos são contexto; preserve ownership, registro, força pragmática e layout.`
+      ]
+    }));
+
+    console.warn(
+      `[POST-CLOSURE RESCUE 9.8.8] pass=${latePass988} | residual-before=${postResidual960.length} | ` +
+      `alvos=${repairIssues988.length}.`
+    );
+
+    finalTranslations = await runFinalPriorityEscalatedRepair(
+      blocks,
+      finalTranslations,
+      repairIssues988,
+      plan,
+      job
+    );
+    finalTranslations = applySourceSdhProvenance986(
+      blocks,
+      finalTranslations,
+      job
+    );
+    finalTranslations = sanitizeTranslationMap(
+      blocks,
+      finalTranslations,
+      job
+    );
+
+    const changedIds988 = new Set();
+    for (const block of blocks) {
+      const id = Number(block?.index);
+      if (
+        semanticTextKey940(before988.get(id)) !==
+        semanticTextKey940(finalTranslations.get(id))
+      ) {
+        changedIds988.add(id);
+      }
+    }
+
+    const focus988 = idsFromIssues(
+      postResidual960,
+      blocks,
+      2
+    );
+    for (const id of changedIds988) focus988.add(id);
+
+    let semanticAfter988 = [];
+    if (focus988.size) {
+      semanticAfter988 = await finalSourceSemanticAudit987(
+        blocks,
+        finalTranslations,
+        plan,
+        job,
+        focus988
+      );
+    }
+
+    const deterministicAfter988 = deterministicFinalResidual960(
+      blocks,
+      finalTranslations,
+      job,
+      plan
+    );
+
+    postResidual960 = mergeIssueLists(
+      deterministicAfter988,
+      semanticAfter988
+    );
+
+    console.log(
+      `[POST-CLOSURE RESCUE 9.8.8] pass=${latePass988} | changed=${changedIds988.size} | ` +
+      `semantic-after=${semanticAfter988.length} | deterministic-after=${deterministicAfter988.length} | ` +
+      `residual-after=${postResidual960.length}.`
+    );
+  }
+
   const semanticHard987 = Array.isArray(job.finalSourceSemanticIssues986)
     ? job.finalSourceSemanticIssues986
     : [];
+
+  // If post-closure repair changed a cue, the focal semantic consensus above
+  // becomes the current authority for that changed region.
+  if (!postResidual960.length) {
+    job.finalSourceSemanticResidual986 = 0;
+    job.finalSourceSemanticIssues986 = [];
+  }
+
   job.finalTargetResidual927 = mergeIssueLists(
     postResidual960,
     semanticHard987
   );
+
   job.finalTargetResidualSnapshot9210 = new Map(
     job.finalTargetResidual927.map(issue => [
       Number(issue?.id),
@@ -24908,32 +25022,34 @@ if (finalClosure898.gender > 0) {
   );
 
   if (postResidual960.length) {
-
-    for (
-      const issue of
-        postResidual960.slice(
-          0,
-          24
-        )
-    ) {
+    for (const issue of postResidual960.slice(0, 24)) {
       console.error(
-        `[POST-CLOSURE RESIDUAL 9.7.4] cue=${Number(issue?.id)} | ` +
+        `[POST-CLOSURE RESIDUAL 9.8.8] cue=${Number(issue?.id)} | ` +
         `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
       );
     }
-
-    job.qualityStatus =
-      "best_available";
+    job.qualityStatus = "best_available";
     job.noCacheFinal923 = true;
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.7.4] residual=${postResidual960.length} | selo bloqueado sem nova chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.8.8] residual=${postResidual960.length} | ` +
+      `duas estratégias focais esgotadas; fail-closed.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.7.4] residual=0 ✅ | 0 chamada cloud.`
+      `[POST-CLOSURE DETERMINISTIC 9.8.8] residual=0 ✅ | consenso hash-bound + rescue focal bounded.`
     );
   }
+
+  // Any accepted late rewrite can affect deterministic summary fields.
+  finalClosure898 = finalClosureResidualSummary898(
+    blocks,
+    finalTranslations,
+    job.filename,
+    plan,
+    job.semanticFallbackCovered983
+  );
 }
+
 
 // 9.8.3 — issues cobertos pelo fallback seletivo continuam visíveis em
 // telemetria, mas não derrubam o episódio. Somente famílias estruturais
@@ -27898,7 +28014,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.7 - CONSENSUS SOURCE SEMANTIC SEAL + SOURCE-SDH PROVENANCE + SHORT OWNERSHIP CONFIRMATION + ZERO-RESIDUAL CANONICAL CONVERGENCE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.8 - CONSENSUS PROOF LEDGER + LATE POST-CLOSURE RESCUE + SOURCE SEMANTIC SEAL | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -28177,9 +28293,10 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-console.log("Final SOURCE Semantic Seal 9.8.7: SOURCE×FINAL usa consenso 2-de-3; short-ownership sozinho é candidato, nunca veredito; residual confirmado recebe rescue final ✅");
-console.log("SOURCE SDH Provenance 9.8.7: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
-console.log("Short Ownership 9.8.7: frases curtas também detectam transplant/early-reveal por vizinhança; thresholds antigos de texto longo não se aplicam ✅");
+console.log("Final SOURCE Semantic Seal 9.8.8: SOURCE×FINAL usa consenso 2-de-3; candidatos limpos ganham proof hash-bound; residual confirmado recebe rescue final ✅");
+console.log("Post-Closure Zero-Residual 9.8.8: residual tardio recebe até 2 repairs focais + revalidação; stale blocker com proof hash-bound não ressuscita ✅");
+console.log("SOURCE SDH Provenance 9.8.8: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Short Ownership 9.8.8: frases curtas selecionam candidatos; somente consenso semântico pode torná-las HARD ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
