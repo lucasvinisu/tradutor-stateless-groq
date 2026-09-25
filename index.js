@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.6 - FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.8.7 - CONSENSUS FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -156,7 +156,7 @@ const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
 const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
 
 const CACHE_VERSION =
-  "9.8.6-final-source-semantic-seal-v1";
+  "9.8.7-consensus-final-source-semantic-seal-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -16289,29 +16289,108 @@ function shortBoundaryOwnershipIssues986(blocks, translations) {
     .sort((a,b)=>a.id-b.id);
 }
 
-async function finalSourceSemanticAudit986(blocks, translations, plan, job, focusIds = null) {
-  const semantic = await scanFinalPriorityAudit(
+async function finalSourceSemanticAudit987(blocks, translations, plan, job, focusIds = null) {
+  const shortOwnershipAll = shortBoundaryOwnershipIssues986(blocks, translations);
+  const sdhAll = finalSdhHardIssues985(blocks, translations);
+
+  const scopedShort = focusIds instanceof Set
+    ? shortOwnershipAll.filter(issue => focusIds.has(Number(issue?.id)))
+    : shortOwnershipAll;
+
+  const scopedSdh = focusIds instanceof Set
+    ? sdhAll.filter(issue => focusIds.has(Number(issue?.id)))
+    : sdhAll;
+
+  // 9.8.7 CONSENSUS LAW:
+  // A probabilistic semantic finding is HARD only when it is reproduced.
+  // Short-ownership heuristic NEVER votes by itself; it only selects candidates
+  // for two focused semantic confirmations. This prevents a deterministic
+  // similarity heuristic from overruling repeated clean SOURCE×PT audits.
+  const first = await scanFinalPriorityAudit(
     blocks,
     translations,
     plan,
     job,
     focusIds
   );
-  const shortOwnership = shortBoundaryOwnershipIssues986(blocks, translations);
-  const sdh = finalSdhHardIssues985(blocks, translations);
 
-  const scopedShort = focusIds instanceof Set
-    ? shortOwnership.filter(issue => focusIds.has(Number(issue?.id)))
-    : shortOwnership;
+  const candidateIds = new Set(
+    [
+      ...first.map(x => Number(x?.id)),
+      ...scopedShort.map(x => Number(x?.id))
+    ].filter(Number.isInteger)
+  );
 
-  const scopedSdh = focusIds instanceof Set
-    ? sdh.filter(issue => focusIds.has(Number(issue?.id)))
-    : sdh;
+  let second = [];
+  let third = [];
 
-  return mergeIssueLists(semantic, scopedShort, scopedSdh);
+  if (candidateIds.size) {
+    second = await scanFinalPriorityAudit(
+      blocks,
+      translations,
+      plan,
+      job,
+      candidateIds
+    );
+    third = await scanFinalPriorityAudit(
+      blocks,
+      translations,
+      plan,
+      job,
+      candidateIds
+    );
+  }
+
+  const voteCount = new Map();
+  for (const list of [first, second, third]) {
+    const seen = new Set();
+    for (const issue of Array.isArray(list) ? list : []) {
+      const id = Number(issue?.id);
+      if (!Number.isInteger(id) || seen.has(id)) continue;
+      seen.add(id);
+      voteCount.set(id, Number(voteCount.get(id) || 0) + 1);
+    }
+  }
+
+  // Two semantic votes are required. The heuristic itself does not count.
+  const confirmedIds = new Set(
+    [...voteCount.entries()]
+      .filter(([, votes]) => votes >= 2)
+      .map(([id]) => id)
+  );
+
+  const semanticMerged = mergeIssueLists(first, second, third)
+    .filter(issue => confirmedIds.has(Number(issue?.id)));
+
+  const confirmedShort = scopedShort
+    .filter(issue => confirmedIds.has(Number(issue?.id)));
+
+  const advisoryShort = scopedShort
+    .filter(issue => !confirmedIds.has(Number(issue?.id)));
+
+  if (candidateIds.size || advisoryShort.length) {
+    console.log(
+      `[FINAL SOURCE CONSENSUS 9.8.7] scope=${focusIds instanceof Set ? "focal" : "full"} | ` +
+      `semantic-first=${first.length} | candidates=${candidateIds.size} | ` +
+      `confirmed=${confirmedIds.size} | short-advisory-cleared=${advisoryShort.length}.`
+    );
+  }
+
+  if (advisoryShort.length && job?.stats) {
+    job.stats.shortOwnershipAdvisoryCleared987 =
+      Number(job.stats.shortOwnershipAdvisoryCleared987 || 0) +
+      advisoryShort.length;
+  }
+
+  return mergeIssueLists(
+    semanticMerged,
+    confirmedShort,
+    scopedSdh
+  );
 }
 
-async function applyFinalSourceSemanticSeal986(
+
+async function applyFinalSourceSemanticSeal987(
   blocks,
   translations,
   plan,
@@ -16320,7 +16399,7 @@ async function applyFinalSourceSemanticSeal986(
   let out = applySourceSdhProvenance986(blocks, new Map(translations), job);
   out = sanitizeTranslationMap(blocks, out, job);
 
-  let issues = await finalSourceSemanticAudit986(
+  let issues = await finalSourceSemanticAudit987(
     blocks,
     out,
     plan,
@@ -16329,7 +16408,7 @@ async function applyFinalSourceSemanticSeal986(
   );
 
   console.log(
-    `[FINAL SOURCE SEMANTIC SEAL 9.8.6] auditoria completa inicial | residual=${issues.length}.`
+    `[FINAL SOURCE SEMANTIC SEAL 9.8.7] auditoria completa inicial | residual=${issues.length}.`
   );
 
   for (
@@ -16370,7 +16449,7 @@ async function applyFinalSourceSemanticSeal986(
     const focus = idsFromIssues(issues, blocks, 2);
     for (const id of changed) focus.add(id);
 
-    issues = await finalSourceSemanticAudit986(
+    issues = await finalSourceSemanticAudit987(
       blocks,
       out,
       plan,
@@ -16379,7 +16458,7 @@ async function applyFinalSourceSemanticSeal986(
     );
 
     console.log(
-      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] cycle=${cycle} | before=${beforeCount} | ` +
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.7] cycle=${cycle} | before=${beforeCount} | ` +
       `changed=${changed.size} | focal-after=${issues.length}.`
     );
 
@@ -16412,7 +16491,7 @@ async function applyFinalSourceSemanticSeal986(
         );
 
         const trial = applySourceSdhProvenance986(blocks, candidate, job);
-        const audit = await finalSourceSemanticAudit986(
+        const audit = await finalSourceSemanticAudit987(
           blocks,
           trial,
           plan,
@@ -16424,7 +16503,7 @@ async function applyFinalSourceSemanticSeal986(
           out = trial;
           issues = issues.filter(x => Number(x?.id) !== id);
           console.warn(
-            `[FINAL SOURCE SEMANTIC SEAL 9.8.6] cue=${id} isolated pass=${pass} PASSOU ✅`
+            `[FINAL SOURCE SEMANTIC SEAL 9.8.7] cue=${id} isolated pass=${pass} PASSOU ✅`
           );
           break;
         }
@@ -16434,18 +16513,65 @@ async function applyFinalSourceSemanticSeal986(
     // Recompute focal residual after isolated strategy.
     const remainingFocus = idsFromIssues(issues, blocks, 2);
     issues = remainingFocus.size
-      ? await finalSourceSemanticAudit986(blocks, out, plan, job, remainingFocus)
+      ? await finalSourceSemanticAudit987(blocks, out, plan, job, remainingFocus)
       : [];
   }
 
   // Mandatory final FULL episode audit after all repairs/rollbacks.
-  const fullFinal = await finalSourceSemanticAudit986(
+  let fullFinal = await finalSourceSemanticAudit987(
     blocks,
     out,
     plan,
     job,
     null
   );
+
+  // 9.8.7: a newly-confirmed issue discovered only by the final full sweep
+  // gets a real correction opportunity instead of becoming an immediate
+  // terminal failure. Two rescue rounds are enough because every residual
+  // here already passed 2-of-3 semantic consensus.
+  for (let finalRescue987 = 1; fullFinal.length && finalRescue987 <= 2; finalRescue987++) {
+    const before987 = new Map(out);
+
+    out = await runFinalPriorityEscalatedRepair(
+      blocks,
+      out,
+      fullFinal.map(issue => ({
+        id:Number(issue?.id),
+        reasons:[
+          ...(Array.isArray(issue?.reasons) ? issue.reasons : []),
+          `FINAL_PRIORITY:SOURCE_FINAL_CONSENSUS_987_PASS_${finalRescue987}: use SOMENTE SOURCE deste id como conteúdo; vizinhos são contexto; elimine transplant/early-reveal/omissão sem alterar ownership.`
+        ]
+      })),
+      plan,
+      job
+    );
+
+    out = applySourceSdhProvenance986(blocks, out, job);
+    out = sanitizeTranslationMap(blocks, out, job);
+
+    let changed987 = 0;
+    for (const block of blocks) {
+      const id = Number(block?.index);
+      if (
+        semanticTextKey940(before987.get(id)) !==
+        semanticTextKey940(out.get(id))
+      ) changed987++;
+    }
+
+    fullFinal = await finalSourceSemanticAudit987(
+      blocks,
+      out,
+      plan,
+      job,
+      null
+    );
+
+    console.log(
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.7] final-rescue=${finalRescue987} | ` +
+      `changed=${changed987} | residual=${fullFinal.length}.`
+    );
+  }
 
   job.finalSourceSemanticResidual986 = fullFinal.length;
   job.finalSourceSemanticIssues986 = fullFinal;
@@ -16458,12 +16584,12 @@ async function applyFinalSourceSemanticSeal986(
     job.noCacheFinal923 = true;
     job.qualityStatus = "best_available";
     console.error(
-      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] HARD residual=${fullFinal.length} | ` +
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.7] HARD residual=${fullFinal.length} | ` +
       `ids=[${[...new Set(fullFinal.map(x=>Number(x?.id)).filter(Number.isInteger))].slice(0,40).join(",")}].`
     );
   } else {
     console.log(
-      `[FINAL SOURCE SEMANTIC SEAL 9.8.6] PASSOU ✅ | SOURCE×FINAL=0 | early-reveal=0 | transplant=0 | ` +
+      `[FINAL SOURCE SEMANTIC SEAL 9.8.7] PASSOU ✅ | SOURCE×FINAL=0 | early-reveal=0 | transplant=0 | ` +
       `omission=0 | residual-English=0 | source-SDH-visible=0.`
     );
   }
@@ -24727,7 +24853,7 @@ finalTranslations = canonicalZero985.translations;
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
 // 9.8.6 — authoritative postcondition after ALL previous rewrites/closures.
-const finalSourceSemantic986 = await applyFinalSourceSemanticSeal986(
+const finalSourceSemantic986 = await applyFinalSourceSemanticSeal987(
   blocks,
   finalTranslations,
   plan,
@@ -24767,9 +24893,15 @@ if (finalClosure898.gender > 0) {
     job,
     plan
   );
-  job.finalTargetResidual927 = postResidual960;
+  const semanticHard987 = Array.isArray(job.finalSourceSemanticIssues986)
+    ? job.finalSourceSemanticIssues986
+    : [];
+  job.finalTargetResidual927 = mergeIssueLists(
+    postResidual960,
+    semanticHard987
+  );
   job.finalTargetResidualSnapshot9210 = new Map(
-    postResidual960.map(issue => [
+    job.finalTargetResidual927.map(issue => [
       Number(issue?.id),
       String(finalTranslations.get(Number(issue?.id)) || "")
     ])
@@ -25266,6 +25398,18 @@ function startJob(job) {
   return job.promise;
 }
 
+function publicQualityStatus987(job) {
+  const internal = String(job?.qualityStatus || "pending");
+  const status = String(job?.status || "processing");
+  if (
+    status === "processing" &&
+    (internal === "final_pass" || internal === "cache_verified")
+  ) {
+    return "validating_final";
+  }
+  return internal;
+}
+
 function jobResponse(
   req,
   job
@@ -25280,7 +25424,7 @@ function jobResponse(
       job.status,
 
     qualityStatus:
-      job.qualityStatus,
+      publicQualityStatus987(job),
 
     residualBlockers:
       Array.isArray(job.finalTargetResidual927) ? job.finalTargetResidual927.length : 0,
@@ -27525,7 +27669,7 @@ app.get(
           job.status,
 
         qualityStatus:
-          job.qualityStatus,
+          publicQualityStatus987(job),
 
         sourceKind:
           job.sourceKind,
@@ -27754,7 +27898,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.6 - FINAL SOURCE SEMANTIC SEAL + SOURCE-SDH PROVENANCE + SHORT OWNERSHIP + ZERO-RESIDUAL CANONICAL CONVERGENCE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.8.7 - CONSENSUS SOURCE SEMANTIC SEAL + SOURCE-SDH PROVENANCE + SHORT OWNERSHIP CONFIRMATION + ZERO-RESIDUAL CANONICAL CONVERGENCE | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -28033,9 +28177,9 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-console.log("Final SOURCE Semantic Seal 9.8.6: auditoria SOURCE×FINAL completa ocorre APÓS todas as rewrites; falha volta para Repair focal e reauditoria ✅");
-console.log("SOURCE SDH Provenance 9.8.6: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
-console.log("Short Ownership 9.8.6: frases curtas também detectam transplant/early-reveal por vizinhança; thresholds antigos de texto longo não se aplicam ✅");
+console.log("Final SOURCE Semantic Seal 9.8.7: SOURCE×FINAL usa consenso 2-de-3; short-ownership sozinho é candidato, nunca veredito; residual confirmado recebe rescue final ✅");
+console.log("SOURCE SDH Provenance 9.8.7: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Short Ownership 9.8.7: frases curtas também detectam transplant/early-reveal por vizinhança; thresholds antigos de texto longo não se aplicam ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
