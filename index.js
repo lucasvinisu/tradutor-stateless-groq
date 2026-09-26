@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.9.1 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA + JUSTIFIED LAYOUT EXCEPTIONS + IMMUTABLE TIMELINE (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.9.2 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA + JUSTIFIED LAYOUT EXCEPTIONS + IMMUTABLE TIMELINE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -156,7 +156,7 @@ const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
 const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
 
 const CACHE_VERSION =
-  "9.9.1-shared-decision-ledger-bounded-production-v1";
+  "9.9.2-shared-decision-ledger-layout-consensus-fastcompact-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -404,7 +404,7 @@ const COMPACT_RESCUE_TARGET_TOTAL_CHARS = 96;
 // semântica independente antes de devolver qualquer mudança.
 const TIMING_COMPACT_MAX_ITEMS_928 = 48;
 const TIMING_COMPACT_MAX_CHARS_928 = 48000;
-const TIMING_COMPACT_THINKING_928 = "high";
+const TIMING_COMPACT_THINKING_928 = "medium";
 const TIMING_COMPACT_MAX_OUTPUT_TOKENS_928 = 14000;
 
 // ============================================================
@@ -16010,11 +16010,11 @@ async function applyCanonicalOwnershipClosure984(
   job.canonicalOwnershipResidual984 = issues.length;
   if (issues.length) {
     console.warn(
-      `[OWNERSHIP HANDOFF 9.9.1] candidatos=${issues.length} | ` +
+      `[OWNERSHIP HANDOFF 9.9.2] candidatos=${issues.length} | ` +
       `0 rodada cloud separada; delegados à Shared Decision Conference.`
     );
   } else {
-    console.log(`[OWNERSHIP HANDOFF 9.9.1] residual=0 ✅ | 0 cloud.`);
+    console.log(`[OWNERSHIP HANDOFF 9.9.2] residual=0 ✅ | 0 cloud.`);
   }
 
   return { translations: out, issues };
@@ -16673,12 +16673,12 @@ async function applyCanonicalZeroResidualClosure985(
         focus
       );
       console.log(
-        `[DECISION DETECTOR 9.9.1] foco=${focus.size} | ` +
+        `[DECISION DETECTOR 9.9.2] foco=${focus.size} | ` +
         `semantic-flags=${semanticAfterCorrection.length} | auditoria única pós-correção.`
       );
     } catch (error) {
       console.warn(
-        `[DECISION DETECTOR 9.9.1] auditoria focal indisponível; ` +
+        `[DECISION DETECTOR 9.9.2] auditoria focal indisponível; ` +
         `guards objetivos + baseline seguro assumem autoridade | ${errorMessage(error).slice(0,220)}`
       );
     }
@@ -16795,18 +16795,18 @@ async function applyCanonicalZeroResidualClosure985(
   const exceptionCount = [...ledger.values()].filter(x => /exception|fallback|reaffirmed/i.test(String(x.status))).length;
 
   console.log(
-    `[SHARED DECISION LEDGER 9.9.1] decisions=${ledger.size} | exceptions/fallbacks=${exceptionCount} | ` +
+    `[SHARED DECISION LEDGER 9.9.2] decisions=${ledger.size} | exceptions/fallbacks=${exceptionCount} | ` +
     `structural-residual=${structuralResidual.length} | cloud-cycles=1 | isolated-repair-loop=0.`
   );
 
   if (!structuralResidual.length) {
     console.log(
-      `[BOUNDED PRODUCTION CLOSURE 9.9.1] PASSOU ✅ | ownership=0 | SDH=0 | ` +
+      `[BOUNDED PRODUCTION CLOSURE 9.9.2] PASSOU ✅ | ownership=0 | SDH=0 | ` +
       `semantic re-litigation bloqueada por hash-bound ledger.`
     );
   } else {
     console.error(
-      `[BOUNDED PRODUCTION CLOSURE 9.9.1] structural-residual=${structuralResidual.length} | ` +
+      `[BOUNDED PRODUCTION CLOSURE 9.9.2] structural-residual=${structuralResidual.length} | ` +
       `sem loop adicional; final seals decidirão usando o melhor baseline íntegro.`
     );
   }
@@ -20733,6 +20733,13 @@ async function runCompactRescue(
     `overflow restante=${remaining.length}.`
   );
 
+  // 9.9.2: persist only the cue IDs that already exhausted the dedicated
+  // compactor. A later validator may accept a bounded visual exception for
+  // these cues without reopening another cloud correction loop.
+  job.compactRescueExhaustedIds992 = new Set(
+    remaining.map(issue => Number(issue?.id)).filter(Number.isInteger)
+  );
+
   return updated;
 }
 
@@ -23726,6 +23733,8 @@ function hasSemanticCleanProof974(
 // and SOURCE-bound context; the resulting text/hash becomes an explicit
 // decision. Later validators may reopen it ONLY for a new objective regression.
 const DELIVERY_LAYOUT_SOFT_MAX_CHARS_990 = 60;
+const DELIVERY_LAYOUT_EXHAUSTED_MAX_CHARS_992 = 80;
+const DELIVERY_LAYOUT_MAX_EXCEPTION_CUES_992 = 4;
 const DELIVERY_LEDGER_MAX_FOCUS_990 = 240;
 
 function decisionLedger990(job) {
@@ -23767,13 +23776,22 @@ function absoluteStructuralReason990(reason) {
   );
 }
 
-function layoutExceptionEligible990(block, value) {
+function layoutExceptionEligible990(block, value, job = null) {
   const text = String(value || "").replace(/\r/g, "").trim();
   if (!text) return false;
   const lines = text.split("\n").map(x => x.trim()).filter(Boolean);
   if (!lines.length || lines.length > 2) return false;
   const maxLine = Math.max(...lines.map(line => [...line].length));
-  return maxLine <= DELIVERY_LAYOUT_SOFT_MAX_CHARS_990;
+
+  if (maxLine <= DELIVERY_LAYOUT_SOFT_MAX_CHARS_990) return true;
+
+  const id = Number(block?.index);
+  const exhausted = Boolean(
+    job?.compactRescueExhaustedIds992 instanceof Set &&
+    job.compactRescueExhaustedIds992.has(id)
+  );
+
+  return exhausted && maxLine <= DELIVERY_LAYOUT_EXHAUSTED_MAX_CHARS_992;
 }
 
 function filterIssuesThroughDecisionLedger990(blocks, translations, issues, job) {
@@ -23795,7 +23813,7 @@ function filterIssuesThroughDecisionLedger990(blocks, translations, issues, job)
       const reason = String(raw || "");
       if (!reason) continue;
 
-      if (/SUBTITLE_TOO_DENSE|LAYOUT/i.test(reason) && layoutExceptionEligible990(block, value)) {
+      if (/SUBTITLE_TOO_DENSE|LAYOUT/i.test(reason) && layoutExceptionEligible990(block, value, job)) {
         acceptedLayout.add(id);
         recordDecision990(
           job, id, value, decision?.status || "layout_exception",
@@ -23856,7 +23874,7 @@ async function onePassDecisionRepair990(
   }
 
   console.warn(
-    `[DECISION CONFERENCE 9.9.1] alvos=${unique.length} | lotes=${batches.length} | ` +
+    `[DECISION CONFERENCE 9.9.2] alvos=${unique.length} | lotes=${batches.length} | ` +
     `concorrência=${Math.min(REPAIR_CONCURRENCY, batches.length)} | UMA rodada sem micro-loop.`
   );
 
@@ -23877,13 +23895,13 @@ async function onePassDecisionRepair990(
           job
         );
         console.log(
-          `[DECISION CONFERENCE 9.9.1 W${workerId}] lote=${at+1}/${batches.length} ` +
+          `[DECISION CONFERENCE 9.9.2 W${workerId}] lote=${at+1}/${batches.length} ` +
           `retornado=${results[at]?.translations?.size || 0}/${batch.length}.`
         );
       } catch (error) {
         results[at] = { translations:new Map(), unresolvedIds:batch.map(x=>Number(x.id)), rejected:new Map(), technicalFailed:true };
         console.warn(
-          `[DECISION CONFERENCE 9.9.1 W${workerId}] lote=${at+1} falhou tecnicamente; ` +
+          `[DECISION CONFERENCE 9.9.2 W${workerId}] lote=${at+1} falhou tecnicamente; ` +
           `baseline atual preservado | ${errorMessage(error).slice(0,220)}`
         );
       }
@@ -23945,21 +23963,29 @@ async function onePassDecisionRepair990(
 function applyDeliveryClosureExceptions990(blocks, translations, summary, job) {
   const adjusted = { ...(summary || {}) };
   let layoutExceptions = 0;
+  const layoutExceptionIds992 = [];
 
   for (const block of blocks) {
     const id = Number(block.index);
     const value = String(translations.get(id) || "");
     if (layoutCueResult(block, value).fits) continue;
-    if (!layoutExceptionEligible990(block, value)) continue;
+    if (!layoutExceptionEligible990(block, value, job)) continue;
+    if (layoutExceptions >= DELIVERY_LAYOUT_MAX_EXCEPTION_CUES_992) continue;
     layoutExceptions++;
     if (!(job.deliveryLayoutExceptionIds990 instanceof Set)) {
       job.deliveryLayoutExceptionIds990 = new Set();
     }
     job.deliveryLayoutExceptionIds990.add(id);
+    layoutExceptionIds992.push(id);
     recordDecision990(
       job, id, value, "layout_exception",
       ["SUBTITLE_TOO_DENSE"],
-      `2x50 é alvo; exceção aceita até 2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990} para preservar significado sem truncar.`
+      (
+        job?.compactRescueExhaustedIds992 instanceof Set &&
+        job.compactRescueExhaustedIds992.has(id)
+      )
+        ? `2x50 foi tentado e Compact Rescue já esgotou este cue; exceção bounded até 2x${DELIVERY_LAYOUT_EXHAUSTED_MAX_CHARS_992} preserva significado sem truncar.`
+        : `2x50 é alvo; exceção aceita até 2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990} para preservar significado sem truncar.`
     );
   }
 
@@ -23968,8 +23994,10 @@ function applyDeliveryClosureExceptions990(blocks, translations, summary, job) {
 
   if (layoutExceptions) {
     console.warn(
-      `[DELIVERY LAYOUT EXCEPTION 9.9.0] aceitas=${layoutExceptions} | ` +
-      `limite excepcional=2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990}; significado > compactação destrutiva.`
+      `[DELIVERY LAYOUT EXCEPTION 9.9.2] aceitas=${layoutExceptions} | ` +
+      `soft=2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990} | exhausted=2x${DELIVERY_LAYOUT_EXHAUSTED_MAX_CHARS_992} ` +
+      `(somente cues que já esgotaram Compact Rescue, máx=${DELIVERY_LAYOUT_MAX_EXCEPTION_CUES_992}) | ` +
+      `ids=[${layoutExceptionIds992.join(",")}]; significado > compactação destrutiva.`
     );
   }
   return adjusted;
@@ -24133,12 +24161,12 @@ async function runBoundedFinalQuality88(
 
   if (residual.length) {
     console.warn(
-      `[POST-REPAIR LOCAL HANDOFF 9.9.1] candidatos=${residual.length} | ` +
+      `[POST-REPAIR LOCAL HANDOFF 9.9.2] candidatos=${residual.length} | ` +
       `0 QA cloud / 0 Repair cloud nesta etapa; encaminhados à única Decision Conference.`
     );
   } else {
     console.log(
-      `[POST-REPAIR LOCAL HANDOFF 9.9.1] residual=0 ✅ | 0 QA cloud / 0 Repair cloud.`
+      `[POST-REPAIR LOCAL HANDOFF 9.9.2] residual=0 ✅ | 0 QA cloud / 0 Repair cloud.`
     );
   }
 
@@ -24357,7 +24385,7 @@ let qaIssues =
   let preClosureSemantic950 = [];
   if (preClosureFocus950.size) {
     console.log(
-      `[SHARED DECISION LEDGER 9.9.1] PRE-AUDIT probabilístico redundante dispensado | ` +
+      `[SHARED DECISION LEDGER 9.9.2] PRE-AUDIT probabilístico redundante dispensado | ` +
       `foco=${preClosureFocus950.size}; QA global + guards locais alimentam a única rodada de Repair. ✅`
     );
   }
@@ -24556,7 +24584,7 @@ finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 job.finalSourceSemanticResidual986 = 0;
 job.finalSourceSemanticIssues986 = [];
 console.log(
-  `[FINAL SOURCE SEMANTIC SEAL 9.9.1] delegado ao Shared Decision Ledger | ` +
+  `[FINAL SOURCE SEMANTIC SEAL 9.9.2] delegado ao Shared Decision Ledger | ` +
   `segunda auditoria global dispensada; somente novas regressões objetivas podem reabrir um cue. ✅`
 );
 
@@ -24620,12 +24648,12 @@ if (finalClosure898.gender > 0) {
 
   if (structural990.length) {
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.9.1] structural=${structural990.length} | ` +
+      `[POST-CLOSURE DETERMINISTIC 9.9.2] structural=${structural990.length} | ` +
       `sem cloud-loop; melhor baseline same-cue já foi tentado.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.9.1] residual=0 ✅ | ` +
+      `[POST-CLOSURE DETERMINISTIC 9.9.2] residual=0 ✅ | ` +
       `ledger compartilhado respeitado; 0 nova chamada cloud.`
     );
   }
@@ -24788,7 +24816,7 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
       : "canonical";
 
     console.log(
-      `[PIPELINE 9.9.1 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.9.2 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -24919,7 +24947,7 @@ async function processJob(
           Number(job.stats.deliveryFirstReleases990 || 0) + 1;
 
         console.warn(
-          `[DELIVERY FIRST 9.9.1] FINAL entregue ✅ | canonical-cache=NAO | ` +
+          `[DELIVERY FIRST 9.9.2] FINAL entregue ✅ | canonical-cache=NAO | ` +
           `motivo=excecao/quality residual; timestamps preservados; ` +
           `o usuário não fica sem legenda por disputa entre validadores.`
         );
@@ -25091,7 +25119,7 @@ async function processJob(
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
     job.stats.deliveryFirstReleases990 = Number(job.stats.deliveryFirstReleases990 || 0) + 1;
     console.warn(
-      `[DELIVERY FIRST 9.9.1] cloud/closure não chegou ao canonical, mas checkpoint íntegro ` +
+      `[DELIVERY FIRST 9.9.2] cloud/closure não chegou ao canonical, mas checkpoint íntegro ` +
       `foi ENTREGUE ✅ | label=${job.bestAvailableLabel927} | canonical-cache=NAO.`
     );
     return;
@@ -26076,7 +26104,7 @@ async function localTranslateHandler(
 }
 
 
-const TIMING_COMPACT_VARIANTS_940 = 5;
+const TIMING_COMPACT_VARIANTS_940 = 3;
 const TIMING_COMPACT_SCHEMA_928 = {
   type: "object",
   additionalProperties: false,
@@ -26183,7 +26211,7 @@ function timingCompactHardVisibleChars941(availableDisplayMs) {
 
 function timingCompactVariantCaps941(availableDisplayMs) {
   const hard = timingCompactHardVisibleChars941(availableDisplayMs);
-  const factors = [1.00, 0.94, 0.88, 0.82, 0.76];
+  const factors = [1.00, 0.88, 0.76];
   return factors.map(f => Math.max(3, Math.min(hard, Math.floor(hard * f))));
 }
 
@@ -26372,7 +26400,7 @@ async function timingAwareCompactSingle942(items) {
         `chosen_index deve ser o índice 0-based da PRIMEIRA candidata totalmente segura, ou -1 se nenhuma preservar integralmente significado, negação, referente, predicado/ação, identidade, ownership, registro/força e conteúdo.\n`+
         `Portanto escolha o texto MAIS CURTO que ainda seja semanticamente completo. Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
       user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after}))}),
-      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:12000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
     });
@@ -26512,7 +26540,7 @@ async function timingAwareCompactTurnAware943(items) {
         `Para itens com dialogue_turn_count > 1, rejeite qualquer candidata que funda, apague, reordene ou troque conteúdo entre turnos/speakers; cada turno precisa continuar semanticamente fiel ao correspondente SOURCE/PT.\n`+
         `Portanto escolha o texto MAIS CURTO que ainda seja semanticamente completo. Compactação idiomática é permitida; perda semântica não. Contexto é apenas contexto. JSON somente.`,
       user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:x.variants,before:x.before,after:x.after,dialogue_turn_count:x.dialogueTurnCount,source_turns:x.sourceTurns,current_pt_turns:x.ptTurns,turn_aware_rescue:x.turnAwareRescue}))}),
-      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:"high", maxOutputTokens:12000,
+      schema:TIMING_COMPACT_AUDIT_SCHEMA_928, thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:12000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
     });
@@ -26714,7 +26742,7 @@ async function timingAwareCompactNeedleSingle9434(items) {
         `Se não houver formulação fiel dentro do cap, devolva current_pt. JSON somente.`,
       user:JSON.stringify({cues:group}),
       schema:TIMING_COMPACT_NEEDLE_SCHEMA_9434,
-      thinkingLevel:"high", maxOutputTokens:6000,
+      thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:6000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"repair"
     });
@@ -26755,7 +26783,7 @@ async function timingAwareCompactNeedleSingle9434(items) {
         `chosen_index=0 somente se candidate_pts[0] for totalmente segura; senão -1. JSON somente.`,
       user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:[x.candidate],rejection_reason_previous:x.rejectionReason,before:x.before,after:x.after}))}),
       schema:TIMING_COMPACT_AUDIT_SCHEMA_928,
-      thinkingLevel:"high", maxOutputTokens:5000,
+      thinkingLevel:TIMING_COMPACT_THINKING_928, maxOutputTokens:5000,
       timeoutMs:60000, maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY], job:null, metric:"qa"
     });
@@ -26827,7 +26855,7 @@ async function timingAwareCompactSourceTurns9434(items) {
         `Não transfira palavras/sentido entre speakers. Não invente. Não altere timestamps. JSON somente.`,
       user:JSON.stringify({items:group}),
       schema:TIMING_COMPACT_SOURCE_TURNS_SCHEMA_9434,
-      thinkingLevel:"high",maxOutputTokens:7000,
+      thinkingLevel:TIMING_COMPACT_THINKING_928,maxOutputTokens:7000,
       timeoutMs:60000,maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],job:null,metric:"repair"
     });
@@ -26875,7 +26903,7 @@ async function timingAwareCompactSourceTurns9434(items) {
         `chosen_index=0 somente se a candidata preservar TODAS as falas na mesma ordem, sem fundir/trocar ownership e sem perda de significado, negação, modalidade, referente ou força pragmática. Caso contrário -1. JSON somente.`,
       user:JSON.stringify({items:group.map(x=>({i:x.i,source:x.source,before_pt:x.pt,candidate_pts:[x.candidate],before:x.before,after:x.after}))}),
       schema:TIMING_COMPACT_AUDIT_SCHEMA_928,
-      thinkingLevel:"high",maxOutputTokens:5000,
+      thinkingLevel:TIMING_COMPACT_THINKING_928,maxOutputTokens:5000,
       timeoutMs:60000,maxRetries:1,
       routeOverride:[GEMINI_MODELS.MAIN_FALLBACK,GEMINI_MODELS.MAIN_PRIMARY],job:null,metric:"qa"
     });
@@ -27647,7 +27675,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.9.1 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.9.2 - SHARED DECISION LEDGER + LAYOUT CONSENSUS + FAST TIMING COMPACT | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -27926,12 +27954,12 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-console.log("Shared Decision Ledger 9.9.1: Auditor aponta; Corretor SOURCE-bound decide; hash+rationale impedem re-litigation sem regressão objetiva ✅");
-console.log("Bounded Production Closure 9.9.1: 1 conferência de correção + 1 detector focal; zero canonical cycles / zero isolated repair loop ✅");
-console.log("SOURCE SDH Provenance 9.9.1: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
-console.log("Responsive QA 9.9.1: lotes menores + MEDIUM + concorrência 4; ownership curto seleciona candidato, não inicia loop ✅");
-console.log("Delivery First 9.9.1: residual de qualidade bloqueia cache canônico, NÃO bloqueia reprodução; melhor SRT íntegro sempre é entregue ✅");
-console.log("Canonical Contract 9.9.1: API publica canonicalEligible + deliveryMode para a Ponte não congelar provisional como canônico ✅");
+console.log("Shared Decision Ledger 9.9.2: Auditor aponta; Corretor SOURCE-bound decide; hash+rationale impedem re-litigation sem regressão objetiva ✅");
+console.log("Bounded Production Closure 9.9.2: 1 conferência de correção + 1 detector focal; zero canonical cycles / zero isolated repair loop ✅");
+console.log("SOURCE SDH Provenance 9.9.2: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Responsive QA 9.9.2: lotes menores + MEDIUM + concorrência 4; ownership curto seleciona candidato, não inicia loop ✅");
+console.log("Delivery First 9.9.2: residual de qualidade bloqueia cache canônico, NÃO bloqueia reprodução; melhor SRT íntegro sempre é entregue ✅");
+console.log("Canonical Contract 9.9.2: API publica canonicalEligible + deliveryMode para a Ponte não congelar provisional como canônico ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
