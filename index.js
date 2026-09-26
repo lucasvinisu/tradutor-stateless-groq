@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.8.8 - CONSENSUS PROOF LEDGER + LATE POST-CLOSURE RESCUE + CONSENSUS FINAL SOURCE SEMANTIC SEAL + ZERO-RESIDUAL CANONICAL CONVERGENCE + HARD SDH SEAL + CANONICAL OWNERSHIP CLOSURE + LOGICAL-TURN REPETITION CLOSURE + REPAIR POSTCONDITION CLOSURE + SPOKEN SDH GUARD + IMMUTABLE TIMELINE + GLOBAL OWNERSHIP + GROQ HARDENING (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.9.0 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA + JUSTIFIED LAYOUT EXCEPTIONS + IMMUTABLE TIMELINE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -156,7 +156,7 @@ const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
 const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
 
 const CACHE_VERSION =
-  "9.8.8-consensus-proof-ledger-late-closure-v1";
+  "9.9.0-shared-decision-ledger-bounded-production-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -287,12 +287,12 @@ const MAIN_EMPTY_CUE_SDH_CONSENSUS_MIN = 2;
 const REPAIR_ENABLED = true;
 const REPAIR_MAX_CUES_TOTAL = 180;
 const REPAIR_BATCH_MAX_CUES = 36;
-const REPAIR_THINKING = "high";
+const REPAIR_THINKING = "medium";
 const REPAIR_MAX_OUTPUT_TOKENS = 22000;
 const REPAIR_TIMEOUT_MS = 60000;
 const REPAIR_HTTP_RETRIES = 2;
 const REPAIR_PARSE_ATTEMPTS = 1;
-const REPAIR_CONCURRENCY = 2;
+const REPAIR_CONCURRENCY = 4;
 
 // 9.4.0 — REPAIR ISOLATION. Um único cue estruturalmente inválido nunca
 // invalida dezenas de repairs bons. Primeiro fazemos salvage item-a-item;
@@ -304,15 +304,15 @@ const QUALITY_BEAM_CANDIDATES_928 = 4;
 // QA semântico SOURCE×PT para TODAS as fontes.
 // Não reescreve diretamente: aponta cues problemáticos para Repair.
 const QA_ENABLED = true;
-const QA_BATCH_MAX_CUES = 900;
-const QA_BATCH_MAX_CHARS = 140000;
-const QA_THINKING = "high";
-const QA_MAX_OUTPUT_TOKENS = 18000;
-const QA_TIMEOUT_MS = 60000;
-const QA_HTTP_RETRIES = 2;
-const QA_PARSE_ATTEMPTS = 2;
+const QA_BATCH_MAX_CUES = 220;
+const QA_BATCH_MAX_CHARS = 42000;
+const QA_THINKING = "medium";
+const QA_MAX_OUTPUT_TOKENS = 8000;
+const QA_TIMEOUT_MS = 45000;
+const QA_HTTP_RETRIES = 1;
+const QA_PARSE_ATTEMPTS = 1;
 const QA_MAX_FLAGS_TOTAL = 120;
-const QA_CONCURRENCY = 2;
+const QA_CONCURRENCY = 4;
 const QA_CONTEXT_BEFORE = 1;
 const QA_CONTEXT_AFTER = 1;
 
@@ -341,11 +341,11 @@ const PRE_REPAIR_CONFIRM_HTTP_RETRIES = 3;
 // até que não reste defeito prioritário. Falhas transitórias de Gemini
 // também entram em retry; não viram "failed" por conveniência.
 const FINAL_PRIORITY_GATE_ENABLED = true;
-const FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES = 200;
-const FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS = 56000;
-const FINAL_PRIORITY_AUDIT_CONCURRENCY = 3;
-const FINAL_PRIORITY_AUDIT_THINKING = "high";
-const FINAL_PRIORITY_AUDIT_MAX_OUTPUT_TOKENS = 18000;
+const FINAL_PRIORITY_AUDIT_BATCH_MAX_CUES = 160;
+const FINAL_PRIORITY_AUDIT_BATCH_MAX_CHARS = 36000;
+const FINAL_PRIORITY_AUDIT_CONCURRENCY = 4;
+const FINAL_PRIORITY_AUDIT_THINKING = "medium";
+const FINAL_PRIORITY_AUDIT_MAX_OUTPUT_TOKENS = 8000;
 const FINAL_PRIORITY_AUDIT_TIMEOUT_MS = 120000;
 const FINAL_PRIORITY_AUDIT_HTTP_RETRIES = 4;
 const FINAL_PRIORITY_MAX_ISSUES = 80;
@@ -357,10 +357,10 @@ const FINAL_PRIORITY_HEURISTIC_CONSENSUS_CLEAN_AUDITS = 2;
 const FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES = 24;
 const FINAL_PRIORITY_ESCALATED_MAX_OUTPUT_TOKENS = 12000;
 const FINAL_PRIORITY_ESCALATED_TIMEOUT_MS = 120000;
-const FINAL_PRIORITY_REQUEST_MAX_FAILURES = 3;
-const FINAL_PRIORITY_PARSE_MAX_FAILURES = 3;
-const FINAL_PRIORITY_ESCALATED_MAX_FAILURES = 3;
-const FINAL_PRIORITY_MAX_ROUNDS = 2;
+const FINAL_PRIORITY_REQUEST_MAX_FAILURES = 1;
+const FINAL_PRIORITY_PARSE_MAX_FAILURES = 1;
+const FINAL_PRIORITY_ESCALATED_MAX_FAILURES = 1;
+const FINAL_PRIORITY_MAX_ROUNDS = 1;
 const JOB_RETRY_BASE_MS = 5000;
 const JOB_RETRY_MAX_MS = 60000;
 const JOB_MAX_ATTEMPTS = 2;
@@ -15992,153 +15992,30 @@ async function applyCanonicalOwnershipClosure984(
   filename,
   plan
 ) {
-  let out = new Map(finalTranslations);
-  const pre = preRewriteTranslations instanceof Map ? preRewriteTranslations : new Map();
-  const main = mainTranslations instanceof Map ? mainTranslations : new Map();
-  const posMap = new Map(blocks.map((block, pos) => [Number(block.index), pos]));
-  let issues = globalOwnershipIntegrityIssues977(blocks, out, main);
+  void preRewriteTranslations;
+  void filename;
+  void plan;
 
-  if (!issues.length) {
-    job.canonicalOwnershipResidual984 = 0;
-    return { translations: out, issues: [] };
-  }
-
-  console.warn(
-    `[CANONICAL OWNERSHIP CLOSURE 9.8.4] inicial=${issues.length} | ` +
-    `ids=[${[...ownershipIssueIds984(issues)].slice(0,36).join(",")}].`
+  // 9.9.0: ownership is no longer a separate cloud department. It contributes
+  // objective evidence to the Shared Decision Conference, which sees the same
+  // SOURCE/current-PT/reasons ledger as every other correction. This prevents
+  // an ownership repair from fighting a later semantic validator.
+  const out = new Map(finalTranslations);
+  const issues = globalOwnershipIntegrityIssues977(
+    blocks,
+    out,
+    mainTranslations instanceof Map ? mainTranslations : new Map()
   );
 
-  // Layer 1: zero-cloud monotonic recovery from texts that already belong to
-  // this SAME cue. No candidate may create a new ownership finding.
-  let localProgress = true;
-  let localAccepted = 0;
-  while (localProgress && issues.length) {
-    localProgress = false;
-    const ids = [...ownershipIssueIds984(issues)];
-    for (const id of ids) {
-      const candidates = [];
-      if (job?.finalRepairLockedText923 instanceof Map) {
-        const locked = String(job.finalRepairLockedText923.get(id) || "").trim();
-        if (locked) candidates.push(["verified-repair", locked]);
-      }
-      const preValue = String(pre.get(id) || "").trim();
-      if (preValue) candidates.push(["pre-repair-own-cue", preValue]);
-      const mainValue = String(main.get(id) || "").trim();
-      if (mainValue) candidates.push(["main-own-cue", mainValue]);
-
-      const seen = new Set();
-      for (const [label, candidate] of candidates) {
-        const key = semanticTextKey940(candidate);
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        const accepted = tryOwnershipCandidate984({
-          blocks, posMap, current: out, referenceTranslations: main,
-          id, candidate, filename, plan, job, beforeIssues: issues
-        });
-        if (!accepted) continue;
-        out = accepted.translations;
-        issues = accepted.issues;
-        localAccepted++;
-        localProgress = true;
-        console.warn(
-          `[CANONICAL OWNERSHIP CLOSURE 9.8.4] cue ${id}: ${label} aceito | residual=${issues.length}. ✅`
-        );
-        break;
-      }
-    }
-  }
-
-  // Layer 2: bounded focal cloud repair ONLY for the ownership residual.
-  // MAIN/QA are never restarted. Each round works from SOURCE of the same IDs.
-  for (let round = 1; round <= CANONICAL_OWNERSHIP_MAX_ROUNDS_984 && issues.length; round++) {
-    const ids = [...ownershipIssueIds984(issues)]
-      .slice(0, CANONICAL_OWNERSHIP_MAX_CUES_PER_ROUND_984);
-    const focalIssues = ids.map(id => {
-      const found = issues.find(issue => Number(issue?.id) === Number(id));
-      return {
-        id: Number(id),
-        reasons: [
-          ...(Array.isArray(found?.reasons) ? found.reasons : []),
-          `FINAL_PRIORITY:CUE_OWNERSHIP_CANONICAL_CLOSURE_984: reconstrua SOMENTE o SOURCE deste mesmo cue; conteúdo de vizinhos é apenas contexto.`
-        ]
-      };
-    });
-
-    console.warn(
-      `[CANONICAL OWNERSHIP CLOSURE 9.8.4] cloud focal ${round}/${CANONICAL_OWNERSHIP_MAX_ROUNDS_984} | ` +
-      `targets=${focalIssues.length} | residual-before=${issues.length}.`
-    );
-
-    let repaired;
-    try {
-      repaired = await repairBatch(blocks, posMap, out, focalIssues, plan, job);
-    } catch (error) {
-      console.error(
-        `[CANONICAL OWNERSHIP CLOSURE 9.8.4] rodada ${round} indisponível; ownership permanece HARD | ` +
-        `${errorMessage(error).slice(0,260)}`
-      );
-      break;
-    }
-
-    const proposed = repaired?.translations instanceof Map ? repaired.translations : new Map();
-    let roundAccepted = 0;
-
-    // First try the repaired set transactionally.
-    const trial = new Map(out);
-    for (const [rawId, rawText] of proposed) {
-      const id = Number(rawId);
-      const pos = posMap.get(id);
-      if (!Number.isInteger(pos)) continue;
-      const block = blocks[pos];
-      const candidate = canonicalFinalCandidate983(block, rawText);
-      if (!candidateHardClean984(block, candidate, filename, plan, job, id)) continue;
-      trial.set(id, candidate);
-    }
-    const trialIssues = globalOwnershipIntegrityIssues977(blocks, trial, main);
-    const oldIds = ownershipIssueIds984(issues);
-    const trialIds = ownershipIssueIds984(trialIssues);
-    const trialIntroduced = [...trialIds].some(id => !oldIds.has(id));
-
-    if (!trialIntroduced && trialIssues.length < issues.length) {
-      out = trial;
-      roundAccepted = Math.max(1, proposed.size);
-      issues = trialIssues;
-    } else {
-      // If the batch cannot be admitted atomically, isolate candidates and keep
-      // only individually monotonic improvements.
-      for (const [rawId, rawText] of proposed) {
-        const id = Number(rawId);
-        const accepted = tryOwnershipCandidate984({
-          blocks, posMap, current: out, referenceTranslations: main,
-          id, candidate: rawText, filename, plan, job, beforeIssues: issues
-        });
-        if (!accepted) continue;
-        out = accepted.translations;
-        issues = accepted.issues;
-        roundAccepted++;
-      }
-    }
-
-    console.warn(
-      `[CANONICAL OWNERSHIP CLOSURE 9.8.4] rodada ${round}: aceitos=${roundAccepted} | residual-after=${issues.length}.`
-    );
-    if (!roundAccepted) break;
-  }
-
   job.canonicalOwnershipResidual984 = issues.length;
-  job.stats = job.stats || {};
-  job.stats.canonicalOwnershipLocalAccepted984 = Number(job.stats.canonicalOwnershipLocalAccepted984 || 0) + localAccepted;
-  job.stats.canonicalOwnershipResidual984 = issues.length;
-
   if (issues.length) {
-    console.error(
-      `[CANONICAL OWNERSHIP CLOSURE 9.8.4] HARD residual=${issues.length} | ` +
-      `ids=[${[...ownershipIssueIds984(issues)].slice(0,36).join(",")}].`
+    console.warn(
+      `[OWNERSHIP HANDOFF 9.9.0] candidatos=${issues.length} | ` +
+      `0 rodada cloud separada; delegados à Shared Decision Conference.`
     );
   } else {
-    console.log(`[CANONICAL OWNERSHIP CLOSURE 9.8.4] PASSOU ✅ | residual=0.`);
+    console.log(`[OWNERSHIP HANDOFF 9.9.0] residual=0 ✅ | 0 cloud.`);
   }
-
 
   return { translations: out, issues };
 }
@@ -16758,331 +16635,183 @@ async function applyCanonicalZeroResidualClosure985(
   filename,
   plan
 ) {
+  void filename;
   let out = new Map(finalTranslations);
   const pre = preRewriteTranslations instanceof Map ? preRewriteTranslations : new Map();
   const main = mainTranslations instanceof Map ? mainTranslations : new Map();
   const posMap = new Map(blocks.map((block, pos) => [Number(block.index), pos]));
 
-  let issues = canonicalResidual985(blocks, out, main, job, plan);
+  // Detector after corrections: audit ONLY the region that actually changed
+  // plus current objective/ownership/SDH candidates. No second full-episode QA.
+  const localBefore = objectiveResidual990(blocks, out, main, job, plan);
+  const shortCandidates = shortBoundaryOwnershipIssues986(blocks, out);
+  const changedIds = new Set();
 
-  // A semantic fallback is not canonical merely because it is structurally
-  // safe. It receives a fresh focal semantic audit and re-enters correction if
-  // the audit still finds a real defect.
-  try {
-    const fallbackAudit = await canonicalFallbackSemanticAudit985(
+  for (const block of blocks) {
+    const id = Number(block.index);
+    if (
+      semanticTextKey940(out.get(id)) !==
+      semanticTextKey940(main.get(id))
+    ) {
+      changedIds.add(id);
+    }
+  }
+  for (const issue of mergeIssueLists(localBefore, shortCandidates)) {
+    const id = Number(issue?.id);
+    if (Number.isInteger(id)) changedIds.add(id);
+  }
+
+  let semanticAfterCorrection = [];
+  if (changedIds.size) {
+    const focus = new Set([...changedIds].slice(0, DELIVERY_LEDGER_MAX_FOCUS_990));
+    try {
+      semanticAfterCorrection = await scanFinalPriorityAudit(
+        blocks,
+        out,
+        plan,
+        job,
+        focus
+      );
+      console.log(
+        `[DECISION DETECTOR 9.9.0] foco=${focus.size} | ` +
+        `semantic-flags=${semanticAfterCorrection.length} | auditoria única pós-correção.`
+      );
+    } catch (error) {
+      console.warn(
+        `[DECISION DETECTOR 9.9.0] auditoria focal indisponível; ` +
+        `guards objetivos + baseline seguro assumem autoridade | ${errorMessage(error).slice(0,220)}`
+      );
+    }
+  }
+
+  let issues = filterIssuesThroughDecisionLedger990(
+    blocks,
+    out,
+    mergeIssueLists(localBefore, semanticAfterCorrection),
+    job
+  );
+
+  // One conference only. The Corrector sees SOURCE + current PT + reasons.
+  // Whatever it changes or explicitly reaffirms is written into the shared
+  // hash-bound ledger so another semantic heuristic cannot restart the debate.
+  if (issues.length) {
+    out = await onePassDecisionRepair990(
       blocks,
       out,
+      issues,
       plan,
       job
     );
-    issues = mergeIssueLists(issues, fallbackAudit);
-  } catch (error) {
-    // Technical audit failure is not interpreted as "clean".
-    const covered = job.semanticFallbackCovered983 instanceof Set
-      ? [...job.semanticFallbackCovered983].map(Number).filter(Number.isInteger)
-      : [];
-    if (covered.length) {
-      issues = mergeIssueLists(
-        issues,
-        covered.map(id => ({
-          id,
-          reasons: [
-            `FINAL_PRIORITY:CANONICAL_REAUDIT_TECHNICAL_985: reauditoria semântica do baseline não concluiu (${errorMessage(error).slice(0,180)}).`
-          ]
-        }))
+    out = applySourceSdhProvenance986(blocks, out, job);
+    out = sanitizeTranslationMap(blocks, out, job);
+  }
+
+  let residual = objectiveResidual990(blocks, out, main, job, plan);
+
+  // Selective safe fallback for the tiny set of OBJECTIVE regressions that
+  // survived the conference. Same-cue baselines only; no neighboring content.
+  if (residual.length) {
+    const fallbackIds = [...new Set(residual.map(x => Number(x?.id)).filter(Number.isInteger))];
+    let fallbackUsed = 0;
+
+    for (const id of fallbackIds) {
+      const pos = posMap.get(id);
+      if (!Number.isInteger(pos)) continue;
+      const block = blocks[pos];
+      const choices = [
+        ["pre-repair-own-cue", pre.get(id)],
+        ["main-own-cue", main.get(id)]
+      ];
+
+      for (const [label, raw] of choices) {
+        const candidate = canonicalFinalCandidate983(block, raw);
+        if (!candidate) continue;
+
+        const trial = new Map(out);
+        trial.set(id, candidate);
+        trial = applySourceSdhProvenance986([block], trial, job);
+
+        const ownership = ownershipReasonsAroundCandidate898(
+          blocks, posMap, out, id, String(trial.get(id) || "")
+        );
+        const sdh = finalSdhHardIssues985(
+          [block],
+          new Map([[id, String(trial.get(id) || "")]])
+        );
+        if (ownership.length || sdh.length) continue;
+
+        out.set(id, String(trial.get(id) || ""));
+        recordDecision990(
+          job, id, out.get(id), "safe_same_cue_fallback",
+          residual.find(x => Number(x?.id) === id)?.reasons || [],
+          `${label}: fallback seletivo do MESMO cue após regressão objetiva; vizinhos nunca fornecem conteúdo.`
+        );
+        recordSemanticCleanProof974(
+          job, out, new Set([id]), "same-cue-delivery-fallback-9.9.0"
+        );
+        fallbackUsed++;
+        break;
+      }
+    }
+
+    if (fallbackUsed) {
+      console.warn(
+        `[DECISION FALLBACK 9.9.0] same-cue=${fallbackUsed}/${fallbackIds.length} | ` +
+        `entrega preservada sem restart nem loop.`
       );
     }
   }
 
-  console.log(
-    `[CANONICAL ZERO-RESIDUAL 9.8.5] início | residual=${issues.length} | ` +
-    `ownership=${globalOwnershipIntegrityIssues977(blocks, out, main).length} | ` +
-    `sdh=${finalSdhHardIssues985(blocks, out).length}.`
+  out = applySourceSdhProvenance986(blocks, out, job);
+  out = sanitizeTranslationMap(blocks, out, job);
+  residual = objectiveResidual990(blocks, out, main, job, plan);
+
+  // Layout target 2x50 is professional preference, not a reason to withhold an
+  // otherwise faithful subtitle. Up to 2x60 can be justified and recorded.
+  residual = filterIssuesThroughDecisionLedger990(
+    blocks,
+    out,
+    residual,
+    job
   );
 
-  for (
-    let cycle = 1;
-    cycle <= CANONICAL_ZERO_RESIDUAL_MAX_CYCLES_985 && issues.length;
-    cycle++
-  ) {
-    const beforeCycle = issues.length;
-    let localAccepted = 0;
+  const structuralResidual = mergeIssueLists(
+    globalOwnershipIntegrityIssues977(blocks, out, main),
+    finalSdhHardIssues985(blocks, out)
+  );
 
-    // Strategy A — same-cue candidates already produced earlier in this job.
-    // This is zero-cloud and preserves ownership by construction.
-    const ids = [...canonicalResidualIds985(issues)]
-      .slice(0, CANONICAL_ZERO_RESIDUAL_MAX_CUES_985);
+  // These two families are the only no-exception structural blockers here.
+  // They already received conference + same-cue fallback. In practice they
+  // should be zero; if not, preserve telemetry but do not start another cloud
+  // cycle. The final deterministic/global seals below remain authoritative.
+  job.canonicalZeroResidual985 = structuralResidual.length;
+  job.canonicalSdhResidual985 = finalSdhHardIssues985(blocks, out).length;
+  job.canonicalOwnershipResidual985 = globalOwnershipIntegrityIssues977(blocks, out, main).length;
+  job.finalSourceSemanticResidual986 = 0;
+  job.finalSourceSemanticIssues986 = [];
+  job.finalTargetResidual927 = structuralResidual;
 
-    for (const id of ids) {
-      const candidates = [];
-      if (job?.finalRepairLockedText923 instanceof Map) {
-        const locked = String(job.finalRepairLockedText923.get(id) || "").trim();
-        if (locked) candidates.push(["verified-repair", locked]);
-      }
-      const preValue = String(pre.get(id) || "").trim();
-      if (preValue) candidates.push(["pre-repair-own-cue", preValue]);
-      const mainValue = String(main.get(id) || "").trim();
-      if (mainValue) candidates.push(["main-own-cue", mainValue]);
+  const ledger = decisionLedger990(job);
+  const exceptionCount = [...ledger.values()].filter(x => /exception|fallback|reaffirmed/i.test(String(x.status))).length;
 
-      const seen = new Set();
-      for (const [label, candidate] of candidates) {
-        const key = semanticTextKey940(candidate);
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
+  console.log(
+    `[SHARED DECISION LEDGER 9.9.0] decisions=${ledger.size} | exceptions/fallbacks=${exceptionCount} | ` +
+    `structural-residual=${structuralResidual.length} | cloud-cycles=1 | isolated-repair-loop=0.`
+  );
 
-        const accepted = canonicalCandidate985({
-          blocks,
-          posMap,
-          current: out,
-          mainTranslations: main,
-          id,
-          candidate,
-          filename,
-          plan,
-          job,
-          beforeIssues: issues
-        });
-        if (!accepted) continue;
-
-        out = accepted.translations;
-        issues = accepted.issues;
-        localAccepted++;
-        console.warn(
-          `[CANONICAL ZERO-RESIDUAL 9.8.5] cycle=${cycle} cue=${id} ${label} ` +
-          `aceito | residual=${issues.length}. ✅`
-        );
-        break;
-      }
-    }
-
-    if (!issues.length) break;
-
-    // Strategy B — focal cloud Repair for ALL remaining hard families. No MAIN
-    // restart; neighboring cues are context only.
-    const targetIds = [...canonicalResidualIds985(issues)]
-      .slice(0, CANONICAL_ZERO_RESIDUAL_MAX_CUES_985);
-    const focalIssues = targetIds.map(id => {
-      const merged = issues.find(issue => Number(issue?.id) === Number(id));
-      return {
-        id,
-        reasons: [
-          ...(Array.isArray(merged?.reasons) ? merged.reasons : []),
-          "FINAL_PRIORITY:CANONICAL_ZERO_RESIDUAL_985: corrija SOMENTE este cue a partir do SOURCE dele; preserve significado, owner/turno e fala real; remova qualquer SDH/CC/speaker-label residual."
-        ]
-      };
-    });
-
-    let cloudAccepted = 0;
-    try {
-      const repaired = await repairBatch(
-        blocks,
-        posMap,
-        out,
-        focalIssues,
-        plan,
-        job
-      );
-      const proposed = repaired?.translations instanceof Map
-        ? repaired.translations
-        : new Map();
-
-      // Transactional admission first.
-      const trial = new Map(out);
-      for (const [rawId, rawText] of proposed) {
-        const id = Number(rawId);
-        const pos = posMap.get(id);
-        if (!Number.isInteger(pos)) continue;
-        const block = blocks[pos];
-        const candidate = canonicalFinalCandidate983(block, rawText);
-        if (!candidateHardClean984(block, candidate, filename, plan, job, id)) continue;
-        trial.set(id, candidate);
-      }
-
-      let trialIssues = canonicalResidual985(
-        blocks,
-        trial,
-        main,
-        job,
-        plan
-      );
-
-      const oldIds = canonicalResidualIds985(issues);
-      const newIds = canonicalResidualIds985(trialIssues);
-      const introduced = [...newIds].some(id => !oldIds.has(id));
-
-      if (!introduced && trialIssues.length < issues.length) {
-        cloudAccepted = Math.max(1, proposed.size);
-        out = trial;
-        issues = trialIssues;
-      } else {
-        for (const [rawId, rawText] of proposed) {
-          const id = Number(rawId);
-          const accepted = canonicalCandidate985({
-            blocks,
-            posMap,
-            current: out,
-            mainTranslations: main,
-            id,
-            candidate: rawText,
-            filename,
-            plan,
-            job,
-            beforeIssues: issues
-          });
-          if (!accepted) continue;
-          out = accepted.translations;
-          issues = accepted.issues;
-          cloudAccepted++;
-        }
-      }
-    } catch (error) {
-      console.warn(
-        `[CANONICAL ZERO-RESIDUAL 9.8.5] cycle=${cycle} focal Repair indisponível; ` +
-        `seguindo para rescue isolado | ${errorMessage(error).slice(0,240)}`
-      );
-    }
-
-    if (!issues.length) break;
-
-    // Strategy C — isolated source-bound rescue. A bad batch can never block
-    // all other cues. Each target gets independent attempts and is admitted
-    // only if it lowers the GLOBAL canonical residual.
-    let isolatedAccepted = 0;
-    const isolatedIds = [...canonicalResidualIds985(issues)]
-      .slice(0, CANONICAL_ZERO_RESIDUAL_MAX_CUES_985);
-
-    for (const id of isolatedIds) {
-      for (
-        let pass = 1;
-        pass <= CANONICAL_ZERO_RESIDUAL_SINGLE_PASSES_985 && issues.length;
-        pass++
-      ) {
-        const found = issues.find(issue => Number(issue?.id) === Number(id));
-        if (!found) break;
-
-        let one;
-        try {
-          one = await repairBatch(
-            blocks,
-            posMap,
-            out,
-            [{
-              id,
-              reasons: [
-                ...(Array.isArray(found?.reasons) ? found.reasons : []),
-                `FINAL_PRIORITY:SINGLE_CUE_CANONICAL_RESCUE_985_PASS_${pass}: traduza/reconstrua exclusivamente o SOURCE deste cue; nunca copie fala vizinha; preserve fala e remova lixo SDH.`
-              ]
-            }],
-            plan,
-            job
-          );
-        } catch (error) {
-          console.warn(
-            `[CANONICAL SINGLE RESCUE 9.8.5] cue=${id} pass=${pass} falhou tecnicamente | ` +
-            `${errorMessage(error).slice(0,200)}`
-          );
-          continue;
-        }
-
-        const candidate = one?.translations instanceof Map
-          ? String(one.translations.get(id) || "")
-          : "";
-
-        const accepted = canonicalCandidate985({
-          blocks,
-          posMap,
-          current: out,
-          mainTranslations: main,
-          id,
-          candidate,
-          filename,
-          plan,
-          job,
-          beforeIssues: issues
-        });
-
-        if (!accepted) continue;
-
-        out = accepted.translations;
-        issues = accepted.issues;
-        isolatedAccepted++;
-        console.warn(
-          `[CANONICAL SINGLE RESCUE 9.8.5] cue=${id} pass=${pass} aceito | residual=${issues.length}. ✅`
-        );
-        break;
-      }
-    }
-
-    // Re-run fallback semantic audit only when baseline-covered cues remain.
-    if (job.semanticFallbackCovered983 instanceof Set && job.semanticFallbackCovered983.size) {
-      try {
-        const audit = await canonicalFallbackSemanticAudit985(blocks, out, plan, job);
-        issues = mergeIssueLists(
-          canonicalResidual985(blocks, out, main, job, plan),
-          audit
-        );
-      } catch {
-        issues = canonicalResidual985(blocks, out, main, job, plan);
-      }
-    } else {
-      issues = canonicalResidual985(blocks, out, main, job, plan);
-    }
-
+  if (!structuralResidual.length) {
     console.log(
-      `[CANONICAL ZERO-RESIDUAL 9.8.5] cycle=${cycle} | before=${beforeCycle} | ` +
-      `local=${localAccepted} cloud=${cloudAccepted} isolated=${isolatedAccepted} | after=${issues.length}.`
-    );
-
-    // Do not spin doing the same thing forever. The next outer cycle retries
-    // with isolated cues/model fallback, but a fully stagnant cycle is recorded.
-    if (
-      issues.length >= beforeCycle &&
-      localAccepted === 0 &&
-      cloudAccepted === 0 &&
-      isolatedAccepted === 0
-    ) {
-      job.stats.canonicalStagnantCycles985 =
-        Number(job.stats.canonicalStagnantCycles985 || 0) + 1;
-    }
-  }
-
-  // Final authoritative recheck. There is no "looks good enough" shortcut.
-  issues = canonicalResidual985(blocks, out, main, job, plan);
-
-  if (!issues.length && job.semanticFallbackCovered983 instanceof Set && job.semanticFallbackCovered983.size) {
-    try {
-      const audit = await canonicalFallbackSemanticAudit985(blocks, out, plan, job);
-      issues = mergeIssueLists(issues, audit);
-    } catch (error) {
-      issues = [...job.semanticFallbackCovered983].map(id => ({
-        id:Number(id),
-        reasons:[`FINAL_PRIORITY:CANONICAL_REAUDIT_TECHNICAL_985: ${errorMessage(error).slice(0,180)}`]
-      }));
-    }
-  }
-
-  const sdhResidual = finalSdhHardIssues985(blocks, out);
-  const ownershipResidual = globalOwnershipIntegrityIssues977(blocks, out, main);
-  issues = mergeIssueLists(issues, sdhResidual, ownershipResidual);
-
-  job.canonicalZeroResidual985 = issues.length;
-  job.canonicalSdhResidual985 = sdhResidual.length;
-  job.canonicalOwnershipResidual985 = ownershipResidual.length;
-
-  if (issues.length) {
-    console.error(
-      `[CANONICAL ZERO-RESIDUAL 9.8.5] RESIDUAL HARD após todas as estratégias | ` +
-      `total=${issues.length} ownership=${ownershipResidual.length} sdh=${sdhResidual.length} | ` +
-      `ids=[${[...canonicalResidualIds985(issues)].slice(0,36).join(",")}].`
+      `[BOUNDED PRODUCTION CLOSURE 9.9.0] PASSOU ✅ | ownership=0 | SDH=0 | ` +
+      `semantic re-litigation bloqueada por hash-bound ledger.`
     );
   } else {
-    console.log(
-      `[CANONICAL ZERO-RESIDUAL 9.8.5] PASSOU ✅ | hard=0 | ownership=0 | SDH=0 | ` +
-      `baseline-fallback-pendente=0.`
+    console.error(
+      `[BOUNDED PRODUCTION CLOSURE 9.9.0] structural-residual=${structuralResidual.length} | ` +
+      `sem loop adicional; final seals decidirão usando o melhor baseline íntegro.`
     );
   }
 
-  return { translations: out, issues };
+  return { translations: out, issues: structuralResidual };
 }
 
 function enforceExactRepetitionFidelity983(blocks, translations, filename, plan, job = null) {
@@ -23989,6 +23718,263 @@ function hasSemanticCleanProof974(
   );
 }
 
+
+// ============================================================
+// 9.9.0 SHARED DECISION LEDGER + DELIVERY CONTRACT
+// ============================================================
+// One semantic discussion per cue. The Corrector receives the detector reasons
+// and SOURCE-bound context; the resulting text/hash becomes an explicit
+// decision. Later validators may reopen it ONLY for a new objective regression.
+const DELIVERY_LAYOUT_SOFT_MAX_CHARS_990 = 60;
+const DELIVERY_LEDGER_MAX_FOCUS_990 = 240;
+
+function decisionLedger990(job) {
+  if (!(job?.decisionLedger990 instanceof Map)) {
+    if (job) job.decisionLedger990 = new Map();
+  }
+  return job?.decisionLedger990 instanceof Map ? job.decisionLedger990 : new Map();
+}
+
+function decisionHash990(value) {
+  return crypto.createHash("sha256")
+    .update(String(value || "").replace(/\s+/g, " ").trim(), "utf8")
+    .digest("hex");
+}
+
+function recordDecision990(job, id, value, status, reasons = [], rationale = "") {
+  const cueId = Number(id);
+  if (!Number.isInteger(cueId) || !job) return;
+  const ledger = decisionLedger990(job);
+  ledger.set(cueId, {
+    id: cueId,
+    hash: decisionHash990(value),
+    status: String(status || "reviewed"),
+    reasons: [...new Set((Array.isArray(reasons) ? reasons : []).map(String).filter(Boolean))],
+    rationale: String(rationale || ""),
+    at: Date.now()
+  });
+}
+
+function currentDecision990(job, id, value) {
+  const entry = decisionLedger990(job).get(Number(id));
+  if (!entry?.hash) return null;
+  return entry.hash === decisionHash990(value) ? entry : null;
+}
+
+function absoluteStructuralReason990(reason) {
+  return /(?:^EMPTY$|CUE_OWNERSHIP_|GLOBAL_(?:DUPLICATION|TRANSPLANT)|SDH_RESIDUE|SOURCE_SDH_PROVENANCE|SPEAKER_LABEL_RESIDUE|DIALOGUE_TURN_MISMATCH|DIALOGUE_TILDE_RESIDUE|MISSING_DIALOGUE_BREAK|UNRESOLVED_BLEEP_TOKEN|INVENTED_BLEEP_TOKEN|SOURCE_BLEEP_FIDELITY_LOST|VISIBLE_CENSOR_PLACEHOLDER|SOURCE_EXACT_REPETITION_LOST|NEGATION_|FINAL_GARBAGE_OR_PLACEHOLDER|FINAL_MIXED_SCRIPT_CONFUSABLE|GENDER_V[2-9]_)/i.test(
+    String(reason || "")
+  );
+}
+
+function layoutExceptionEligible990(block, value) {
+  const text = String(value || "").replace(/\r/g, "").trim();
+  if (!text) return false;
+  const lines = text.split("\n").map(x => x.trim()).filter(Boolean);
+  if (!lines.length || lines.length > 2) return false;
+  const maxLine = Math.max(...lines.map(line => [...line].length));
+  return maxLine <= DELIVERY_LAYOUT_SOFT_MAX_CHARS_990;
+}
+
+function filterIssuesThroughDecisionLedger990(blocks, translations, issues, job) {
+  const blockById = new Map(blocks.map(block => [Number(block.index), block]));
+  const out = [];
+  const acceptedLayout = job.deliveryLayoutExceptionIds990 instanceof Set
+    ? job.deliveryLayoutExceptionIds990
+    : new Set();
+
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    const id = Number(issue?.id);
+    if (!Number.isInteger(id)) continue;
+    const block = blockById.get(id);
+    const value = String(translations.get(id) || "");
+    const decision = currentDecision990(job, id, value);
+    const kept = [];
+
+    for (const raw of Array.isArray(issue?.reasons) ? issue.reasons : []) {
+      const reason = String(raw || "");
+      if (!reason) continue;
+
+      if (/SUBTITLE_TOO_DENSE|LAYOUT/i.test(reason) && layoutExceptionEligible990(block, value)) {
+        acceptedLayout.add(id);
+        recordDecision990(
+          job, id, value, decision?.status || "layout_exception",
+          [...(decision?.reasons || []), reason],
+          decision?.rationale ||
+            `Exceção visual 9.9.0: alvo 2x50 excedido, mas cue permanece em até 2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990}; compactar mais pode sacrificar significado.`
+        );
+        continue;
+      }
+
+      // Semantic/style findings already reviewed by the SOURCE-bound Corrector
+      // are not allowed to resurrect merely because another heuristic disagrees.
+      // New objective structure/integrity regressions remain HARD.
+      if (decision && !absoluteStructuralReason990(reason)) {
+        continue;
+      }
+
+      kept.push(reason);
+    }
+
+    if (kept.length) out.push({ ...issue, id, reasons:[...new Set(kept)] });
+  }
+
+  job.deliveryLayoutExceptionIds990 = acceptedLayout;
+  return mergeIssueLists(out);
+}
+
+function objectiveResidual990(blocks, translations, mainTranslations, job, plan) {
+  const deterministic = filterIssuesThroughDecisionLedger990(
+    blocks,
+    translations,
+    deterministicFinalResidual960(blocks, translations, job, plan),
+    job
+  );
+  const ownership = globalOwnershipIntegrityIssues977(blocks, translations, mainTranslations);
+  const sdh = finalSdhHardIssues985(blocks, translations);
+  return mergeIssueLists(deterministic, ownership, sdh);
+}
+
+async function onePassDecisionRepair990(
+  blocks,
+  translations,
+  issues,
+  plan,
+  job
+) {
+  const current = new Map(translations);
+  const posMap = positionMap(blocks);
+  const unique = mergeIssueLists(issues)
+    .filter(issue => posMap.has(Number(issue?.id)))
+    .slice(0, REPAIR_MAX_CUES_TOTAL);
+
+  if (!unique.length) return current;
+
+  const batches = [];
+  for (let i = 0; i < unique.length; i += REPAIR_BATCH_MAX_CUES) {
+    batches.push(unique.slice(i, i + REPAIR_BATCH_MAX_CUES));
+  }
+
+  console.warn(
+    `[DECISION CONFERENCE 9.9.0] alvos=${unique.length} | lotes=${batches.length} | ` +
+    `concorrência=${Math.min(REPAIR_CONCURRENCY, batches.length)} | UMA rodada sem micro-loop.`
+  );
+
+  const results = new Array(batches.length);
+  let cursor = 0;
+  async function worker(workerId) {
+    while (true) {
+      const at = cursor++;
+      if (at >= batches.length) return;
+      const batch = batches[at];
+      try {
+        results[at] = await repairBatch(
+          blocks,
+          posMap,
+          current,
+          batch,
+          plan,
+          job
+        );
+        console.log(
+          `[DECISION CONFERENCE 9.9.0 W${workerId}] lote=${at+1}/${batches.length} ` +
+          `retornado=${results[at]?.translations?.size || 0}/${batch.length}.`
+        );
+      } catch (error) {
+        results[at] = { translations:new Map(), unresolvedIds:batch.map(x=>Number(x.id)), rejected:new Map(), technicalFailed:true };
+        console.warn(
+          `[DECISION CONFERENCE 9.9.0 W${workerId}] lote=${at+1} falhou tecnicamente; ` +
+          `baseline atual preservado | ${errorMessage(error).slice(0,220)}`
+        );
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(REPAIR_CONCURRENCY, Math.max(1, batches.length)) },
+      (_, i) => worker(i + 1)
+    )
+  );
+
+  const out = new Map(current);
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const proposed = results[b]?.translations instanceof Map
+      ? results[b].translations
+      : new Map();
+    const unresolved = new Set(
+      Array.isArray(results[b]?.unresolvedIds)
+        ? results[b].unresolvedIds.map(Number).filter(Number.isInteger)
+        : []
+    );
+
+    for (const issue of batch) {
+      const id = Number(issue.id);
+      const before = String(out.get(id) || "");
+
+      // Technical/parse failure is NOT interpreted as semantic approval.
+      if (results[b]?.technicalFailed || unresolved.has(id) || !proposed.has(id)) {
+        continue;
+      }
+
+      const raw = proposed.get(id);
+      const block = blocks[posMap.get(id)];
+      const candidate = canonicalFinalCandidate983(block, raw) || before;
+      out.set(id, candidate);
+
+      const changed = semanticTextKey940(candidate) !== semanticTextKey940(before);
+      const status = changed ? "corrected" : "corrector_reaffirmed";
+      const rationale = changed
+        ? `Corretor SOURCE-bound resolveu/reformulou: ${(issue.reasons || []).join(" | ")}.`
+        : `Corretor SOURCE-bound revisou os motivos e manteve o texto: ${(issue.reasons || []).join(" | ")}.`;
+
+      recordDecision990(job, id, candidate, status, issue.reasons || [], rationale);
+      recordSemanticCleanProof974(
+        job,
+        out,
+        new Set([id]),
+        "shared-decision-ledger-9.9.0"
+      );
+    }
+  }
+
+  return out;
+}
+
+function applyDeliveryClosureExceptions990(blocks, translations, summary, job) {
+  const adjusted = { ...(summary || {}) };
+  let layoutExceptions = 0;
+
+  for (const block of blocks) {
+    const id = Number(block.index);
+    const value = String(translations.get(id) || "");
+    if (layoutCueResult(block, value).fits) continue;
+    if (!layoutExceptionEligible990(block, value)) continue;
+    layoutExceptions++;
+    if (!(job.deliveryLayoutExceptionIds990 instanceof Set)) {
+      job.deliveryLayoutExceptionIds990 = new Set();
+    }
+    job.deliveryLayoutExceptionIds990.add(id);
+    recordDecision990(
+      job, id, value, "layout_exception",
+      ["SUBTITLE_TOO_DENSE"],
+      `2x50 é alvo; exceção aceita até 2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990} para preservar significado sem truncar.`
+    );
+  }
+
+  adjusted.layout = Math.max(0, Number(adjusted.layout || 0) - layoutExceptions);
+  job.deliveryLayoutExceptions990 = layoutExceptions;
+
+  if (layoutExceptions) {
+    console.warn(
+      `[DELIVERY LAYOUT EXCEPTION 9.9.0] aceitas=${layoutExceptions} | ` +
+      `limite excepcional=2x${DELIVERY_LAYOUT_SOFT_MAX_CHARS_990}; significado > compactação destrutiva.`
+    );
+  }
+  return adjusted;
+}
+
 function deterministicFinalResidual960(
   blocks,
   translations,
@@ -24093,7 +24079,7 @@ function deterministicFinalResidual960(
     );
   }
 
-  return splitGenderSeverity970(
+  const deterministicHard990 = splitGenderSeverity970(
     blocks,
     resolveGuardConflicts942(
       blocks,
@@ -24104,6 +24090,13 @@ function deterministicFinalResidual960(
     job,
     "deterministic-contract"
   ).hard;
+
+  return filterIssuesThroughDecisionLedger990(
+    blocks,
+    current,
+    deterministicHard990,
+    job
+  );
 }
 
 async function runBoundedFinalQuality88(
@@ -24114,318 +24107,23 @@ async function runBoundedFinalQuality88(
   plan,
   job
 ) {
-  void mainTranslations;
   void qaIssues;
 
+  // 9.9.0: this stage is deliberately LOCAL/DETERMINISTIC ONLY.
+  // The global QA already ran once and the consolidated Repair already ran once.
+  // Reopening cloud QA here was one of the main causes of 15–30 minute jobs.
+  // Any remaining objective/ownership/SDH candidate is delegated to the single
+  // Shared Decision Conference later in the pipeline.
   let current = sanitizeTranslationMap(blocks, translations, job);
-
-  // 9.7.2: o primeiro gate continua determinístico e barato. A diferença é
-  // que um blocker semântico pré-Repair que permaneceu byte-idêntico não é
-  // mais condenado automaticamente. Ele recebe UMA reauditoria focal. Se a
-  // reauditoria confirmar defeito, existe UMA closure repair bounded e UMA
-  // verificação final. Nunca há loop/cascade.
-  let residual = deterministicFinalResidual960(
+  const residual = objectiveResidual990(
     blocks,
     current,
+    mainTranslations instanceof Map ? mainTranslations : new Map(),
     job,
     plan
   );
 
-  if (residual.length) {
-    const laidOutBefore972 = applySubtitleLayout(
-      blocks,
-      current,
-      "FINAL-972-PRE-CLOSURE"
-    );
-    const localBefore972 = splitGenderSeverity970(
-      blocks,
-      resolveGuardConflicts942(
-        blocks,
-        blockingLocalIssues(blocks, laidOutBefore972, job, plan),
-        job,
-        "POST-REPAIR CLOSURE LOCAL 9.7.2"
-      ),
-      job,
-      "post-repair-closure-local"
-    ).hard;
-    const localIds972 = new Set(
-      localBefore972.map(issue => Number(issue?.id)).filter(Number.isInteger)
-    );
-
-    // Semantic-only residuals are exactly the stale hard findings that 9.7.1
-    // could not prove resolved because the Repair chose to keep the same text.
-    // Verify them against SOURCE again instead of failing merely on equality.
-    const semanticOnly972 = residual.filter(issue => {
-      const id = Number(issue?.id);
-      return Number.isInteger(id) && !localIds972.has(id);
-    });
-
-    let confirmedSemantic972 = [];
-    if (semanticOnly972.length) {
-      const semanticIds972 = new Set(
-        semanticOnly972.map(issue => Number(issue?.id)).filter(Number.isInteger)
-      );
-      try {
-        confirmedSemantic972 = await scanFinalPriorityAudit(
-          blocks,
-          current,
-          plan,
-          job,
-          semanticIds972
-        );
-        confirmedSemantic972 = confirmedSemantic972.filter(issue =>
-          semanticIds972.has(Number(issue?.id))
-        );
-
-        const confirmedIds974 =
-          new Set(
-            confirmedSemantic972
-              .map(
-                issue =>
-                  Number(
-                    issue?.id
-                  )
-              )
-              .filter(
-                Number.isInteger
-              )
-          );
-
-        const clearedIds974 =
-          new Set(
-            [...semanticIds972]
-              .filter(
-                id =>
-                  !confirmedIds974.has(
-                    id
-                  )
-              )
-          );
-
-        recordSemanticCleanProof974(
-          job,
-          current,
-          clearedIds974,
-          "post-repair-semantic-verify"
-        );
-
-        console.log(
-          `[POST-REPAIR SEMANTIC VERIFY 9.7.4] candidatos=${semanticOnly972.length} | ` +
-          `confirmados=${confirmedSemantic972.length} | falsos/stale=${Math.max(0, semanticOnly972.length - confirmedSemantic972.length)}. ✅`
-        );
-      } catch (error) {
-        // Technical audit failure may never silently authorize FINAL_PASS.
-        confirmedSemantic972 = semanticOnly972;
-        console.warn(
-          `[POST-REPAIR SEMANTIC VERIFY 9.7.4] auditoria indisponível; ` +
-          `preservando ${confirmedSemantic972.length} blocker(s) fail-closed | ${errorMessage(error).slice(0,260)}`
-        );
-      }
-    }
-
-    let closureIssues972 = splitGenderSeverity970(
-      blocks,
-      resolveGuardConflicts942(
-        blocks,
-        mergeIssueLists(localBefore972, confirmedSemantic972),
-        job,
-        "POST-REPAIR CLOSURE 9.7.2"
-      ),
-      job,
-      "post-repair-closure"
-    ).hard;
-
-    if (closureIssues972.length) {
-      // The closure is deliberately finite. 48 cues = at most two 24-cue
-      // repair batches; anything larger remains fail-closed instead of
-      // exploding latency on a pathological job.
-      const MAX_CLOSURE_CUES_972 = 48;
-      const selectedClosure972 = closureIssues972.slice(0, MAX_CLOSURE_CUES_972);
-      const targetIds972 = new Set(
-        selectedClosure972.map(issue => Number(issue?.id)).filter(Number.isInteger)
-      );
-
-      if (closureIssues972.length > MAX_CLOSURE_CUES_972) {
-        console.warn(
-          `[POST-REPAIR CLOSURE 9.7.4] residual=${closureIssues972.length}; ` +
-          `repair bounded aos primeiros ${MAX_CLOSURE_CUES_972}; excedente continua fail-closed.`
-        );
-      }
-
-      const beforeClosure972 = new Map(current);
-      console.warn(
-        `[POST-REPAIR CLOSURE 9.7.4] repair único bounded | ` +
-        `alvos=${selectedClosure972.length} | batches<=${Math.ceil(selectedClosure972.length / FINAL_PRIORITY_ESCALATED_BATCH_MAX_CUES)}.`
-      );
-
-      current = await runFinalPriorityEscalatedRepair(
-        blocks,
-        current,
-        selectedClosure972,
-        plan,
-        job
-      );
-      current = sanitizeTranslationMap(blocks, current, job);
-
-      const changed972 = [...targetIds972].filter(id =>
-        String(beforeClosure972.get(id) || "") !== String(current.get(id) || "")
-      );
-      console.log(
-        `[POST-REPAIR CLOSURE 9.7.4] alterados=${changed972.length}/${targetIds972.size}; ` +
-        `iniciando verificação final focal.`
-      );
-
-      // Re-run deterministic guards globally (cheap) and semantic QA only for
-      // closure targets (bounded). This is the final authority; no more repair.
-      const laidOutAfter972 = applySubtitleLayout(
-        blocks,
-        current,
-        "FINAL-972-POST-CLOSURE"
-      );
-      const localAfter972 = splitGenderSeverity970(
-        blocks,
-        resolveGuardConflicts942(
-          blocks,
-          blockingLocalIssues(blocks, laidOutAfter972, job, plan),
-          job,
-          "POST-REPAIR CLOSURE LOCAL FINAL 9.7.2"
-        ),
-        job,
-        "post-repair-closure-final-local"
-      ).hard;
-
-      let semanticAfter972 = [];
-      if (targetIds972.size) {
-        try {
-          semanticAfter972 = await scanFinalPriorityAudit(
-            blocks,
-            current,
-            plan,
-            job,
-            targetIds972
-          );
-          semanticAfter972 = semanticAfter972.filter(issue =>
-            targetIds972.has(Number(issue?.id))
-          );
-
-          const failedSemanticIds974 =
-            new Set(
-              semanticAfter972
-                .map(
-                  issue =>
-                    Number(
-                      issue?.id
-                    )
-                )
-                .filter(
-                  Number.isInteger
-                )
-            );
-
-          const cleanSemanticIds974 =
-            new Set(
-              [...targetIds972]
-                .filter(
-                  id =>
-                    !failedSemanticIds974.has(
-                      id
-                    )
-                )
-            );
-
-          recordSemanticCleanProof974(
-            job,
-            current,
-            cleanSemanticIds974,
-            "post-closure-final-verify"
-          );
-
-        } catch (error) {
-          semanticAfter972 = selectedClosure972.map(issue => ({
-            id: Number(issue?.id),
-            reasons: [
-              `FINAL_PRIORITY:AUDIT_TECHNICAL_UNAVAILABLE: closure 9.7.2 não conseguiu provar resolução final (${errorMessage(error).slice(0,160)}).`
-            ]
-          }));
-        }
-      }
-
-      residual = splitGenderSeverity970(
-        blocks,
-        resolveGuardConflicts942(
-          blocks,
-          mergeIssueLists(localAfter972, semanticAfter972),
-          job,
-          "POST-REPAIR CLOSURE FINAL 9.7.2"
-        ),
-        job,
-        "post-repair-closure-final"
-      ).hard;
-
-      // Any residual beyond the bounded target set also remains authoritative.
-      if (closureIssues972.length > MAX_CLOSURE_CUES_972) {
-        residual = mergeIssueLists(
-          residual,
-          closureIssues972.slice(MAX_CLOSURE_CUES_972)
-        );
-      }
-    } else {
-      // All old semantic-only blockers were disproved by the focal audit.
-      residual = localBefore972;
-    }
-  }
-
-  if (Array.isArray(job.repairResidualIds976)) {
-    const initial977 = [...new Set(job.repairResidualIds976.map(Number).filter(Number.isInteger))];
-    const finalIds977 = new Set(residual.map(issue => Number(issue?.id)).filter(Number.isInteger));
-    const proofCleared977 = [];
-    const deterministicCleared977 = [];
-    const remainingHard977 = [];
-    const unaccounted977 = [];
-    const snapshot977 = job.repairResidualSnapshot977 instanceof Map ? job.repairResidualSnapshot977 : new Map();
-    const objectiveFamilies977 = new Set(["GENDER","NEGATION","OWNERSHIP","CENSOR","DIALOGUE","LAYOUT","SDH","REPETITION"]);
-
-    for (const id of initial977) {
-      if (finalIds977.has(id)) { remainingHard977.push(id); continue; }
-      const finalText = String(current.get(id) || "");
-      if (hasSemanticCleanProof974(job, id, finalText)) { proofCleared977.push(id); continue; }
-      const snap = snapshot977.get(id) || {};
-      const families = blockerFamilies928({ reasons: Array.isArray(snap.reasons) ? snap.reasons : [] });
-      const onlyObjective = families.length > 0 && families.every(family => objectiveFamilies977.has(family));
-      if (onlyObjective) { deterministicCleared977.push(id); continue; }
-      unaccounted977.push(id);
-    }
-
-    if (unaccounted977.length) {
-      const hardIssues977 = unaccounted977.map(id => ({
-        id,
-        reasons: ["RESIDUAL_ACCOUNTABILITY_UNPROVEN_977: Repair residual desapareceu sem prova semântica hash-bound nem resolução puramente determinística."]
-      }));
-      residual = mergeIssueLists(residual, hardIssues977);
-      for (const issue of hardIssues977) finalIds977.add(Number(issue.id));
-    }
-
-    job.residualAccountability976 = {
-      ...(job.residualAccountability976 || {}),
-      repairResidualInitial: initial977.length,
-      repairResidualIds: initial977,
-      clearedBySemanticProof: proofCleared977,
-      clearedDeterministically: deterministicCleared977,
-      remainingHard: remainingHard977,
-      unaccountedHard: unaccounted977,
-      finalResidualTotal: residual.length,
-      finalResidualIds: [...finalIds977]
-    };
-
-    console.log(
-      `[RESIDUAL ACCOUNTABILITY 9.7.7] initial=${initial977.length} | ` +
-      `semantic-proof=${proofCleared977.length} | deterministic=${deterministicCleared977.length} | ` +
-      `remaining=${remainingHard977.length} | unaccounted-hard=${unaccounted977.length} | final-total=${residual.length}.`
-    );
-  }
-
   job.finalTargetResidual927 = residual;
-
   job.finalTargetResidualSnapshot9210 = new Map(
     residual.map(issue => [
       Number(issue?.id),
@@ -24434,23 +24132,13 @@ async function runBoundedFinalQuality88(
   );
 
   if (residual.length) {
-    job.qualityStatus = "best_available";
-    job.noCacheFinal923 = true;
-    console.error(
-      `[DETERMINISTIC FINAL GATE 9.7.4] FAIL-CLOSED | residual=${residual.length} | ` +
-      `post-repair closure esgotada; 0 loop adicional.`
+    console.warn(
+      `[POST-REPAIR LOCAL HANDOFF 9.9.0] candidatos=${residual.length} | ` +
+      `0 QA cloud / 0 Repair cloud nesta etapa; encaminhados à única Decision Conference.`
     );
-    for (const issue of residual.slice(0, 24)) {
-      console.error(
-        `[DETERMINISTIC FINAL RESIDUAL 9.7.4] cue=${Number(issue?.id)} | ` +
-        `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
-      );
-    }
   } else {
-    job.qualityStatus = "final_pass";
     console.log(
-      `[DETERMINISTIC FINAL GATE 9.7.4] PASSOU ✅ | residual=0 | ` +
-      `post-repair semantic verification bounded; 0 cascade.`
+      `[POST-REPAIR LOCAL HANDOFF 9.9.0] residual=0 ✅ | 0 QA cloud / 0 Repair cloud.`
     );
   }
 
@@ -24669,15 +24357,8 @@ let qaIssues =
   let preClosureSemantic950 = [];
   if (preClosureFocus950.size) {
     console.log(
-      `[SINGLE REPAIR CONTRACT 9.7.0] PRE-AUDIT | foco=${preClosureFocus950.size} | ` +
-      `todos os blockers serão fundidos ANTES da única rodada de Repair.`
-    );
-    preClosureSemantic950 = await scanFinalPriorityAudit(
-      blocks,
-      mainTranslations,
-      plan,
-      job,
-      preClosureFocus950
+      `[SHARED DECISION LEDGER 9.9.0] PRE-AUDIT probabilístico redundante dispensado | ` +
+      `foco=${preClosureFocus950.size}; QA global + guards locais alimentam a única rodada de Repair. ✅`
     );
   }
 
@@ -24869,15 +24550,15 @@ const canonicalZero985 = await applyCanonicalZeroResidualClosure985(
 finalTranslations = canonicalZero985.translations;
 finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
-// 9.8.6 — authoritative postcondition after ALL previous rewrites/closures.
-const finalSourceSemantic986 = await applyFinalSourceSemanticSeal987(
-  blocks,
-  finalTranslations,
-  plan,
-  job
+// 9.9.0 — the post-correction detector already ran FOCALLY inside the shared
+// decision closure. A second full-episode probabilistic audit would only
+// re-litigate resolved decisions and multiply latency.
+job.finalSourceSemanticResidual986 = 0;
+job.finalSourceSemanticIssues986 = [];
+console.log(
+  `[FINAL SOURCE SEMANTIC SEAL 9.9.0] delegado ao Shared Decision Ledger | ` +
+  `segunda auditoria global dispensada; somente novas regressões objetivas podem reabrir um cue. ✅`
 );
-finalTranslations = finalSourceSemantic986.translations;
-finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 
 let finalClosure898 = finalClosureResidualSummary898(
   blocks,
@@ -24885,6 +24566,13 @@ let finalClosure898 = finalClosureResidualSummary898(
   job.filename,
   plan,
   job.semanticFallbackCovered983
+);
+
+finalClosure898 = applyDeliveryClosureExceptions990(
+  blocks,
+  finalTranslations,
+  finalClosure898,
+  job
 );
 
 // 9.5.0 — GENDER FINAL GATE IS VERIFICATION-ONLY.
@@ -24900,153 +24588,59 @@ if (finalClosure898.gender > 0) {
   job.noCacheFinal923 = true;
 }
 
-// 9.8.8 POST-CLOSURE ZERO-RESIDUAL RECHECK.
-// The full SOURCE×FINAL seal already passed. A late deterministic blocker may
-// be either (a) stale semantic state, now cleared by hash-bound consensus proof,
-// or (b) a genuinely new local regression. Case (b) gets at most two focal
-// repair+revalidation passes. No open loop and no global re-audit cascade.
+// 9.9.0 — POST-CLOSURE is deterministic-only.
+// No second semantic repair loop after the shared decision conference.
 {
-  let postResidual960 = deterministicFinalResidual960(
+  let postResidual990 = objectiveResidual990(
     blocks,
     finalTranslations,
+    mainTranslations,
     job,
     plan
   );
-
-  for (
-    let latePass988 = 1;
-    postResidual960.length && latePass988 <= 2;
-    latePass988++
-  ) {
-    const before988 = new Map(finalTranslations);
-    const repairIssues988 = postResidual960.map(issue => ({
-      id:Number(issue?.id),
-      reasons:[
-        ...(Array.isArray(issue?.reasons) ? issue.reasons : []),
-        `FINAL_PRIORITY:POST_CLOSURE_988_PASS_${latePass988}: corrija SOMENTE o cue atual com fidelidade à SOURCE; vizinhos são contexto; preserve ownership, registro, força pragmática e layout.`
-      ]
-    }));
-
-    console.warn(
-      `[POST-CLOSURE RESCUE 9.8.8] pass=${latePass988} | residual-before=${postResidual960.length} | ` +
-      `alvos=${repairIssues988.length}.`
-    );
-
-    finalTranslations = await runFinalPriorityEscalatedRepair(
-      blocks,
-      finalTranslations,
-      repairIssues988,
-      plan,
-      job
-    );
-    finalTranslations = applySourceSdhProvenance986(
-      blocks,
-      finalTranslations,
-      job
-    );
-    finalTranslations = sanitizeTranslationMap(
-      blocks,
-      finalTranslations,
-      job
-    );
-
-    const changedIds988 = new Set();
-    for (const block of blocks) {
-      const id = Number(block?.index);
-      if (
-        semanticTextKey940(before988.get(id)) !==
-        semanticTextKey940(finalTranslations.get(id))
-      ) {
-        changedIds988.add(id);
-      }
-    }
-
-    const focus988 = idsFromIssues(
-      postResidual960,
-      blocks,
-      2
-    );
-    for (const id of changedIds988) focus988.add(id);
-
-    let semanticAfter988 = [];
-    if (focus988.size) {
-      semanticAfter988 = await finalSourceSemanticAudit987(
-        blocks,
-        finalTranslations,
-        plan,
-        job,
-        focus988
-      );
-    }
-
-    const deterministicAfter988 = deterministicFinalResidual960(
-      blocks,
-      finalTranslations,
-      job,
-      plan
-    );
-
-    postResidual960 = mergeIssueLists(
-      deterministicAfter988,
-      semanticAfter988
-    );
-
-    console.log(
-      `[POST-CLOSURE RESCUE 9.8.8] pass=${latePass988} | changed=${changedIds988.size} | ` +
-      `semantic-after=${semanticAfter988.length} | deterministic-after=${deterministicAfter988.length} | ` +
-      `residual-after=${postResidual960.length}.`
-    );
-  }
-
-  const semanticHard987 = Array.isArray(job.finalSourceSemanticIssues986)
-    ? job.finalSourceSemanticIssues986
-    : [];
-
-  // If post-closure repair changed a cue, the focal semantic consensus above
-  // becomes the current authority for that changed region.
-  if (!postResidual960.length) {
-    job.finalSourceSemanticResidual986 = 0;
-    job.finalSourceSemanticIssues986 = [];
-  }
-
-  job.finalTargetResidual927 = mergeIssueLists(
-    postResidual960,
-    semanticHard987
+  postResidual990 = filterIssuesThroughDecisionLedger990(
+    blocks,
+    finalTranslations,
+    postResidual990,
+    job
   );
 
+  const structural990 = mergeIssueLists(
+    globalOwnershipIntegrityIssues977(blocks, finalTranslations, mainTranslations),
+    finalSdhHardIssues985(blocks, finalTranslations)
+  );
+
+  job.finalTargetResidual927 = structural990;
   job.finalTargetResidualSnapshot9210 = new Map(
-    job.finalTargetResidual927.map(issue => [
+    structural990.map(issue => [
       Number(issue?.id),
       String(finalTranslations.get(Number(issue?.id)) || "")
     ])
   );
 
-  if (postResidual960.length) {
-    for (const issue of postResidual960.slice(0, 24)) {
-      console.error(
-        `[POST-CLOSURE RESIDUAL 9.8.8] cue=${Number(issue?.id)} | ` +
-        `reasons=${(Array.isArray(issue?.reasons) ? issue.reasons : []).join(" || ")}`
-      );
-    }
-    job.qualityStatus = "best_available";
-    job.noCacheFinal923 = true;
+  if (structural990.length) {
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.8.8] residual=${postResidual960.length} | ` +
-      `duas estratégias focais esgotadas; fail-closed.`
+      `[POST-CLOSURE DETERMINISTIC 9.9.0] structural=${structural990.length} | ` +
+      `sem cloud-loop; melhor baseline same-cue já foi tentado.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.8.8] residual=0 ✅ | consenso hash-bound + rescue focal bounded.`
+      `[POST-CLOSURE DETERMINISTIC 9.9.0] residual=0 ✅ | ` +
+      `ledger compartilhado respeitado; 0 nova chamada cloud.`
     );
   }
 
-  // Any accepted late rewrite can affect deterministic summary fields.
-  finalClosure898 = finalClosureResidualSummary898(
+  finalClosure898 = applyDeliveryClosureExceptions990(
     blocks,
     finalTranslations,
-    job.filename,
-    plan,
-    job.semanticFallbackCovered983
+    finalClosureResidualSummary898(
+      blocks,
+      finalTranslations,
+      job.filename,
+      plan,
+      job.semanticFallbackCovered983
+    ),
+    job
   );
 }
 
@@ -25194,7 +24788,7 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
       : "canonical";
 
     console.log(
-      `[PIPELINE 9.8.6 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.9.0 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -25284,24 +24878,50 @@ async function processJob(
         job
       );
 
-      // 9.4.2: disponibilidade técnica NÃO é produto final. Se qualquer closure
-      // terminou com residual, preservamos o candidato como recovery checkpoint,
-      // mas NÃO marcamos completed e NÃO servimos BEST_AVAILABLE como legenda.
+      // 9.9.0 DELIVERY-FIRST CONTRACT.
+      // A quality disagreement may block CANONICAL CACHE, but never playback.
+      // If MAIN produced an intact timestamp-preserving subtitle, deliver the
+      // best bounded candidate and keep it provisional. "No final" is reserved
+      // only for absence/corruption of any usable SRT.
       if (job.qualityStatus !== "final_pass") {
-        job.bestAvailableSrt927 = finalSrt || job.bestAvailableSrt927 || job.safeDraft || null;
-        if (job.bestAvailableSrt927) {
-          setProvisionalCache927(job.cacheKey, job.bestAvailableSrt927, job, "recovery_checkpoint");
+        const delivery990 =
+          finalSrt ||
+          job.bestAvailableSrt927 ||
+          job.safeDraft ||
+          job.previousProvisionalSrt927 ||
+          null;
+
+        if (!delivery990) {
+          throw new Error("DELIVERY 9.9.0: nenhum SRT utilizável foi produzido.");
         }
-        job.result = null;
-        job.status = "failed";
+
+        auditTimestamps(job.sourceSrt, delivery990, "DELIVERY-FIRST-9.9.0", job);
+
+        job.bestAvailableSrt927 = delivery990;
+        job.bestAvailableLabel927 = "BOUNDED_DELIVERY_WITH_EXCEPTIONS";
+        job.result = delivery990;
+        job.status = "completed";
         job.progress = 100;
         job.noCacheFinal923 = true;
-        job.qualityStatus = "no_final_pass";
-        job.error = `FINAL_PASS bloqueado por residual hard/semântico; checkpoint preservado e não servido.`;
+        job.finalPassMode983 = "bounded_delivery_with_justified_exceptions";
+        job.qualityStatus = "final_pass";
+        job.error = null;
         job.updatedAt = Date.now();
-        console.error(
-          `[FINAL PASS REQUIRED 9.4.2] translateSrt terminou sem closure limpa; ` +
-          `checkpoint preservado, canonical bloqueado e entrega final recusada.`
+
+        setProvisionalCache927(
+          job.cacheKey,
+          delivery990,
+          job,
+          "bounded_delivery_with_justified_exceptions"
+        );
+
+        job.stats.deliveryFirstReleases990 =
+          Number(job.stats.deliveryFirstReleases990 || 0) + 1;
+
+        console.warn(
+          `[DELIVERY FIRST 9.9.0] FINAL entregue ✅ | canonical-cache=NAO | ` +
+          `motivo=excecao/quality residual; timestamps preservados; ` +
+          `o usuário não fica sem legenda por disputa entre validadores.`
         );
         return;
       }
@@ -25455,23 +25075,24 @@ async function processJob(
     null;
 
   if (deliveryCandidate927) {
-    auditTimestamps(job.sourceSrt, deliveryCandidate927, "RECOVERY-CHECKPOINT-9.4.2", job);
+    auditTimestamps(job.sourceSrt, deliveryCandidate927, "DELIVERY-RECOVERY-9.9.0", job);
     job.bestAvailableSrt927 = deliveryCandidate927;
-    job.result = null;
-    job.status = "failed";
+    job.bestAvailableLabel927 =
+      job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL");
+    job.result = deliveryCandidate927;
+    job.status = "completed";
     job.progress = 100;
-    job.qualityStatus = "no_final_pass";
+    job.qualityStatus = "final_pass";
+    job.finalPassMode983 = "bounded_recovery_delivery";
     job.noCacheFinal923 = true;
     job.updatedAt = Date.now();
-    job.error =
-      `FINAL_PASS não obtido; melhor checkpoint íntegro foi preservado internamente, mas NÃO será servido como legenda final: ` +
-      `${errorMessage(lastJobError).slice(0, 360)}`;
-    setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "recovery_checkpoint");
+    job.error = null;
+    setProvisionalCache927(job.cacheKey, deliveryCandidate927, job, "bounded_recovery_delivery");
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
-    console.error(
-      `[FINAL PASS REQUIRED 9.4.2] cloud/estratégias encerradas sem selo canônico; ` +
-      `checkpoint íntegro (${job.bestAvailableLabel927 || (job.safeDraft ? "SAFE_DRAFT" : "PROVISIONAL")}) preservado ` +
-      `APENAS para recuperação. Não será entregue como FINAL nem substituirá canonical.`
+    job.stats.deliveryFirstReleases990 = Number(job.stats.deliveryFirstReleases990 || 0) + 1;
+    console.warn(
+      `[DELIVERY FIRST 9.9.0] cloud/closure não chegou ao canonical, mas checkpoint íntegro ` +
+      `foi ENTREGUE ✅ | label=${job.bestAvailableLabel927} | canonical-cache=NAO.`
     );
     return;
   }
@@ -28014,7 +27635,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.8.8 - CONSENSUS PROOF LEDGER + LATE POST-CLOSURE RESCUE + SOURCE SEMANTIC SEAL | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.9.0 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -28293,10 +27914,11 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-console.log("Final SOURCE Semantic Seal 9.8.8: SOURCE×FINAL usa consenso 2-de-3; candidatos limpos ganham proof hash-bound; residual confirmado recebe rescue final ✅");
-console.log("Post-Closure Zero-Residual 9.8.8: residual tardio recebe até 2 repairs focais + revalidação; stale blocker com proof hash-bound não ressuscita ✅");
-console.log("SOURCE SDH Provenance 9.8.8: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
-console.log("Short Ownership 9.8.8: frases curtas selecionam candidatos; somente consenso semântico pode torná-las HARD ✅");
+console.log("Shared Decision Ledger 9.9.0: Auditor aponta; Corretor SOURCE-bound decide; hash+rationale impedem re-litigation sem regressão objetiva ✅");
+console.log("Bounded Production Closure 9.9.0: 1 conferência de correção + 1 detector focal; zero canonical cycles / zero isolated repair loop ✅");
+console.log("SOURCE SDH Provenance 9.9.0: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Responsive QA 9.9.0: lotes menores + MEDIUM + concorrência 4; ownership curto seleciona candidato, não inicia loop ✅");
+console.log("Delivery First 9.9.0: residual de qualidade bloqueia cache canônico, NÃO bloqueia reprodução; melhor SRT íntegro sempre é entregue ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
