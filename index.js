@@ -10,7 +10,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
 // ============================================================
-// STREMIO PT-BR 9.9.0 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA + JUSTIFIED LAYOUT EXCEPTIONS + IMMUTABLE TIMELINE (UNIVERSAL / TITLE-AGNOSTIC)
+// STREMIO PT-BR 9.9.1 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA + JUSTIFIED LAYOUT EXCEPTIONS + IMMUTABLE TIMELINE (UNIVERSAL / TITLE-AGNOSTIC)
 // GenerateContent + per-model quotas + phase-aware routing + bounded checkpoints.
 // 9.7.7 never gives a model timestamp authority: SOURCE coordinates are immutable and FINAL is fail-closed
 // on ID-order/timestamp drift, global long-duplicate ownership corruption or unaccounted Repair residuals.
@@ -156,7 +156,7 @@ const SHORT_OWNERSHIP_TARGET_SIM_986 = 0.72;
 const SHORT_OWNERSHIP_SOURCE_SIM_MAX_986 = 0.38;
 
 const CACHE_VERSION =
-  "9.9.0-shared-decision-ledger-bounded-production-v1";
+  "9.9.1-shared-decision-ledger-bounded-production-v1";
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SOURCE_CHARS = 800000;
@@ -16010,11 +16010,11 @@ async function applyCanonicalOwnershipClosure984(
   job.canonicalOwnershipResidual984 = issues.length;
   if (issues.length) {
     console.warn(
-      `[OWNERSHIP HANDOFF 9.9.0] candidatos=${issues.length} | ` +
+      `[OWNERSHIP HANDOFF 9.9.1] candidatos=${issues.length} | ` +
       `0 rodada cloud separada; delegados à Shared Decision Conference.`
     );
   } else {
-    console.log(`[OWNERSHIP HANDOFF 9.9.0] residual=0 ✅ | 0 cloud.`);
+    console.log(`[OWNERSHIP HANDOFF 9.9.1] residual=0 ✅ | 0 cloud.`);
   }
 
   return { translations: out, issues };
@@ -16673,12 +16673,12 @@ async function applyCanonicalZeroResidualClosure985(
         focus
       );
       console.log(
-        `[DECISION DETECTOR 9.9.0] foco=${focus.size} | ` +
+        `[DECISION DETECTOR 9.9.1] foco=${focus.size} | ` +
         `semantic-flags=${semanticAfterCorrection.length} | auditoria única pós-correção.`
       );
     } catch (error) {
       console.warn(
-        `[DECISION DETECTOR 9.9.0] auditoria focal indisponível; ` +
+        `[DECISION DETECTOR 9.9.1] auditoria focal indisponível; ` +
         `guards objetivos + baseline seguro assumem autoridade | ${errorMessage(error).slice(0,220)}`
       );
     }
@@ -16727,7 +16727,7 @@ async function applyCanonicalZeroResidualClosure985(
         const candidate = canonicalFinalCandidate983(block, raw);
         if (!candidate) continue;
 
-        const trial = new Map(out);
+        let trial = new Map(out);
         trial.set(id, candidate);
         trial = applySourceSdhProvenance986([block], trial, job);
 
@@ -16795,18 +16795,18 @@ async function applyCanonicalZeroResidualClosure985(
   const exceptionCount = [...ledger.values()].filter(x => /exception|fallback|reaffirmed/i.test(String(x.status))).length;
 
   console.log(
-    `[SHARED DECISION LEDGER 9.9.0] decisions=${ledger.size} | exceptions/fallbacks=${exceptionCount} | ` +
+    `[SHARED DECISION LEDGER 9.9.1] decisions=${ledger.size} | exceptions/fallbacks=${exceptionCount} | ` +
     `structural-residual=${structuralResidual.length} | cloud-cycles=1 | isolated-repair-loop=0.`
   );
 
   if (!structuralResidual.length) {
     console.log(
-      `[BOUNDED PRODUCTION CLOSURE 9.9.0] PASSOU ✅ | ownership=0 | SDH=0 | ` +
+      `[BOUNDED PRODUCTION CLOSURE 9.9.1] PASSOU ✅ | ownership=0 | SDH=0 | ` +
       `semantic re-litigation bloqueada por hash-bound ledger.`
     );
   } else {
     console.error(
-      `[BOUNDED PRODUCTION CLOSURE 9.9.0] structural-residual=${structuralResidual.length} | ` +
+      `[BOUNDED PRODUCTION CLOSURE 9.9.1] structural-residual=${structuralResidual.length} | ` +
       `sem loop adicional; final seals decidirão usando o melhor baseline íntegro.`
     );
   }
@@ -23856,7 +23856,7 @@ async function onePassDecisionRepair990(
   }
 
   console.warn(
-    `[DECISION CONFERENCE 9.9.0] alvos=${unique.length} | lotes=${batches.length} | ` +
+    `[DECISION CONFERENCE 9.9.1] alvos=${unique.length} | lotes=${batches.length} | ` +
     `concorrência=${Math.min(REPAIR_CONCURRENCY, batches.length)} | UMA rodada sem micro-loop.`
   );
 
@@ -23877,13 +23877,13 @@ async function onePassDecisionRepair990(
           job
         );
         console.log(
-          `[DECISION CONFERENCE 9.9.0 W${workerId}] lote=${at+1}/${batches.length} ` +
+          `[DECISION CONFERENCE 9.9.1 W${workerId}] lote=${at+1}/${batches.length} ` +
           `retornado=${results[at]?.translations?.size || 0}/${batch.length}.`
         );
       } catch (error) {
         results[at] = { translations:new Map(), unresolvedIds:batch.map(x=>Number(x.id)), rejected:new Map(), technicalFailed:true };
         console.warn(
-          `[DECISION CONFERENCE 9.9.0 W${workerId}] lote=${at+1} falhou tecnicamente; ` +
+          `[DECISION CONFERENCE 9.9.1 W${workerId}] lote=${at+1} falhou tecnicamente; ` +
           `baseline atual preservado | ${errorMessage(error).slice(0,220)}`
         );
       }
@@ -24133,12 +24133,12 @@ async function runBoundedFinalQuality88(
 
   if (residual.length) {
     console.warn(
-      `[POST-REPAIR LOCAL HANDOFF 9.9.0] candidatos=${residual.length} | ` +
+      `[POST-REPAIR LOCAL HANDOFF 9.9.1] candidatos=${residual.length} | ` +
       `0 QA cloud / 0 Repair cloud nesta etapa; encaminhados à única Decision Conference.`
     );
   } else {
     console.log(
-      `[POST-REPAIR LOCAL HANDOFF 9.9.0] residual=0 ✅ | 0 QA cloud / 0 Repair cloud.`
+      `[POST-REPAIR LOCAL HANDOFF 9.9.1] residual=0 ✅ | 0 QA cloud / 0 Repair cloud.`
     );
   }
 
@@ -24357,7 +24357,7 @@ let qaIssues =
   let preClosureSemantic950 = [];
   if (preClosureFocus950.size) {
     console.log(
-      `[SHARED DECISION LEDGER 9.9.0] PRE-AUDIT probabilístico redundante dispensado | ` +
+      `[SHARED DECISION LEDGER 9.9.1] PRE-AUDIT probabilístico redundante dispensado | ` +
       `foco=${preClosureFocus950.size}; QA global + guards locais alimentam a única rodada de Repair. ✅`
     );
   }
@@ -24556,7 +24556,7 @@ finalTranslations = sanitizeTranslationMap(blocks, finalTranslations, job);
 job.finalSourceSemanticResidual986 = 0;
 job.finalSourceSemanticIssues986 = [];
 console.log(
-  `[FINAL SOURCE SEMANTIC SEAL 9.9.0] delegado ao Shared Decision Ledger | ` +
+  `[FINAL SOURCE SEMANTIC SEAL 9.9.1] delegado ao Shared Decision Ledger | ` +
   `segunda auditoria global dispensada; somente novas regressões objetivas podem reabrir um cue. ✅`
 );
 
@@ -24620,12 +24620,12 @@ if (finalClosure898.gender > 0) {
 
   if (structural990.length) {
     console.error(
-      `[POST-CLOSURE DETERMINISTIC 9.9.0] structural=${structural990.length} | ` +
+      `[POST-CLOSURE DETERMINISTIC 9.9.1] structural=${structural990.length} | ` +
       `sem cloud-loop; melhor baseline same-cue já foi tentado.`
     );
   } else {
     console.log(
-      `[POST-CLOSURE DETERMINISTIC 9.9.0] residual=0 ✅ | ` +
+      `[POST-CLOSURE DETERMINISTIC 9.9.1] residual=0 ✅ | ` +
       `ledger compartilhado respeitado; 0 nova chamada cloud.`
     );
   }
@@ -24788,7 +24788,7 @@ auditGlobalOwnershipSrt977(sourceSrt, finalSrt, "FINAL", job);
       : "canonical";
 
     console.log(
-      `[PIPELINE 9.9.0 ROUTED] FINAL OK | ${
+      `[PIPELINE 9.9.1 ROUTED] FINAL OK | ${
         blocks.length
       } source cues | pipeline=${
         pipelineElapsedSeconds.toFixed(1)
@@ -24919,7 +24919,7 @@ async function processJob(
           Number(job.stats.deliveryFirstReleases990 || 0) + 1;
 
         console.warn(
-          `[DELIVERY FIRST 9.9.0] FINAL entregue ✅ | canonical-cache=NAO | ` +
+          `[DELIVERY FIRST 9.9.1] FINAL entregue ✅ | canonical-cache=NAO | ` +
           `motivo=excecao/quality residual; timestamps preservados; ` +
           `o usuário não fica sem legenda por disputa entre validadores.`
         );
@@ -25091,7 +25091,7 @@ async function processJob(
     job.stats.boundedSafeDraftReleases = (job.stats.boundedSafeDraftReleases || 0) + 1;
     job.stats.deliveryFirstReleases990 = Number(job.stats.deliveryFirstReleases990 || 0) + 1;
     console.warn(
-      `[DELIVERY FIRST 9.9.0] cloud/closure não chegou ao canonical, mas checkpoint íntegro ` +
+      `[DELIVERY FIRST 9.9.1] cloud/closure não chegou ao canonical, mas checkpoint íntegro ` +
       `foi ENTREGUE ✅ | label=${job.bestAvailableLabel927} | canonical-cache=NAO.`
     );
     return;
@@ -25162,6 +25162,12 @@ function jobResponse(
 
     qualityStatus:
       publicQualityStatus987(job),
+
+    canonicalEligible:
+      job.noCacheFinal923 !== true,
+
+    deliveryMode:
+      String(job.finalPassMode983 || ""),
 
     residualBlockers:
       Array.isArray(job.finalTargetResidual927) ? job.finalTargetResidual927.length : 0,
@@ -27408,6 +27414,12 @@ app.get(
         qualityStatus:
           publicQualityStatus987(job),
 
+        canonicalEligible:
+          job.noCacheFinal923 !== true,
+
+        deliveryMode:
+          String(job.finalPassMode983 || ""),
+
         sourceKind:
           job.sourceKind,
 
@@ -27635,7 +27647,7 @@ app.listen(PORT, () => {
   );
 
     console.log(
-        " STREMIO PT-BR 9.9.0 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
+        " STREMIO PT-BR 9.9.1 - SHARED DECISION LEDGER + BOUNDED PRODUCTION CLOSURE + RESPONSIVE QA | UNIVERSAL / TIMING 9.4.3.4 PRESERVED"
   );
 
   console.log(
@@ -27914,11 +27926,12 @@ console.log(
   console.log(
     `Cache namespace: ${CACHE_VERSION}`
   );
-console.log("Shared Decision Ledger 9.9.0: Auditor aponta; Corretor SOURCE-bound decide; hash+rationale impedem re-litigation sem regressão objetiva ✅");
-console.log("Bounded Production Closure 9.9.0: 1 conferência de correção + 1 detector focal; zero canonical cycles / zero isolated repair loop ✅");
-console.log("SOURCE SDH Provenance 9.9.0: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
-console.log("Responsive QA 9.9.0: lotes menores + MEDIUM + concorrência 4; ownership curto seleciona candidato, não inicia loop ✅");
-console.log("Delivery First 9.9.0: residual de qualidade bloqueia cache canônico, NÃO bloqueia reprodução; melhor SRT íntegro sempre é entregue ✅");
+console.log("Shared Decision Ledger 9.9.1: Auditor aponta; Corretor SOURCE-bound decide; hash+rationale impedem re-litigation sem regressão objetiva ✅");
+console.log("Bounded Production Closure 9.9.1: 1 conferência de correção + 1 detector focal; zero canonical cycles / zero isolated repair loop ✅");
+console.log("SOURCE SDH Provenance 9.9.1: stage-direction/SDH puro nunca pode virar diálogo visível após tradução ✅");
+console.log("Responsive QA 9.9.1: lotes menores + MEDIUM + concorrência 4; ownership curto seleciona candidato, não inicia loop ✅");
+console.log("Delivery First 9.9.1: residual de qualidade bloqueia cache canônico, NÃO bloqueia reprodução; melhor SRT íntegro sempre é entregue ✅");
+console.log("Canonical Contract 9.9.1: API publica canonicalEligible + deliveryMode para a Ponte não congelar provisional como canônico ✅");
   console.log("Quality Closure 9.7.4: focal clean proof is hash-bound; stale pre-Repair blocker cannot resurrect; real residual stays fail-closed.");
   console.log("Semantic Repair Budget 9.7.4: one main Repair; bounded focal closure only for proven residual; zero global cloud pass after Repair.");
   console.log("Adaptive MAIN Circuit Breaker 9.7.5: normal=6; brownout=HOLD -> 1 probe -> recovery=2 -> 6 após 2 sucessos; checkpoint MAIN preservado ✅");
